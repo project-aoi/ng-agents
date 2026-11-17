@@ -100,7 +100,7 @@ stateDiagram-v2
 
     SilentNote --> [*]
     InlineRun --> ClarifyCard: 几秒内备好带版本初稿并触发 ⑦ Gate(defer)
-    InlineRun --> ActiveCellTree: 超过 5 秒自动热 fork 转后台 / 启动异步 Job / 动态拼装多步 Project Cell
+    InlineRun --> ActiveCellTree: 超过 5 秒触发 detach 执行迁移转后台 / 启动异步 Job / spawnCell 委派多步项目
 
     SubscribedCell --> ActiveCellTree: 收到部分回信(如 2/3) 或 CI 报错 (走 protocol 原子记账推进, 不弹通知卡)
     ActiveCellTree --> ClarifyCard: 结果就绪 / all 汇合收齐 / 超时未回 / 需拍板或超预算升级 (单事项至多 1 张卡)

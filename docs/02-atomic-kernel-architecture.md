@@ -3,7 +3,7 @@
 > [!IMPORTANT]
 > **核心结论：既不需要为每种 Agent 产品单独设计一套架构，也不需要在内核里塞满定制业务实体。**
 > 1. **数据面只需要 1 条统一消息流（`Envelope`）+ 8 个职责封闭的基础原语**：`① Channel`（渠道接入与能力声明）、`② Clock`（定时与唤醒）、`③ Inbox`（收件队列、租约锁与实时控制旁路）、`④ Context`（分层状态/记录/技能存储与带版本原子提交）、`⑤ Loop`（大模型推理或确定性处理器）、`⑥ Workspace`（隔离沙箱与异步 `Job` 句柄）、`⑦ Gate`（权限收紧、绑定版本的审批与预算控制）、`⑧ Outbox`（区分内部协议消息与对人通知的投递层）。
-> 2. **控制面只需要 1 个组合容器 `Cell` + 运行在原语上的显式状态协议**：真实工作的粒度跨度极大（从 2 秒记条笔记，到跨天等三方回信、并发扒 15 家竞品、或定期跑监控脚本）。把“8 个原语怎么连在一起”封装成可动态创建的 **`Cell`**，配合 `Context + Loop` 上的状态与汇合协议——靠**预设模板**应付日常 90% 的场景，靠 **Agent 动态拼装**应付长尾复杂场景，再靠**长耗时自动热 `fork` 与异步 `Job`** 避免堵死主会话——就能在同一套底座上搭出 Pi、OpenClaw、Hermes、DeepSeek Super-agent、Poke、Devin、Manus、Paperclip 以及我们的 GTD 工作台。
+> 2. **控制面只需要 1 个组合容器 `Cell` + 运行在原语上的显式状态协议**：真实工作的粒度跨度极大（从 2 秒记条笔记，到跨天等三方回信、并发扒 15 家竞品、或定期跑监控脚本）。把“8 个原语怎么连在一起”封装成可动态创建的 **`Cell`**，配合 `Context + Loop` 上的状态与汇合协议——靠**预设模板**应付日常 90% 的场景，靠 **Agent 动态委派拼装（`spawnCell`）** 应付长尾复杂场景，再靠**长耗时原任务执行迁移（`detach`）与异步 `Job`** 避免堵死主会话——就能在同一套底座上搭出 Pi、OpenClaw、Hermes、DeepSeek Super-agent、Poke、Devin、Manus、Paperclip 以及我们的 GTD 工作台。
 
 ---
 
@@ -18,10 +18,10 @@
 | **③** | **`Inbox`**（队列、租约与控制旁路） | 数据面原语 | 消息落盘去重、单 `Cell` 串行合并锁 / 共享抢单锁 / 跑题退回（`handback`），以及**绕开普通排队锁的实时控制旁路（`cancel / pause / steer`）** | 少了它，连发消息会并发撞车；少了控制旁路，跑长任务时用户喊“快停下”只能排在队尾干等 |
 | **④** | **`Context`**（分层状态、记录与技能） | 数据面原语 | 分层保存 **① 带 `revision` 版本的业务状态与草稿产物、② 原始对话与外部证据（支持 `Inline & Spill` URI 直读）、③ `SKILL.md` 与长期偏好**；提供**状态变更 + 待发意图的原子条件提交（CAS）**，以及前缀稳定的只读推理快照 | 少了分层与版本提交，人机同时改草稿会互相覆盖，进程重启会丢派单，上下文压缩还会误删活跃项目状态 |
 | **⑤** | **`Loop`**（推理或确定性处理） | 数据面原语 | 无状态的单次有界执行（`Run`）：既可跑大模型推理，**也可跑已注册的确定性处理器/纯脚本**（处理审批回执、UI 改稿保存、子任务 `all/any` 汇合计数、零 Token 巡检） | 都调大模型既贵又慢还可能算错账；双模式兼顾了灵活生成与零 Token 精确状态流转 |
-| **⑥** | **`Workspace`**（沙箱与异步 `Job`） | 数据面原语 | 与推理循环分离的隔离执行环境（`git worktree` / 容器 / MicroVM）：支持短命令直跑、**脱离单次 `Run` 的异步 `Job` 句柄**，以及超时热过户时**将原沙箱连同在途进程整套移交后台（主台另起新沙箱）** | 若命令必须卡住 `Run` 或半路硬搬已启动进程的目录，要么锁死主窗口，要么主后台写同一目录互相踩踏 |
-| **⑦** | **`Gate`**（权限、版本审批与预算） | 数据面原语 | 硬护栏：**沙箱外代理注入密钥、区分“自身可执行权限”与“可委派权限池”的单调收紧、绑定具体草稿版本号的 `defer` 审批、撤销（`revoke`）、金额+Token 树状预算控制** | 不区分自身与可委派权限，轻权限接待 `Router` 就派不出能改代码的 `Worker`；少了版本绑定则会误发新草稿 |
+| **⑥** | **`Workspace`**（沙箱与异步 `Job`） | 数据面原语 | 与推理循环分离的隔离执行环境（`git worktree` / 容器 / MicroVM）：支持短命令直跑、**脱离单次 `Run` 的异步 `Job` 句柄**，以及超时转后台时**将原沙箱连同在途进程整套移交后台槽（主台按需另起新沙箱）** | 若命令必须卡住 `Run` 或半路硬搬已启动进程的目录，要么锁死主窗口，要么主后台写同一目录互相踩踏 |
+| **⑦** | **`Gate`**（权限委派与迁移、版本审批、预算） | 数据面原语 | 硬护栏：**沙箱外代理注入密钥、分离“原任务执行迁移（保留原权限并撤销前台旧槽）”与“子任务委派（`delegatableTools` + `maxDepth` 递减）”、绑定草稿版本号的 `defer` 审批、撤销（`revoke`）、金额+Token 树状预算控制** | 若把转后台当成派生子任务，禁止派单的任务就没法退后台；若不撤销前台旧槽，单份权限又会被复制成双份并发执行 |
 | **⑧** | **`Outbox`**（分类投递与静默过滤） | 数据面原语 | 严格区分 **内部协议消息（`protocol`）**、**对人通知（`notify`）** 与 **暂态流式预览（`preview`）**：可靠投递内部结果，对人通知支持 `silentDrop`、专注期免打扰暂存与真实投递回执（含 `unknown` 状态） | 若内外消息混为一谈，用户一开“免打扰”就会把子任务交上来的汇总结果也吞掉卡死 |
-| **⑨** | **`Cell`**（原语拼装单元） | **控制面容器** | 把上面 8 个原语组装成有明确归属、版本与生命周期边界的运行实例：支持**预设模板、Agent 动态拼装、超 5 秒连同原沙箱热过户、完结/取消按版本级联回收** | 如果把连线写死在启动代码里，系统只能定死一种任务粒度；有了 `Cell`，才能随事情大小自然伸缩 |
+| **⑨** | **`Cell`**（原语拼装单元） | **控制面容器** | 把上面 8 个原语组装成有明确归属、版本与生命周期边界的运行实例：支持**预设模板、超 5 秒原任务执行迁移（`detach`）、Agent 动态委派拼装（`spawnCell`）、完结/取消按版本级联回收** | 如果把连线写死在启动代码里，系统只能定死一种任务粒度；有了 `Cell`，才能随事情大小自然伸缩 |
 
 > [!TIP]
 > **坚持“内核只留通用原语，复杂行为靠显式状态协议组合”——不需要为每种功能往内核里塞定制组件：**
@@ -32,7 +32,7 @@
 
 ---
 
-## 二、核心契约定义：1 条消息总线 + 8 个原语 + `Cell`（约 185 行 TypeScript）
+## 二、核心契约定义：1 条消息总线 + 8 个原语 + `Cell`（约 190 行 TypeScript）
 
 把关键对象（会话线程 `threads`、运行单元 `Cell`、单轮推理 `Run`、后台长进程 `Job`、带版本草稿/产物 `Artifact`、受控动作 `Action`）拆清楚后，核心接口如下：
 
@@ -55,16 +55,17 @@ export interface Envelope<T = unknown> {
   createdAt: number;
 }
 
-export interface PolicyBounds {         // 分离“自身可执行权限”与“可向子 Cell 委派的权限上限”
-  selfTools: ReadonlySet<ToolKind>;     // 当前 Cell 自身可调工具（例: Router 仅留 ["read"]，禁止亲自写文件或跑 bash）
-  delegatableTools: ReadonlySet<ToolKind>; // 允许派给子 Cell 的工具池（强制: child.selfTools ⊆ parent.delegatableTools 且 child.delegatableTools ⊆ parent.delegatableTools）
-  canSendTo: readonly string[];         // 当前 Cell 自身允许投递的目标地址
-  delegatableSendTo: readonly string[]; // 允许子 Cell 投递的地址上限（外加默认允许回传父收件箱 `inbox:${parentCellId}`）
+export interface PolicyBounds {         // 分离“自身可执行权限”与“向新子 Cell 委派的权限上限”
+  selfTools: ReadonlySet<ToolKind>;     // 当前任务自身可调工具（原任务 detach 转后台时原样保留）
+  delegatableTools: ReadonlySet<ToolKind>; // 仅用于 spawnCell 派新子任务的工具池（可为空集，不影响当前任务自身转后台）
+  canSendTo: readonly string[];         // 当前任务自身允许投递的目标地址
+  delegatableSendTo: readonly string[]; // 允许新子 Cell 投递的地址上限（外加默认允许回传父收件箱 `inbox:${parentCellId}`）
   secretRefs: ReadonlySet<string>;      // 可用及可继续下放的沙箱外代理密钥白名单（child ⊆ parent）
   isolation: "none" | "shared_ro" | "git_worktree" | "container" | "cow_microvm"; // 当前隔离模式（子 Cell 可切独立 git_worktree/容器，但禁止降级回无隔离 none）
-  maxTokens: number;                    // 与 maxCents 一起沿父子 Cell 树预留并向上汇总结算
+  maxConcurrentTasks: number;           // 同一授权池允许并发持有 selfTools 执行槽的任务数（默认 1：detach 迁走并撤销前台旧槽，不复制并发权限；>1 时允许主台领新槽并行干活）
+  maxTokens: number;                    // 与 maxCents 一起沿作用域树共享预留并向上汇总结算
   maxCents: number;
-  maxDepth: number;                     // 派生层级递减（child.maxDepth <= parent.maxDepth - 1），防多角色层层开会空转
+  maxDepth: number;                     // 仅限制 spawnCell 派生新子 Cell 的层级（0 表示禁止派生新 Agent，不限制原任务自身 detach）
 }
 
 // ==================== ① Channel：外部协议适配与能力声明 ====================
@@ -133,7 +134,7 @@ export interface ContextStore {
 
 // ==================== ⑤ Loop：有界单次执行（支持大模型推理与确定性处理器） ====================
 export type ProcessorSpec =
-  | { kind: "llm"; skills?: string[]; modelTier?: "fast" | "strong"; autoForkAfterMs?: number; maxSteps?: number }
+  | { kind: "llm"; skills?: string[]; modelTier?: "fast" | "strong"; autoDetachAfterMs?: number; maxSteps?: number }
   | { kind: "handler"; handlerName: string }    // 注册的确定性业务处理器（审批入账、改稿保存、all/any 汇合等，零 Token）
   | { kind: "script"; scriptPath: string };     // 零 Token 巡检脚本：无异常静默结束，有异常产出标准消息
 
@@ -142,7 +143,7 @@ export interface AgentLoop {
     | "completed"
     | "yielded_waiting"         // 已持久化等待条件或启动异步后台 Job，释放本次 Run（休眠期 $0 算力）
     | "deferred_for_approval"   // 触发 Gate.defer 生成待确认卡，存盘释放 Run
-    | "forked_to_background"    // 超过 autoForkAfterMs 连同原沙箱热过户至后台子 Cell，立即释放主台锁
+    | "detached_to_background"  // 超过 autoDetachAfterMs 执行迁移至后台槽（保留原权限并撤销前台旧槽），立即释放主台对话锁
     | "cancelled"
     | "budget_stopped"
   >;
@@ -168,9 +169,17 @@ export interface WorkspacePort {
   cancelJob(jobId: string): Promise<void>;
 }
 
-// ==================== ⑦ Gate：权限委派收紧、绑定版本的审批与树状预算控制 ====================
+// ==================== ⑦ Gate：执行迁移、权限委派收紧、绑定版本的审批与预算 ====================
 export interface Gate {
+  // 1. 新任务委派（spawnCell 专用）：校验 parent.maxDepth >= 1（子级减 1），且 child 权限 ⊆ parent.delegatable*
   attenuate(parent: PolicyBounds, parentCellId: string, requested?: Partial<PolicyBounds>): PolicyBounds;
+  // 2. 原任务执行迁移（内核超时 detach 专用）：原样平移身份、selfTools/canSendTo/secretRefs、maxDepth 与共享预算，
+  //    不查 delegatable*、不扣 maxDepth，同时原子作废前台对该执行槽的旧租约（防单份权限复制成两份并发执行）
+  migrateExecution(fromCellId: string, toDetachedCellId: string): Promise<{
+    migrated: boolean;
+    remainingForegroundExecSlots: number;
+  }>;
+  releaseExecution(detachedCellId: string): Promise<void>; // 后台迁移槽完结或取消时归还执行配额
   authorize(action: ProposedAction, meta: {
     cellId: string;
     principalId: string;
@@ -203,7 +212,7 @@ export interface Outbox {
 // ==================== ⑨ Cell：预设模板与 Agent 动态拼装的统一容器 ====================
 export interface CellSpec {
   id?: string;
-  parentId?: string;                    // 构成父子监督树，上层完结或取消时整棵子树按版本级联回收
+  parentId?: string;                    // 构成监督树作用域，上层完结或取消时整棵子树按版本级联回收
   preset?: "inline" | "worker" | "watcher" | "sensor";
   watches?: Array<{ threadOrFilter: Record<string, unknown>; cancelGroup?: string }>;
   schedules?: Array<{ cron?: string; at?: number; idleSec?: number; cancelGroup?: string }>;
@@ -225,7 +234,7 @@ export interface CellPorts {            // 处理器在运行期可见的受控�
 
 ---
 
-## 三、如何适配不同粒度的工作：4 个预设模板 + 超时自动 `fork` + 动态拼装
+## 三、如何适配不同粒度的工作：4 个预设模板 + 超时执行迁移（`detach`） + 动态委派拼装（`spawnCell`）
 
 为什么单一固定架构应付不了真实工作？因为进入系统的事情从“一句话备忘”到“跨周大项目”差了好几个数量级。我们不在系统里造复杂的档位概念，而是靠 **三条简单机制 + 四道运行硬护栏** 让架构随工作粒度自然伸缩：
 
@@ -234,10 +243,10 @@ flowchart TB
     In["外部信源 ① Channel / 定时信源 ② Clock"] --> Main["主台 Cell (preset: inline, 持独立沙箱实例)"]
 
     Main -->|"2~3 秒内干完的小事 (记笔记 / 定提醒 / 拟短回复)"| Fast["写 ④ Context 或发待确认卡 ➔ 秒回休眠并复用原沙箱"]
-    Main -->|"单轮超阈值 (如 >5 秒) 或启动长构建 Job"| Fork["⚡ 换房不搬人: 原沙箱连同在途 Job 整套过户给后台 Cell · 主台另起新沙箱"]
-    Main -->|"识别出多步等待 / 并发调研 / 新信源"| Dyn["🧩 Agent 调 spawnCell 在可委派权限池内拼装子 Cell 树"]
+    Main -->|"单轮超阈值 (如 >5 秒) 或启动长构建 Job"| Detach["⚡ 原任务执行迁移 (detach): 原权限+原沙箱整套迁往后台槽并撤销前台旧槽"]
+    Main -->|"识别出多步等待 / 并发调研 / 新信源"| Dyn["🧩 新任务委派 (spawnCell): 在 delegatableTools 与 maxDepth 内派生子 Cell"]
 
-    Fork --> Bg["后台独立推进 (原进程零中断继续 · 控制旁路随时可停)"]
+    Detach --> Bg["后台槽继续原任务 (不耗 maxDepth · 前台立即释放对话锁 · 控制旁路随时可停)"]
     Dyn --> W1["并发子 Worker Cells × N (走 protocol 回流父 Cell 原子汇合)"]
     Dyn --> W2["外部守候 Watcher Cell (持久等待条件 + 超时 Clock, 集齐前不弹卡)"]
     Dyn --> W3["定时/监控信源 Sensor Cell (可跑纯脚本, 有异常才往主 Inbox 投信)"]
@@ -250,20 +259,19 @@ flowchart TB
 * **`watcher`（外部跟进监听）**：在 `Context` 持久化具体等待条件（事件类型、匹配对象与截止时间），挂上 `Channel` 线程订阅与共享 `cancelGroup` 的 `Clock` 超时提醒；对方先回信就原子更新状态并销掉催问闹钟。
 * **`sensor`（定时与条件信源）**：挂在入口侧充当“产生任务的信源”——由 `Clock` 或外部事件流触发一段轻量脚本或快速检查，平时没事直接 `silentDrop`（连待办都不产生），发现异常才往主 `Inbox` 投递一条标准 `Envelope`。
 
-### 2. 长耗时任务“换房不搬人”热过户与异步 `Job`（边跑边聊、目录不冲突、随时急刹）
-DeepSeek 在实测中发现：如果只靠提示词劝单个 Agent“遇到重活请调子 Agent”，模型经常觉得顺手就自己在主会话里硬干，一旦跑起代码检查或编译，整个主会话就会堵死十几分钟；但如果先在公共主目录启动了构建进程、等 5 秒超时后再给后台新开 `worktree`，操作系统里已运行进程的当前目录（`cwd`）和打开的文件句柄根本没法半路搬过去，继续跑仍会污染主目录。
-* 我们的解法是 **“换房不搬人（原沙箱随任务整套留给后台，给主台新开干净沙箱）” + `Workspace` 异步 `Job` 句柄**：
-  1. **平时零额外开销复用**：主台 `Cell` 默认在独立隔离沙箱实例（如独立工作分支的 `git_worktree` 或 CoW 容器 `ws_1`）中起跑；2～3 秒搞定的小事当场结束，下一轮继续复用 `ws_1`。
-  2. **超 5 秒整套过户（`Workspace.transfer`）**：一旦某轮耗时超过 5 秒，内核新建后台子 `Cell`，把**原沙箱实例 `ws_1` 连同里面已在运行的 `Job` 进程、已热起来的上下文快照前缀（命中 KV-Cache）与线程订阅原封不动整套过户给后台子 `Cell`**——老进程在原目录 `ws_1` 里零中断继续跑；同时主台立刻释放主 `Inbox` 锁，并在下一轮需要动用文件系统时**按需新切一个干净的隔离沙箱 `ws_2`**，因此用户在主窗口马上开始另一项代码修改时落在新目录 `ws_2` 中，与后台正在跑的构建彻底物理隔离。
-     * *非隔离模式边界声明*：若运行在无隔离的单裸目录直连模式（`isolation: "none"`，底层无法切出第二个独立工作目录），`Workspace.transfer` 返回 `false`——此时主台仅并发响应对话与只读请求，冲突的写目录任务需排队或退回安全检查点在新目录重启，绝不虚构单裸目录并发写不冲突的能力。
-  3. **异步 `Job` 休眠等待与控制旁路急刹**：遇到 20 分钟编译或长测试时，`Workspace.startJob` 返回句柄后当前 `Run` 即可 `yielded_waiting` 释放推理算力（等待期 \$0 推理开销），跑完自动往所属 `Cell` 的 `Inbox` 回投结果唤醒；期间用户若喊“快停下”，命令直接走 `Inbox.control` 旁路秒级中断进程。
+### 2. 原任务超时执行迁移（`detach`）与异步 `Job`（非派生、换房不搬人、随时急刹）
+DeepSeek 在实测中发现：如果只靠提示词劝单个 Agent“遇到重活请调子 Agent”，模型经常顺手在主会话里硬干堵死聊天窗。但解决它时有两个极易踩中的工程陷阱：**一是如果把“超时转后台”实现成“派生子 `Cell`”，那一个被禁止继续派单的任务（`maxDepth = 0, delegatableTools = ∅`）就没法转后台了；二是已启动进程的目录无法半路瞬移。**
+* 因此内核把 **“原任务执行迁移（`detach`）”** 与 **“新任务委派（`spawnCell`）”** 彻底分开：
+  1. **保留原权限平移，撤销前台旧槽（不耗 `maxDepth`、不查 `delegatableTools`）**：一旦单轮执行超过 `autoDetachAfterMs`（如 5 秒），内核执行 `Gate.migrateExecution`——将当前任务连同**原执行身份、原 `selfTools / canSendTo / secretRefs` 权限、已热上下文前缀（命中 KV-Cache）与共享预算账本**直接迁移到独立后台运行槽 `detachedCell`（哪怕 `maxDepth = 0, delegatableTools = ∅`，它在后台照样能合法完成后半程的文件编辑与测试，且依然保持禁止继续派生新 Agent），**同时原子作废前台对该执行槽的旧持有权**，绝不把单份执行权限复制成两份并发执行；待后台完结或取消时再经 `Gate.releaseExecution` 归还配额。
+  2. **“换房不搬人”沙箱移交（`Workspace.transfer`）**：原沙箱实例 `ws_1` 连同里面正在跑的 `Job` 进程原封不动过户给 `detachedCell`（原进程零中断继续跑），同时**立即释放主台对话 `Inbox` 锁**——用户随时可以继续聊天问答、查 `Context` 或喊停。若授权池仅给了单执行槽（`maxConcurrentTasks = 1`），后续需动用 `Workspace` 工具的新请求会等待该槽释放；若工作台授权了多并发槽（`maxConcurrentTasks > 1`）且开启隔离沙箱（如独立工作分支的 `git_worktree`），主台则直接领取空闲槽并新切干净沙箱 `ws_2` 并行开展另一项修改（在 `isolation: "none"` 单裸目录模式下 `transfer` 返回 `false`，冲突写任务排队或退回检查点重启，不虚构裸目录并发写隔离）。
+  3. **异步 `Job` 休眠等待与控制旁路急刹**：遇到 20 分钟编译或长测试时，`Workspace.startJob` 返回句柄后当前 `Run` 即可 `yielded_waiting` 释放推理算力（等待期 \$0 推理开销），跑完自动回投 `Inbox` 唤醒；期间用户若喊“快停下”，命令走 `Inbox.control` 旁路秒级中断进程。
 
-### 3. Agent 动态拼装与四条运行硬护栏
-遇到预设模板套不上的剩下 10% 复杂工作（例如：先并行派 10 个 `worker` 扒数据、按 `all` 协议集齐汇总后再挂 `watcher` 跟进审批；或把跑顺了的每日巡检改成零 Token `script` 信源），Agent 直接通过 `spawnCell / updateCell` 自由组合参数。内核在底下守住四条硬边界：
-1. **自身执行与可委派权限分离收紧**：`PolicyBounds` 严格区分“自己能亲手调的工具（`selfTools`）”和“能派给子 `Cell` 的工具上限（`delegatableTools`）”，`Gate.attenuate` 强制校验 `child.selfTools ⊆ parent.delegatableTools` 且 `child.delegatableTools ⊆ parent.delegatableTools`——既允许只读接待 `Router` 派生出有完整编码权限的 `Worker`，又保证任何节点都无法突破上级的委派上限越权提权。
+### 3. Agent 动态委派拼装与四条运行硬护栏
+遇到预设模板套不上的剩下 10% 复杂工作（例如：先并行派 10 个 `worker` 扒数据、按 `all` 协议集齐汇总后再挂 `watcher` 跟进审批；或把跑顺了的每日巡检改成零 Token `script` 信源），Agent 通过 `spawnCell / updateCell` 自由组合参数。内核在底下守住四条硬边界：
+1. **执行迁移与权限委派分轨管控**：原任务 `detach` 转后台平移原 `selfTools` 并撤销前台旧槽（不增发并发权限、不耗 `maxDepth`）；而 `spawnCell` 主动派生新子 `Cell` 必须经 `Gate.attenuate` 校验 `parent.maxDepth >= 1`（子级 `maxDepth - 1`）且 `child.selfTools ⊆ parent.delegatableTools`、`child.delegatableTools ⊆ parent.delegatableTools`——既允许只读接待 `Router` 派出完整编码权限的 `Worker`，也允许禁止派单的单机任务丝滑退入后台。
 2. **状态与审批严格绑版本（CAS）**：人机改稿与状态流转均带 `expectedRevision` 原子提交（冲突时保留人工已存版本，绝不静默覆盖）；人工点确认绑定当时所见的草稿版本，防后台刚刷新草稿时误发新版；对外发信与改状态通过 `outboxIntents` 原子落盘，崩溃恢复不丢单。
 3. **内外消息分流与真实回执**：子 `Cell` 协作走 `protocol` 通道，绝不被人类专注期的“免打扰”误吞；对外发送如实区分 `sent / failed / unknown`，外部渠道不支持幂等或撤回时绝不伪造成功状态。
-4. **预算沿树共享、完结按版本级联回收**：父子 `Cell` 共享同一笔金额与 Token 预算上限；任务完成或取消时，`closeCell` 原子推进版本并销毁整棵子树名下的 `Clock`、`Channel` 订阅、未决 `Gate` 授权与异步 `Job`——迟到的旧子任务结果因版本过期只会归档，绝不会把已取消的任务重新唤醒。
+4. **预算沿树共享、完结按版本级联回收**：同一作用域下的后台迁移槽与父子 `Cell` 树共享同一笔金额与 Token 预算上限；任务完成或取消时，`closeCell` 原子推进版本、归还执行槽并销毁名下的 `Clock`、`Channel` 订阅、未决 `Gate` 授权与异步 `Job`——迟到的旧结果因版本过期只会归档，绝不会把已取消的任务重新唤醒。
 
 ---
 
@@ -272,7 +280,7 @@ DeepSeek 在实测中发现：如果只靠提示词劝单个 Agent“遇到重�
 以这 **8 个封闭原语 + `Cell`** 为共同底座，配合各自的状态 schema 与处理规则，就能清晰搭出目前主流的各类产品形态：
 
 ### 1. Pi / Claude Code CLI（轻量本地命令行编程工具）
-* **拼装方式**：只起 1 个本地 `Cell`（不配 `Clock`），核心放在精简 `⑤ Loop` 提示词（`<1k Token`）、`⑥ Workspace` 的基础工具 + `code_rpc`（QuickJS `Codemode`），以及流式终端 `streamPreview` 与 `Inbox.control` 实时打断转向（`steer / cancel`）。
+* **拼装方式**：只起 1 个本地 `Cell`（不配 `Clock`，可设 `maxDepth: 0` 禁止乱生子 Agent，耗时任务仍可经 `detach` 或异步 `Job` 跑在后台不挡交互），核心放在精简 `⑤ Loop` 提示词（`<1k Token`）、`⑥ Workspace` 的基础工具 + `code_rpc`（QuickJS `Codemode`），以及流式终端 `streamPreview` 与 `Inbox.control` 实时打断转向（`steer / cancel`）。
 
 ### 2. Anthropic《Building always-on agents》/ Claude Duet（云端常驻个人助手）
 * **拼装方式**：主台 `Cell` 配齐全部 8 个模块 + 空闲整理 `sensor`：外部 Webhook 与 `Clock` 汇入单写者 `Inbox` → `Context` 加载 200 行目录索引 → `Gate` 做代理密钥注入与绑定版本的 `defer` 零算力挂起确认 → 夜间空闲唤醒后台 `Cell` 整理 Wiki 记忆并 `silentDrop`。
@@ -314,11 +322,11 @@ ng-agents/
 │   ├── context/           # ④ 分层状态/证据/SKILL.md 存储、CAS 原子提交（含 Transactional Outbox）、前缀快照与 FTS5
 │   ├── loop/              # ⑤ 有界大模型推理循环、确定性业务处理器注册表与零 Token 脚本执行驱动
 │   ├── workspace/         # ⑥ 基础工具 + Codemode、异步 Job 句柄、transfer 整套沙箱移交、Worktree/容器隔离驱动
-│   ├── gate/              # ⑦ 自身/委派权限分离收紧、密钥代理注入、绑定版本的 defer 审批与撤销、树状预算计量
+│   ├── gate/              # ⑦ 执行迁移(migrateExecution)与委派收紧(attenuate)、密钥代理、版本审批与树状预算
 │   ├── outbox/            # ⑧ 内部 protocol 与对人 notify 分流投递、免打扰缓冲、silentDrop 与流式 preview
-│   └── cell/              # ⑨ Cell 监督树生命周期、动态订阅路由表、超 5 秒热 fork 与按版本级联销毁
+│   └── cell/              # ⑨ Cell 监督树生命周期、动态订阅路由表、超 5 秒执行迁移 detach 与按版本级联销毁
 ├── presets/               # 标准 Cell 拼装模板与确定性编排处理器（如 all/any 汇合、等待匹配）
-│   ├── inline-desk/       # 主台快处理（超 5 秒自动热 fork 转后台）
+│   ├── inline-desk/       # 主台快处理（超 5 秒原任务执行迁移 detach 转后台）
 │   ├── isolated-worker/   # 独立沙箱后台执行单元
 │   ├── thread-watcher/    # 外部回信监听 + 超时跟进单元
 │   └── cron-sensor/       # 定时/条件检查信源单元
