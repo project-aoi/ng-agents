@@ -1,20 +1,20 @@
 # ng-agents
 
-下一代个人与组织级工作辅助 Agent 探索项目：基于 **8 原子微内核（Atomic Microkernel）** 与 **GTD 认知协处理器（GTD Co-Processor）** 产品范式。
+面向日常工作的个人与团队 Agent 探索项目：底层采用 **8 个解耦的基础模块**，上层结合 **GTD（Getting Things Done）工作流**，把杂乱输入整理成随时可推进、可确认的具体事项。
 
-## 核心设计文档索引
+## 文档目录
 
-1. **[2026 热门 AI Agent 产品全景调研与十大底层架构共性](./docs/01-agent-landscape-2026.md)**
-   - 深度拆解 Anthropic《Building always-on agents》、Paperclip、Hermes Agent、OpenClaw、Pi、DeepSeek Harness、Poke、Devin 2.2、Manus 2.0、OpenAI Codex、Cursor Automations 与企业级 SaaS Agent 阵营。
-   - 提炼行业收敛出的十大工程范式（默认休眠按事件唤醒、单写者合并锁、脑手状态分离、KV-Cache 前缀不变性、Codemode 写代码调工具、文件记忆 + 离线 Dreaming、`SKILL.md` 渐进披露、沙箱外凭据代理 + `defer` 零算力审批、主动降噪与可验证交付物、子沙箱隔离与双指标预算熔断）及生产踩坑教训。
+1. **[2026 热门 AI Agent 产品调研与底层工程共性](./docs/01-agent-landscape-2026.md)**
+   - 拆解 Anthropic《Building always-on agents》、Paperclip、Hermes Agent、OpenClaw、Pi、DeepSeek Harness、Poke、Devin 2.2、Manus 2.0、OpenAI Codex、Cursor Automations 以及企业级 SaaS Agent 产品。
+   - 总结行业收敛出的十个工程做法（默认休眠按事件唤醒、单会话串行锁、会话与沙箱分离、保持上下文前缀不变以命中缓存、写代码调工具、文件记忆与后台整理、`SKILL.md` 按需加载、沙箱外代理注入密钥与挂起等待审批、静默过滤低价值通知、子沙箱隔离与预算硬上限），以及线上真实踩过的坑。
 
-2. **[Agent 微内核假说验证：八大原子拆解与全品类产品拼装蓝图](./docs/02-atomic-kernel-architecture.md)**
-   - **1 条通用信封总线（`Envelope`）+ 8 个正交原子**：`① Channel`、`② Clock`、`③ Inbox`、`④ Context`、`⑤ Agent Loop`、`⑥ Workspace`、`⑦ Gate`、`⑧ Outbox`。
-   - 包含 ~100 行最小 TypeScript 内核接口契约、5 大涌现分子电路，以及现场还原 Pi、Claude Always-On、OpenClaw、Hermes、Poke、Devin/Manus 与 Paperclip 的拓扑配方。
+2. **[Agent 核心架构拆解：1 条消息总线 + 8 个基础模块](./docs/02-atomic-kernel-architecture.md)**
+   - **统一消息结构（`Envelope`）+ 8 个职责单一的基础模块**：`① Channel`（渠道接入）、`② Clock`（定时与唤醒）、`③ Inbox`（收件队列与并发锁）、`④ Context`（上下文与记忆）、`⑤ Agent Loop`（无状态推理循环）、`⑥ Workspace`（隔离执行沙箱）、`⑦ Gate`（权限拦截与预算控制）、`⑧ Outbox`（消息投递与静默过滤）。
+   - 包含约 100 行最小 TypeScript 接口定义、5 种常见组合方式，以及如何用同一套模块搭出 Pi、Claude Always-On、OpenClaw、Hermes、Poke、Devin/Manus 和 Paperclip 等不同形态的产品。
 
-3. **[GTD × Agent 微内核：最佳“Agent 辅助工作”产品形态推演](./docs/03-gtd-agent-product-vision.md)**
-   - 从 David Allen 的 GTD 第一性原理出发，剖析为何纯聊天框、传统 AI 待办表与失控全自动黑盒均非最优解。
-   - 提出 **“幕僚预跑原则（把待办变成 80% 半成品批件）”**、**`@Agent / @Human / @Waiting` 三轨球权模型**、**随身闪念口 + 三模态工作台**，并证明其与 8 原子微内核严格 1:1 同构。
+3. **[用 GTD 的思路设计工作辅助 Agent](./docs/03-gtd-agent-product-vision.md)**
+   - 从 GTD 的基本逻辑出发，分析为什么纯聊天框、传统 AI 待办列表和全自动黑盒都不够顺手。
+   - 提出四个设计原则：**后台预处理（收到事儿先查清背景、写好初稿，别让人面对空白页）**、**标清当前归谁推进（`Agent 处理中` / `我来处理` / `等待回复`）**、**随手记入口 + 三个日常视图**、**随信任逐步放开自动执行权限**，并说明这套产品如何直接跑在 8 个基础模块之上。
 
-4. **[GTD 幕僚工作台交互与状态流转规范](./docs/04-gtd-interaction-spec.md)**
-   - 详细定义顶栏心智护盾状态栏、`Clarify 拍板台`（三类标准决策卡片与 `Inbox Zero` 流转）、`Engage 心流工位`（8:4 底稿共创画布 + Context Pack 作战包 + 免打扰拦截）、`Radar 全景与周回顾`（三色球权雷达 + `Dreaming` 个人习惯固化为 `SKILL.md`）的交互细节与端到端状态机。
+4. **[GTD 工作台界面交互与状态流转设计](./docs/04-gtd-interaction-spec.md)**
+   - 定义顶部导航与状态提示、`待确认收件箱（Clarify）`（单卡片处理流与三类常见卡片）、`专注工作区（Engage）`（初稿编辑区 + 关联资料侧栏 + 免打扰拦截）、`项目全局与周回顾（Radar）`（项目状态总览 + 从修改习惯提炼 `SKILL.md`）的具体交互与状态机。
