@@ -18,10 +18,10 @@
 | **③** | **`Inbox`**（队列、租约与控制旁路） | 数据面原语 | 消息落盘去重、单 `Cell` 串行合并锁 / 共享抢单锁 / 跑题退回（`handback`），以及**绕开普通排队锁的实时控制旁路（`cancel / pause / steer`）** | 少了它，连发消息会并发撞车；少了控制旁路，跑长任务时用户喊“快停下”只能排在队尾干等 |
 | **④** | **`Context`**（分层状态、记录与技能） | 数据面原语 | 分层保存 **① 带 `revision` 版本的业务状态与草稿产物、② 原始对话与外部证据（支持 `Inline & Spill` URI 直读）、③ `SKILL.md` 与长期偏好**；提供**状态变更 + 待发意图的原子条件提交（CAS）**，以及前缀稳定的只读推理快照 | 少了分层与版本提交，人机同时改草稿会互相覆盖，进程重启会丢派单，上下文压缩还会误删活跃项目状态 |
 | **⑤** | **`Loop`**（推理或确定性处理） | 数据面原语 | 无状态的单次有界执行（`Run`）：既可跑大模型推理，**也可跑已注册的确定性处理器/纯脚本**（处理审批回执、UI 改稿保存、子任务 `all/any` 汇合计数、零 Token 巡检） | 都调大模型既贵又慢还可能算错账；双模式兼顾了灵活生成与零 Token 精确状态流转 |
-| **⑥** | **`Workspace`**（沙箱与异步 `Job`） | 数据面原语 | 与推理循环分离的隔离执行环境（`git worktree` / 容器 / MicroVM）：既支持短命令直跑，也支持**脱离单次 `Run` 生命周期的异步 `Job` 句柄（启动、查进度、流式交互、随时取消，跑完回投 `Inbox`）** | 若命令必须同步卡住 `Run`，跑 20 分钟编译就会死死占住会话锁且无法中途停掉 |
-| **⑦** | **`Gate`**（权限、版本审批与预算） | 数据面原语 | 硬护栏：**沙箱外代理注入密钥、子权限单调收紧、绑定具体草稿/动作版本号的 `defer` 审批、撤销（`revoke`）、金额+Token 预留与树状结算**（覆盖模型、确定性处理器与沙箱出口） | 少了版本绑定，手机点确认可能误发刚被刷新的草稿；少了预算与代理边界，防不住越权操作和死循环账单 |
+| **⑥** | **`Workspace`**（沙箱与异步 `Job`） | 数据面原语 | 与推理循环分离的隔离执行环境（`git worktree` / 容器 / MicroVM）：支持短命令直跑、**脱离单次 `Run` 的异步 `Job` 句柄**，以及超时热过户时**将原沙箱连同在途进程整套移交后台（主台另起新沙箱）** | 若命令必须卡住 `Run` 或半路硬搬已启动进程的目录，要么锁死主窗口，要么主后台写同一目录互相踩踏 |
+| **⑦** | **`Gate`**（权限、版本审批与预算） | 数据面原语 | 硬护栏：**沙箱外代理注入密钥、区分“自身可执行权限”与“可委派权限池”的单调收紧、绑定具体草稿版本号的 `defer` 审批、撤销（`revoke`）、金额+Token 树状预算控制** | 不区分自身与可委派权限，轻权限接待 `Router` 就派不出能改代码的 `Worker`；少了版本绑定则会误发新草稿 |
 | **⑧** | **`Outbox`**（分类投递与静默过滤） | 数据面原语 | 严格区分 **内部协议消息（`protocol`）**、**对人通知（`notify`）** 与 **暂态流式预览（`preview`）**：可靠投递内部结果，对人通知支持 `silentDrop`、专注期免打扰暂存与真实投递回执（含 `unknown` 状态） | 若内外消息混为一谈，用户一开“免打扰”就会把子任务交上来的汇总结果也吞掉卡死 |
-| **⑨** | **`Cell`**（原语拼装单元） | **控制面容器** | 把上面 8 个原语组装成有明确归属、版本与生命周期边界的运行实例：支持**预设模板、Agent 动态拼装、超 5 秒自动热 `fork`、完结/取消按版本级联回收** | 如果把连线写死在启动代码里，系统只能定死一种任务粒度；有了 `Cell`，才能随事情大小自然伸缩 |
+| **⑨** | **`Cell`**（原语拼装单元） | **控制面容器** | 把上面 8 个原语组装成有明确归属、版本与生命周期边界的运行实例：支持**预设模板、Agent 动态拼装、超 5 秒连同原沙箱热过户、完结/取消按版本级联回收** | 如果把连线写死在启动代码里，系统只能定死一种任务粒度；有了 `Cell`，才能随事情大小自然伸缩 |
 
 > [!TIP]
 > **坚持“内核只留通用原语，复杂行为靠显式状态协议组合”——不需要为每种功能往内核里塞定制组件：**
@@ -32,13 +32,14 @@
 
 ---
 
-## 二、核心契约定义：1 条消息总线 + 8 个原语 + `Cell`（约 175 行 TypeScript）
+## 二、核心契约定义：1 条消息总线 + 8 个原语 + `Cell`（约 185 行 TypeScript）
 
 把关键对象（会话线程 `threads`、运行单元 `Cell`、单轮推理 `Run`、后台长进程 `Job`、带版本草稿/产物 `Artifact`、受控动作 `Action`）拆清楚后，核心接口如下：
 
 ```typescript
 // ==================== 0. 统一消息结构与权限边界 ====================
 export type Address = `inbox:${string}` | `channel:${string}:${string}`;
+export type ToolKind = "read" | "write" | "edit" | "bash" | "code_rpc";
 
 export interface Envelope<T = unknown> {
   id: string;                           // 传输幂等 ID（同一重试保持不变，不替代业务事项或草稿 ID）
@@ -54,14 +55,16 @@ export interface Envelope<T = unknown> {
   createdAt: number;
 }
 
-export interface PolicyBounds {         // 子 Cell 只能比父 Cell 更严格（child ⊆ parent），不可由 Agent 自行放宽
-  tools: ReadonlySet<"read" | "write" | "edit" | "bash" | "code_rpc">;
-  canSendTo: readonly string[];         // 例: 子 Worker 仅允许发往 ["inbox:parent"]，禁止直发外部渠道刷屏
-  secretRefs: ReadonlySet<string>;      // 允许沙箱外代理注入的密钥白名单
-  isolation: "none" | "shared_ro" | "git_worktree" | "container" | "cow_microvm";
+export interface PolicyBounds {         // 分离“自身可执行权限”与“可向子 Cell 委派的权限上限”
+  selfTools: ReadonlySet<ToolKind>;     // 当前 Cell 自身可调工具（例: Router 仅留 ["read"]，禁止亲自写文件或跑 bash）
+  delegatableTools: ReadonlySet<ToolKind>; // 允许派给子 Cell 的工具池（强制: child.selfTools ⊆ parent.delegatableTools 且 child.delegatableTools ⊆ parent.delegatableTools）
+  canSendTo: readonly string[];         // 当前 Cell 自身允许投递的目标地址
+  delegatableSendTo: readonly string[]; // 允许子 Cell 投递的地址上限（外加默认允许回传父收件箱 `inbox:${parentCellId}`）
+  secretRefs: ReadonlySet<string>;      // 可用及可继续下放的沙箱外代理密钥白名单（child ⊆ parent）
+  isolation: "none" | "shared_ro" | "git_worktree" | "container" | "cow_microvm"; // 当前隔离模式（子 Cell 可切独立 git_worktree/容器，但禁止降级回无隔离 none）
   maxTokens: number;                    // 与 maxCents 一起沿父子 Cell 树预留并向上汇总结算
   maxCents: number;
-  maxDepth: number;                     // 限制派生层级（如 <= 2），防止多角色层层开会空转
+  maxDepth: number;                     // 派生层级递减（child.maxDepth <= parent.maxDepth - 1），防多角色层层开会空转
 }
 
 // ==================== ① Channel：外部协议适配与能力声明 ====================
@@ -139,7 +142,7 @@ export interface AgentLoop {
     | "completed"
     | "yielded_waiting"         // 已持久化等待条件或启动异步后台 Job，释放本次 Run（休眠期 $0 算力）
     | "deferred_for_approval"   // 触发 Gate.defer 生成待确认卡，存盘释放 Run
-    | "forked_to_background"    // 超过 autoForkAfterMs 热过户至后台子 Cell，立即释放主台锁
+    | "forked_to_background"    // 超过 autoForkAfterMs 连同原沙箱热过户至后台子 Cell，立即释放主台锁
     | "cancelled"
     | "budget_stopped"
   >;
@@ -148,24 +151,26 @@ export interface AgentLoop {
 // ==================== ⑥ Workspace：隔离执行沙箱与脱离 Run 的异步 Job ====================
 export interface Workspace {
   acquire(cellId: string, isolation: PolicyBounds["isolation"]): Promise<WorkspacePort>;
+  // “换房不搬人”整套移交：将 fromCellId 当前持有的隔离沙箱连同内部运行中的 Job 进程原封不动过户给 toCellId，
+  // fromCellId 后续操作再另起全新隔离实例（若为 isolation: "none" 单裸目录不可分叉，则返回 false 不虚构热隔离）
+  transfer(fromCellId: string, toCellId: string): Promise<boolean>;
   hibernate?(cellId: string): Promise<string>;
   restore?(snapshotId: string): Promise<WorkspacePort>;
   destroy(cellId: string): Promise<void>;
 }
 
 export interface WorkspacePort {
-  exec(tool: "read" | "write" | "edit" | "bash" | "code_rpc", args: unknown,
-       signal?: AbortSignal): Promise<{ output: string }>;
-  // 长耗时命令或交互式进程返回稳定 Job 句柄（可跨 Run 存活，跑完自动往所属 Cell 的 Inbox 投递 result 消息）
+  exec(tool: ToolKind, args: unknown, signal?: AbortSignal): Promise<{ output: string }>;
+  // 长耗时命令或交互式进程返回稳定 Job 句柄（可跨 Run 存活，跑完自动往当前归属 Cell 的 Inbox 投递 result 消息）
   startJob(spec: { command: string; streamPreview?: boolean }): Promise<{ jobId: string }>;
   observeJob(jobId: string): Promise<{ state: "running" | "succeeded" | "failed" | "cancelled"; tail: string }>;
   writeJobInput?(jobId: string, input: string): Promise<void>;
   cancelJob(jobId: string): Promise<void>;
 }
 
-// ==================== ⑦ Gate：权限收紧、绑定版本的审批与树状预算控制 ====================
+// ==================== ⑦ Gate：权限委派收紧、绑定版本的审批与树状预算控制 ====================
 export interface Gate {
-  attenuate(parent: PolicyBounds, requested?: Partial<PolicyBounds>): PolicyBounds;
+  attenuate(parent: PolicyBounds, parentCellId: string, requested?: Partial<PolicyBounds>): PolicyBounds;
   authorize(action: ProposedAction, meta: {
     cellId: string;
     principalId: string;
@@ -226,13 +231,13 @@ export interface CellPorts {            // 处理器在运行期可见的受控�
 
 ```mermaid
 flowchart TB
-    In["外部信源 ① Channel / 定时信源 ② Clock"] --> Main["主台 Cell (preset: inline)"]
+    In["外部信源 ① Channel / 定时信源 ② Clock"] --> Main["主台 Cell (preset: inline, 持独立沙箱实例)"]
 
-    Main -->|"2~3 秒内干完的小事 (记笔记 / 定提醒 / 拟短回复)"| Fast["写 ④ Context 或发待确认卡 ➔ 秒回休眠"]
-    Main -->|"单轮运行超过阈值 (如 >5 秒) 或启动后台长 Job"| Fork["⚡ 内核自动热 fork 成独立后台 Cell (保留热 KV-Cache, 秒释放主队列)"]
-    Main -->|"识别出多步等待 / 并发调研 / 新信源"| Dyn["🧩 Agent 调 spawnCell 套用预设或动态拼装子 Cell 树"]
+    Main -->|"2~3 秒内干完的小事 (记笔记 / 定提醒 / 拟短回复)"| Fast["写 ④ Context 或发待确认卡 ➔ 秒回休眠并复用原沙箱"]
+    Main -->|"单轮超阈值 (如 >5 秒) 或启动长构建 Job"| Fork["⚡ 换房不搬人: 原沙箱连同在途 Job 整套过户给后台 Cell · 主台另起新沙箱"]
+    Main -->|"识别出多步等待 / 并发调研 / 新信源"| Dyn["🧩 Agent 调 spawnCell 在可委派权限池内拼装子 Cell 树"]
 
-    Fork --> Bg["后台独立推进 (切 git_worktree · 异步 Job · 控制旁路随时可停)"]
+    Fork --> Bg["后台独立推进 (原进程零中断继续 · 控制旁路随时可停)"]
     Dyn --> W1["并发子 Worker Cells × N (走 protocol 回流父 Cell 原子汇合)"]
     Dyn --> W2["外部守候 Watcher Cell (持久等待条件 + 超时 Clock, 集齐前不弹卡)"]
     Dyn --> W3["定时/监控信源 Sensor Cell (可跑纯脚本, 有异常才往主 Inbox 投信)"]
@@ -240,21 +245,22 @@ flowchart TB
 
 ### 1. 预设的 4 种基础拼装模板（覆盖日常 90% 的工作）
 预设模板不需要在内核里写特殊逻辑，它们本身就是预先配好的 `CellSpec` 默认值（配合对应的确定性处理器与 `SKILL.md`）：
-* **`inline`（主台快处理）**：单 `Cell` 串行锁 + 连发消息合并，专门接住日常输入。几秒内能搞定的小事当场办完，不建多余子队列。
-* **`worker`（后台隔离执行）**：独立 `Context`（只带任务目标背景，不混入主聊天杂音）+ 独立 `Workspace`（如 `git_worktree`），`Gate` 锁死其 `Outbox` 只能以 `category: "protocol"` 向父 `Cell` 汇报，适合修代码、跑异步长测试 `Job` 或分头查资料。
+* **`inline`（主台快处理）**：单 `Cell` 串行锁 + 连发消息合并，默认持有可隔离沙箱实例（如独立分支的 `git_worktree` 或 CoW 快照）。几秒内能搞定的小事当场办完并继续复用该沙箱，不建多余子队列。
+* **`worker`（后台隔离执行）**：独立 `Context`（只带任务目标背景，不混入主聊天杂音）+ 独立 `Workspace`（`git_worktree` / 容器），`Gate` 锁死其 `canSendTo` 只能以 `category: "protocol"` 向父 `Cell` 汇报，适合修代码、跑异步长测试 `Job` 或分头查资料。
 * **`watcher`（外部跟进监听）**：在 `Context` 持久化具体等待条件（事件类型、匹配对象与截止时间），挂上 `Channel` 线程订阅与共享 `cancelGroup` 的 `Clock` 超时提醒；对方先回信就原子更新状态并销掉催问闹钟。
 * **`sensor`（定时与条件信源）**：挂在入口侧充当“产生任务的信源”——由 `Clock` 或外部事件流触发一段轻量脚本或快速检查，平时没事直接 `silentDrop`（连待办都不产生），发现异常才往主 `Inbox` 投递一条标准 `Envelope`。
 
-### 2. 长耗时任务自动热 `fork` 与异步 `Job`（边跑边聊、随时急刹）
-DeepSeek 在实测中发现：如果只靠提示词劝单个 Agent“遇到重活请调子 Agent”，模型经常觉得顺手就自己在主会话里硬干，一旦跑起代码检查或编译，整个主会话就会堵死十几分钟。
-* 我们的解法不是一刀切阉割主会话工具，而是结合 **`autoForkAfterMs`（如 5 秒）运行期热过户** 与 **`Workspace` 异步 `Job` 句柄**：
-  1. 任务一开始直接在主台跑；2～3 秒搞定的小事当场结束。
-  2. 一旦某轮耗时超过 5 秒，内核新建后台子 `Cell`，把当前无状态推理轮次（连同**已热起来的上下文快照前缀，100% 命中 KV-Cache**）及已启动的 `Job` 句柄、线程订阅原子过户给该后台 `Cell`（涉及改代码时分配独立 `git_worktree`），主台留下轻量关联记录后**立刻释放主 `Inbox` 锁**——用户接着问别的问题完全不排队。
-  3. 遇到 20 分钟编译或长测试时，`Workspace.startJob` 返回异步句柄后当前 `Run` 即可 `yielded_waiting` 休眠（等待期 \$0 推理开销），跑完自动往 `Inbox` 回投结果唤醒；期间用户若喊“快停下”，命令直接走 `Inbox.control` 旁路秒级中断进程，绝不会排在队列后面干等。
+### 2. 长耗时任务“换房不搬人”热过户与异步 `Job`（边跑边聊、目录不冲突、随时急刹）
+DeepSeek 在实测中发现：如果只靠提示词劝单个 Agent“遇到重活请调子 Agent”，模型经常觉得顺手就自己在主会话里硬干，一旦跑起代码检查或编译，整个主会话就会堵死十几分钟；但如果先在公共主目录启动了构建进程、等 5 秒超时后再给后台新开 `worktree`，操作系统里已运行进程的当前目录（`cwd`）和打开的文件句柄根本没法半路搬过去，继续跑仍会污染主目录。
+* 我们的解法是 **“换房不搬人（原沙箱随任务整套留给后台，给主台新开干净沙箱）” + `Workspace` 异步 `Job` 句柄**：
+  1. **平时零额外开销复用**：主台 `Cell` 默认在独立隔离沙箱实例（如独立工作分支的 `git_worktree` 或 CoW 容器 `ws_1`）中起跑；2～3 秒搞定的小事当场结束，下一轮继续复用 `ws_1`。
+  2. **超 5 秒整套过户（`Workspace.transfer`）**：一旦某轮耗时超过 5 秒，内核新建后台子 `Cell`，把**原沙箱实例 `ws_1` 连同里面已在运行的 `Job` 进程、已热起来的上下文快照前缀（命中 KV-Cache）与线程订阅原封不动整套过户给后台子 `Cell`**——老进程在原目录 `ws_1` 里零中断继续跑；同时主台立刻释放主 `Inbox` 锁，并在下一轮需要动用文件系统时**按需新切一个干净的隔离沙箱 `ws_2`**，因此用户在主窗口马上开始另一项代码修改时落在新目录 `ws_2` 中，与后台正在跑的构建彻底物理隔离。
+     * *非隔离模式边界声明*：若运行在无隔离的单裸目录直连模式（`isolation: "none"`，底层无法切出第二个独立工作目录），`Workspace.transfer` 返回 `false`——此时主台仅并发响应对话与只读请求，冲突的写目录任务需排队或退回安全检查点在新目录重启，绝不虚构单裸目录并发写不冲突的能力。
+  3. **异步 `Job` 休眠等待与控制旁路急刹**：遇到 20 分钟编译或长测试时，`Workspace.startJob` 返回句柄后当前 `Run` 即可 `yielded_waiting` 释放推理算力（等待期 \$0 推理开销），跑完自动往所属 `Cell` 的 `Inbox` 回投结果唤醒；期间用户若喊“快停下”，命令直接走 `Inbox.control` 旁路秒级中断进程。
 
 ### 3. Agent 动态拼装与四条运行硬护栏
 遇到预设模板套不上的剩下 10% 复杂工作（例如：先并行派 10 个 `worker` 扒数据、按 `all` 协议集齐汇总后再挂 `watcher` 跟进审批；或把跑顺了的每日巡检改成零 Token `script` 信源），Agent 直接通过 `spawnCell / updateCell` 自由组合参数。内核在底下守住四条硬边界：
-1. **权限单调收紧**：子 `Cell` 的工具集、可发送地址、密钥范围永远是父 `Cell` 的子集（`Gate.attenuate`），模型、确定性处理器与沙箱出口受同一套权限约束。
+1. **自身执行与可委派权限分离收紧**：`PolicyBounds` 严格区分“自己能亲手调的工具（`selfTools`）”和“能派给子 `Cell` 的工具上限（`delegatableTools`）”，`Gate.attenuate` 强制校验 `child.selfTools ⊆ parent.delegatableTools` 且 `child.delegatableTools ⊆ parent.delegatableTools`——既允许只读接待 `Router` 派生出有完整编码权限的 `Worker`，又保证任何节点都无法突破上级的委派上限越权提权。
 2. **状态与审批严格绑版本（CAS）**：人机改稿与状态流转均带 `expectedRevision` 原子提交（冲突时保留人工已存版本，绝不静默覆盖）；人工点确认绑定当时所见的草稿版本，防后台刚刷新草稿时误发新版；对外发信与改状态通过 `outboxIntents` 原子落盘，崩溃恢复不丢单。
 3. **内外消息分流与真实回执**：子 `Cell` 协作走 `protocol` 通道，绝不被人类专注期的“免打扰”误吞；对外发送如实区分 `sent / failed / unknown`，外部渠道不支持幂等或撤回时绝不伪造成功状态。
 4. **预算沿树共享、完结按版本级联回收**：父子 `Cell` 共享同一笔金额与 Token 预算上限；任务完成或取消时，`closeCell` 原子推进版本并销毁整棵子树名下的 `Clock`、`Channel` 订阅、未决 `Gate` 授权与异步 `Job`——迟到的旧子任务结果因版本过期只会归档，绝不会把已取消的任务重新唤醒。
@@ -272,9 +278,9 @@ DeepSeek 在实测中发现：如果只靠提示词劝单个 Agent“遇到重�
 * **拼装方式**：主台 `Cell` 配齐全部 8 个模块 + 空闲整理 `sensor`：外部 Webhook 与 `Clock` 汇入单写者 `Inbox` → `Context` 加载 200 行目录索引 → `Gate` 做代理密钥注入与绑定版本的 `defer` 零算力挂起确认 → 夜间空闲唤醒后台 `Cell` 整理 Wiki 记忆并 `silentDrop`。
 
 ### 3. DeepSeek Super-agent（`dsh-superagent`：Router-Worker 多任务协同研发助手）
-* **拼装方式**：用 **1 个轻权限主路由 `Cell` + N 个订阅直通的工单 `worker` `Cell`** 拼装：
-  * 主路由 `Cell` 通过 `PolicyBounds` 拿掉 `write / edit` 工具（物理强制它只管接话与派单，积压事件由 `Inbox` 自动合并批处理）。
-  * 每接一单 `spawnCell({ preset: "worker", watches: [PR/话题线程] })`，分配独立 `git_worktree`。后续同线程的人类追问经 `watches` **直接绕过主路由进该 `worker` 的 `Inbox`**；万一用户聊起无关新事，`worker` 调 `Inbox.handback` 退回主路由重评。
+* **拼装方式**：用 **1 个轻执行权限主路由 `Cell` + N 个订阅直通的工单 `worker` `Cell`** 拼装：
+  * 主路由 `Cell` 设置 `selfTools: ["read"]`（同时移除 `write / edit / bash / code_rpc`，从物理上杜绝它亲自改文件或借 `bash` 绕过限制跑重活），但保留完整的 `delegatableTools` 派单权限，积压事件由 `Inbox` 自动合并批处理。
+  * 每接一单调用 `spawnCell({ preset: "worker", watches: [PR/话题线程] })`，从 `delegatableTools` 授予编码与测试工具并分配独立 `git_worktree`。后续同线程的人类追问经 `watches` **直接绕过主路由进该 `worker` 的 `Inbox`**；万一用户聊起无关新事，`worker` 调 `Inbox.handback` 退回主路由重评。
   * 上下文采用 `Context.readResource` 实现 `Inline & Spill`（短卡片内联 + URI 链式直读）；新群聊规则可先拼成“写日志 + `silentDrop`”做试运行观察。
 
 ### 4. OpenClaw 2.0（本地多渠道个人网关）
@@ -284,7 +290,7 @@ DeepSeek 在实测中发现：如果只靠提示词劝单个 Agent“遇到重�
 * **拼装方式**：主任务跑完后，通过 `protocol` 消息唤醒内部复盘 `Cell`（`contextMode: "fork_prefix"`，直接命中刚跑完的热缓存），总结经验调用 `upsertSkillOrNote` 更新 `SKILL.md`；纯例行检查则用 `processor: { kind: "script" }` 实现零 Token 巡检。
 
 ### 6. Poke（前后台分离的免运维聊天助手）
-* **拼装方式**：前台接待 `Cell`（不挂重工具，只管自然聊天与过滤提醒） + 后台多个按事项常驻的 `worker/watcher` `Cell`（`canSendTo` 锁死只能以 `protocol` 发回前台 `Inbox`，没有直接给用户手机发通知的权限）。
+* **拼装方式**：前台接待 `Cell`（`selfTools` 不挂重执行工具，只管自然聊天、过滤提醒与向下委派；`canSendTo` 持有用户聊天渠道） + 后台多个按事项常驻的 `worker/watcher` `Cell`（由前台从 `delegatableTools` 授予执行能力，但 `canSendTo` 收紧为仅允许以 `protocol` 发回前台 `Inbox`，无权直接打扰用户手机）。
 
 ### 7. Devin 2.2 / Cursor Cloud Agents / Manus（云端沙箱工作台）
 * **拼装方式**：把 `⑥ Workspace` 换成毫秒级 CoW 快照虚拟机（`cow_microvm`）与异步 `Job`，工单 `Cell` 同时订阅 GitHub Actions Webhook（CI 挂了自动唤醒原沙箱重修，过程不弹通知烦人，全绿再发交付卡）；调研大任务则一次性派生几十个隔离 `worker` `Cell` 并发执行，经确定性 `all` 汇合协议收口汇总。
@@ -307,8 +313,8 @@ ng-agents/
 │   ├── inbox/             # ③ SQLite WAL 幂等入队、租约合并锁/抢单锁、handback 退回与实时 control 控制旁路
 │   ├── context/           # ④ 分层状态/证据/SKILL.md 存储、CAS 原子提交（含 Transactional Outbox）、前缀快照与 FTS5
 │   ├── loop/              # ⑤ 有界大模型推理循环、确定性业务处理器注册表与零 Token 脚本执行驱动
-│   ├── workspace/         # ⑥ 基础工具 + Codemode 脚本执行、异步 Job 进程句柄、Git Worktree / 容器隔离驱动
-│   ├── gate/              # ⑦ 权限单调收紧、沙箱外密钥代理注入、绑定版本的 defer 审批与撤销、树状预算计量
+│   ├── workspace/         # ⑥ 基础工具 + Codemode、异步 Job 句柄、transfer 整套沙箱移交、Worktree/容器隔离驱动
+│   ├── gate/              # ⑦ 自身/委派权限分离收紧、密钥代理注入、绑定版本的 defer 审批与撤销、树状预算计量
 │   ├── outbox/            # ⑧ 内部 protocol 与对人 notify 分流投递、免打扰缓冲、silentDrop 与流式 preview
 │   └── cell/              # ⑨ Cell 监督树生命周期、动态订阅路由表、超 5 秒热 fork 与按版本级联销毁
 ├── presets/               # 标准 Cell 拼装模板与确定性编排处理器（如 all/any 汇合、等待匹配）
