@@ -1,0 +1,38 @@
+{
+  "name": "@ng/gtd-desk",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run --root ../../ --project @ng/gtd-desk",
+    "dev": "tsx watch src/server/main.ts",
+    "start": "tsx src/server/main.ts",
+    "dev:web": "vite --config src/web/vite.config.ts",
+    "build:web": "vite build --config src/web/vite.config.ts"
+  },
+  "dependencies": {
+    "@ng/protocol": "workspace:*",
+    "@ng/channel": "workspace:*",
+    "@ng/inbox": "workspace:*",
+    "@ng/context": "workspace:*",
+    "@ng/loop": "workspace:*",
+    "@ng/workspace": "workspace:*",
+    "@ng/gate": "workspace:*",
+    "@ng/cell": "workspace:*",
+    "@ng/presets": "workspace:*",
+    "hono": "^4.13.19",
+    "@hono/node-server": "^2.1.8",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "vite": "^8.3.8",
+    "@vitejs/plugin-react": "^6.3.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0"
+  }
+}

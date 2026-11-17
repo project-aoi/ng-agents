@@ -1,0 +1,22 @@
+{
+  "name": "@ng/presets",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run --root ../ --project @ng/presets"
+  },
+  "dependencies": {
+    "@ng/protocol": "workspace:*",
+    "@ng/cell": "workspace:*",
+    "@ng/loop": "workspace:*",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@ng/channel": "workspace:*"
+  }
+}

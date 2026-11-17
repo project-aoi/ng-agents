@@ -1,0 +1,24 @@
+{
+  "name": "ng-agents",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@12.21.0",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "pnpm --filter @ng/gtd-desk run --if-present build:web",
+    "start": "pnpm --filter @ng/gtd-desk start",
+    "dev": "pnpm --filter @ng/gtd-desk run \"/^dev(:web)?$/\"",
+    "typecheck": "pnpm -r --workspace-concurrency=4 run typecheck",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.0"
+  }
+}

@@ -1,0 +1,446 @@
+import { attenuateBounds, meetBounds } from "@ng/gate";
+import { CLI_FORK_SESSION_KEY, CLI_SESSION_KEY } from "@ng/loop";
+import {
+  afterCommit,
+  all,
+  cellPrincipal,
+  createEnvelope,
+  inboxAddr,
+  KERNEL_FROM,
+  makeBounds,
+  newId,
+  NgError,
+  parsePrincipal,
+  PAYLOAD,
+  run,
+  serializeBounds,
+  stableStringify,
+  timerFrom,
+  toJson,
+  withTx,
+  type BoundsInit,
+  type CellRecord,
+  type CellResultPayload,
+  type CellSpec,
+  type CellTaskPayload,
+  type CloseReason,
+  type InboxAddr,
+  type PolicyBounds,
+  type ScheduleRule,
+  type TimerFiredPayload,
+} from "@ng/protocol";
+import type { KernelCore } from "./core";
+import { jsonSafeBounds, resolveSpec, scheduleEnvelopeId, validateSpec } from "./spec";
+import type { ActorOptions, CellSpecInput, CloseResult, RootCellOptions, SpawnOptions } from "./types";
+
+export interface Lifecycle {
+  createRootCell(spec: CellSpecInput, opts?: RootCellOptions): CellRecord;
+  ensureRootCell(spec: CellSpecInput & { id: string }, opts?: RootCellOptions): CellRecord;
+  spawnCell(parentId: string, spec: CellSpecInput, initialPayload?: unknown, opts?: SpawnOptions): InboxAddr;
+  updateCell(cellId: string, patch: Partial<CellSpec>, opts?: ActorOptions): CellRecord;
+  /** The transactional cascade; returns the ids it closed (empty if already closed). Cleanup is the caller's. */
+  closeCellSync(cellId: string, reason: CloseReason, opts?: ActorOptions): string[];
+  closeCell(cellId: string, reason?: CloseReason, opts?: ActorOptions): Promise<CloseResult>;
+  /** Abort Runs, cancel Jobs and destroy workspaces of cells that were just closed. */
+  cleanupClosed(cellIds: readonly string[]): Promise<void>;
+  /** Deactivate a cell's watches (all, or one cancelGroup's). */
+  deactivateWatches(cellId: string, cancelGroup?: string): number;
+}
+
+const UPDATABLE = new Set(["title", "meta", "processor", "bounds", "watches", "schedules"]);
+
+function definedEntries<T extends object>(o: T): Partial<T> {
+  const out: Partial<T> = {};
+  for (const [k, v] of Object.entries(o)) if (v !== undefined) (out as Record<string, unknown>)[k] = v;
+  return out;
+}
+
+function sameBounds(a: PolicyBounds, b: PolicyBounds): boolean {
+  return stableStringify(serializeBounds(a)) === stableStringify(serializeBounds(b));
+}
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return v !== null && typeof v === "object" && !Array.isArray(v);
+}
+
+export function createLifecycle(core: KernelCore): Lifecycle {
+  const { db, cells, inbox, gate, context, registry, bus, clock } = core;
+
+  // ---------- principals ----------
+
+  function actorKind(principalId: string): { kind: "owner" } | { kind: "cell"; cellId: string } {
+    const p = parsePrincipal(principalId, core.ownerPrincipal);
+    if (p.kind === "owner") return { kind: "owner" };
+    if (p.kind === "cell") return { kind: "cell", cellId: p.cellId };
+    throw new NgError("bounds_violation", `principal "${principalId}" may not manage cells`);
+  }
+
+  function isStrictAncestor(ancestorId: string, cellId: string): boolean {
+    return ancestorId !== cellId && cells.ancestors(cellId).some((a) => a.id === ancestorId);
+  }
+
+  /** Owner: any cell. `cell:X`: only X's strict descendants. */
+  function assertManages(principalId: string, target: CellRecord, what: string): "owner" | "ancestor" {
+    const actor = actorKind(principalId);
+    if (actor.kind === "owner") return "owner";
+    if (isStrictAncestor(actor.cellId, target.id)) return "ancestor";
+    throw new NgError("bounds_violation", `${what}: cell "${actor.cellId}" may only manage its own descendants, not "${target.id}"`);
+  }
+
+  // ---------- materialization ----------
+
+  function insertWatches(cellId: string, watches: NonNullable<CellSpec["watches"]>): void {
+    const now = clock.now();
+    for (const w of watches) {
+      const thread = typeof w.threadOrFilter["thread"] === "string" ? (w.threadOrFilter["thread"] as string) : null;
+      run(db, "INSERT INTO cell_watches (cell_id, thread, filter, cancel_group, active, created_at) VALUES (?, ?, ?, ?, 1, ?)", [
+        cellId,
+        thread,
+        toJson(w.threadOrFilter),
+        w.cancelGroup ?? null,
+        now,
+      ]);
+    }
+  }
+
+  function deactivateWatches(cellId: string, cancelGroup?: string): number {
+    return cancelGroup === undefined
+      ? run(db, "UPDATE cell_watches SET active = 0 WHERE cell_id = ? AND active = 1", [cellId]).changes
+      : run(db, "UPDATE cell_watches SET active = 0 WHERE cell_id = ? AND active = 1 AND cancel_group = ?", [cellId, cancelGroup]).changes;
+  }
+
+  /** Ids of a schedule rule's live rows/schedules (a re-added deliverAt rule gets a `~n` suffix). */
+  function liveScheduleIds(cellId: string, base: string): string[] {
+    const matches = (id: string) => id === base || id.startsWith(`${base}~`);
+    const rows = inbox.listMessagesSync({ cellId, status: ["pending"], type: PAYLOAD.timerFired }).map((m) => m.envelope.id).filter(matches);
+    const scheds = inbox.listSchedulesSync({ cellId, activeOnly: true }).map((s) => s.template.id).filter(matches);
+    return [...new Set([...rows, ...scheds])];
+  }
+
+  function enqueueSchedule(cell: CellRecord, rule: ScheduleRule, index: number): void {
+    const base = scheduleEnvelopeId(cell.id, rule);
+    let id = base;
+    if (rule.deliverAt !== undefined) {
+      // A deliverAt row id can never be reused (dedupe), so a rule that comes back after removal gets a fresh id.
+      const used = inbox.listMessagesSync({ cellId: cell.id, type: PAYLOAD.timerFired }).filter((m) => m.envelope.id === base || m.envelope.id.startsWith(`${base}~`)).length;
+      if (used > 0) id = `${base}~${used}`;
+    }
+    const env = createEnvelope<TimerFiredPayload>(
+      {
+        id,
+        from: timerFrom(cell.id),
+        principalId: cellPrincipal(cell.id),
+        kind: "event",
+        type: PAYLOAD.timerFired,
+        payload: { label: `schedule:${index}` },
+        expectedEpoch: cell.epoch,
+      },
+      clock,
+    );
+    inbox.enqueueSync(cell.id, env, rule);
+  }
+
+  function insertCell(init: { id: string; parentId: string | null; spec: CellSpec; bounds: PolicyBounds; principalId: string }): CellRecord {
+    const rec = cells.insert({
+      id: init.id,
+      parentId: init.parentId,
+      preset: init.spec.preset ?? null,
+      title: init.spec.title ?? null,
+      spec: init.spec,
+      bounds: init.bounds,
+      principalId: init.principalId,
+    });
+    insertWatches(rec.id, init.spec.watches ?? []);
+    (init.spec.schedules ?? []).forEach((rule, i) => enqueueSchedule(rec, rule, i));
+    afterCommit(db, () => bus.emit("cell.changed", { cellId: rec.id, change: "created", status: rec.status, epoch: rec.epoch }));
+    return rec;
+  }
+
+  // ---------- bounds ----------
+
+  function assertBudget(b: PolicyBounds, what: string): PolicyBounds {
+    if (!(b.maxTokens > 0) || !(b.maxCents > 0)) {
+      throw new NgError(
+        "invalid_argument",
+        `${what} needs positive maxTokens and maxCents (got ${b.maxTokens} tokens, ${b.maxCents} cents): a zero budget is exhausted from the start and the cell would be denied everything`,
+      );
+    }
+    return b;
+  }
+
+  function rootBounds(init: BoundsInit | undefined): PolicyBounds {
+    return assertBudget(makeBounds({ ...core.rootBounds, ...definedEntries(init ?? {}) }), "a root cell");
+  }
+
+  function updatedBounds(cell: CellRecord, req: Partial<PolicyBounds>, isOwner: boolean): PolicyBounds {
+    const merged = { ...cell.bounds, ...definedEntries(req) } as Partial<PolicyBounds>;
+    if (!cell.parentId) {
+      if (!isOwner) throw new NgError("bounds_violation", "only the owner may change a root cell's bounds");
+      return assertBudget(makeBounds(merged as BoundsInit), "a root cell");
+    }
+    const parent = cells.require(cell.parentId);
+    // No ledger cap here (unlike spawn): re-capping by "remaining" would drop the limit below what the cell already used.
+    const next = attenuateBounds(parent.bounds, parent.id, merged);
+    return isOwner ? next : meetBounds(next, cell.bounds);
+  }
+
+  /** Keep child ⊆ parent after a parent narrowed: re-clamp descendants (never widen them). */
+  function cascadeNarrowing(rootId: string): void {
+    const queue = [rootId];
+    while (queue.length > 0) {
+      const parent = cells.require(queue.shift()!);
+      for (const child of cells.children(parent.id, { status: ["active", "paused"] })) {
+        let next: PolicyBounds;
+        try {
+          next = meetBounds(attenuateBounds(parent.bounds, parent.id, child.bounds), child.bounds);
+        } catch {
+          next = meetBounds(child.bounds, { ...parent.bounds, canSendTo: [...parent.bounds.canSendTo, inboxAddr(parent.id)], maxDepth: 0 });
+        }
+        if (sameBounds(next, child.bounds)) continue;
+        cells.update(child.id, { bounds: next });
+        context.refreshPrefixSync(child.id);
+        afterCommit(db, () => bus.emit("cell.changed", { cellId: child.id, change: "updated" }));
+        queue.push(child.id);
+      }
+    }
+  }
+
+  // ---------- create ----------
+
+  function createRootCell(spec: CellSpecInput, opts: RootCellOptions = {}): CellRecord {
+    const principalId = opts.principalId ?? core.ownerPrincipal;
+    if (actorKind(principalId).kind !== "owner") throw new NgError("bounds_violation", "only the owner may create root cells");
+    return withTx(db, () => {
+      const id = spec.id ?? newId("cell", clock);
+      if (cells.get(id)) throw new NgError("duplicate", `cell "${id}" already exists`);
+      const { spec: resolved } = resolveSpec(registry, spec, null);
+      validateSpec(registry, resolved);
+      const bounds = rootBounds(opts.bounds);
+      delete resolved.bounds;
+      return insertCell({ id, parentId: null, spec: { ...resolved, id }, bounds, principalId });
+    });
+  }
+
+  function ensureRootCell(spec: CellSpecInput & { id: string }, opts: RootCellOptions = {}): CellRecord {
+    return withTx(db, () => cells.get(spec.id) ?? createRootCell(spec, opts));
+  }
+
+  function cellTask(parentId: string, title: string | undefined, initial: unknown): CellTaskPayload {
+    const base: CellTaskPayload = { parentCellId: parentId, ...(title ? { title } : {}) };
+    if (typeof initial === "string") return { ...base, instruction: initial };
+    if (isRecord(initial) && typeof initial["instruction"] === "string") {
+      const t = typeof initial["title"] === "string" ? (initial["title"] as string) : title;
+      return {
+        ...base,
+        ...(t ? { title: t } : {}),
+        instruction: initial["instruction"] as string,
+        ...(initial["input"] !== undefined ? { input: initial["input"] } : {}),
+      };
+    }
+    return { ...base, input: initial };
+  }
+
+  function spawnCell(parentId: string, spec: CellSpecInput, initialPayload?: unknown, opts: SpawnOptions = {}): InboxAddr {
+    const principalId = opts.principalId ?? core.ownerPrincipal;
+    return withTx(db, () => {
+      const parent = cells.require(parentId);
+      const actor = actorKind(principalId);
+      if (actor.kind === "cell" && actor.cellId !== parent.id && !isStrictAncestor(actor.cellId, parent.id)) {
+        throw new NgError("bounds_violation", `cell "${actor.cellId}" may only spawn children of itself or of its descendants`);
+      }
+      if (parent.status === "closed") throw new NgError("conflict", `cell "${parent.id}" is closed; it cannot have new children`);
+
+      const { spec: resolved, boundsRequest } = resolveSpec(registry, spec, parent);
+      validateSpec(registry, resolved);
+      if (parent.bounds.maxDepth < 1) {
+        throw new NgError("bounds_violation", `cell "${parent.id}" may not spawn children (maxDepth 0); do the work itself or report to its parent`);
+      }
+      const open = cells.children(parent.id, { status: ["active", "paused"] }).length;
+      if (open >= parent.bounds.maxConcurrentChildren) {
+        throw new NgError(
+          "bounds_violation",
+          `cell "${parent.id}" already has ${open} open children (maxConcurrentChildren ${parent.bounds.maxConcurrentChildren}); wait for one to finish or close one`,
+        );
+      }
+      // Never trust requested bounds: Gate clamps them to the parent's effective bounds and remaining budget.
+      const bounds = gate.attenuate(parent.bounds, parent.id, boundsRequest);
+      if (bounds.maxTokens <= 0 || bounds.maxCents <= 0) {
+        throw new NgError("bounds_violation", `the budget of "${parent.id}" (or an ancestor) is used up; a child would be denied everything. Ask the owner to raise it.`);
+      }
+
+      const id = spec.id ?? newId("cell", clock);
+      if (cells.get(id)) throw new NgError("duplicate", `cell "${id}" already exists`);
+      const stored: CellSpec = { ...resolved, id, parentId: parent.id };
+      if (stored.contextMode === "fork_prefix") stored.fork = { fromCellId: parent.id, uptoSeq: context.lastEvidenceSeqSync(parent.id) };
+      const rec = insertCell({ id, parentId: parent.id, spec: stored, bounds, principalId });
+      if (stored.fork) {
+        // A CLI-run parent's agent session: the child's CLI loop forks it instead of replaying the inherited history.
+        const parentSession = context.readStateSync(parent.id, CLI_SESSION_KEY);
+        if (parentSession) context.commitSync(id, { statePatches: { [CLI_FORK_SESSION_KEY]: parentSession } });
+      }
+      if (initialPayload !== undefined) {
+        const task = createEnvelope<CellTaskPayload>(
+          {
+            id: `${id}:task`,
+            from: KERNEL_FROM.spawn,
+            principalId,
+            kind: "event",
+            type: PAYLOAD.cellTask,
+            payload: cellTask(parent.id, stored.title, initialPayload),
+            expectedEpoch: rec.epoch,
+          },
+          clock,
+        );
+        inbox.enqueueSync(id, task);
+      }
+      return inboxAddr(id);
+    });
+  }
+
+  // ---------- update ----------
+
+  function updateCell(cellId: string, patch: Partial<CellSpec>, opts: ActorOptions = {}): CellRecord {
+    const principalId = opts.principalId ?? core.ownerPrincipal;
+    if (!patch || typeof patch !== "object") throw new NgError("invalid_argument", "patch must be an object");
+    const given = definedEntries(patch);
+    for (const key of Object.keys(given)) {
+      if (!UPDATABLE.has(key)) throw new NgError("invalid_argument", `updateCell cannot change "${key}" (allowed: ${[...UPDATABLE].join(", ")})`);
+    }
+    return withTx(db, () => {
+      const cell = cells.require(cellId);
+      if (cell.status === "closed") throw new NgError("conflict", `cell "${cellId}" is closed`);
+      const isOwner = assertManages(principalId, cell, "updateCell") === "owner";
+      const next: CellSpec = { ...cell.spec };
+      let refreshPrefix = false;
+      if (given.title !== undefined) next.title = given.title;
+      if (given.meta !== undefined) next.meta = given.meta;
+      if (given.processor !== undefined) {
+        next.processor = given.processor;
+        refreshPrefix = true;
+      }
+      if (given.watches !== undefined) next.watches = given.watches;
+      if (given.schedules !== undefined) next.schedules = given.schedules;
+      validateSpec(registry, next);
+
+      let bounds = cell.bounds;
+      if (given.bounds !== undefined) {
+        bounds = updatedBounds(cell, given.bounds, isOwner);
+        next.bounds = jsonSafeBounds({ ...(cell.spec.bounds ?? {}), ...definedEntries(given.bounds) });
+        if (!sameBounds(bounds, cell.bounds)) refreshPrefix = true;
+      }
+
+      if (given.watches !== undefined) {
+        deactivateWatches(cellId);
+        insertWatches(cellId, given.watches);
+      }
+      if (given.schedules !== undefined) {
+        const before = new Set((cell.spec.schedules ?? []).map((r) => scheduleEnvelopeId(cellId, r)));
+        const after = new Map(given.schedules.map((r, i) => [scheduleEnvelopeId(cellId, r), { r, i }] as const));
+        for (const base of before) {
+          if (after.has(base)) continue;
+          for (const id of liveScheduleIds(cellId, base)) inbox.cancelScheduledSync({ cellId, envelopeId: id });
+        }
+        for (const [base, { r, i }] of after) if (!before.has(base)) enqueueSchedule(cell, r, i);
+      }
+
+      const updated = cells.update(cellId, { spec: next, title: next.title ?? null, bounds });
+      if (!sameBounds(bounds, cell.bounds)) cascadeNarrowing(cellId);
+      if (refreshPrefix) context.refreshPrefixSync(cellId);
+      afterCommit(db, () => bus.emit("cell.changed", { cellId, change: "updated" }));
+      return updated;
+    });
+  }
+
+  // ---------- close ----------
+
+  /** Did the child already deliver a final cell.result to the parent (pending or processed)? */
+  function reportedResult(parentId: string, childId: string): boolean {
+    return inbox
+      .listMessagesSync({ cellId: parentId, type: PAYLOAD.cellResult, status: ["pending", "claimed", "done"] })
+      .some((m) => isRecord(m.envelope.payload) && m.envelope.payload["childCellId"] === childId);
+  }
+
+  function closeCellSync(cellId: string, reason: CloseReason, opts: ActorOptions = {}): string[] {
+    const principalId = opts.principalId ?? core.ownerPrincipal;
+    if (reason !== "completed" && reason !== "cancelled") throw new NgError("invalid_argument", `invalid close reason "${String(reason)}"`);
+    return withTx(db, () => {
+      const target = cells.require(cellId);
+      if (target.status === "closed") return [];
+      assertManages(principalId, target, "closeCell");
+      const subtree = [target, ...cells.descendants(target.id, { status: ["active", "paused"] })];
+
+      // A parent waiting on this child (a join, the desk's record) must not wait forever when someone else closes it.
+      const parent = target.parentId ? cells.get(target.parentId) : undefined;
+      if (parent && parent.status !== "closed" && principalId !== cellPrincipal(parent.id) && !reportedResult(parent.id, target.id)) {
+        const payload: CellResultPayload = {
+          childCellId: target.id,
+          status: reason,
+          summary: `Closed (${reason}) by ${principalId} before it reported a result.`,
+          data: { closedBy: principalId, synthetic: true },
+        };
+        inbox.enqueueSync(
+          parent.id,
+          createEnvelope<CellResultPayload>(
+            {
+              id: `${target.id}:closed`,
+              from: inboxAddr(target.id),
+              principalId,
+              kind: "result",
+              type: PAYLOAD.cellResult,
+              payload,
+              expectedEpoch: parent.epoch,
+            },
+            clock,
+          ),
+        );
+      }
+
+      const closed: Array<{ id: string; epoch: number }> = [];
+      for (const c of subtree) {
+        const epoch = cells.bumpEpoch(c.id);
+        cells.setStatus(c.id, "closed", c.id === target.id ? reason : "cancelled");
+        inbox.cancelScheduledSync({ cellId: c.id });
+        deactivateWatches(c.id);
+        closed.push({ id: c.id, epoch });
+      }
+      // Cancels the subtree's pending approvals and unused tokens, permanently.
+      gate.revokeSync(target.id);
+      afterCommit(db, () => {
+        for (const c of closed) bus.emit("cell.changed", { cellId: c.id, change: "status", status: "closed", epoch: c.epoch });
+      });
+      return closed.map((c) => c.id);
+    });
+  }
+
+  async function cleanupClosed(cellIds: readonly string[]): Promise<void> {
+    if (cellIds.length === 0) return;
+    core.dispatcher.abortCells(cellIds, "close");
+    await core.dispatcher.settled(cellIds);
+    for (const id of cellIds) {
+      try {
+        const ws = core.workspace.getWorkspaceSync(id);
+        if (ws && ws.status !== "destroyed") await core.workspace.destroy(id);
+        else await core.workspace.cancelJobsForCell(id);
+      } catch (err) {
+        core.onError(err, `cleanup of closed cell ${id}`);
+      }
+    }
+  }
+
+  async function closeCell(cellId: string, reason: CloseReason = "completed", opts: ActorOptions = {}): Promise<CloseResult> {
+    const closed = closeCellSync(cellId, reason, opts);
+    await core.track(cleanupClosed(closed));
+    return { closed };
+  }
+
+  return { createRootCell, ensureRootCell, spawnCell, updateCell, closeCellSync, closeCell, cleanupClosed, deactivateWatches };
+}
+
+/** Active watches as rows (for routing and read models). */
+export function activeWatches(core: Pick<KernelCore, "db">, cellId?: string): Array<{ cellId: string; thread: string | null; filter: Record<string, unknown> }> {
+  const rows =
+    cellId === undefined
+      ? all<{ cell_id: string; thread: string | null; filter: string }>(core.db, "SELECT cell_id, thread, filter FROM cell_watches WHERE active = 1 ORDER BY id")
+      : all<{ cell_id: string; thread: string | null; filter: string }>(core.db, "SELECT cell_id, thread, filter FROM cell_watches WHERE active = 1 AND cell_id = ? ORDER BY id", [cellId]);
+  return rows.map((r) => ({ cellId: r.cell_id, thread: r.thread, filter: JSON.parse(r.filter) as Record<string, unknown> }));
+}

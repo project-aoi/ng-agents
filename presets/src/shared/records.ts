@@ -1,0 +1,133 @@
+import {
+  CELL_STATUS_KEY,
+  gtdKeys,
+  isEnvelopeOfType,
+  parseAddress,
+  type ActionRecord,
+  type ActivityRecord,
+  type CellStatusLine,
+  type ClarifyCard,
+  type Envelope,
+  type ItemSource,
+  type Progress,
+  type ProjectRecord,
+  type SourceRecord,
+} from "@ng/protocol";
+
+// GTD record helpers. Records are plain Context state (gtd.ts); everything here writes through the running cell's
+// own ports, so a record always lives in the cell that owns it.
+
+export type RawInput = ClarifyCard["rawInput"];
+
+/** Envelope types that are "an item" (something that came in and may deserve a card). */
+const ITEM_TYPES = new Set(["user.message", "source.hit", "handback"]);
+
+const CHANNEL_LABELS: Readonly<Record<string, string>> = {
+  ui: "随手记",
+  cli: "命令行",
+  feishu: "飞书",
+  slack: "Slack",
+  github: "GitHub",
+  webhook: "Webhook",
+  email: "邮件",
+  memory: "测试通道",
+  demo: "演示 IM",
+};
+
+/** A handback carries the original item. */
+export function unwrapItem(env: Envelope): Envelope {
+  return isEnvelopeOfType(env, "handback") ? env.payload.original : env;
+}
+
+/** The item a batch is about: the first message / sensor hit / handback (unwrapped). */
+export function primaryItem(envelopes: readonly Envelope[]): Envelope | undefined {
+  const env = envelopes.find((e) => ITEM_TYPES.has(e.type));
+  return env ? unwrapItem(env) : undefined;
+}
+
+export function itemSource(env: Envelope | undefined, now: number): ItemSource {
+  if (!env) return { label: "系统", at: now };
+  const base = { principalId: env.principalId, envelopeId: env.id, at: env.createdAt };
+  if (isEnvelopeOfType(env, "source.hit")) {
+    return { ...base, label: `信源 · ${env.payload.title}`, ...(env.payload.uri ? { uri: env.payload.uri } : {}) };
+  }
+  const from = parseAddress(env.from);
+  if (from?.kind === "channel") return { ...base, label: CHANNEL_LABELS[from.channelId] ?? from.channelId, channelId: from.channelId };
+  if (env.from.startsWith("timer:")) return { ...base, label: "定时提醒" };
+  return { ...base, label: "系统" };
+}
+
+export function itemRawInput(env: Envelope | undefined): RawInput {
+  if (!env) return { text: "", kind: "system" };
+  if (isEnvelopeOfType(env, "user.message")) return { text: env.payload.text, kind: env.payload.voice ? "voice_transcript" : "message" };
+  if (isEnvelopeOfType(env, "source.hit")) return { text: env.payload.rawInput ?? env.payload.summary, kind: "monitor_summary" };
+  return { text: "", kind: "system" };
+}
+
+// ---------- builders ----------
+
+export function newProject(init: Omit<ProjectRecord, "lifecycle" | "createdAt" | "updatedAt"> & { lifecycle?: ProjectRecord["lifecycle"] }, now: number): ProjectRecord {
+  return { lifecycle: "active", ...init, createdAt: now, updatedAt: now };
+}
+
+export function newAction(init: Omit<ActionRecord, "status" | "createdAt" | "updatedAt"> & { status?: ActionRecord["status"] }, now: number): ActionRecord {
+  return { status: "open", ...init, createdAt: now, updatedAt: now };
+}
+
+/** Apply a patch; `null` removes an optional field. Closing an action stamps completedAt. */
+export function patchAction(prev: ActionRecord, patch: { [K in keyof ActionRecord]?: ActionRecord[K] | null }, now: number): ActionRecord {
+  const next: Record<string, unknown> = { ...prev };
+  for (const [k, v] of Object.entries(patch)) {
+    if (v === null) delete next[k];
+    else if (v !== undefined) next[k] = v;
+  }
+  next["updatedAt"] = now;
+  if (prev.status === "open" && next["status"] !== "open" && next["completedAt"] === undefined) next["completedAt"] = now;
+  return next as unknown as ActionRecord;
+}
+
+export function patchProject(prev: ProjectRecord, patch: Partial<ProjectRecord>, now: number): ProjectRecord {
+  const next: ProjectRecord = { ...prev, ...patch, updatedAt: now };
+  if (prev.lifecycle === "active" && (next.lifecycle === "completed" || next.lifecycle === "cancelled") && next.completedAt === undefined) next.completedAt = now;
+  return next;
+}
+
+export function newActivity(init: Omit<ActivityRecord, "at"> & { at?: number }, now: number): ActivityRecord {
+  return { ...init, at: init.at ?? now };
+}
+
+export function newSource(init: Omit<SourceRecord, "createdAt" | "updatedAt" | "runCount" | "hitCount" | "status"> & Partial<Pick<SourceRecord, "status">>, now: number): SourceRecord {
+  return { status: "ok", ...init, runCount: 0, hitCount: 0, createdAt: now, updatedAt: now };
+}
+
+export function statusLine(text: string, now: number, progress?: Progress): CellStatusLine {
+  return { text, at: now, ...(progress ? { progress } : {}) };
+}
+
+export const keyOf = {
+  action: (a: Pick<ActionRecord, "id">) => gtdKeys.action(a.id),
+  activity: (a: Pick<ActivityRecord, "id">) => gtdKeys.activity(a.id),
+  status: CELL_STATUS_KEY,
+};
+
+// ---------- owner-facing text ----------
+
+export function formatWhen(ms: number, timeZone: string): string {
+  const parts = new Intl.DateTimeFormat("zh-CN", {
+    timeZone,
+    month: "numeric",
+    day: "numeric",
+    weekday: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(new Date(ms));
+  const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "";
+  return `${get("month")}月${get("day")}日${get("weekday")} ${get("hour")}:${get("minute")}`;
+}
+
+export function clip(text: string, max: number): string {
+  const t = text.trim();
+  return t.length > max ? `${t.slice(0, max)}…` : t;
+}
+

@@ -1,0 +1,111 @@
+/* Design tokens. Color is restrained on purpose: neutrals carry the interface; the three ball owners
+   (🔵 我来处理 · 🟢 Agent 处理中 · 🟡 等待回复) and the stalled red are the only strong signals. */
+
+:root {
+  color-scheme: light dark;
+
+  /* neutrals — warm paper and ink */
+  --bg: #f6f5f2;
+  --surface: #ffffff;
+  --surface-2: #f0eee9;
+  --surface-3: #e8e5df;
+  --border: #e2dfd8;
+  --border-strong: #cfcbc2;
+  --text: #1f1e1c;
+  --text-2: #57534d;
+  --text-3: #8b867d;
+  --ink: #1f1e1c;
+  --on-ink: #fbfaf7;
+  --scrim: rgb(28 27 25 / 0.28);
+  --shadow-1: 0 1px 2px rgb(28 27 25 / 0.05), 0 1px 1px rgb(28 27 25 / 0.03);
+  --shadow-2: 0 10px 30px -12px rgb(28 27 25 / 0.18), 0 2px 6px rgb(28 27 25 / 0.05);
+  --shadow-3: 0 24px 60px -20px rgb(28 27 25 / 0.35);
+
+  /* signals */
+  --human: #2f66d0;
+  --agent: #23864f;
+  --waiting: #a87508;
+  --danger: #c5362d;
+  --human-soft: color-mix(in srgb, var(--human) 11%, transparent);
+  --agent-soft: color-mix(in srgb, var(--agent) 11%, transparent);
+  --waiting-soft: color-mix(in srgb, var(--waiting) 13%, transparent);
+  --danger-soft: color-mix(in srgb, var(--danger) 10%, transparent);
+  --focus: #3b73e6;
+
+  /* type */
+  --font-sans: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei",
+    "Noto Sans CJK SC", "Noto Sans SC", "Source Han Sans SC", "WenQuanYi Micro Hei", "Helvetica Neue", Arial,
+    "Segoe UI Symbol", "Noto Sans Symbols 2", "Noto Sans Symbols", "DejaVu Sans", sans-serif, "Apple Color Emoji", "Segoe UI Emoji",
+    "Noto Color Emoji";
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Mono", Menlo, Consolas, "Noto Sans Mono CJK SC", "Sarasa Mono SC",
+    monospace;
+  --fs-xs: 0.75rem;
+  --fs-sm: 0.8125rem;
+  --fs-md: 0.9375rem;
+  --fs-lg: 1.125rem;
+  --fs-xl: 1.375rem;
+  --fs-2xl: 1.75rem;
+  --lh-tight: 1.35;
+  --lh-body: 1.65;
+  --lh-loose: 1.75;
+  --fw-medium: 500;
+  --fw-bold: 600;
+
+  /* space (4px grid) */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-7: 32px;
+  --sp-8: 48px;
+  --sp-9: 64px;
+
+  /* shape */
+  --r-xs: 4px;
+  --r-sm: 6px;
+  --r-md: 10px;
+  --r-lg: 14px;
+  --r-pill: 999px;
+
+  /* motion */
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+  --t-fast: 120ms;
+  --t-med: 200ms;
+
+  /* layout */
+  --w-narrow: 720px;
+  --w-wide: 1240px;
+  --bar-h: 56px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #161615;
+    --surface: #1e1e1c;
+    --surface-2: #272725;
+    --surface-3: #31302d;
+    --border: #33322e;
+    --border-strong: #46443f;
+    --text: #ebe9e4;
+    --text-2: #b0aca4;
+    --text-3: #817d75;
+    --ink: #ebe9e4;
+    --on-ink: #161615;
+    --scrim: rgb(0 0 0 / 0.5);
+    --shadow-1: 0 1px 2px rgb(0 0 0 / 0.4);
+    --shadow-2: 0 12px 32px -12px rgb(0 0 0 / 0.6), 0 2px 6px rgb(0 0 0 / 0.3);
+    --shadow-3: 0 24px 60px -20px rgb(0 0 0 / 0.75);
+
+    --human: #79a5f7;
+    --agent: #5cc58a;
+    --waiting: #e2b44a;
+    --danger: #f06a5f;
+    --human-soft: color-mix(in srgb, var(--human) 16%, transparent);
+    --agent-soft: color-mix(in srgb, var(--agent) 15%, transparent);
+    --waiting-soft: color-mix(in srgb, var(--waiting) 16%, transparent);
+    --danger-soft: color-mix(in srgb, var(--danger) 15%, transparent);
+    --focus: #8ab2ff;
+  }
+}

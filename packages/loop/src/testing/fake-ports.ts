@@ -1,0 +1,448 @@
+import {
+  anyCovers,
+  cellPrincipal,
+  createEnvelope,
+  DEFAULT_RESOURCE_PAGE_CHARS,
+  inboxAddr,
+  makeBounds,
+  NgError,
+  spillNotice,
+  systemClock,
+  TOOL_KINDS,
+  type Address,
+  type AuthorizeResult,
+  type CancelScope,
+  type CellSpec,
+  type ChildSummary,
+  type Clock,
+  type CommitResult,
+  type CommitTx,
+  type ControlAction,
+  type EmitOptions,
+  type Envelope,
+  type EnvelopeDraft,
+  type EvidenceAppendResult,
+  type ExecResult,
+  type InboxAddr,
+  type KnowledgePatch,
+  type MeterResult,
+  type ModelMessage,
+  type ParkedAddition,
+  type PolicyBounds,
+  type PromptSnapshot,
+  type ProposedAction,
+  type RunPorts,
+  type ScheduleRule,
+  type SendReceipt,
+  type StateEntry,
+  type StepOrExternalEvidence,
+  type ToolKind,
+  type Usage,
+  type VersionedArtifact,
+  type WorkspacePort,
+} from "@ng/protocol";
+
+type SendRequest = Parameters<RunPorts["notifyChannel"]>[0];
+
+export interface FakeRunOptions {
+  cellId?: string;                      // default "cell1"
+  epoch?: number;                       // default 1
+  runId?: string;                       // default "run_1"
+  parentId?: string | null;             // default "desk"
+  depth?: number;
+  /** Default: every tool kind, may send to `channel:*` and `inbox:*`, maxDepth 2, generous budget. */
+  bounds?: PolicyBounds;
+  /** Default `{ processor: { kind: "llm" } }`; `parentId` is filled from `parentId`. */
+  spec?: Partial<CellSpec>;
+  clock?: Clock;
+  system?: string;
+  history?: ModelMessage[];
+  /** The claimed batch. Strings become `user.message` envelopes from `channel:ui:owner`. */
+  batch?: Array<Envelope | string>;
+  roster?: ChildSummary[];
+  /** Gate stand-in. Default: channel.send outside canSendTo → deny; sideEffect external → defer; else allow. */
+  authorize?: (action: ProposedAction, opts?: { artifactVersion?: number }) => AuthorizeResult | Promise<AuthorizeResult>;
+  /** Ledger stand-in. Default: hard_stop once the totals reach bounds.maxTokens or bounds.maxCents, warn at 80%. */
+  meter?: (usage: Usage, total: Usage) => MeterResult;
+  exec?: (tool: ToolKind, args: unknown, signal?: AbortSignal) => ExecResult | Promise<ExecResult>;
+  notify?: (req: SendRequest) => SendReceipt | Promise<SendReceipt>;
+  /** Spill threshold for tool_result/external text (Context's Inline & Spill). Default 4000 chars. */
+  inlineLimit?: number;
+  steer?: string[];
+  /** Directory the workspace port reports as its root; also enables `ports.workspaceAccess` (CLI loops). */
+  workspaceRoot?: string;
+  /** Tool kinds `workspaceAccess` reports. Default: bounds.tools. */
+  workspaceTools?: ToolKind[];
+}
+
+export interface FakeLog {
+  evidence: StepOrExternalEvidence[];
+  authorizations: Array<{ action: ProposedAction; opts?: { artifactVersion?: number }; result: AuthorizeResult }>;
+  sends: Array<SendRequest & { receipt: SendReceipt }>;
+  metered: Usage[];
+  emitted: Array<{ type: string; payload: unknown; opts?: EmitOptions }>;
+  scheduled: Array<{ env: EnvelopeDraft; rule: ScheduleRule }>;
+  cancelled: CancelScope[];
+  spawned: Array<{ spec: CellSpec; initialPayload: unknown; addr: InboxAddr }>;
+  updated: Array<{ cellId: string; patch: Partial<CellSpec> }>;
+  closed: Array<{ cellId: string; reason?: "completed" | "cancelled" }>;
+  controls: Array<{ cellId: string; action: ControlAction; steerMessage?: string }>;
+  commits: CommitTx[];
+  inboxOut: NonNullable<CommitTx["inboxOut"]>;
+  knowledge: KnowledgePatch[];
+  parked: ParkedAddition[];
+  execs: Array<{ tool: ToolKind; args: unknown }>;
+  jobs: Array<{ jobId: string; command: string; input: string[]; cancelled: boolean }>;
+  previews: Array<{ target: string; chunk: string }>;
+}
+
+export interface FakeRunPorts extends RunPorts {
+  readonly log: FakeLog;
+  readonly state: Map<string, unknown>;
+  readonly artifacts: Map<string, VersionedArtifact>;
+  readonly resources: Map<string, string>;
+  /** Queue steer messages; the Loop picks them up at its next drainSteer(). */
+  pushSteer(...messages: string[]): void;
+  /** Simulate the human saving a new version in the Engage editor. */
+  humanEdit(artifactId: string, body: string): VersionedArtifact;
+  /** Sum of everything metered so far. */
+  totalUsage(): Usage;
+}
+
+export interface FakeRun {
+  ports: FakeRunPorts;
+  snapshot: PromptSnapshot;
+  /** A fresh, not-yet-aborted controller for `loop.run(snapshot, ports, controller.signal)`. */
+  controller: AbortController;
+}
+
+export function defaultFakeBounds(): PolicyBounds {
+  return makeBounds({
+    tools: TOOL_KINDS,
+    canSendTo: ["channel:*", "inbox:*"] as Address[],
+    isolation: "git_worktree",
+    maxConcurrentChildren: 4,
+    maxDepth: 2,
+    maxTokens: 10_000_000,
+    maxCents: 100_000,
+  });
+}
+
+/** A user.message envelope as a Channel would deliver it. */
+export function userMessage(text: string, opts: { id?: string; from?: Envelope["from"]; principalId?: string; at?: number } = {}): Envelope {
+  return createEnvelope(
+    {
+      ...(opts.id ? { id: opts.id } : {}),
+      from: opts.from ?? "channel:ui:owner",
+      principalId: opts.principalId ?? "owner",
+      kind: "event",
+      type: "user.message",
+      payload: { text },
+      ...(opts.at !== undefined ? { createdAt: opts.at } : {}),
+    },
+    { now: () => opts.at ?? 0 },
+  );
+}
+
+/** How the fake renders a batch envelope into the volatile tail (Context's real rendering differs; tests only need stability). */
+export function renderEnvelope(env: Envelope): string {
+  const p = env.payload as { text?: unknown } | null;
+  const body = p && typeof p.text === "string" ? p.text : JSON.stringify(env.payload);
+  return `[${env.type} from ${env.from}] ${body}`;
+}
+
+/**
+ * In-memory RunPorts + a matching PromptSnapshot. Every port call is recorded in `ports.log`; Context behaviour
+ * (versioned artifacts with conflicts and parking, Inline & Spill with `modelText`) is imitated closely enough to
+ * test Loops, tools and code processors without a database.
+ */
+export function createFakeRun(opts: FakeRunOptions = {}): FakeRun {
+  const clock = opts.clock ?? systemClock;
+  const cellId = opts.cellId ?? "cell1";
+  const epoch = opts.epoch ?? 1;
+  const runId = opts.runId ?? "run_1";
+  const parentId = opts.parentId === undefined ? "desk" : opts.parentId;
+  const bounds = opts.bounds ?? defaultFakeBounds();
+  const spec: CellSpec = { processor: { kind: "llm" }, ...opts.spec, ...(parentId ? { parentId } : {}) };
+  const inlineLimit = opts.inlineLimit ?? 4000;
+
+  const log: FakeLog = {
+    evidence: [],
+    authorizations: [],
+    sends: [],
+    metered: [],
+    emitted: [],
+    scheduled: [],
+    cancelled: [],
+    spawned: [],
+    updated: [],
+    closed: [],
+    controls: [],
+    commits: [],
+    inboxOut: [],
+    knowledge: [],
+    parked: [],
+    execs: [],
+    jobs: [],
+    previews: [],
+  };
+  const state = new Map<string, unknown>();
+  const artifacts = new Map<string, VersionedArtifact>();
+  const resources = new Map<string, string>();
+  const steerQueue = [...(opts.steer ?? [])];
+  const total: Usage = { tokens: 0, billedCents: 0 };
+  const scheduledIds = new Set<string>();
+  let counter = 0;
+  const next = (prefix: string) => `${prefix}_${++counter}`;
+
+  const defaultAuthorize = (action: ProposedAction, o?: { artifactVersion?: number }): AuthorizeResult => {
+    if (action.type === "channel.send" && !anyCovers(bounds.canSendTo, action.target)) {
+      return { type: "deny", feedback: `${action.target} is not in this cell's canSendTo` };
+    }
+    if (action.sideEffect === "external") {
+      return {
+        type: "defer",
+        actionId: next("act"),
+        ...(o?.artifactVersion !== undefined ? { boundArtifactVersion: o.artifactVersion } : {}),
+        approvalCard: action.card ?? { format: "card", body: action.summary },
+      };
+    }
+    return { type: "allow", actionToken: next("tok") };
+  };
+
+  const defaultMeter = (_u: Usage, t: Usage): MeterResult => {
+    if (t.tokens >= bounds.maxTokens || t.billedCents >= bounds.maxCents) return "hard_stop";
+    if (t.tokens >= bounds.maxTokens * 0.8 || t.billedCents >= bounds.maxCents * 0.8) return "warn";
+    return "ok";
+  };
+
+  function commitSync(tx: CommitTx): CommitResult {
+    log.commits.push(tx);
+    let artifactVersion: number | undefined;
+    if (tx.artifact) {
+      const w = tx.artifact;
+      const cur = artifacts.get(w.artifactId);
+      const ok = cur
+        ? w.expectedVersion === cur.version || (w.expectedVersion === undefined && w.updatedBy === "agent" && cur.updatedBy === "agent")
+        : w.expectedVersion === undefined || w.expectedVersion === 0;
+      if (!ok && cur) {
+        if (w.updatedBy === "agent" && cur.updatedBy === "human") {
+          log.parked.push({ id: next("park"), artifactId: w.artifactId, basedOnVersion: w.expectedVersion ?? cur.version, content: w.content, createdAt: clock.now(), dismissedAt: null });
+        }
+        return { ok: false, currentArtifact: cur };
+      }
+      if (!ok) throw new NgError("conflict", `artifact ${w.artifactId} does not exist (expectedVersion ${w.expectedVersion})`);
+      const now = clock.now();
+      artifactVersion = (cur?.version ?? 0) + 1;
+      artifacts.set(w.artifactId, {
+        artifactId: w.artifactId,
+        version: artifactVersion,
+        content: w.content,
+        updatedBy: w.updatedBy,
+        cellId,
+        createdAt: cur?.createdAt ?? now,
+        updatedAt: now,
+      });
+    }
+    for (const [k, v] of Object.entries(tx.statePatches ?? {})) {
+      if (v === null || v === undefined) state.delete(k);
+      else state.set(k, structuredClone(v));
+    }
+    log.inboxOut.push(...(tx.inboxOut ?? []));
+    return artifactVersion === undefined ? { ok: true } : { ok: true, artifactVersion };
+  }
+
+  function appendEvidenceSync(record: StepOrExternalEvidence): EvidenceAppendResult {
+    log.evidence.push(record);
+    const seq = log.evidence.length;
+    const text = record.kind === "tool_result" ? record.output : record.kind === "external" ? record.text : undefined;
+    if (text === undefined) return { seq };
+    if (text.length <= inlineLimit) return { seq, modelText: text };
+    const uri = `res://${cellId}/${next("res")}`;
+    resources.set(uri, text);
+    const head = text.slice(0, inlineLimit);
+    return { seq, spill: { uri, totalChars: text.length, inlineChars: head.length }, modelText: head + spillNotice(uri, text.length, head.length) };
+  }
+
+  const workspace: WorkspacePort = {
+    cellId,
+    isolation: bounds.isolation,
+    root: opts.workspaceRoot ?? `/fake/workspaces/${cellId}`,
+    async exec(tool, args, signal) {
+      log.execs.push({ tool, args });
+      if (opts.exec) return opts.exec(tool, args, signal);
+      return { output: `${tool} ok`, ...(tool === "bash" || tool === "code_rpc" ? { exitCode: 0 } : {}) };
+    },
+    async startJob(s) {
+      const jobId = next("job");
+      log.jobs.push({ jobId, command: s.command, input: [], cancelled: false });
+      return { jobId };
+    },
+    async observeJob(jobId) {
+      const job = log.jobs.find((j) => j.jobId === jobId);
+      if (!job) throw new NgError("not_found", `no job ${jobId}`);
+      return { state: job.cancelled ? "cancelled" : "running", tail: "" };
+    },
+    async writeJobInput(jobId, input) {
+      log.jobs.find((j) => j.jobId === jobId)?.input.push(input);
+    },
+    async cancelJob(jobId) {
+      const job = log.jobs.find((j) => j.jobId === jobId);
+      if (job) job.cancelled = true;
+    },
+  };
+
+  const listStateSync = (prefix: string): StateEntry[] =>
+    [...state.entries()].filter(([k]) => k.startsWith(prefix)).map(([key, value]) => ({ cellId, key, value, updatedAt: clock.now() }));
+
+  const ports: FakeRunPorts = {
+    log,
+    state,
+    artifacts,
+    resources,
+    self: { cellId, epoch, runId, principalId: cellPrincipal(cellId), parentId, depth: opts.depth ?? (parentId ? 1 : 0), bounds, spec },
+    workspace,
+    async notifyChannel(req) {
+      const receipt = opts.notify ? await opts.notify(req) : "sent";
+      log.sends.push({ ...req, receipt });
+      return receipt;
+    },
+    async streamPreview(target, chunk) {
+      log.previews.push({ target, chunk });
+    },
+    context: {
+      async readState<T>(_cell: string, key: string) {
+        return (state.has(key) ? structuredClone(state.get(key)) : null) as T | null;
+      },
+      async commit(_cell, tx) {
+        return commitSync(tx);
+      },
+      async appendEvidence(_cell, record) {
+        return appendEvidenceSync(record);
+      },
+      async readResource(_cell, uri, page) {
+        let text: string | undefined = resources.get(uri);
+        if (text === undefined && uri.startsWith("artifact://")) text = artifacts.get(uri.slice("artifact://".length).split("@")[0]!)?.content.body;
+        if (text === undefined) throw new NgError("not_found", `no resource ${uri}`);
+        const offset = page?.offset ?? 0;
+        return text.slice(offset, offset + (page?.limit ?? DEFAULT_RESOURCE_PAGE_CHARS));
+      },
+      async searchHistory(_cell, query) {
+        const q = query.toLowerCase();
+        return log.evidence.flatMap((e, i) => {
+          const text = "text" in e ? e.text : e.kind === "tool_result" ? e.output : "";
+          return text.toLowerCase().includes(q) ? [{ seq: i + 1, cellId, runId: e.runId, kind: e.kind, text, at: e.at, source: "evidence" as const }] : [];
+        });
+      },
+      async upsertSkillOrNote(_cell, patch) {
+        log.knowledge.push(patch);
+      },
+      async listState(_cell, prefix) {
+        return listStateSync(prefix);
+      },
+      async getArtifact(id) {
+        return artifacts.get(id) ?? null;
+      },
+      async listArtifacts() {
+        return [...artifacts.values()];
+      },
+    },
+    async cancelScheduled(scope) {
+      log.cancelled.push(scope);
+    },
+    async spawnCell(childSpec, initialPayload) {
+      const addr = inboxAddr(next("child"));
+      log.spawned.push({ spec: childSpec, initialPayload, addr });
+      return addr;
+    },
+    async updateCell(id, patch) {
+      log.updated.push({ cellId: id, patch });
+    },
+    async closeCell(id, reason) {
+      log.closed.push({ cellId: id, ...(reason ? { reason } : {}) });
+    },
+    async authorize(action, o) {
+      const result = await (opts.authorize ?? defaultAuthorize)(action, o);
+      log.authorizations.push({ action, ...(o ? { opts: o } : {}), result });
+      return result;
+    },
+    meter(usage) {
+      log.metered.push(usage);
+      total.tokens += usage.tokens;
+      total.billedCents += usage.billedCents;
+      return (opts.meter ?? defaultMeter)(usage, { ...total });
+    },
+    drainSteer() {
+      return steerQueue.splice(0);
+    },
+    async emitToParent(type, payload, o) {
+      if (!parentId) throw new NgError("invalid_argument", `cell ${cellId} has no parent`);
+      log.emitted.push({ type, payload, ...(o ? { opts: o } : {}) });
+    },
+    async scheduleSelf(env, rule) {
+      if (env.id && scheduledIds.has(env.id)) return "deduped";
+      if (env.id) scheduledIds.add(env.id);
+      log.scheduled.push({ env, rule });
+      return "accepted";
+    },
+    async controlCell(id, cmd) {
+      log.controls.push({ cellId: id, action: cmd.action, ...(cmd.steerMessage !== undefined ? { steerMessage: cmd.steerMessage } : {}) });
+      return { applied: true, epoch: 1 };
+    },
+    pushSteer(...messages) {
+      steerQueue.push(...messages);
+    },
+    humanEdit(artifactId, body) {
+      const cur = artifacts.get(artifactId);
+      if (!cur) throw new NgError("not_found", `no artifact ${artifactId}`);
+      const r = commitSync({ artifact: { artifactId, content: { ...cur.content, body }, updatedBy: "human", expectedVersion: cur.version } });
+      if (!r.ok) throw new Error("unreachable");
+      return artifacts.get(artifactId)!;
+    },
+    totalUsage() {
+      return { ...total };
+    },
+    ...(opts.workspaceRoot !== undefined
+      ? {
+          async workspaceAccess() {
+            return { root: opts.workspaceRoot!, isolation: bounds.isolation, tools: opts.workspaceTools ?? [...bounds.tools] };
+          },
+        }
+      : {}),
+  };
+
+  const envelopes = (opts.batch ?? []).map((e, i) => (typeof e === "string" ? userMessage(e, { id: `env_${i + 1}`, at: clock.now() }) : e));
+  const rosterText = opts.roster?.length
+    ? [{ role: "user" as const, content: [{ type: "text" as const, text: `[children]\n${opts.roster.map((c) => `- ${c.cellId} ${c.title ?? ""} ${c.status}`).join("\n")}` }] }]
+    : [];
+  const snapshot: PromptSnapshot = {
+    cellId,
+    epoch,
+    runId,
+    mode: spec.contextMode ?? "isolated",
+    spec,
+    bounds,
+    batch: {
+      claimId: runId,
+      cellId,
+      epoch,
+      workerId: "worker_1",
+      mode: "serial_coalesce",
+      envelopes,
+      seqs: envelopes.map((_, i) => i + 1),
+      claimedAt: clock.now(),
+      leaseExpiresAt: clock.now() + 60_000,
+    },
+    system: { text: opts.system ?? "You are a test cell.", hash: "fake" },
+    history: opts.history ?? [],
+    historyUptoSeq: 0,
+    tail: {
+      roster: opts.roster ?? [],
+      messages: [...rosterText, ...envelopes.map((e) => ({ role: "user" as const, content: [{ type: "text" as const, text: renderEnvelope(e) }] }))],
+    },
+    skills: [],
+    createdAt: clock.now(),
+  };
+
+  return { ports, snapshot, controller: new AbortController() };
+}

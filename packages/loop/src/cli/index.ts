@@ -1,0 +1,34 @@
+export {
+  createCliAgentLoop,
+  cliAdapterFor,
+  capabilitiesOf,
+  CLI_SESSION_KEY,
+  CLI_FORK_SESSION_KEY,
+  CLI_MCP_SERVER,
+  NATIVE_REPLACED_TOOLS,
+  RUN_ENDED_NOTICE,
+  RUN_ALREADY_ENDED,
+  type CliAgentLoopOptions,
+  type CliDebugEvent,
+} from "./loop";
+export { createRoutingLoop, UnconfiguredModelClient, type RoutingLoop, type RoutingLoopOptions } from "./routing";
+export { startToolBridge, MCP_SHIM_PATH, MCP_PROTOCOL_VERSIONS, type ToolBridge, type ToolBridgeOptions, type BridgeToolSpec, type BridgeCallResult, type McpServerLaunch, type BridgeLogEvent } from "./bridge";
+export {
+  cliEnvironment,
+  detectCli,
+  apiProviderConfigured,
+  parseAgentBackend,
+  resolveAgentBackend,
+  resolveAgentBackendFromEnv,
+  cliBinsFromEnv,
+  cliModelsFromEnv,
+  CLI_ENV_DROP,
+  DEFAULT_CLI_BINS,
+  type AgentBackendSetting,
+} from "./env";
+export { claudeAdapter, claudeArgs, claudeBuiltinTools, CLAUDE_SANDBOX_SETTINGS } from "./adapters/claude";
+export { codexAdapter, codexArgs, codexSandboxMode } from "./adapters/codex";
+export { agyAdapter, agyArgs, agyPermissionAllowed } from "./adapters/agy";
+export { renderTranscript, tailText, freshPrompt, forkNoteIndex, FORK_NOTE_PREFIX } from "./render";
+export { spawnCli, descendants, probeVersion, type CliProcess } from "./process";
+export type { CliAdapter, CliCapabilities, CliDriver, CliEvent, CliModels, CliSessionRecord, DriverIO, LaunchRequest } from "./types";

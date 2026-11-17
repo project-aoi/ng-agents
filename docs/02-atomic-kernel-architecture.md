@@ -276,10 +276,12 @@ ng-agents/
 │   ├── gate/              # ⑥ 单调权限收紧(child ⊆ parent)、沙箱外密钥代理、绑定草稿 version 的审批与双账本预算
 │   └── cell/              # ⑦ Cell 监督树与 epoch 纪元管理、在途分身摘要、动态 watches 路由表与级联回收
 ├── presets/               # 标准 Cell 拼装模板与确定性 code 处理器（如 join_all 汇合、等待匹配）
-│   ├── inline-desk/       # 轻装主台接待（微事秒办、重活秒派分身、掌握在途分身花名册）
-│   ├── isolated-worker/   # 独立沙箱后台执行单元（支持异步长 Job 与按需 1对1 直连授权）
-│   ├── thread-watcher/    # 外部回信订阅直通 + deliverAt 超时催问单元
-│   └── cron-sensor/       # 定时/群聊条件探头信源单元（平时无事直接静默返回）
+│   └── src/
+│       ├── inline-desk/   # 轻装主台接待（微事秒办、重活秒派分身、掌握在途分身花名册）
+│       ├── isolated-worker/ # 独立沙箱后台执行单元（支持异步长 Job 与按需 1对1 直连授权）
+│       ├── thread-watcher/  # 外部回信订阅直通 + deliverAt 超时催问单元
+│       ├── cron-sensor/   # 定时/群聊条件探头信源单元（平时无事直接静默返回）
+│       └── shared/        # 四个模板共用的 GTD 记账、卡片构造与 join_all 汇合
 └── apps/
     └── gtd-desk/          # 面向用户的极简 GTD 工作台界面、UI 同步状态/改稿/审批接口与三视图投影
 ```
