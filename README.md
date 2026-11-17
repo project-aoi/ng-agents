@@ -18,3 +18,7 @@
 
 4. **[GTD 工作台界面交互与状态流转设计](./docs/04-gtd-interaction-spec.md)**
    - 定义顶部导航与状态提示、`待确认收件箱（Clarify）`（单卡片处理流与三类常见卡片）、`专注工作区（Engage）`（初稿编辑区 + 关联资料侧栏 + 免打扰拦截）、`项目全局与周回顾（Radar）`（项目状态总览 + 从修改习惯提炼 `SKILL.md`）的具体交互与状态机。
+
+5. **[模块精确定义与用户需求检验](./docs/05-module-contracts-and-capability-review.md)**
+   - 明确 8 个模块的状态归属、操作边界与组合规则，区分 Session、Task、Run、Job、Action 和 Artifact。
+   - 标明原接口所需的契约扩展，用并行工作、执行中取消、协同改稿、多 Agent 汇合等用户需求检验能力边界；不把定义遗漏或外部系统限制当成架构反例。
