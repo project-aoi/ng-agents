@@ -1,13 +1,13 @@
 # 2026 热门 AI Agent 产品调研与底层工程共性
 
 > [!IMPORTANT]
-> **范围说明**：本文档基于各项目公开工程文档、GitHub 源码仓、安全审计与技术博客整理（时间基准：2026 年 11 月），重点拆解 **Anthropic《Building always-on agents》**、**Paperclip**、**Hermes Agent**，并横向对比 **OpenClaw、Pi、DeepSeek Harness、Poke、Perplexity Computer、Devin 2.2、Manus 2.0、OpenAI Codex Cloud、Cursor Automations、Google Antigravity / Jules、Factory Droids、Genspark Super Agent** 及 **Lindy / Dust / Relevance / Glean** 等产品。
+> **范围说明**：本文档基于各项目公开工程文档、GitHub 源码仓、安全审计与技术博客整理（时间基准：2026 年 11 月），重点拆解 **Anthropic《Building always-on agents》**、**Paperclip**、**Hermes Agent** 与 **DeepSeek Super-agent / DeepSeek Harness (`dsh`)**，并横向对比 **OpenClaw、Pi、Poke、Perplexity Computer、Devin 2.2、Manus 2.0、OpenAI Codex Cloud、Cursor Automations、Google Antigravity / Jules、Factory Droids、Genspark Super Agent** 及 **Lindy / Dust / Relevance / Glean** 等产品。
 
 ---
 
 ## 一、核心结论：2026 热门 Agent 产品的十个底层工程共性
 
-纵观 2025—2026 年跑出来的热门开源项目（如 39.5 万 Star 的 OpenClaw、26.3 万 Star 的 Hermes、11.4 万 Star 的 Paperclip、12.2 万 Star 的 Pi）与头部商业平台（Anthropic、OpenAI、Cognition、Manus、Cursor），大家已经不再靠“把提示词串成死板的流程图”或“拉几个角色在群里互相聊天”来做产品，工程实现上普遍收敛到了以下 **十个具体做法**：
+纵观 2025—2026 年跑出来的热门开源项目（如 39.5 万 Star 的 OpenClaw、28.2 万 Star 的 DeepSeek Harness、26.3 万 Star 的 Hermes、11.4 万 Star 的 Paperclip、12.2 万 Star 的 Pi）与头部商业平台（Anthropic、OpenAI、Cognition、Manus、Cursor），大家已经不再靠“把提示词串成死板的流程图”或“拉几个角色在群里互相聊天”来做产品，工程实现上普遍收敛到了以下 **十个具体做法**：
 
 ```mermaid
 flowchart TB
@@ -47,6 +47,7 @@ flowchart TB
 * **解决什么问题**：一旦同时接进 GitHub Webhook、群聊、邮件和定时任务，最容易出事的就是 **并发冲突**——用户连发 4 条消息或 CI 连续报警时，如果同时拉起多个进程，就会互相覆盖记忆文件、重复修同一个 Bug，甚至给客户重复发信或重复扣款。
 * **各家做法**：
   * **Anthropic**：规定每个 Event Inbox **同一时刻最多只有 1 个活跃 Worker**，运行期间新进来的消息自动做 **Batching 合并**（一轮回复消化多条消息），并区分三种中途消息处理策略（排队等下一轮 / 在两次工具调用之间塞进当前轮 / 直接打断重跑）。
+  * **DeepSeek Super-agent (`dsh-superagent`)**：前台 `Router` 按线程串行评估并自动合并思考期间积压的突发事件（压测中触发频率从 1 条/分升至 40 条/分时，单次决策均摊推理耗时反而从 **6.4 秒降到 1.6 秒**）；后台 `Worker` 认领工单后直接订阅对应线程，后续人类追问绕过 `Router` 直投 `Worker`（省掉 **30% 路由调用**和 **37% 缓存读取 Token**）。
   * **Paperclip**：用数据库队列合并运行期内的重复唤醒，并用 **单条 PostgreSQL 条件 `UPDATE` 实现工单抢锁**（没抢到直接返回 `409 Conflict`，不依赖 Redis，也不白跑模型 Token）。
   * **OpenClaw & 企业级工作流**：OpenClaw 用分通道 FIFO 队列强制单会话 `concurrency: 1`（支持 `collect` 合并与 `steer` 打断转向）；Lindy / Dust / Sim 标配 Webhook HMAC 去重表和定时任务互斥锁。
 
@@ -96,10 +97,10 @@ flowchart TB
   * **输出好检查的交付物 + CI 报错自动重修**：Google Antigravity 输出可逐行批注的计划、截图和操作录屏；Cursor Cloud Agents 用 `recordScreen` 直接往 PR 里贴演示视频；Devin Review 把代码改动按逻辑分组展示，并且和 Cursor Bugbot Autofix、Google Jules CI Fixer 一样，遇到 CI 报错或有人提了评审意见时 **自动唤醒原沙箱接着改到测试通过**。
 
 ### 10. 子 Agent 上下文隔离、大小模型分级调用与预算硬上限（Isolation & Governance）
-* **解决什么问题**：早期框架喜欢让“产品经理、开发、测试”几个 Agent 在同一个上下文里来回群聊，不仅上下文互相干扰，10 步每步 95% 成功率串下来整体成功率也会掉到 $0.95^{10} \approx 59.9\%$，一旦死循环还会刷爆账单。
+* **解决什么问题**：早期框架喜欢让“产品经理、开发、测试”几个 Agent 在同一个上下文里来回群聊，不仅上下文互相干扰，10 步每步 95% 成功率串下来整体成功率也会掉到 $0.95^{10} \approx 59.9\%$，一旦死循环还会刷爆账单；反过来，如果只给单个长会话挂一个 `subagent` 工具靠提示词劝它派单，模型又很容易顺手自己硬干导致阻塞（DeepSeek 实测 300 条消息负载下，中性提示词的单会话 **5 轮里派单次数为 0**，p95 耗时拖到 **29.5 分钟**，而架构级拆分后降至 **15.7 分钟**）。
 * **各家做法**：
-  * **子 Agent 隔离运行 + 独立验收（Generator-Evaluator）**：**Manus Wide Research** 同时拉起上百台独立 Linux 虚拟机，**禁止子 Agent 之间直接互相发消息**；Hermes `delegate_task` 不给子任务传完整父对话历史，也不给全局记忆写权限；Anthropic 和 Google Jules 单独安排跑 Playwright 实测验收的 **Evaluator / Critic Agent**；Paperclip 按上下级汇报关系（`reports_to`）切分上下文，开发做完转交独立 QA 角色验收。
-  * **大小模型分工 + 纯脚本巡检**：DeepSeek Super Agent 先过一层不调模型的规则筛选；Hermes 定时任务支持 `no_agent` 纯脚本检查（零 Token 消耗）；OpenClaw 和 Poke 用便宜的小模型盯每分钟的邮件和心跳，真遇到复杂任务再调大模型。
+  * **子 Agent 隔离运行 + 独立验收（Generator-Evaluator）**：**Manus Wide Research** 同时拉起上百台独立 Linux 虚拟机，**禁止子 Agent 之间直接互相发消息**；**DeepSeek Super-agent** 把负责接话协调的 `Router`（不给改代码权限）与独占 `git worktree` 的 `Worker` 拆开，Worker 只向上汇报不直接回群消息；Hermes `delegate_task` 不给子任务传完整父对话历史，也不给全局记忆写权限；Anthropic 和 Google Jules 单独安排跑 Playwright 实测验收的 **Evaluator / Critic Agent**；Paperclip 按上下级汇报关系（`reports_to`）切分上下文，开发做完转交独立 QA 角色验收。
+  * **大小模型分工 + 纯脚本巡检**：DeepSeek Super-agent 入站先过纯代码规则过滤，并用轻快模型跑 `Router`、用最强模型跑 `Worker`；Hermes 定时任务支持 `no_agent` 纯脚本检查（零 Token 消耗）；OpenClaw 和 Poke 用便宜的小模型盯每分钟的邮件和心跳，真遇到复杂任务再调大模型。
   * **预算硬上限**：Paperclip（按团队/项目/单个 Agent 分别统计 `billed_cents`，到 80% 提醒、到 100% 自动暂停并停掉在途任务）、Dust（单轮额度上限）、Glean Protect（发现用户在源系统的文档权限被收回时，自动暂停对应的后台订阅任务）。
 
 
@@ -131,18 +132,28 @@ flowchart TB
   * **五层记忆结构 + Honcho 用户偏好推断**：`SOUL.md` 基础规则 + 定长快照 `MEMORY.md`/`USER.md` + SQLite WAL **FTS5 BM25 跨会话全文搜索（`session_search`）** + **Honcho 三步推断**（推测意图 → 核对历史记录 → 处理用户前后习惯变化）+ 保留精确 Git SHA 与文件路径的上下文压缩。
   * **多渠道常驻服务**：`hermes gateway install` 一键注册系统后台服务，接入 Telegram、Discord、Slack、WhatsApp、飞书、企微、Home Assistant 等 **25+ 渠道**，支持在终端输入 `/handoff telegram` 带着当前 `session_id` 出门在手机上接着聊。
 
-### 2.4 OpenClaw 与轻量 Harness 项目（Pi、DeepSeek Harness、OpenHands V1、Goose）
+### 2.4 DeepSeek Harness (`dsh`) 与 DeepSeek Super-agent：插件微内核与注意力解耦
+* **三层演进关系**：DeepSeek 在 2026 年 8 月开源单机编码内核 **`deepseek-ai/deepseek-harness` (`dsh`，28.2 万+ Stars)**，底层基于自研 **`Cordis` 可逆插件微内核**（注册工具、提示词段或拦截器时自动生成反向卸载函数，连 `agentLoop` 和 `sandbox` 都能按会话作用域热插拔；在 FrontierHarness 同模型评测下依靠 `PTC` 脚本批量调工具把单次通过成本从 **\$18.34 压到 \$3.28**，并内置 `followup`、`steer`、以及只塞背景不唤醒休眠实例的 `inject` 三种消息投递语义）。**2026 年 10 月 31 日**，团队进一步发表《Super-agent 设计探索：迈向更自主的 Agent 系统》并开源参考原型 **`deepseek-ai/dsh-superagent-prototype`**。
+* **Super-agent 核心判断与五大机制**：
+  * **打破“以 Session 为基本工作单位”**：团队指出单任务上限取决于模型，但**多任务上限取决于人的注意力（人通常只能同时跟进 3～5 个活跃 Session）**，应当由一个连续在线的实体在底层接管会话管理。
+  * **1. `Router + Worker` 硬隔离与预填充批处理**：前台只有一个长生命周期 `Router`（拿掉写代码和长命令权限，只做沟通与派单，回复限 100 字以内；突发积压事件合并推理，均摊决策耗时从 `6.4s` 压到 `1.6s`）；后台每个工单独占隔离 `git worktree` 和强模型 `Worker`，且预留 **`+1` 人类优先槽位**防后台修 CI 堵死人工追问。
+  * **2. 两阶段准入、版本化 `Mandate` 与静默试运行**：外部消息（Trigger）先过纯代码规则白名单，再由模型对照团队规则评估并做确定性字段校验；主动抓群聊缺陷的规则默认跑在 **`observe` 观察模式**（只记“本来会接哪单”而不真执行），开启自动后采用“静默复现修复”（修不出来直接 `dropped` 静默关单，不发废话通知）；每张工单记录授权时的策略版本 `Mandate`，跨天恢复前必须重新核验权限。
+  * **3. `Thread ↔ Ticket` 订阅直通与 `Handback` 退回**：Worker 接单后直接订阅对应 PR 或群聊话题，后续追问绕过 `Router` 直达 `Worker`（省 30% 路由调用与 37% 缓存读取 Token）；若用户在原帖聊起无关新事，Worker 调 `handback` 退回 `Router` 重新评估。
+  * **4. `Inline & Spill` 与链式召回（Chain of Recall）**：上下文只内联短摘要卡与相邻几条消息，长内容溢出为按 URI 分页直读的资源，并靠 `Trigger ↔ Thread ↔ Ticket` 精确关联 ID 顺藤摸瓜找回几周前的背景，不依赖模糊向量检索。
+  * **5. 5 秒自动转后台与开放难题**：耗时超 5 秒的命令自动转入后台 `jobs`，保证前台随时 5 秒内响应打断；文章同时坦承跨数月的长程记忆退化、外部群聊提示词注入以及云端循环连接本地电脑（BYOM）时的凭据隔离仍是待解难题。
+
+### 2.5 OpenClaw 与轻量 Harness 项目（Pi、OpenHands V1、Goose）
 * **OpenClaw（`openclaw/openclaw`，39.5 万+ Stars）**：Peter Steinberger 基于 **Pi SDK** 做的本地常驻个人助手网关（`:18789`），接入 50+ 聊天软件、语音唤醒、动态交互界面 `Live Canvas (A2UI)` 与手机/树莓派硬件节点（摄像头、GPS、录屏）。它带火了 `SOUL.md` + `AGENTS.md` + `USER.md` + `MEMORY.md` + `HEARTBEAT.md` 纯文本目录结构，并在 2.0 版本加上了 **SQLite 来源标记（联网回合自动标为 `untrusted`，禁止直接写进长期记忆）**。
 * **轻量编码内核代表**：
   * **Pi (`earendil-works/pi`)**：4 个基础工具 + 树状分支 JSONL 会话 + 支持 Agent 自己写 TypeScript 插件并 `/reload` 热加载 + QuickJS `Codemode`。
-  * **DeepSeek Harness (`dsh`，27.9 万+ Stars)**：基于 Cordis 把所有模块做成可替换插件（连 `agentLoop` 都能随时换掉），在相同模型评测下把单任务平均成本从 **\$18.34 压到了 \$3.28**。
+  * **OpenHands Software Agent SDK (V1)**：把不可变配置与只追加事件流彻底解耦，支持本地 CLI 与云端沙箱无缝切换。
   * **Goose (`aaif-goose/goose`)**：Block 捐给 Linux 基金会 AAIF 的 Rust 单二进制工具，主打用 YAML Recipes 在团队内共享固定流程。
 
-### 2.5 免运维主动型消费级产品：Poke 与 Perplexity Computer
+### 2.6 免运维主动型消费级产品：Poke 与 Perplexity Computer
 * **Poke（`poke.com`，2026.07 被 Cognition 收购）**：首个拿到苹果官方批准接入 **Apple Messages for Business（原生 iMessage）** 的独立 AI Agent。不用自己配服务器，加好友就能用：前台是一个负责自然聊天的 **Interaction Agent**，配了 `wait()` 工具过滤无用提醒；后台是一组 **长期保留上下文的执行子 Agent**，配合每分钟扫 Gmail/日历的小模型分类器与 `Code.Storage` Git 记忆库，在后台默默把事办完。
 * **Perplexity Comet & Computer**：Comet 在浏览器里跨标签页操作网页；Computer 调度十几种模型盯邮件、航班、日历和本地文件，提供 **云端沙箱 / 混合模式（本地读私密文件 + 云端推理） / 纯本地 Apple Silicon 离线运行** 三种部署方式。
 
-### 2.6 云端工作台与企业级 SaaS 平台
+### 2.7 云端工作台与企业级 SaaS 平台
 * **云端研发 Agent（Devin 2.2 / OpenAI Codex / Cursor / Google Antigravity / Factory）**：到 2026 年 5 月，**Devin 由外部事件自动触发的任务量已经超过了人工手动发起的对话量**；Cursor 内部超过 **30%** 的合并 PR 由云虚拟机里的 Cloud Agents 完成；Factory 线上有 **14% 的任务连续运行超过 24 小时（最长 16 天）**。
 * **通用云端工作台（Manus 2.0 / Genspark Super Agent）**：每个任务分配一台独立云端 Linux 电脑，关掉网页也能在后台继续跑或定时重跑（Manus Scheduled Tasks 2.0 支持在同一个持久目录里按周累加数据；Manus 2.0 `Cue` 还给 Agent 配了独立邮箱、手机号和限额付款卡）。
 * **企业级 SaaS 平台（Lindy / Dust / Relevance / Fleece / Gumloop / Glean）**：主要拼 **1,000～4,000+ 现成 OAuth 连接器** + 没 API 时用云端浏览器兜底（Autopilot / Playwright）+ **实时同步源系统文档权限（ACL）**（Dust 区分团队共享凭据与个人凭据；Glean Protect 实时拦截越权访问）+ 幂等防重发与人工审批队列。
@@ -152,24 +163,25 @@ flowchart TB
 ## 三、2026 Agent 生态分层与横向对比
 
 ### 3.1 五层分工：为什么不同开源项目经常搭在一起用？
-市面上的热门项目并不是都在做同一层，放在一起看其实是 **上下游互补的五层**（所以社区里常把 `Paperclip + Hermes + OpenClaw + Claude Code` 串起来用）：
+市面上的热门项目并不是都在做同一层，放在一起看其实是 **上下游互补的五层**（比如 `dsh-superagent` 本身就是架在单机内核 `dsh` 之上的多任务协同插件，社区也常把 `Paperclip + Hermes + OpenClaw + Claude Code` 串起来用）：
 
 1. **L0 通用协议与文件约定（Linux 基金会 AAIF 等）**：`MCP`（工具连接）、`AGENTS.md`（项目说明）、`SKILL.md`（按需加载的操作规范）。
-2. **L1 单机执行内核（Agent Harness）**：**Pi**、**DeepSeek Harness**、**OpenHands V1**、**Goose**、**Claude Code CLI / Codex CLI** —— 管单进程里的推理循环、上下文压缩和命令执行。
-3. **L2 个人常驻网关与记忆层**：**OpenClaw**（强在多聊天软件接入和硬件节点）、**Hermes Agent**（强在自动沉淀技能和多层记忆）、**Poke**（免部署托管版）、**Claude Duet**。
+2. **L1 单机执行内核（Agent Harness）**：**Pi**、**DeepSeek Harness (`dsh`)**、**OpenHands V1**、**Goose**、**Claude Code CLI / Codex CLI** —— 管单进程里的推理循环、上下文压缩和命令执行。
+3. **L2 个人/团队常驻网关与记忆层**：**OpenClaw**（强在多聊天软件接入和硬件节点）、**Hermes Agent**（强在自动沉淀技能和多层记忆）、**DeepSeek Super-agent**（跨群聊与代码仓的连续协作者）、**Poke**（免部署托管版）、**Claude Duet**。
 4. **L3 云端沙箱电脑与垂直平台**：**Devin**、**Cursor Cloud Agents**、**Google Antigravity**、**Manus**、**Genspark**、**Claude Managed Agents**、**Lindy / Dust / Glean**。
-5. **L4 多 Agent 团队调度与预算控制面（Control Plane）**：**Paperclip**、**Factory Mission Control**、**Linear for Agents**、**OpenAI Symphony** —— 不管单个 Agent 内部怎么推理，专门管任务分配、工单锁、目录隔离、总账单上限和人工审批。
+5. **L4 多 Agent 团队调度与预算控制面（Control Plane）**：**Paperclip**、**DeepSeek Super-agent 工单引擎**、**Factory Mission Control**、**Linear for Agents**、**OpenAI Symphony** —— 不管单个 Agent 内部怎么推理，专门管任务分配、工单锁、目录隔离、总账单上限和人工审批。
 
-### 3.2 十二款代表性产品横向对比
+### 3.2 十三款代表性产品横向对比
 
 | 产品 / 项目 | 形态与定位 | 唤醒与并发控制 | 记忆与技能管理 | 沙箱与权限安全 | 主要特点 |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **Anthropic Always-On / Managed Agents / Duet** | 官方工程指南 + 托管云服务 + 个人助手 | Event Inbox 单 Worker + 独立 Timers 表 + 连发合并 | 4 类记忆文件 + 200 行目录 + 后台 **Dreaming** Wiki + `SKILL.md` | 推理与容器分离按需启动 + **沙箱外代理注入密钥** + 安全分类器 + `defer` 挂起 | 体系最完整；按实际运行毫秒计费，休眠 `\$0`；支持私有化 ZDR |
 | **Paperclip** (`paperclipai`) | 开源多 Agent 团队调度与控制面 | 4 类触发唤醒 **Heartbeat** + 队列合并 + 单条 SQL `409` 抢锁 | 工单 **Goal Ancestry** 目标背景注入 + PARA 文件记忆 + 团队模板包 | 外部适配器接入 + `git_worktree` + 网关三级权限 + 关键操作审批 | 把多 Agent 协作做成清晰的工单状态机、汇报关系与预算硬上限 |
 | **Hermes Agent** (`NousResearch`) | 开源常驻网关与多沙箱运行时 | systemd/launchd 服务 + 60s 文件锁 Cron + 异步子任务 | 固定快照 `MEMORY/USER.md` + SQLite **FTS5** + **Honcho** 偏好推断 + **自动总结 `SKILL.md`** | 本地 / Docker / SSH / **Modal & Daytona** 休眠云沙箱 + 技能安全扫描 | 技能自动沉淀、格式检查、Curator 定期清理与 `/handoff` 换端续聊最成熟 |
+| **DeepSeek Super-agent** (`dsh-superagent`) | 基于 `dsh` 的跨渠道多工单研发协同原型 | `Router` 突发合并批处理 + **线程订阅直通 `Worker`** + `+1` 人类优先槽 | **`Inline & Spill`** 摘要卡 + **链式召回**关联 ID 图谱 + 作用域 `SKILL.md` | 阉割 `Router` 写权限强制派单 + 每工单 `git_worktree` + 版本化 `Mandate` + `observe` 试运行 | 隐藏 Session 概念；靠订阅直通省 37% 缓存 Token；5s 长命令自动转后台 |
+| **DeepSeek Harness** (`dsh`) | 全插件化开源单机编码内核 | `followup / steer / inject(不唤醒)` 三模式队列 + 异步 `jobs` | zstd 压缩可重放 JSONL（模型可见即落盘）+ Cordis 作用域 | `ctx.sandbox` 统一封装本地/远程进程 + 单调叠加工具守卫 | 基于 Cordis 万物皆可逆插件；`PTC` 写 TS 批量调工具，同模型成本压至 \$3.28 |
 | **OpenClaw** (`openclaw`) | 开源本地优先多渠道个人网关 | `:18789` 网关 + 30m 定时检查 (`HEARTBEAT_OK` 静默) + Webhook | 工作区 Markdown (`SOUL/AGENTS/MEMORY.md`) + 2.0 **来源标记 + 后台整理** | 分会话单写者队列 + 多层工具白名单 + 设备配对签名（早期默认配置偏宽松） | 50+ 聊天软件覆盖 + 语音唤醒 + Live Canvas 界面 + 手机/树莓派节点 |
 | **Pi** (`earendil-works/pi`) | 轻量可自扩展编码内核与 SDK | 无固定步数上限循环 + 实时 `steer` 转向 + `Pi Durable` 恢复 | 本地 `AGENTS.md` / `PLAN.md` + 树状分支 JSONL | 默认本地运行（建议套容器）+ **QuickJS WASM `Codemode`** 隔离调 MCP | 不到 1k Token 提示词 + 4 个基础工具 + Agent 可自己写 TS 插件热加载 |
-| **DeepSeek Harness** (`dsh`) | 全插件化开源编码内核 | 规则前置过滤 + 动态路由 + 隔离 Worker | zstd 压缩可重放 JSONL + Cordis 上下文管理 | `ctx.sandbox` 统一封装本地/远程进程与文件系统 | 连 `agentLoop` 都能热插拔；把工具转成 TS SDK 调用，成本控制极低 |
 | **Poke** (Cognition) | 免运维主动式 iMessage/聊天助手 | 每分钟邮箱/日历小模型扫描 + 绑定子任务的 SQL 触发器 | 近期消息摘要 + 常驻子任务完整记录 + 邮箱检索 + **托管 Git (`Code.Storage`)** | 多租户托管 OAuth + 前台对话层与后台工具层隔离 | 原生接入 iMessage；靠 `wait()` 少打扰用户，前后台职责分明 |
 | **Devin 2.2** (Cognition) | 云端软件工程 Agent 平台 | Slack/Linear/PR/Sentry/定时触发（自动触发量已超手动） | **DeepWiki** 仓库图谱 + 按需知识注入 + Playbooks + 历史问题去重 | 自研 **`otterlink` microVM**（支持嵌套 Docker）+ **`blockdiff` 200ms 快照** | 毫秒级整机休眠分叉；逻辑分组代码 Diff + CI 报错与评审意见自动重修 |
 | **OpenAI Codex** (Cloud / App / CLI) | 多端编码 Agent 与云沙箱 | `background=true` 断点续传 SSE + 定时/Webhook 自动任务 | 层级 `AGENTS.md` + `Skills` + 只追加前缀 + `/responses/compact` 压缩 | **两阶段容器（装完依赖清密钥 + 运行期默认断网/只读白名单）** + 本地 Worktree | 安全隔离最严格；兼容无状态 ZDR，100% 保证前缀缓存命中 |
@@ -229,10 +241,12 @@ flowchart TB
 * **Hermes Agent & 记忆进化生态**：
   * [NousResearch/hermes-agent GitHub](https://github.com/NousResearch/hermes-agent) | [Hermes Agent Official Docs](https://hermes-agent.nousresearch.com/docs/) | [Hermes Self-Evolution (DSPy + GEPA)](https://github.com/NousResearch/hermes-agent-self-evolution)
   * [Letta — Towards Agents That Learn](https://www.letta.com/blog/towards-agents-that-learn/) | [garrytan/gbrain GitHub](https://github.com/garrytan/gbrain)
+* **DeepSeek Harness & Super-agent**：
+  * [deepseek-ai/dsh-superagent-prototype GitHub (2026-10-31)](https://github.com/deepseek-ai/dsh-superagent-prototype) | [deepseek-ai/deepseek-harness (`dsh`) GitHub](https://github.com/deepseek-ai/deepseek-harness) | [Cordis Plugin Microkernel (`cordiverse/cordis`)](https://github.com/cordiverse/cordis)
 * **OpenClaw、极简 Harness 与消费级主动 Agent**：
   * [openclaw/openclaw GitHub](https://github.com/openclaw/openclaw) | [OpenClaw 2.0 Memory Architecture](https://docs.openclaw.ai/concepts/memory-architecture)
   * [earendil-works/pi GitHub](https://github.com/earendil-works/pi) & [Mario Zechner — Minimal Coding Agent](https://mariozechner.at/posts/2025-11-30-pi-coding-agent/)
-  * [deepseek-ai/deepseek-harness GitHub](https://github.com/deepseek-ai/deepseek-harness) | [OpenHands Software Agent SDK](https://github.com/OpenHands/software-agent-sdk) | [aaif-goose/goose](https://github.com/aaif-goose/goose)
+  * [OpenHands Software Agent SDK](https://github.com/OpenHands/software-agent-sdk) | [aaif-goose/goose](https://github.com/aaif-goose/goose)
   * [OpenPoke Architecture Breakdown](https://www.shloked.com/openpoke) & [Poke `Code.Storage` Git Memory Case Study](https://code.storage/changelog/poke-case-study)
 * **商业云端与企业级 Agent**：
   * [Cognition — `blockdiff` CoW Snapshot Engine](https://cognition.com/blog/blockdiff) | [Devin Review](https://cognition.com/blog/devin-review) | [Devin Auto-Triage](https://cognition.com/blog/auto-triage)

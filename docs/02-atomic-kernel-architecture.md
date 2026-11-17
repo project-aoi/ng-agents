@@ -1,278 +1,259 @@
-# Agent 核心架构拆解：1 条消息总线 + 8 个基础模块
+# Agent 核心架构拆解：1 条消息总线 + 8 个基础原语 + `Cell` 动态拼装
 
 > [!IMPORTANT]
-> **核心结论：不需要为每种 Agent 产品单独设计一套架构。**
-> 从最基础的 5 个信息流模块（`Channel` 渠道接入、`Inbox` 消息队列、`Context` 跨会话上下文、`Agent Loop` 推理循环、`Outbox` 消息发送）出发，只要再补上 **3 个实际落地绕不开的基础模块**——**`Clock`（把定时和延迟任务变成普通消息）**、**`Workspace`（与推理循环分离的代码/工具执行沙箱）**、**`Gate`（权限拦截、密钥代理注入与挂起等待确认）**——并约定 **“系统内一切触发与通信都用统一的 `Envelope` 消息格式，另一个 Agent 只是另一个 `Inbox` 地址”**，就能直接搭出市面上从 Pi、OpenClaw、Hermes 到 Poke、Devin、Manus 乃至 Paperclip 这类截然不同的产品。
+> **核心结论：既不需要为每种 Agent 产品单独设计一套架构，也不需要在内核里塞满定制业务实体。**
+> 1. **数据面只需要 1 条统一消息流（`Envelope`）+ 8 个职责单一的基础原语**：`① Channel`（渠道与信源接入）、`② Clock`（定时与唤醒）、`③ Inbox`（收件队列与锁）、`④ Context`（上下文与记忆）、`⑤ Loop`（推理循环或确定性脚本）、`⑥ Workspace`（隔离执行沙箱）、`⑦ Gate`（权限拦截与预算控制）、`⑧ Outbox`（发送与静默过滤）。
+> 2. **控制面只需要 1 个组合容器 `Cell`（预设模板 + Agent 动态拼装 + 超时自动热 `fork`）**：真实工作的粒度跨度极大（从 2 秒记条笔记、单轮回句话，到跨天等三方回信、并发扒 15 家竞品、或定期跑监控脚本）。把“8 个原语怎么连在一起”封装成可由 Agent 动态创建的 **`Cell`**，靠**少量预设拼装模板**应付日常 90% 的场景，靠 **Agent 动态拼装**应付长尾复杂场景，再靠**长耗时任务自动热 `fork`** 避免堵死主会话——就能在不增加多余概念的前提下，统一搭出 Pi、OpenClaw、Hermes、DeepSeek Super-agent、Poke、Devin、Manus、Paperclip 以及我们的 GTD 工作台。
 
 ---
 
-## 一、为什么刚好是这 8 个模块？
+## 一、为什么刚好是“8 个数据面原语 + 1 个 `Cell` 容器”？
 
-拿最基本的 5 个模块去搭真实产品，很快就能看清每一块负责什么，以及为什么还得补上另外 3 块：
+拿真实场景去拆解，数据流转靠 8 个原子模块就能完全覆盖，而不同粒度任务的组织则靠 `Cell` 把它们装在一起：
 
-| 序号 | 模块名称 | 来源 | 职责（每块只管一件事） | 如果少了它，会卡在哪儿？ |
+| 序号 | 模块名称 | 层级 | 职责（每块只管一件事） | 如果少了它，会卡在哪儿？ |
 | :--- | :--- | :--- | :--- | :--- |
-| **①** | **`Channel`**（渠道接入） | 基础 5 块 | 负责外部协议（IM / Webhook / PR / CLI）与内部统一消息 `Envelope` 的双向转换 | 少了它，Agent 只能跑在本地测试脚本里，接不进飞书、Telegram、GitHub 或 iMessage（如 OpenClaw / Poke） |
-| **③** | **`Inbox`**（收件队列与锁） | 基础 5 块 | 消息落盘、幂等去重、**单会话串行锁 / 连发消息合并 / 共享工单抢锁** | 少了它，Webhook 重试或用户连发几条消息就会引发并发冲突、改坏记忆文件甚至重复发信扣费 |
-| **④** | **`Context`**（上下文与记忆） | 基础 5 块 | 启动或恢复会话时加载记忆索引、检索历史记录（FTS5/Wiki）、按需读取 `SKILL.md`，并在结束后受控写回 | 少了它，每次新开会话都得从零交代背景（搭不出 Hermes / Letta / OpenClaw） |
-| **⑤** | **`Agent Loop`**（推理循环） | 基础 5 块 | 无状态的单轮推理循环：读入拼好的上下文快照，调工具或生成回复，跑完即释放 | 少了它，系统就退化成了写死规则的传统脚本工作流 |
-| **⑧** | **`Outbox`**（发送与静默过滤） | 基础 5 块 | 把结果幂等发往外部 `Channel` **或另一个 `Inbox`**；没事需要汇报时支持 **`NO_REPLY` / `wait()` 直接静默结束** | 少了它，没法做多 Agent 协作和防重发，更没法拦住 24 小时没完没了的废话通知 |
-| **②** | **`Clock`**（定时与唤醒） | **补齐 #1** | 把 **固定 Cron、Agent 自己预约的跟进提醒（Follow-up）、系统空闲（Idle）** 转成标准消息塞进 `Inbox` | 光有 `Channel`，Agent 只能“问一句动一下”；加上 `Clock`，才能做定时巡检、超时催问和空闲后台整理 |
-| **⑥** | **`Workspace`**（执行沙箱） | **补齐 #2** | 与推理循环分离的执行环境（读写文件、跑命令、写代码调接口、控制浏览器），支持 `git worktree` 或虚拟机快照 | 光有 `Loop` 只是纯聊天机器人；加上可隔离、可休眠恢复的 `Workspace`，才能搭出 Pi、Claude Code、Devin、Manus |
-| **⑦** | **`Gate`**（权限与预算拦截） | **补齐 #3** | 挡在工具执行与对外发送前的硬检查：**沙箱外代理注入密钥、安全分类拦截、预算超限停机、`defer` 挂起等待人工确认** | 只靠提示词防不住越权操作和死循环账单；加上 `Gate`，才能安全地跑后台任务和团队审批 |
+| **①** | **`Channel`**（渠道与信源接入） | 数据面原语 | 负责外部协议（IM / 邮件 / Webhook / PR / CLI）与内部统一消息 `Envelope` 的双向转换 | 少了它，Agent 只能跑在本地测试脚本里，接不进飞书、Telegram、GitHub 或 iMessage |
+| **②** | **`Clock`**（定时与唤醒） | 数据面原语 | 把 **固定 Cron、单次延迟跟进（`at`）、空闲触发（`idle`）** 转成标准消息投进指定 `Inbox`，支持按组自动销钟 | 光有 `Channel`，Agent 只能“问一句动一下”；加上 `Clock`，才能做定时信源、超时催问和空闲后台整理 |
+| **③** | **`Inbox`**（收件队列与锁） | 数据面原语 | 消息落盘、幂等去重、**单会话串行与连发合并 / 共享队列抢锁 / 跑题消息退回（`handback`）** | 少了它，Webhook 重试或用户连发消息就会并发撞车、改坏记忆文件甚至重复发信扣费 |
+| **④** | **`Context`**（上下文与记忆） | 数据面原语 | 组装前缀稳定的上下文快照、按 URI 直读关联记录（`Inline & Spill`）、检索历史（FTS5/Wiki）、按需加载 `SKILL.md` 并受控写回 | 少了它，每次新开会话都得从零交代背景，长对话还会打碎大模型 KV-Cache |
+| **⑤** | **`Loop`**（推理或脚本处理） | 数据面原语 | 无状态的单轮处理步：既可以跑大模型推理循环，**也可以不调模型直接跑一段确定性检查脚本** | 既保留大模型的灵活判断，又允许高频巡检直接走零 Token 纯脚本通道 |
+| **⑥** | **`Workspace`**（执行沙箱） | 数据面原语 | 与推理循环分离的执行环境（读写文件、跑命令、写代码批量调接口），支持按需切 `git worktree` / 容器及长命令转后台 | 光有 `Loop` 只是纯聊天机器人；加上可隔离、可恢复的 `Workspace`，才能并行改代码和跑复杂脚本 |
+| **⑦** | **`Gate`**（权限与预算边界） | 数据面原语 | 硬安全护栏：**沙箱外代理注入密钥、子权限单调收紧、金额+Token 双上限控制、`defer` 挂起等待人工确认** | 只靠提示词防不住越权操作、不可信网页注入和死循环账单 |
+| **⑧** | **`Outbox`**（发送与静默过滤） | 数据面原语 | 把结果幂等发往外部 `Channel` **或另一个 `Cell` 的 `Inbox`**；无需打扰时支持 **`silentDrop` 直接静默结束**及免打扰暂存 | 少了它，没法做父子协作和防重发，更没法拦住 24 小时没完没了的废话通知 |
+| **⑨** | **`Cell`**（原语拼装单元） | **控制面容器** | 把上面 8 个原语组装成一个有明确归属边界的运行实例：支持**预设模板实例化、Agent 动态拼装、长耗时任务自动热 `fork`、完结一键级联销毁** | 如果把连线写死在启动代码里，系统只能定死一种任务粒度；有了 `Cell`，Agent 才能看菜下碟动态组织原语 |
 
 > [!TIP]
-> **几个常被当成“独立大功能”、其实只是模块连线组合的能力：**
-> * **“自动总结经验写 `SKILL.md`”（Hermes）** 不需要新加底层模块：只要在主会话结束时往后台复盘 `Inbox` 发一条消息，唤醒只读 `Loop` 把总结写回 `Context` 即可。
-> * **“空闲时间后台整理记忆”（Anthropic / OpenClaw 2.0 Dreaming）** 不需要新加底层模块：只是 `Clock(空闲/夜间)` → `Inbox` → `Loop` 对照日志清理 `Context` → `Outbox(静默结束)`。
-> * **“多 Agent 协作 / 子任务派发”（Paperclip / Poke / Manus）** 也不需要专门的编排引擎：只要允许 **`Outbox` 的收件地址填另一个 Agent 的 `Inbox`**，单 Agent 和多 Agent 用的就是完全同一套机制。
+> **坚持“原语组合优于造新实体”的原则——许多看似复杂的功能，其实只是这 8 个原子的拼装方式，不需要在内核里写专有概念：**
+> * **“影子观察 / 试运行”（DeepSeek Super-agent `observe`）**：不用加内置观察模式——拼一个 `Channel(群消息过滤) → Inbox → Loop → Workspace(追加写进观察笔记) → Outbox(silentDrop)` 的 `Cell` 就行。
+> * **“把重复的大模型巡检降本为零 Token 脚本”**：不用加专门的结晶引擎——Agent 在 `Workspace` 写好检查小脚本，把定时信源 `Cell` 的 `⑤ Loop` 切到直接跑该脚本（正常则 `silentDrop`，异常才往主 `Inbox` 发信）。
+> * **“等三方回信集齐再比价，48 小时没回催问”**：不用造专门的等待屏障实体——项目 `Cell` 挂上这 3 个线程的监听和 48h `Clock`，前两家回信时记入 `Context` 后直接 `silentDrop`，第 3 家回齐时销掉闹钟、生成唯一一张比价确认卡。
+> * **“空闲整理记忆 / 自动总结 `SKILL.md`”（Anthropic Dreaming / Hermes）**：只是 `Clock(空闲)` 或主轮结束 → 唤醒只读复盘 `Cell`（复用刚热起来的上下文前缀缓存） → 受控更新 `Context` → `Outbox(silentDrop)`。
 
 ---
 
-## 二、最小接口定义：1 条消息总线 + 8 个模块（约 100 行 TypeScript）
+## 二、最小接口定义：1 条消息总线 + 8 个原语 + `Cell`（约 130 行 TypeScript）
 
-把这套结构写成 TypeScript 接口，核心定义加起来 **不到 110 行代码**，不绑定任何具体业务：
+把这套底座写成 TypeScript 接口，核心定义加起来 **130 行左右**，不绑定任何具体业务概念：
 
 ```typescript
-// ==================== 0. 统一消息结构 (Envelope) ====================
-// 基本规则：外部消息、定时触发、人工确认回执、子 Agent 汇报，在内部全都是同一种 Envelope
-export type Address =
-  | `inbox:${string}`                 // 发给某个 Agent（或共享工单池）的 Inbox
-  | `channel:${string}:${string}`;    // 发给外部渠道（如 channel:telegram:chat_889）
+// ==================== 0. 统一消息结构与权限边界 ====================
+export type Trust = "owner" | "internal" | "untrusted"; // 单调安全水位线: owner > internal > untrusted
+export type Address = `inbox:${string}` | `channel:${string}:${string}`;
 
 export interface Envelope<T = unknown> {
-  id: string;                         // 全局幂等 ID（防 Webhook 重试、防重复发信）
-  from: Address | `clock:${string}`;  // 来源地址
-  to: Address;                        // 目标地址
-  sessionKey?: string;                // 会话键：决定续接已有会话还是新开会话
-  trust: "owner" | "internal" | "untrusted"; // 数据可信度标记（防止外部网页/告警内容直接污染长期记忆）
+  id: string;                           // 全局幂等 ID（防 Webhook 重试、防重复发信）
+  from: Address | `clock:${string}` | `kernel:${string}`;
+  to?: Address;                         // 外部入站可为空，由内核按线程订阅表动态路由到对应 Cell
+  threads?: string[];                   // 关联外部会话/PR/邮件线程 ID（支持订阅直通绕过主路由）
+  delivery?: "wakeup" | "steer" | "silent_inject"; // 常规唤醒 | 步骤间打断 | 仅塞入下次背景但不唤醒休眠实例
+  trust: Trust;                         // 内核强制打标并沿因果链传染（防不可信网页/群消息洗白）
   payload: T;
   createdAt: number;
 }
 
-// ==================== ① Channel：外部渠道接入与渲染适配 ====================
+export interface PolicyBounds {         // 子 Cell 只能比父 Cell 更严格，不可由 Agent 自行放宽
+  tools: ReadonlySet<"read" | "write" | "edit" | "bash" | "code_rpc">;
+  canSendTo: readonly string[];         // 例: 子 Worker 仅允许发往 ["inbox:parent"]，禁止直发外部渠道或刷屏
+  secretRefs: ReadonlySet<string>;      // 允许沙箱外代理注入的密钥白名单
+  isolation: "none" | "shared_ro" | "git_worktree" | "container" | "cow_microvm";
+  maxTokens: number;                    // 与 maxCents 一起沿父子 Cell 树向上汇总扣减
+  maxCents: number;
+  maxDepth: number;                     // 限制派生层级（如 <= 2），防止多角色层层开会空转
+}
+
+// ==================== ① Channel：外部渠道与信源适配 ====================
 export interface Channel {
   readonly id: string;
-  // 外部消息 -> 转成标准 Envelope 推入 Inbox（如 Webhook 验签落库后立即返回 200）
-  onIngress(emitToInbox: (env: Envelope) => Promise<void>): void;
-  // Outbox -> 发回终端界面、IM 聊天窗、GitHub PR 评论或确认卡片
+  onIngress(emit: (raw: Omit<Envelope, "to">) => Promise<void>): void;
   deliver(target: string, content: Deliverable, idempotencyKey: string): Promise<void>;
 }
 
-// ==================== ② Clock：把定时与空闲转成普通消息 ====================
+// ==================== ② Clock：把定时与超时跟进转成普通消息 ====================
 export interface Clock {
-  // 支持固定 Cron、单次延迟跟进（at）、以及空闲触发（idle）
-  schedule(rule: { cron?: string; at?: number; idleSec?: number }, template: Omit<Envelope, "id" | "createdAt">): Promise<string>;
-  cancel(timerId: string): Promise<void>;
-  // 到点后不直接调 AgentLoop，而是统一往目标 Inbox 写入一条 Envelope
+  schedule(ownerCellId: string, rule: { cron?: string; at?: number; idleSec?: number },
+           payload: unknown, cancelGroup?: string): Promise<string>;
+  cancel(scope: { timerId?: string; ownerCellId?: string; cancelGroup?: string }): Promise<void>;
 }
 
-// ==================== ③ Inbox：消息持久化、串行锁与合并 ====================
+// ==================== ③ Inbox：消息落盘、合并锁与退回 ====================
 export interface Inbox {
-  enqueue(env: Envelope): Promise<"accepted" | "deduped">;
-  // 两种常见取任务模式：单会话串行 + 连发消息合并，或多人共享队列抢锁（抢不到返回 409）
-  claimNextRun(workerId: string, mode: "coalesce_per_session" | "atomic_ticket_checkout"): Promise<ClaimedBatch | null>;
+  enqueue(cellId: string, env: Envelope): Promise<"accepted" | "deduped">;
+  claimNextRun(cellId: string, workerId: string,
+               mode: "serial_coalesce" | "competing_workers"): Promise<ClaimedBatch | null>;
   complete(claimId: string): Promise<void>;
+  handback(claimId: string, envelopeId: string, reason: string): Promise<void>; // 无关追问退回主收件箱重新分拣
 }
 
-// ==================== ④ Context：跨会话记忆、历史日志与技能加载 ====================
+// ==================== ④ Context：稳定前缀快照、链式直读与记忆技能 ====================
 export interface ContextStore {
-  // 新开或恢复会话时，拼出前缀稳定的上下文快照，尽量命中模型 KV-Cache
-  hydrate(sessionKey: string, batch: ClaimedBatch): Promise<PromptSnapshot>;
-  appendTrajectory(sessionKey: string, event: StepEvent): Promise<void>; // 只追加的事件日志
-  // 受控更新记忆或 SKILL.md（自动拦截 untrusted 回合写入，超字数时触发合并整理而不是粗暴截断）
-  mutateKnowledge(op: KnowledgePatch, sourceTrust: Envelope["trust"]): Promise<void>;
-  searchHistory(query: string, engine: "fts5_bm25" | "wiki_graph" | "git_grep"): Promise<Snippet[]>;
+  hydrate(cellId: string, batch: ClaimedBatch, mode: "isolated" | "fork_prefix"): Promise<PromptSnapshot>;
+  appendTrajectory(cellId: string, event: StepEvent): Promise<void>;
+  readResource(cellId: string, uri: string, page?: { offset: number; limit: number }): Promise<string>; // Inline & Spill 按需细读
+  searchHistory(cellId: string, query: string, engine: "fts5_bm25" | "wiki_graph" | "git_grep"): Promise<Snippet[]>;
+  mutateKnowledge(cellId: string, op: KnowledgePatch, effectiveTrust: Trust): Promise<void>; // 自动拦截 untrusted 写入长期记忆
 }
 
-// ==================== ⑤ AgentLoop：无状态推理循环 ====================
+// ==================== ⑤ Loop：单轮处理步（支持大模型推理或零 Token 纯脚本） ====================
+export type ProcessorSpec =
+  | { kind: "llm"; skills?: string[]; modelTier?: "fast" | "strong"; autoForkAfterMs?: number }
+  | { kind: "script"; scriptPath: string }; // 不调模型直接跑脚本：无输出静默结束，有输出转成消息发出
+
 export interface AgentLoop {
-  // 本身不保存状态：只读取上下文快照，通过受 Gate 保护的接口干活，跑完一轮即可释放
-  run(snapshot: PromptSnapshot, ports: {
-    workspace: WorkspacePort;   // 经 Gate 权限检查后的沙箱执行接口
-    outbox: Outbox;             // 发消息 / 派子任务 / 静默退出
-    clock: Clock;               // 允许 Agent 给自己预约后续跟进提醒
-    context: ContextStore;      // 按需读取 SKILL.md 正文或检索历史记录
-  }): Promise<"completed" | "silent_noop" | "deferred_for_approval" | "budget_stopped">;
+  run(snapshot: PromptSnapshot, ports: CellPorts, signal: AbortSignal): Promise<
+    "completed" | "silent_noop" | "deferred_for_approval" | "forked_to_background" | "budget_stopped"
+  >;
 }
 
-// ==================== ⑥ Workspace：独立的代码与工具执行沙箱 ====================
+// ==================== ⑥ Workspace：隔离执行沙箱 ====================
 export interface Workspace {
-  acquire(sessionKey: string, isolation: "host" | "git_worktree" | "container" | "cow_microvm"): Promise<WorkspacePort>;
-  // 可选支持写时复制快照休眠与快速恢复（如 Devin blockdiff / Modal / Daytona）
-  hibernate?(sessionKey: string): Promise<string>;
-  restore?(snapshotId: string): Promise<WorkspacePort>;
+  acquire(cellId: string, isolation: PolicyBounds["isolation"]): Promise<WorkspacePort>;
+  destroy(cellId: string): Promise<void>;
 }
 
 export interface WorkspacePort {
-  // 少量基础工具 + 写代码批量调接口（Codemode / CodeAct，避免往提示词塞几十个 MCP JSON Schema）
-  exec(tool: "read" | "write" | "edit" | "bash" | "code_rpc", args: unknown): Promise<Observation>;
+  exec(tool: "read" | "write" | "edit" | "bash" | "code_rpc", args: unknown,
+       signal?: AbortSignal): Promise<{ output: string; dataTrust: Trust }>;
 }
 
-// ==================== ⑦ Gate：权限校验、密钥注入与挂起等待确认 ====================
+// ==================== ⑦ Gate：权限收紧、密钥代理注入与挂起等待确认 ====================
 export interface Gate {
-  // 1. 动作校验：放行并由沙箱外代理补上真实密钥 | 拒绝并把原因返回给模型 | defer 挂起等人工点确认
-  authorize(action: ProposedAction, ctx: RunMeta): Promise<
+  attenuate(parent: PolicyBounds, requested?: Partial<PolicyBounds>): PolicyBounds; // 强校验子权限 ⊆ 父权限
+  authorize(action: ProposedAction, meta: { cellId: string; taint: Trust }): Promise<
     | { type: "allow"; proxyInjectedSecretRef?: string }
     | { type: "deny"; feedbackToModel: string }
-    | { type: "defer"; approvalCard: Deliverable } // 保存状态后立即停机，人工点确认后再从 Inbox 唤醒
+    | { type: "defer"; approvalId: string; approvalCard: Deliverable } // 存盘停机省算力，点确认后再从 Inbox 唤醒
   >;
-  // 2. 成本与用量监控：同时看实际金额（cents）和 Token 消耗速度，到上限立即暂停队列并停掉在途任务
-  meter(usage: { inputTokens: number; outputTokens: number; billedCents: number }): "ok" | "warn" | "hard_stop";
+  meter(cellId: string, usage: { tokens: number; billedCents: number }): "ok" | "warn" | "hard_stop";
 }
 
-// ==================== ⑧ Outbox：幂等发送与静默过滤 ====================
+// ==================== ⑧ Outbox：幂等发送、跨 Cell 投递与静默过滤 ====================
 export interface Outbox {
-  // 可发往外部用户渠道，也可发往另一个 Agent 的 Inbox，或者在无需打扰时直接静默结束
-  send(packet: { to: Address; content: Deliverable; idempotencyKey: string } | { silentDrop: true; reason: string }): Promise<void>;
+  send(packet: { to: Address; content: Deliverable; idempotencyKey: string }
+             | { silentDrop: true; reason: string }): Promise<void>;
+}
+
+// ==================== ⑨ Cell：预设模板与 Agent 动态拼装的统一容器 ====================
+export interface CellSpec {
+  id?: string;
+  parentId?: string;                    // 构成父子监督树，上层事项结束时整棵子树自动级联回收
+  preset?: "inline" | "worker" | "watcher" | "sensor"; // 可直接套预设模板，也可由 Agent 按需覆盖下方配置
+  watches?: Array<{ threadOrFilter: Record<string, unknown>; cancelGroup?: string }>;
+  schedules?: Array<{ cron?: string; at?: number; cancelGroup?: string }>;
+  contextMode?: "isolated" | "fork_prefix";
+  processor: ProcessorSpec;
+  bounds?: Partial<PolicyBounds>;
+}
+
+export interface CellPorts {            // Agent 在运行期可见的极简能力面（受内核 Gate 强约束）
+  exec: WorkspacePort["exec"];
+  send: Outbox["send"];
+  context: Pick<ContextStore, "readResource" | "searchHistory">;
+  proposeKnowledge(op: KnowledgePatch): Promise<void>;
+  // 动态拼装接口：Agent 靠这 3 个动作就能按任务粒度自由组织原语
+  spawnCell(spec: CellSpec, initialPayload?: unknown): Promise<`inbox:${string}`>;
+  updateCell(cellId: string, patch: Partial<CellSpec>): Promise<void>;
+  closeCell(cellId: string): Promise<void>; // 级联取消关联 Clock、Watch、子队列与临时 Worktree
 }
 ```
 
 ---
 
-## 三、五种常见的模块组合方式
+## 三、如何适配不同粒度的工作：4 个预设模板 + 超时自动 `fork` + 动态拼装
 
-有了上面 8 个模块，不用再写新组件，靠不同的连线方式就能拼出日常最需要的 5 种工作流：
-
-```mermaid
-flowchart LR
-    subgraph C1["组合 1: 定时巡检与静默过滤"]
-        clk1["② Clock (定时 / 跟进提醒)"] -->|"写入定时消息"| in1["③ Inbox"]
-        in1 --> loop1["⑤ Loop"]
-        loop1 -->|"一切正常: NO_REPLY / wait()"| drop["⑧ Outbox (静默结束)"]
-        loop1 -->|"发现异常需处理"| ch1["① Channel (通知用户)"]
-    end
-
-    subgraph C2["组合 2: 挂起等待人工确认 (Defer HITL)"]
-        loop2["⑤ Loop"] -->|"发起对外或高危操作"| gate2["⑦ Gate (返回 defer)"]
-        gate2 -->|"1. 状态落盘至 ④ Context 并释放算力"| out2["⑧ Outbox (发送确认卡片)"]
-        out2 --> ch2["① Channel (工作台 / 手机按钮)"]
-        ch2 -->|"2. 几小时后人工点确认"| in2["③ Inbox (唤醒原会话继续执行)"]
-    end
-```
-
-1. **组合 1：定时跟进与静默过滤** = `② Clock` → `③ Inbox` → `④ Context` → `⑤ Loop` → `⑧ Outbox(silentDrop | Channel)`
-   * **例子**：发完邮件后，Agent 调 `Clock.schedule({ at: +48h })` 定个两天后的检查提醒，中间完全休眠不耗资源；48 小时后消息进 `Inbox`，如果查到对方已经回了，直接走 `Outbox({ silentDrop: true })` 静默结束；真没回才通过 `Channel` 提醒你。
-2. **组合 2：不占算力的人工确认（Serverless HITL）** = `⑤ Loop` → `⑦ Gate(defer)` → 保存上下文到 `④ Context` 并停机 → `⑧ Outbox` → `① Channel` → 人点确认后回流 `③ Inbox`
-   * **例子**：不用让容器干等人类八个小时白烧钱，当前 Worker 也能立刻腾出来去处理队列里的其他事。
-3. **组合 3：空闲整理记忆与自动沉淀技能** = `主轮结束 / ② Clock(idle)` → `③ 后台复盘 Inbox` → `⑤ 只读 Loop`（复用刚跑完的缓存） → `④ Context.mutateKnowledge(SKILL.md / MEMORY.md)` → `⑧ Outbox(silentDrop)`
-   * **例子**：把“总结经验”和“清理过期记忆”从正常对话路径里拆出去，放到后台异步做，不拖慢当前响应速度。
-4. **组合 4：父子 Agent 分工与报错自动重修** = `父 ⑧ Outbox` → `子 ③ Inbox`（独立 `④ Context` + 隔离 `⑥ Workspace`） → `子 ⑧ Outbox` → `父 ③ Inbox`（或外部 CI 报错经 `① Channel` 重新塞回原 `③ Inbox`）
-   * **例子**：子任务并发调研（Manus Wide Research）、前后台角色拆分（Poke），以及提完 PR 后 CI 挂了自动唤醒接着修（Devin / Cursor Autofix），底层都是这一种连线。
-5. **组合 5：多人/多角色共享工单池与预算控制** = 多个 Agent 共享 `③ Inbox(atomic_ticket_checkout)` + 带上下级目标背景的 `④ Context(Goal Ancestry)` + 统一的 `⑦ Gate(预算上限 + 关键操作审批)`。
-
----
-
-## 四、用同一套模块还原市面上的 7 类代表性产品
-
-把上面 8 个模块做不同的取舍和连线，就能对应到目前主流的几类产品形态：
-
-### 1. Pi / Claude Code CLI（轻量本地命令行编程工具）
-* **取舍**：**不启用 `② Clock`**，把 `③ Inbox` 简化成内存单队列，主要精力放在 **精简 `⑤ Loop` 系统提示词（控制在 1k Token 以内）** 和 **`⑥ Workspace` 的 4 个基础工具 + QuickJS `Codemode`** 上。
-* **链路**：`① CLI 终端` → `③ 内存队列(支持按键打断 steer)` → `④ 本地 AGENTS.md + JSONL 会话树` → `⑤ 轻量 Loop` ↔ `⑥ 本地 read/write/edit/bash + Codemode` → `⑧ 终端流式输出`。
-
-### 2. Anthropic《Building always-on agents》/ Claude Duet（云端常驻个人助手）
-* **取舍**：单 Agent 配齐全部 8 个模块，串起上面的 **组合 1 + 组合 2 + 组合 3**。
-* **链路**：
-  * `① Webhook 快速入库 + 手机端` + `② Schedules / Follow-up 定时表` → 汇入 **`③ 单用户单活跃 Worker 队列（连发消息自动合并）`**。
-  * 唤醒无状态 `⑤ Loop`，从 `④ 四类记忆文件（前 200 行作目录索引，外部数据只存 ID 指针）` 按需读取上下文。
-  * 调工具统一经过 **`⑦ Gate（沙箱外代理注入密钥 + Auto Mode 安全分类器 + PreToolUse: defer）`** → 按需启动 **`⑥ 云容器`**。
-  * 结果走 **`⑧ 幂等 Outbox`**（免打扰时段合并发送 / 无事静默退出），夜间由 `② Clock` 触发后台整理记忆生成交叉链接 Wiki。
-
-### 3. OpenClaw 2.0（本地多渠道个人网关）
-* **取舍**：重点做厚 **`① Channel` 多平台接入** 和 **`④ Context` 外部不可信数据隔离**，内部 `⑤ Loop` 直接复用上面的 **Pi SDK**。
-* **链路**：
-  * `① 50+ 聊天软件桥接（WhatsApp/Telegram/iMessage）+ 语音唤醒 + 手机/树莓派硬件节点` + `② 30 分钟定时心跳` → `③ 按会话分桶的单写者 FIFO 队列`。
-  * 只要 `⑥ 浏览器 / 网页搜索` 读到了外部网页内容，当前回合就标上 `trust: "untrusted"`，由 `④ SQLite 来源追踪` 拦住不让直接写进长期 `MEMORY.md`，只允许后台整理任务清洗后合入；没事时返回 `HEARTBEAT_OK` 由 `⑧ Outbox` 直接静默吞掉。
-
-### 4. Hermes Agent（带技能自动总结的常驻网关）
-* **取舍**：在单守护进程网关上，靠 **`⑧ Outbox` → 内部 `③ 复盘队列`** 把日常任务自动沉淀成可复用的 `SKILL.md`。
-* **链路**：
-  * 主路径：`① 25+ 渠道（支持 /handoff 换设备接着聊）` + `② 60s 定时检查（支持不调模型的纯脚本巡检）` → `③ SQLite WAL 队列` → `④ 冻结快照 MEMORY.md(2.2KB) + FTS5 全文检索 + Honcho 偏好推断` → `⑤ 主 Loop` ↔ `⑥ Unix Socket RPC 代码调工具 + Modal/Daytona 休眠沙箱`。
-  * **后台总结支路**：主轮刚跑完，`⑧` 立即触发一个 **保持相同前缀的只读复盘 `⑤ Fork Loop`**（直接命中刚热起来的缓存），通过 `⑦ 技能格式检查（Linter）` 自动新建或更新 `④ ~/.hermes/skills/**/SKILL.md`；系统空闲满 2 小时后，`② Clock(idle)` 再唤醒整理进程归档冷门技能、合并重复技能。
-
-### 5. Poke（前后台分离的免运维聊天助手）
-* **取舍**：模块本身不变，只是拆成 **“1 个负责聊天的接待 Agent + N 个在后台干活的执行 Agent”** 两层：
-
-```mermaid
-flowchart LR
-    User["① iMessage / 短信"] <--> InA["③ 前台 Inbox"]
-    InA --> LoopA["⑤ 前台对话 Loop (不挂复杂工具, 专注沟通语气与过滤打扰)"]
-    LoopA <--> CtxA["④ 最近消息摘要"]
-    LoopA -->|"wait() 过滤低价值提醒 或 回复用户"| OutA["⑧ 前台 Outbox"]
-    OutA --> User
-
-    LoopA -->|"派发后台任务"| InB["③ 后台执行 Inbox × N"]
-    ClkB["② 每分钟邮箱/日历小模型扫描 + 触发器"] -->|"唤醒对应执行 Agent"| InB
-    InB --> LoopB["⑤ 后台执行 Loop (保留完整草稿与任务上下文)"]
-    LoopB <--> WorkB["⑥ 业务工具封装 + ④ Code.Storage Git 记忆"]
-    LoopB -->|"结果交回前台判断是否打扰用户 (不直接发手机)"| OutB["⑧ 后台 Outbox"]
-    OutB --> InA
-```
-
-* **这么拆的好处**：前台 `⑤ Loop` 不用塞几十个工具的 JSON 定义，回复快、说话自然；后台执行专员只管盯邮件和跑任务，**没有直接给用户发通知的权限**，所有消息都要先过一遍前台 `⑧ Outbox` 的 `wait()` 过滤。
-
-### 6. Devin 2.2 / Cursor Cloud Agents / Manus（云端沙箱工作台）
-* **取舍**：把 **`⑥ Workspace` 做成毫秒级写时复制（CoW）快照虚拟机 + 桌面录屏**，并把外部 CI 和代码评审评论接回 **`① Channel` → `③ Inbox`** 实现报错自动重修。
-* **链路**：
-  * Slack `@Devin`、Sentry 报错或 PR 评论经 `①` 进 `③` → `⑥` 在 **200ms** 左右从 `XFS reflink` 快照（Devin `blockdiff`）或热内存分叉（Cursor `Builds`）拉起完整开发环境。
-  * `④ Context` 把大文件留在磁盘上，在上下文末尾反复更新 `todo.md` 提醒当前目标；`⑤ Loop` 用输出前缀掩码避免改动工具列表破坏缓存，或者一次向上百个隔离的 `③ 子队列 + ⑥ 子虚拟机` 分发任务（Manus Wide Research，由 `⑦ Gate` 禁止子虚拟机之间互相串消息）。
-  * `⑧ Outbox` 输出按逻辑分组的代码 Diff 和操作录屏；如果 GitHub Actions 跑挂了，Webhook 自动经 `①` 唤醒原快照继续修到测试通过。
-
-### 7. Paperclip（多 Agent 团队协作与预算控制面）—— 以及多开源项目混搭
-* **取舍**：Paperclip 很有意思的一点是它 **自己不写 `⑤ Agent Loop`**（留成外部 Adapter 接口），专门把 **`② Clock + ③ Inbox + ④ Context + ⑥ Workspace + ⑦ Gate + ⑧ Outbox`** 做成管工单、管目录隔离和管账单的控制面。
-* **为什么社区里常把 `Paperclip + Hermes + OpenClaw` 搭在一起用？** 因为它们刚好各自负责了这 8 个模块里自己最擅长的那几块：
+为什么单一固定架构应付不了真实工作？因为进入系统的事情从“一句话备忘”到“跨周大项目”差了好几个数量级。我们不在系统里造复杂的档位概念，而是靠 **三条简单机制** 让架构随工作粒度自然伸缩：
 
 ```mermaid
 flowchart TB
-    subgraph OrgPlane["Paperclip 负责团队调度面 (管 ②定时 ③工单锁 ④目标背景 ⑥Worktree隔离 ⑦预算与审批)"]
-        Board["管理看板"] --> PCh["① Web 界面 / GitHub 接入"]
-        PClock["② 定时心跳 + 任务卡死检查"] --> PInbox["③ 唤醒合并队列 + SQL 409 工单抢锁"]
-        PCh --> PInbox
-        PInbox --> PCtx["④ 拼入任务背景链 (整体目标 → 项目 → 当前工单)"]
-        PCtx --> PGate["⑦ 预算硬上限检查 + 关键动作人工审批"]
-        PGate --> PWork["⑥ 自动分配独立 Git Worktree 目录"]
-    end
+    In["外部信源 ① Channel / 定时信源 ② Clock"] --> Main["主台 Cell (preset: inline)"]
 
-    subgraph Worker1["成员 1: 接入 Hermes Agent (提供 ⑤ 推理循环 + ④ 个人技能自动沉淀)"]
-        PWork -->|"hermes_local 适配器唤醒"| HLoop["⑤ Hermes Loop + Unix RPC 写代码调工具"]
-        HLoop <--> HMem["④ SQLite FTS5 + 后台自动总结 SKILL.md"]
-    end
+    Main -->|"2~3 秒内干完的小事 (记笔记 / 定提醒 / 拟短回复)"| Fast["直接写 ④ Context 或发待确认卡 ➔ 秒回休眠"]
+    Main -->|"单轮运行超过阈值 (如 >5 秒)"| Fork["⚡ 内核自动热 fork 成独立后台 Cell (保留热 KV-Cache, 秒释放主队列)"]
+    Main -->|"Prompt 识别出多步等待 / 并发调研 / 新信源"| Dyn["🧩 Agent 调 spawnCell 套用预设或动态拼装子 Cell 树"]
 
-    subgraph Worker2["成员 2: 接入 OpenClaw (提供 ① 外部多聊天渠道触达与浏览器操作)"]
-        PWork -->|"openclaw_gateway 适配器唤醒"| OLoop["⑤ OpenClaw (内置 Pi Loop)"]
-        OLoop <--> OChan["① 连接 WhatsApp / Slack / 飞书 + 浏览器"]
-    end
-
-    HLoop --> POut["⑧ Outbox 更新工单状态 → 流转给测试/验收角色"]
-    OLoop --> POut
+    Fork --> Bg["后台独立推进 (按需切 git_worktree · 同线程追问直通该 Cell)"]
+    Dyn --> W1["并发子 Worker Cells × N (结果只回流父 Cell 汇总)"]
+    Dyn --> W2["外部守候 Watcher Cell (订阅线程 + 超时 Clock, 集齐前 silentDrop)"]
+    Dyn --> W3["定时/监控信源 Sensor Cell (可跑纯脚本, 有异常才往主 Inbox 投信)"]
 ```
 
-从这张图能看得很明白：这些热门项目底层并没有跳出这 8 个模块，区别只在于是单实例运行还是多实例组合，以及把主要工程精力花在了哪几个模块上。
+### 1. 预设的 4 种基础拼装模板（覆盖日常 90% 的工作）
+预设模板不需要在内核里写特殊逻辑，它们本身就是预先配好的 `CellSpec` 默认值（配合对应的 `SKILL.md` 说明）：
+* **`inline`（主台快处理）**：单会话串行锁 + 连发消息合并，专门接住日常输入。几秒内能搞定的小事当场办完，不建多余子队列。
+* **`worker`（后台隔离执行）**：独立 `Context`（只注入任务目标背景，不带主聊天杂音）+ 独立 `Workspace`（如 `git_worktree`），`Gate` 锁死其 `Outbox` 只能向父 `Cell` 汇报，适合修代码、跑测试或分头查资料。
+* **`watcher`（外部跟进监听）**：挂上 `Channel` 特定会话/PR 的订阅与 `Clock` 超时提醒（共享同一个 `cancelGroup`，对方先回信就自动销掉催问闹钟），适合跨天等回音。
+* **`sensor`（定时与条件信源）**：挂在入口侧充当“产生任务的信源”——由 `Clock` 或外部事件流触发一段轻量脚本或快速检查，平时没事直接 `silentDrop`（连待办都不产生），发现异常才往主 `Inbox` 投递一条标准 `Envelope`。
+
+### 2. 长耗时任务自动热 `fork`（防止主会话被意外卡死）
+DeepSeek 在实测中发现：如果只靠提示词劝单个 Agent“遇到重活请调子 Agent”，模型经常觉得顺手就自己在主会话里硬干，一旦跑起代码检查或编译，整个主会话就会堵死十几分钟。
+* 我们的解法不是像 DeepSeek 那样一刀切阉割主会话的工具（否则办小事也得绕一圈派单），而是由内核提供 **`autoForkAfterMs`（例如 5 秒）运行期热剥离**：
+  1. 任务一开始直接在主会话里跑；3 秒搞定的小事当场结束。
+  2. 一旦某轮执行超过 5 秒，内核**不需要杀掉重跑**，而是直接把当前正在运行的推理循环连同**已经热起来的上下文前缀（100% 命中 KV-Cache）**原封不动过户给一个新建的后台 `Cell`（写文件时自动切到独立 `git worktree`），并在该线程挂上订阅直通。
+  3. 主会话只留下一条“已转入后台继续处理”的轻量记录，**立刻释放主 `Inbox` 锁**，用户随时说下一件事完全不排队。
+
+### 3. Agent 动态拼装与三条安全铁律
+遇到预设模板套不上的剩下 10% 复杂工作（例如：先并行派 10 个 `worker` 扒数据，汇总后再挂一个 `watcher` 跟进审批；或者把跑顺了的每日大模型巡检改成零 Token 的 `script` 信源），Agent 直接通过 `spawnCell / updateCell` 自由组合原语参数。内核只在底下守住三条不可逾越的硬边界：
+1. **权限与可信度单调收紧**：子 `Cell` 的工具集、可发送地址、密钥范围永远是父 `Cell` 的子集；一旦某轮读取了不可信外部网页/群消息（`trust: "untrusted"`），该回合派生的动作与记忆写入自动降级拦截。
+2. **预算沿树共享扣减**：父 `Cell` 剩 \$2 预算，就算派生 10 个子 `Cell` 也是共同扣这 \$2（同时统计 Token 消耗量），绝不允许靠拆分子任务放大账单。
+3. **随事项完结级联回收**：上层任务完成或取消时，`closeCell` 一次性销毁整棵子树名下的所有 `Clock` 闹钟、`Channel` 订阅、子 `Inbox` 和临时沙箱目录，绝不留后台僵尸进程。
+
+---
+
+## 四、用同一套底座还原市面上的 8 类代表性产品
+
+把上面 **8 个原语 + `Cell`** 做不同的拼装，就能直接对应到目前主流的各类产品形态：
+
+### 1. Pi / Claude Code CLI（轻量本地命令行编程工具）
+* **拼装方式**：只起 1 个本地 `Cell`（不配 `Clock`，`maxDepth: 0` 或按需浅层子任务），核心放在精简 `⑤ Loop` 提示词（`<1k Token`）与 `⑥ Workspace` 的 4 个基础工具 + `code_rpc`（QuickJS `Codemode`）。
+
+### 2. Anthropic《Building always-on agents》/ Claude Duet（云端常驻个人助手）
+* **拼装方式**：主台 `Cell` 配齐全部 8 个模块 + 空闲整理 `sensor`：外部 Webhook 与 `Clock` 汇入单写者 `Inbox` → `Context` 加载 200 行目录索引 → `Gate` 做代理密钥注入与 `defer` 零算力挂起确认 → 夜间空闲唤醒后台 `Cell` 整理 Wiki 记忆并 `silentDrop`。
+
+### 3. DeepSeek Super-agent（`dsh-superagent`：Router-Worker 多任务协同研发助手）
+* **拼装方式**：用 **1 个轻权限主路由 `Cell` + N 个订阅直通的工单 `worker` `Cell`** 拼装：
+  * 主路由 `Cell` 通过 `PolicyBounds` 拿掉 `write / edit` 工具（物理强制它只管接话与派单，积压事件由 `Inbox` 自动合并批处理）。
+  * 每接一单 `spawnCell({ preset: "worker", watches: [PR/话题线程] })`，分配独立 `git_worktree`。后续同线程的人类追问经 `watches` **直接绕过主路由进该 `worker` 的 `Inbox`**；万一用户聊起无关新事，`worker` 调 `Inbox.handback` 退回主路由重评。
+  * 上下文采用 `Context.readResource` 实现 `Inline & Spill`（短卡片内联 + URI 链式直读）；新群聊规则可先拼成“写日志 + `silentDrop`”做试运行观察。
+
+### 4. OpenClaw 2.0（本地多渠道个人网关）
+* **拼装方式**：做厚 `① Channel`（50+ 聊天软件与硬件节点）与 `④ Context` 不可信来源隔离；联网回合自动打上 `trust: "untrusted"` 禁止直写 `MEMORY.md`；定时心跳无异常时直接走 `Outbox({ silentDrop: true })`。
+
+### 5. Hermes Agent（带技能自动总结的常驻网关）
+* **拼装方式**：主任务跑完后，向内部复盘 `Cell`（`contextMode: "fork_prefix"`，直接命中刚跑完的热缓存）发一条消息，总结经验更新 `SKILL.md`；纯例行检查则用 `processor: { kind: "script" }` 实现零 Token 巡检。
+
+### 6. Poke（前后台分离的免运维聊天助手）
+* **拼装方式**：前台接待 `Cell`（不挂重工具，只管自然聊天与过滤提醒） + 后台多个按事项常驻的 `worker/watcher` `Cell`（`canSendTo` 锁死只能发回前台 `Inbox`，没有直接给用户手机发通知的权限）。
+
+### 7. Devin 2.2 / Cursor Cloud Agents / Manus（云端沙箱工作台）
+* **拼装方式**：把 `⑥ Workspace` 换成毫秒级 CoW 快照虚拟机（`cow_microvm`），工单 `Cell` 同时订阅 GitHub Actions Webhook（CI 挂了自动唤醒原沙箱重修，`silentDrop` 不烦人，全绿再发交付卡）；调研大任务则一次性派生几十个隔离 `worker` `Cell` 并发执行后回流汇总。
+
+### 8. Paperclip（多 Agent 团队协作与预算控制面）
+* **拼装方式**：自己不绑定单一 `⑤ Loop` 实现（通过适配器调外部 Claude Code / Hermes / OpenClaw），专注把 `Cell` 树的上下级目标背景注入（Goal Ancestry）、`Inbox(competing_workers)` 抢单锁、`git_worktree` 隔离和 `Gate` 层级预算上限做成可视化看板。
 
 ---
 
 ## 五、`ng-agents` 代码目录划分建议
 
-后面在 `project-aoi/ng-agents` 动手写代码时，建议 **不要按具体业务场景（比如“客服助手”“写代码助手”“巡检机器人”）分目录**，而是直接按这 **1 套协议 + 8 个独立模块** 来拆包：
+后续在 `project-aoi/ng-agents` 动手写代码时，底层严格只按 **1 套协议 + 8 个原子包 + 1 个 `cell` 调度包** 划分，所有拼装方案都收敛成轻量的预设配置：
 
 ```text
 ng-agents/
 ├── packages/
-│   ├── protocol/          # Envelope 消息定义、Address 寻址、trust 可信度标记、StepEvent
-│   ├── channel/           # ① CLI、HTTP Webhook、飞书/Slack/Telegram、GitHub PR 接入适配
-│   ├── clock/             # ② Cron 定时表、Follow-up 单次跟进提醒、Idle 空闲触发
-│   ├── inbox/             # ③ SQLite WAL / Postgres 幂等入队、单会话合并锁、工单 409 抢锁
-│   ├── context/           # ④ 稳定前缀组装、MEMORY.md 索引、FTS5 全文检索、SKILL.md 按需加载与安全写回
-│   ├── loop/              # ⑤ 精简无状态推理循环（保持上下文前缀稳定以命中缓存）
-│   ├── workspace/         # ⑥ 4 个基础工具 + Codemode 脚本执行 + 本地 / Docker / Git Worktree 隔离驱动
-│   ├── gate/              # ⑦ 沙箱外密钥代理注入、安全分类校验、金额+Token 双上限控制、defer 挂起恢复
-│   └── outbox/            # ⑧ 幂等发送、NO_REPLY/wait() 静默过滤、跨 Agent Inbox 转发
-└── recipes/               # 只做模块连线组装的配置层（不写底层逻辑，只把上面 8 个模块串起来）
-    ├── cli-coder.ts       # 轻量本地命令行编码工具
-    ├── gtd-desk.ts        # 个人 GTD 工作台（后台预处理 + 待确认卡片 + 周回顾沉淀 SKILL.md）
-    ├── dual-agent.ts      # 前后台分离助手（类似 Poke）
-    └── team-board.ts      # 多角色共享工单与预算控制面（类似 Paperclip）
+│   ├── protocol/          # Envelope 消息结构、Trust 水位线、PolicyBounds 权限与预算定义
+│   ├── channel/           # ① CLI、HTTP Webhook、飞书/Slack/Telegram、GitHub 接入与发送适配
+│   ├── clock/             # ② Cron 定时表、单次延迟唤醒（at）、按 cancelGroup 联动销钟
+│   ├── inbox/             # ③ SQLite WAL 幂等入队、单会话合并锁、抢单锁与 handback 退回
+│   ├── context/           # ④ 稳定前缀组装、Inline & Spill URI 直读、FTS5 检索、SKILL.md 与安全写回
+│   ├── loop/              # ⑤ 无状态推理循环与零 Token 脚本执行器驱动
+│   ├── workspace/         # ⑥ 基础文件/命令/脚本执行 + 本地 / Git Worktree / 容器隔离驱动
+│   ├── gate/              # ⑦ 权限单调收紧校验、沙箱外密钥代理注入、金额+Token 树状计量、defer 挂起
+│   ├── outbox/            # ⑧ 幂等外发、silentDrop 静默结束、专注期免打扰缓冲
+│   └── cell/              # ⑨ Cell 生命周期管理、动态订阅路由表、超时热 fork 与完结级联销毁
+├── presets/               # 预设的少量标准 Cell 拼装模板（纯配置 + SKILL.md，Agent 也可动态组合或新增）
+│   ├── inline-desk/       # 主台快处理（超 5 秒自动热 fork 转后台）
+│   ├── isolated-worker/   # 独立沙箱后台执行单元
+│   ├── thread-watcher/    # 外部回信监听 + 超时跟进单元
+│   └── cron-sensor/       # 定时/条件检查信源单元
+└── apps/
+    └── gtd-desk/          # 面向用户的极简 GTD 工作台界面与投影层
 ```
-
-这样底层始终只有 **8 个边界清晰、可以单独写测试的小包**，上层不管想试验哪种产品形态，都只是在 `recipes/` 里换一种连线组合。
