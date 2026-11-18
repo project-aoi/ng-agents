@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { projectIdForApproval } from "@ng/presets";
 import { gtdKeys, type ActionRecord, type ProjectProposalCard, type ProjectRecord, type SourceRecord } from "@ng/protocol";
 import type { Kernel } from "@ng/cell";
 import type {
@@ -18,7 +19,8 @@ import { PLACEHOLDER_DEMO } from "../src/server/demo";
 import { viewsForBusEvent } from "../src/server/events";
 import { SecurityConfigError, isLoopbackHost } from "../src/server/security";
 import { SKILL_SUGGESTION_PREFIX } from "../src/server/projections";
-import { bootDesk, cleanupAll, DAY, makeProject, makeReplyCard, tempDir, writeAction } from "./helpers";
+import { BUILTIN_SKILLS } from "@ng/presets";
+import { bootDesk, bootRealDesk, cellMessages, cleanupAll, DAY, makeProject, makeReplyCard, requestText, tempDir, writeAction } from "./helpers";
 
 afterEach(cleanupAll);
 
@@ -69,10 +71,12 @@ describe("the bearer-token rule (docs/01 坑 1)", () => {
 });
 
 describe("boot with the real presets", () => {
-  it("registers @ng/presets before start, creates the desk with the inline preset and takes a capture", async () => {
+  it("registers @ng/presets before start, seeds the built-in playbooks, creates the desk with the inline preset and takes a capture", async () => {
     const d = await bootDesk({ registerPresets: undefined as never });
     expect(d.kernel.getCell("desk")).toMatchObject({ preset: "inline", status: "active", title: "主台" });
-    expect(d.kernel.registry.presets.list().map((p) => p.name).sort()).toEqual(["inline", "sensor", "watcher", "worker"]);
+    expect(d.kernel.registry.presets.list().map((p) => p.name).sort()).toEqual(["hub", "inline", "project", "sensor", "watcher", "worker"]);
+    // The playbooks the presets' prompts refer to, as global skills (seedBuiltinSkills at boot).
+    expect(d.kernel.context.listSkillsSync().map((x) => x.name).sort()).toEqual(BUILTIN_SKILLS.map((x) => x.name).sort());
     await d.post("/api/capture", { text: "把这篇文章存进阅读清单 https://example.com/a" });
     await d.kernel.idle();
     expect(d.script.requests.some((r) => r.cellId === "desk")).toBe(true);
@@ -130,9 +134,11 @@ describe("⚡ sources", () => {
     const id = c.sensorId!;
     expect(d.kernel.getCell(id)!.spec).toMatchObject({ preset: "sensor", processor: { kind: "code", entry: "script:checks/metrics.sh" }, schedules: [{ cron: "0 9 * * 1", tz: "Asia/Shanghai" }] });
     expect(d.kernel.inbox.listSchedulesSync({ cellId: id, activeOnly: true })).toHaveLength(1);
-    // a script check runs bash, so it gets its own worktree instead of the owner's directory
-    expect(d.kernel.getCell(id)!.bounds.isolation).toBe("git_worktree");
-    expect([...d.kernel.getCell(id)!.bounds.tools].sort()).toEqual(["bash", "read"]);
+    // a script check runs commands: write mode in a directory of its own — never given a cwd (so never the owner's
+    // repository), no worktree, no sandbox (docs/05)
+    expect(d.kernel.getCell(id)!.spec).toMatchObject({ cwdMode: "write" });
+    expect(d.kernel.getCell(id)!.spec.cwd).toBeUndefined();
+    expect(d.kernel.getCell(id)!.bounds.isolation).toBe("none");
 
     const p = await d.post<SourcesMutationResponse>(`/api/sources/${id}/pause`);
     expect(p.view.sensors[0]).toMatchObject({ status: "paused", statusLabel: "已暂停" });
@@ -159,9 +165,13 @@ describe("weekly review actions", () => {
   it("accepts a suggested skill and enables an auto rule for a class approved unedited five times", async () => {
     const d = await bootDesk();
     d.kernel.context.commitSync("desk", { statePatches: { [`${SKILL_SUGGESTION_PREFIX}reply-style`]: { name: "reply-style", description: "回复客户的语气", body: "- 先结论" } } });
+    const before = d.kernel.context.listSkillsSync().map((x) => x.name);
+    expect(before).not.toContain("reply-style");
     const s = await d.post<ReviewMutationResponse>("/api/review/skills/reply-style/accept");
     expect(s).toMatchObject({ outcome: "skill_saved", view: { skillSuggestions: [] } });
-    expect(d.kernel.context.listSkillsSync().map((x) => x.name)).toEqual(["reply-style"]);
+    // exactly one skill more than the built-in playbooks: the one accepted
+    expect(d.kernel.context.listSkillsSync().map((x) => x.name).sort()).toEqual([...before, "reply-style"].sort());
+    expect(d.kernel.context.getKnowledgeSync({ kind: "skill", name: "reply-style", scope: "global" })).toMatchObject({ description: "回复客户的语气" });
 
     for (let i = 0; i < 5; i++) {
       const { actionId } = makeReplyCard(d.kernel, { text: `第 ${i} 次回复` });
@@ -209,8 +219,8 @@ function proposalCard(kernel: Kernel, title = "官网改版"): string {
 }
 
 describe("project proposal card", () => {
-  it("edit plan saves with version protection; someday parks it without running anything; activate re-proposes it", async () => {
-    const d = await bootDesk();
+  it("edit plan saves with version protection; “先放进以后再说” creates the real project paused, nothing runs; activate starts that same project", async () => {
+    const d = await bootRealDesk();
     const id = proposalCard(d.kernel);
     const plan = { outcome: "新官网上线", actions: [{ title: "出设计稿", owner: "agent" }, { title: "约设计师", owner: "human", effort: "15m" }] };
     const saved = await d.req<ClarifyMutationResponse>("PUT", `/api/clarify/${id}/plan`, { expectedVersion: 1, proposal: plan });
@@ -222,21 +232,33 @@ describe("project proposal card", () => {
     const s = await d.post<ClarifyMutationResponse>(`/api/clarify/${id}/someday`);
     expect(s).toMatchObject({ outcome: "someday", view: { remaining: 0 } });
     const projectId = s.projectId!;
-    expect(d.kernel.getCell(projectId)!.status).toBe("closed");
-    const record = d.kernel.context.readStateSync<ProjectRecord & { proposal: { actions: unknown[] } }>(projectId, gtdKeys.project)!;
+    // the real project cell (the id an approval would have given it), paused before it ever ran — not an empty
+    // holder that is closed at once
+    expect(projectId).toBe(projectIdForApproval(id));
+    expect(d.kernel.getCell(projectId)).toMatchObject({ preset: "project", status: "paused", parentId: "desk" });
+    const record = d.kernel.context.readStateSync<ProjectRecord>(projectId, gtdKeys.project)!;
     expect(record).toMatchObject({ lifecycle: "someday", title: "官网改版" });
-    expect(record.proposal.actions).toHaveLength(2);
+    expect(record.proposal!.actions).toHaveLength(2);
+    // its first task waits in the queue, unclaimed
+    expect(d.kernel.inbox.listMessagesSync({ cellId: projectId, type: "cell.task" })).toMatchObject([{ status: "pending" }]);
     await d.kernel.idle();
     expect(d.script.requests).toEqual([]);
 
     const radar = await d.get<RadarDTO>("/api/radar");
     expect(radar.someday.map((p) => p.id)).toEqual([projectId]);
+    expect(radar.someday[0]!.buttons.map((b) => b.id)).toEqual(["activate", "cancel"]);
     const a = await d.post<ProjectMutationResponse>(`/api/projects/${projectId}/activate`);
-    expect(a).toMatchObject({ outcome: "reproposed", view: { someday: [] } });
-    const q = await d.get<ClarifyQueueDTO>("/api/clarify");
-    expect(q.cards).toMatchObject([{ id: a.cardId, cardType: "project_proposal", title: "官网改版", proposal: { actions: [{}, { title: "约设计师" }] } }]);
-    const ok = await d.post<ApproveResponse>(`/api/clarify/${a.cardId}/approve`, { seenVersion: q.cards[0]!.sourceBar.version });
-    expect(ok).toMatchObject({ outcome: "approved", message: "已确认立项，Agent 开始推进" });
+    expect(a).toMatchObject({ outcome: "activated", view: { someday: [] } });
+    expect(a.view.projects.map((p) => p.id)).toEqual([projectId]);
+    expect(d.kernel.getCell(projectId)!.status).toBe("active");
+    expect(cellMessages(d.kernel, projectId).map((e) => (e.payload as { text: string }).text)).toEqual([expect.stringContaining("主人点了启动")]);
+    await d.kernel.idle();
+    // it ran once, with its brief (the plan the owner saw) and the owner's go-ahead in the same wake-up
+    const runs = d.script.requests.filter((r) => r.cellId === projectId);
+    expect(runs).toHaveLength(1);
+    expect(requestText(runs[0]!.req)).toContain("约设计师");
+    expect(requestText(runs[0]!.req)).toContain("主人点了启动");
+    expect(d.kernel.context.readStateSync<ProjectRecord>(projectId, gtdKeys.project)).toMatchObject({ lifecycle: "active", title: "官网改版" });
   });
 });
 

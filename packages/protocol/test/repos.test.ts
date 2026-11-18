@@ -65,8 +65,8 @@ describe("artifactsRepo", () => {
     const v1 = JSON.stringify({ format: "markdown", body: "初稿 v1" });
     const v2 = JSON.stringify({ format: "markdown", body: "初稿 v2" });
     run(db, "INSERT INTO artifacts (artifact_id, cell_id, version, format, content, updated_by, created_at, updated_at) VALUES ('a1','desk',2,'markdown',?,'human',1,2)", [v2]);
-    run(db, "INSERT INTO artifact_versions VALUES ('a1',1,?,'agent',1)", [v1]);
-    run(db, "INSERT INTO artifact_versions VALUES ('a1',2,?,'human',2)", [v2]);
+    run(db, "INSERT INTO artifact_versions (artifact_id, version, content, updated_by, created_at) VALUES ('a1',1,?,'agent',1)", [v1]);
+    run(db, "INSERT INTO artifact_versions (artifact_id, version, content, updated_by, created_at) VALUES ('a1',2,?,'human',2)", [v2]);
     const repo = artifactsRepo(db);
     expect(repo.get("a1")).toMatchObject({ artifactId: "a1", version: 2, updatedBy: "human", cellId: "desk", content: { body: "初稿 v2" } });
     expect(repo.currentVersion("a1")).toBe(2);

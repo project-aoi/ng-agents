@@ -58,19 +58,67 @@ describe("llm run", () => {
     const names = model.calls[0]!.tools.map((t) => t.name);
     expect(names).toContain("read");
     expect(names).toContain("peek");
-    for (const hidden of ["bash", "write", "edit", "job_start", "shell", "spawn_cell", "close_cell", "send_message", "report_to_parent", "handback"]) {
+    // complete_self / pause_self need a parent too (and a persistent cell)
+    for (const hidden of ["bash", "write", "edit", "job_start", "shell", "spawn_cell", "close_cell", "control_cell", "report_to_parent", "handback", "complete_self", "pause_self"]) {
       expect(names).not.toContain(hidden);
     }
     expect(names).toContain("request_approval");
     expect(names).toContain("wait");
+    // docs/05: send_message also reaches other cells (inbox:<id>), so it is offered without a channel grant; a cell may
+    // always change its own watches/schedules, so update_cell is offered without spawn depth
+    expect(names).toContain("send_message");
+    expect(names).toContain("update_cell");
     expect(model.calls[1]!.tools).toEqual(model.calls[0]!.tools);
 
-    // a child with depth left and a channel grant sees spawn and send tools
+    // a child with depth left, a channel grant and cwdMode "write" sees spawn, send and the mutating workspace tools
     const model2 = new ScriptedModelClient([say("ok")]);
-    const run2 = createFakeRun({ spec: llm(toolsets), batch: ["hi"] });
+    const run2 = createFakeRun({ spec: { ...llm(toolsets), cwdMode: "write" }, batch: ["hi"] });
     await createAgentLoop({ model: model2, registry }).run(run2.snapshot, run2.ports, run2.controller.signal);
     const names2 = model2.calls[0]!.tools.map((t) => t.name);
-    for (const shown of ["bash", "write", "spawn_cell", "send_message", "report_to_parent", "handback", "shell"]) expect(names2).toContain(shown);
+    for (const shown of ["bash", "write", "edit", "code_rpc", "job_start", "spawn_cell", "send_message", "report_to_parent", "handback", "shell", "complete_self", "pause_self"]) {
+      expect(names2).toContain(shown);
+    }
+
+    // the same cell in cwdMode "read" (the default) is shown exactly the same tools: cwdMode only says whether the cell
+    // queues for its work tree's write slot; what it does with its tools is the prompt's business, not a filter's
+    const model3 = new ScriptedModelClient([say("ok")]);
+    const run3 = createFakeRun({ spec: llm(toolsets), batch: ["hi"] });
+    await createAgentLoop({ model: model3, registry }).run(run3.snapshot, run3.ports, run3.controller.signal);
+    const names3 = model3.calls[0]!.tools.map((t) => t.name);
+    for (const shown of ["read", "peek", "spawn_cell", "send_message", "report_to_parent", "bash", "write", "edit", "code_rpc", "job_start", "job_observe", "job_input", "job_cancel", "shell"]) {
+      expect(names3).toContain(shown);
+    }
+    expect(names3).toEqual(names2);
+    expect(model3.calls[0]!.tools).toEqual(model2.calls[0]!.tools);
+
+    // a one-shot child reports a result once instead of closing itself
+    const model4 = new ScriptedModelClient([say("ok")]);
+    const run4 = createFakeRun({ spec: { ...llm(toolsets), lifetime: "one_shot" }, batch: ["hi"] });
+    await createAgentLoop({ model: model4, registry }).run(run4.snapshot, run4.ports, run4.controller.signal);
+    const names4 = model4.calls[0]!.tools.map((t) => t.name);
+    expect(names4).toContain("report_to_parent");
+    expect(names4).not.toContain("complete_self");
+    expect(names4).not.toContain("pause_self");
+  });
+
+  it("refuses a channel send from a cell without any channel grant (send_message is offered for inbox messages)", async () => {
+    const model = new ScriptedModelClient([
+      call("send_message", { to: "channel:ui:owner", text: "进展", summary: "progress" }),
+      (req) => {
+        expect(toolResultsOf(req)[0]).toMatchObject({
+          isError: true,
+          content: "This cell has no channel it may send to. Report to your parent (report_to_parent) or ask the desk (send_message to inbox:desk) instead.",
+        });
+        return say("ok");
+      },
+    ]);
+    const bounds = makeBounds({ tools: ["read"], canSendTo: ["inbox:desk"], maxDepth: 0, maxTokens: 1e9, maxCents: 1e9 });
+    const { ports, snapshot, controller } = createFakeRun({ bounds, spec: llm(["kernel.comms"]), batch: ["告诉主人进展"] });
+    expect(await createAgentLoop({ model, registry: makeRegistry() }).run(snapshot, ports, controller.signal)).toBe("completed");
+    expect(model.calls).toHaveLength(2);
+    expect(ports.log.authorizations).toHaveLength(0);
+    expect(ports.log.sends).toHaveLength(0);
+    expect(ports.artifacts.size).toBe(0);
   });
 
   it("feeds a Gate deny back to the model, which can correct course", async () => {
@@ -223,13 +271,34 @@ describe("llm run", () => {
     expect(model.calls).toHaveLength(2);
   });
 
-  it("stops at maxSteps", async () => {
+  it("stops at maxSteps with step_limit (work is left: never reported as completed)", async () => {
     const model = new ScriptedModelClient(() => call("echo", { text: "again" }));
     const { ports, snapshot, controller } = createFakeRun({ spec: llm(["probe"], { maxSteps: 3 }), batch: ["loop forever"] });
     const outcome = await createAgentLoop({ model, registry: makeRegistry() }).run(snapshot, ports, controller.signal);
-    expect(outcome).toBe("completed");
+    expect(outcome).toBe("step_limit");
     expect(model.calls).toHaveLength(3);
-    expect(ports.log.evidence.at(-1)).toMatchObject({ kind: "system_note" });
+    expect(ports.log.evidence.at(-1)).toMatchObject({
+      kind: "system_note",
+      text: "[run stopped after 3 model calls (step limit); the kernel wakes you to continue]",
+    });
+    // every call that was made was executed (the cap is checked before a model call, never mid-step)
+    expect(ports.log.evidence.filter((e) => e.kind === "tool_result")).toHaveLength(3);
+  });
+
+  it("ends refused when the model refuses, leaving the calls of that turn unexecuted", async () => {
+    const model = new ScriptedModelClient([
+      call("echo", { text: "before" }),
+      { toolCalls: [{ name: "echo", input: { text: "declined" } }], stopReason: "refusal" },
+      say("never asked"),
+    ]);
+    const { ports, snapshot, controller } = createFakeRun({ spec: llm(["probe"]), batch: ["do something questionable"] });
+    expect(await createAgentLoop({ model, registry: makeRegistry() }).run(snapshot, ports, controller.signal)).toBe("refused");
+    expect(model.calls).toHaveLength(2);
+    const results = ports.log.evidence.filter((e) => e.kind === "tool_result");
+    expect(results.map((r) => r.kind === "tool_result" && [r.output, r.isError ?? false])).toEqual([
+      ["echo: before", false],
+      ["Not executed: the model declined this turn.", true],
+    ]);
   });
 
   it("turns tool exceptions, unknown tools and invalid input into error results", async () => {
@@ -277,10 +346,56 @@ describe("llm run", () => {
     expect(await createAgentLoop({ model: waiting, registry }).run(w.snapshot, w.ports, w.controller.signal)).toBe("yielded_waiting");
     expect(waiting.calls).toHaveLength(1);
 
-    const j = createFakeRun({ spec: llm(["workspace"]), batch: ["run the tests"] });
+    // job_start is a bash-kind tool: only a cell that holds cwdMode "write" has it
+    const j = createFakeRun({ spec: { ...llm(["workspace"]), cwdMode: "write" }, batch: ["run the tests"] });
     const jobs = new ScriptedModelClient([call("job_start", { command: "pnpm test" }), say("Tests are running; I'll report when done.")]);
     expect(await createAgentLoop({ model: jobs, registry }).run(j.snapshot, j.ports, j.controller.signal)).toBe("yielded_waiting");
     expect(j.ports.log.jobs[0]!.command).toBe("pnpm test");
+
+    // spawn_cell arranges a wake-up the same way (the child reports back): a run that then ends is waiting, not done
+    const s = createFakeRun({ spec: llm(["kernel.cells"]), batch: ["delegate it"] });
+    const spawns = new ScriptedModelClient([call("spawn_cell", { preset: "worker", title: "do it", instruction: "do it and report" }), say("Delegated.")]);
+    expect(await createAgentLoop({ model: spawns, registry }).run(s.snapshot, s.ports, s.controller.signal)).toBe("yielded_waiting");
+    expect(s.ports.log.spawned).toHaveLength(1);
+  });
+
+  it("takes messages that arrive mid-run into the same run (drainInbound) before it may end", async () => {
+    let ports!: ReturnType<typeof createFakeRun>["ports"];
+    const model = new ScriptedModelClient([
+      () => {
+        ports.pushInbound("顺便把标题也改了");
+        return call("echo", { text: "draft" });
+      },
+      (req) => {
+        // absorbed after the step's tool results, rendered exactly as the kernel's hydrate would show it
+        expect(req.messages.at(-1)!.content.map((b) => b.type)).toEqual(["tool_result", "text"]);
+        expect(req.messages.at(-1)!.content[1]).toEqual({ type: "text", text: "[user.message from channel:ui:owner] 顺便把标题也改了" });
+        return say("改好了。");
+      },
+    ]);
+    // a follow-up that arrives while the model answers without tools: the run continues instead of ending
+    const model2 = new ScriptedModelClient([
+      () => {
+        ports.pushInbound("还有作者名");
+        return say("草稿好了。");
+      },
+      (req) => {
+        expect(req.messages.at(-1)!.content).toEqual([{ type: "text", text: "[user.message from channel:ui:owner] 还有作者名" }]);
+        return say("作者名也改了。");
+      },
+    ]);
+    const run = createFakeRun({ spec: llm(["probe"]), batch: ["写个草稿"] });
+    ports = run.ports;
+    expect(await createAgentLoop({ model, registry: makeRegistry() }).run(run.snapshot, run.ports, run.controller.signal)).toBe("completed");
+    expect(model.calls).toHaveLength(2);
+    expect(run.ports.log.drained.map((e) => (e.payload as { text: string }).text)).toEqual(["顺便把标题也改了"]);
+    // the absorbed message joined the claimed batch (the tools and handback see it)
+    expect(run.snapshot.batch.envelopes.map((e) => (e.payload as { text: string }).text)).toEqual(["写个草稿", "顺便把标题也改了"]);
+
+    const run2 = createFakeRun({ spec: llm([]), batch: ["写个草稿"] });
+    ports = run2.ports;
+    expect(await createAgentLoop({ model: model2, registry: makeRegistry() }).run(run2.snapshot, run2.ports, run2.controller.signal)).toBe("completed");
+    expect(model2.calls).toHaveLength(2);
   });
 
   it("does not execute a tool call cut off by the output limit", async () => {

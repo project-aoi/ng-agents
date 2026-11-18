@@ -11,24 +11,26 @@ import {
   type ApprovalResolvedPayload,
   type CellResultPayload,
   type ChannelAddr,
+  type Clock,
   type Envelope,
   type ItemSource,
   type PrepareRunInput,
   type ProjectProposal,
+  type ProjectRecord,
   type ProjectStartAction,
   type RunPorts,
   type ToolContext,
   type UserMessagePayload,
   type VersionedArtifact,
 } from "@ng/protocol";
+import { projectLaunch, startProjectSync, type ProjectInit, type RepoRef } from "../project/launch";
 import { KEYS, RESTORE_REASON, ROLES, type PresetsConfig } from "../shared/config";
 import { notifyOwner } from "../shared/notify";
-import { projectPlan, rootSpec, rootTask, type ItemInfo, type ItemPlan } from "../shared/plan";
-import { itemRawInput, itemSource, newAction, newActivity, patchAction, primaryItem, type RawInput } from "../shared/records";
+import { newAction, newActivity, patchAction, primaryItem, type RawInput } from "../shared/records";
 
 // Desk-side bookkeeping shared by the desk's tools: what an inbound item is, the reply drafts the desk keeps cards for,
-// and the deterministic follow-ups of background events (a reminder came due, a proposal was approved, an item
-// finished, a reply was sent). The model decides what to do with an item; these keep the books.
+// and the deterministic follow-ups of background events (a reminder came due, a proposal was approved, a reply was
+// sent, a project finished). The model decides what to do with an item; these keep the books.
 
 /** A reply the desk drafted and keeps one card for (`desk:reply:<subjectKey>`). */
 export interface ReplyItem {
@@ -52,8 +54,9 @@ export interface ProposalItem {
   source: ItemSource;
   rawInput: RawInput;
   envelope?: Envelope;
-  research?: boolean;
-  repoPath?: string;
+  cwd?: string;
+  repos?: RepoRef[];
+  phases?: string[];
 }
 
 export interface ReminderData {
@@ -97,30 +100,14 @@ async function ensureWeeklyReview(cfg: PresetsConfig, ports: RunPorts): Promise<
   );
 }
 
-export function itemInfo(ctx: ToolContext, title: string, extra: Partial<ItemInfo> = {}): ItemInfo {
-  const env = currentItem(ctx);
-  const now = ctx.clock.now();
-  return { title, source: itemSource(env, now), rawInput: itemRawInput(env), ...(env ? { envelope: env } : {}), ...extra };
-}
-
 export function replyAddressOf(env: Envelope | undefined): ChannelAddr | undefined {
   if (!env || !isEnvelopeOfType(env, "user.message")) return undefined;
   const r = (env.payload as UserMessagePayload).replyTo;
   return r && isChannelAddr(r) ? r : undefined;
 }
 
-export const projectRootIdFor = (actionId: string) => `proj_${actionId.replace(/^act_/, "")}`;
-
-export async function startItem(ports: RunPorts, cfg: PresetsConfig, plan: ItemPlan, o: { fork?: boolean; notice?: string; noticeKey: string }): Promise<"started" | "exists"> {
-  try {
-    await ports.spawnCell(rootSpec(plan, o.fork ? { fork: true } : {}), rootTask(plan));
-  } catch (err) {
-    if (isNgError(err, "duplicate")) return "exists";
-    throw err;
-  }
-  if (o.notice) await notifyOwner(ports, cfg.ownerAddress, o.notice, o.noticeKey);
-  return "started";
-}
+/** The project an approval starts: derived from the approval id, so every path that starts it starts the same cell once. */
+export const projectIdForApproval = (approvalId: string) => `proj_${approvalId.replace(/^act_/, "")}`;
 
 function proposalOf(data: unknown, fallback: ProjectProposal): ProjectProposal {
   const p = data as Partial<ProjectProposal> | undefined;
@@ -133,38 +120,41 @@ export const ACKNOWLEDGE_ACTION = "gtd.acknowledge";
 
 /**
  * The project an approved proposal starts: the plan version the owner saw (the json artifact, edits included), the
- * item it came from, and a root id derived from the approval, so every path that starts it starts the same cell once.
+ * item it came from, and an id derived from the approval.
  */
-export function approvedProjectPlan(
+export function approvedProjectInit(
   approvalId: string,
   action: ProjectStartAction,
   art: Pick<VersionedArtifact, "content"> | null,
   remembered: ProposalItem | null,
-  now: number,
-): ItemPlan {
+  clock: Clock,
+): ProjectInit {
   const proposal = proposalOf(art?.content.data, action.proposal);
-  const item: ItemInfo = {
+  const brief = ["主人在立项卡上确认了这份方案（可能亲手改过），按它开始推进。", proposal.background ?? ""].filter(Boolean).join("\n");
+  return {
+    id: projectIdForApproval(approvalId),
     title: proposal.title,
     outcome: proposal.outcome,
-    source: remembered?.source ?? { label: "立项", at: now },
-    rawInput: remembered?.rawInput ?? { text: proposal.background ?? proposal.outcome, kind: "system" },
-    ...(remembered?.envelope ? { envelope: remembered.envelope } : {}),
+    brief,
+    proposal,
+    plan: proposal.actions.map((a) => ({ title: a.title, owner: a.owner, ...(a.nextStep ? { nextStep: a.nextStep } : {}), ...(a.effort ? { effort: a.effort } : {}) })),
+    source: remembered?.source ?? { label: "立项", at: clock.now() },
+    ...(remembered?.rawInput.text ? { rawInput: remembered.rawInput.text } : {}),
+    ...(remembered?.cwd ? { cwd: remembered.cwd } : {}),
+    ...(remembered?.repos?.length ? { repos: remembered.repos } : {}),
+    ...(remembered?.phases?.length ? { phases: remembered.phases } : {}),
   };
-  return projectPlan(projectRootIdFor(approvalId), item, proposal, {
-    ...(remembered?.research !== undefined ? { research: remembered.research } : {}),
-    ...(remembered?.repoPath ? { repo: { repoPath: remembered.repoPath } } : {}),
-  });
 }
 
 /**
  * docs/04 §2.2 B "✓ 确认立项并让 Agent 开工" as a synchronous transaction: right after the owner approved a proposal the
- * desk raised, create the project root (as the desk would). Idempotent with the desk's own catch-up (same root id).
- * Returns null when the approval is not an approved desk proposal.
+ * desk raised, create the project cell (as the desk would — same builder, same id). Idempotent with the desk's own
+ * catch-up. Returns null when the approval is not an approved desk proposal.
  */
 export function startApprovedProjectSync(
-  kernel: Pick<Kernel, "gate" | "context" | "getCell" | "spawnCell" | "clock">,
+  kernel: Pick<Kernel, "gate" | "context" | "getCell" | "spawnCell" | "clock" | "deskCellId">,
   approvalId: string,
-): { rootId: string; started: boolean } | null {
+): { projectId: string; started: boolean } | null {
   const rec = kernel.gate.getApprovalSync(approvalId);
   if (!rec || rec.action.type !== "project.start" || rec.status !== "approved") return null;
   const holder = kernel.getCell(rec.cellId);
@@ -172,27 +162,33 @@ export function startApprovedProjectSync(
   const action = rec.action as ProjectStartAction;
   const art = action.artifactId ? kernel.context.getArtifactSync(action.artifactId) : null;
   const remembered = action.artifactId ? kernel.context.readStateSync<ProposalItem>(rec.cellId, KEYS.proposal(action.artifactId)) : null;
-  const plan = approvedProjectPlan(approvalId, action, art, remembered, kernel.clock.now());
+  const init = approvedProjectInit(approvalId, action, art, remembered, kernel.clock);
+  return startProjectSync(kernel, init, { parentId: rec.cellId, principalId: cellPrincipal(rec.cellId) });
+}
+
+/** Start a project from inside a desk Run (same builder as startProjectSync). "exists": that id is already taken. */
+export async function launchProject(ports: RunPorts, init: ProjectInit, clock: Clock): Promise<{ projectId: string; started: boolean }> {
+  const launch = projectLaunch(init, clock);
   try {
-    kernel.spawnCell(rec.cellId, rootSpec(plan), rootTask(plan), { principalId: cellPrincipal(rec.cellId) });
-    return { rootId: plan.rootId, started: true };
+    await ports.spawnCell(launch.spec, launch.task);
+    return { projectId: launch.projectId, started: true };
   } catch (err) {
-    if (isNgError(err, "duplicate")) return { rootId: plan.rootId, started: false };
+    if (isNgError(err, "duplicate")) return { projectId: launch.projectId, started: false };
     throw err;
   }
 }
 
 /**
  * The desk's bookkeeping, run by the kernel at the start of every desk Run (PresetDef.prepareRun) — so a reminder that
- * came due, an approved proposal, a finished item or a sent reply is in the records even when the model does nothing
- * useful with the wake-up. A batch of nothing but such events never reaches the model. What it applied is kept for the
- * Run's apply_updates.
+ * came due, an approved proposal or a sent reply is in the records even when the model does nothing useful with the
+ * wake-up. A batch of nothing but such events never reaches the model; a cell's result always does. What it applied
+ * is kept for the Run's apply_updates.
  */
 export function createDeskBooks(cfg: PresetsConfig) {
   const applied = new Map<string, string[]>();
   return {
     async prepareRun({ snapshot, ports, signal, clock }: PrepareRunInput): Promise<"handled" | void> {
-      // Other cells on the inline preset (the redraft helper) have no books.
+      // Other cells on the inline preset (light helpers) have no books.
       if (ports.self.spec.meta?.["role"] !== ROLES.desk) return;
       const ctx: ToolContext = { ports, snapshot, signal, clock, toolUseId: `prepare_${snapshot.runId}` };
       const r = await settleDeskBatch(cfg, ctx);
@@ -224,7 +220,8 @@ export async function settleDesk(cfg: PresetsConfig, ctx: ToolContext): Promise<
 
 /**
  * settleDesk plus whether every envelope of the batch was pure bookkeeping (nothing left for the model: a reminder that
- * came due, a decided proposal or reply card, a finished item, a progress note).
+ * came due, a decided proposal or reply card, a progress note). A `cell.result` is never pure bookkeeping: a fixer's
+ * result must reach the model so it can tell the cells that wait on it.
  */
 export async function settleDeskBatch(cfg: PresetsConfig, ctx: ToolContext): Promise<{ lines: string[]; consumedAll: boolean }> {
   const { ports, clock } = ctx;
@@ -249,6 +246,18 @@ export async function settleDeskBatch(cfg: PresetsConfig, ctx: ToolContext): Pro
     out.push(`提醒已到：${data.text}（已放进专注工作区，主人已收到提醒）`);
   }
 
+  /** A project of the desk finished: one line in the "后台已处理" drawer. Once per project. */
+  async function projectFinished(p: CellResultPayload): Promise<void> {
+    if (p.status !== "completed") return;
+    const project = await ports.context.readState<ProjectRecord>(p.childCellId, gtdKeys.project).catch(() => null);
+    if (!project || project.lifecycle !== "completed") return;
+    const id = `done-${p.childCellId}`;
+    if (await ports.context.readState(self, gtdKeys.activity(id))) return;
+    const a: ActivityRecord = newActivity({ id, kind: "action_completed", title: `已完成：${project.title}`, detail: p.summary, ...(project.source ? { source: project.source } : {}), restorable: false }, now);
+    await ports.context.commit(self, { statePatches: { [gtdKeys.activity(id)]: a } });
+    out.push(`项目已完成：${project.title}`);
+  }
+
   /** True when the envelope needs nothing from the model. */
   async function settleOne(env: Envelope): Promise<boolean> {
     if (isEnvelopeOfType(env, "timer.fired")) {
@@ -263,9 +272,12 @@ export async function settleDeskBatch(cfg: PresetsConfig, ctx: ToolContext): Pro
         const action = p.action as ProjectStartAction;
         const art = action.artifactId ? await ports.context.getArtifact(action.artifactId) : null;
         const remembered = action.artifactId ? await ports.context.readState<ProposalItem>(self, KEYS.proposal(action.artifactId)) : null;
-        const plan = approvedProjectPlan(p.actionId, action, art, remembered, now);
-        const r = await startItem(ports, cfg, plan, { notice: `已立项：${plan.item.title}，后台开始推进`, noticeKey: `project:${p.actionId}` });
-        if (r === "started") out.push(`项目「${plan.item.title}」已按确认的安排启动（${plan.rootId}）`);
+        const init = approvedProjectInit(p.actionId, action, art, remembered, clock);
+        const r = await launchProject(ports, init, clock);
+        if (r.started) {
+          await notifyOwner(ports, cfg.ownerAddress, `已立项：${init.title}，后台开始推进`, `project:${p.actionId}`);
+          out.push(`项目「${init.title}」已按确认的安排启动（${r.projectId}）`);
+        }
         return true;
       } else if (p.action.type === "custom") {
         return p.action.name === ACKNOWLEDGE_ACTION;
@@ -289,20 +301,8 @@ export async function settleDeskBatch(cfg: PresetsConfig, ctx: ToolContext): Pro
       }
       return false;
     } else if (isEnvelopeOfType(env, "cell.result")) {
-      const p = env.payload as CellResultPayload;
-      const data = p.data as { synthetic?: boolean; gtd?: { finished?: boolean; lifecycle?: string } } | undefined;
-      const fin = data?.gtd;
-      if (!fin?.finished) {
-        // An item root closed from outside (the owner cancelled or completed it in Radar): the app kept its books.
-        return data?.synthetic === true && (await ports.context.readState(p.childCellId, KEYS.coordinator).catch(() => null)) !== null;
-      }
-      try {
-        await ports.closeCell(p.childCellId, fin.lifecycle === "cancelled" ? "cancelled" : "completed");
-        out.push(p.summary);
-      } catch (err) {
-        if (!isNgError(err, "bounds_violation") && !isNgError(err, "not_found")) throw err;
-      }
-      return true;
+      await projectFinished(env.payload as CellResultPayload);
+      return false;
     } else if (isEnvelopeOfType(env, "cell.progress")) {
       return true;
     }
@@ -327,16 +327,6 @@ export async function settleDeskBatch(cfg: PresetsConfig, ctx: ToolContext): Pro
       } catch (err) {
         out.push(`${SETTLE_ERROR}${err instanceof Error ? err.message : String(err)}`);
       }
-    }
-  }
-  // A finished item whose report this wake-up did not carry (reported while the desk was busy) is closed too.
-  for (const child of ctx.snapshot.tail.roster) {
-    const st = await ports.context.readState<{ finished?: string | null }>(child.cellId, KEYS.coordinator).catch(() => null);
-    if (!st?.finished || child.status === "closed") continue;
-    try {
-      await ports.closeCell(child.cellId, st.finished === "cancelled" ? "cancelled" : "completed");
-    } catch (err) {
-      if (!isNgError(err, "bounds_violation") && !isNgError(err, "not_found")) throw err;
     }
   }
   return { lines: out, consumedAll: consumedAll && !out.some((l) => l.startsWith(SETTLE_ERROR)) };

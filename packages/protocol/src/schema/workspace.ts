@@ -3,7 +3,8 @@ import type { SchemaModule } from "./types";
 // Owner: @ng/workspace.
 export const workspaceSchema: SchemaModule = {
   owner: "@ng/workspace",
-  version: 1,
+  version: 2,
+  migrations: [{ version: 2, up: /* sql */ `ALTER TABLE jobs ADD COLUMN cancel_requested_at INTEGER;` }],
   ddl: /* sql */ `
 CREATE TABLE IF NOT EXISTS workspaces (
   cell_id       TEXT PRIMARY KEY REFERENCES cells(id),
@@ -35,7 +36,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   error               TEXT,
   started_at          INTEGER NOT NULL,
   finished_at         INTEGER,
-  updated_at          INTEGER NOT NULL
+  updated_at          INTEGER NOT NULL,
+  cancel_requested_at INTEGER                  -- "cancelling": requested, process group not yet confirmed gone
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_cell ON jobs(cell_id, state);
 CREATE INDEX IF NOT EXISTS idx_jobs_running ON jobs(state) WHERE state = 'running';

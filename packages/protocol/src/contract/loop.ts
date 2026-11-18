@@ -28,12 +28,14 @@ export interface AgentLoop {
     | "deferred_for_approval"           // Gate.defer produced a pending card; state persisted, Run released
     | "cancelled"
     | "budget_stopped"
+    | "step_limit"                      // [ext] docs/05: hit the per-Run step cap with work left; the kernel schedules a continuation
+    | "refused"                         // [ext] docs/05: the model refused the task; never reported as completed
   >;
 }
 
 // ==================== [ext] ====================
 
-export type RunOutcome = "completed" | "yielded_waiting" | "deferred_for_approval" | "cancelled" | "budget_stopped";
+export type RunOutcome = "completed" | "yielded_waiting" | "deferred_for_approval" | "cancelled" | "budget_stopped" | "step_limit" | "refused";
 
 /**
  * [ext] Who executes an `llm` Run (docs/02 §四.8 "Loop 对接外部 CLI 适配器"): `api` = @ng/loop's own tool loop over a
@@ -170,6 +172,8 @@ export function defineTool<S extends z.ZodType>(def: {
  */
 export function selectRunTools(tools: readonly ToolDef[], processor: LlmProcessorSpec, bounds: PolicyBounds, spec?: CellSpec): ToolDef[] {
   const allowed = processor.allowedTools ? new Set<ToolKind>(processor.allowedTools) : null;
+  // cwdMode hides nothing: it only says whether the cell queues for its work tree's write slot (the dispatcher).
+  // What a cell does with its tools is the prompt's business (docs/05 principle 6), not a filter's.
   return tools.filter(
     (t) =>
       (t.kind === "kernel" || (bounds.tools.has(t.kind) && (allowed === null || allowed.has(t.kind)))) &&

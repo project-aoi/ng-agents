@@ -1,21 +1,23 @@
-// @ng/presets — the four standard Cell templates (docs/02 §三): inline desk, isolated worker, thread watcher, cron
-// sensor, with their prompts, toolsets and zero-token code processors. This is where the GTD product behaviour lives;
-// the records they keep (gtd.ts) are what the workbench UI renders.
+// @ng/presets — the workbench's cell templates (docs/05): the desk (triage + arbitration), persistent projects that keep
+// the records and dispatch one-shot workers, light watchers, sources and hubs, with their prompts, toolsets, playbooks
+// and the few zero-token processors. This is where the GTD product behaviour lives; the records they keep (gtd.ts)
+// are what the workbench UI renders.
 
 import type { Registry } from "@ng/protocol";
-import { deskPreset, deskPrompt } from "./inline-desk/preset";
+import { sensorPreset } from "./cron-sensor/preset";
+import { hubPreset } from "./hub/preset";
 import { createDeskBooks } from "./inline-desk/items";
+import { deskPreset } from "./inline-desk/preset";
 import { deskToolset } from "./inline-desk/toolset";
-import { sensorPreset, sensorPrompt } from "./cron-sensor/preset";
-import { workerPreset, workerPrompt } from "./isolated-worker/preset";
-import { PROCESSORS, resolveConfig, type RegisterPresetsOptions } from "./shared/config";
-import { createCoordinator } from "./shared/coordinator";
-import { editorToolset } from "./shared/editor";
-import { registerGtdPayloads } from "./shared/payloads";
-import { editorPrompt } from "./shared/prompts";
+import { workerPreset } from "./isolated-worker/preset";
+import { projectPreset } from "./project/preset";
+import { projectToolset } from "./project/toolset";
+import { resolveConfig, type RegisterPresetsOptions } from "./shared/config";
+import { legacyProcessors, legacyPrompts, legacyToolsets } from "./shared/legacy";
+import { promptDefs } from "./shared/prompts";
 import { createScriptSensor, sensorToolset } from "./shared/sensor";
 import { createWaitMatch, watcherToolset } from "./shared/watcher";
-import { watcherPreset, watcherPrompt } from "./thread-watcher/preset";
+import { watcherPreset } from "./thread-watcher/preset";
 
 export type { RegisterPresetsOptions, PresetsConfig } from "./shared/config";
 
@@ -27,18 +29,18 @@ export interface RegisteredPresets {
 }
 
 /**
- * Registers the four presets (`inline`, `worker`, `watcher`, `sensor`), their prompts, toolsets and code processors
- * on `registry`, plus the presets' private payload types (process-wide). Call once per registry, before the desk is
- * created and before `kernel.start()`. The standard toolsets the presets list are registered by the kernel.
+ * Registers the six presets (`inline` = the desk, `project`, `worker`, `watcher`, `sensor`, `hub`), their prompts,
+ * toolsets and code processors on `registry`, plus stand-ins for names older databases still use. Call once per
+ * registry, before the desk is created and before `kernel.start()`. The standard toolsets the presets list are
+ * registered by the kernel. Afterwards, `seedBuiltinSkills` installs the playbooks the prompts refer to.
  */
 export function registerPresets(registry: Registry, opts: RegisterPresetsOptions = {}): RegisteredPresets {
   const cfg = resolveConfig(opts);
-  registerGtdPayloads();
   const books = createDeskBooks(cfg);
-  const presets = [deskPreset(books), workerPreset(), watcherPreset(), sensorPreset()];
-  const prompts = [deskPrompt(cfg), workerPrompt(), watcherPrompt(), sensorPrompt(), editorPrompt()];
-  const toolsets = [deskToolset(cfg, books), watcherToolset(cfg), sensorToolset(), editorToolset()];
-  const processors = [createCoordinator(cfg, PROCESSORS.joinAll, "all"), createCoordinator(cfg, PROCESSORS.joinAny, "any"), createWaitMatch(cfg), createScriptSensor()];
+  const presets = [deskPreset(books), projectPreset(cfg), workerPreset(), watcherPreset(), sensorPreset(), hubPreset()];
+  const prompts = [...promptDefs(cfg), ...legacyPrompts()];
+  const toolsets = [deskToolset(cfg, books), projectToolset(cfg), watcherToolset(cfg), sensorToolset(), ...legacyToolsets()];
+  const processors = [createWaitMatch(cfg), createScriptSensor(), ...legacyProcessors()];
   for (const p of presets) registry.presets.register(p);
   for (const p of prompts) registry.prompts.register(p);
   for (const t of toolsets) registry.toolsets.register(t);
@@ -51,29 +53,13 @@ export function registerPresets(registry: Registry, opts: RegisterPresetsOptions
   };
 }
 
-// ---------- for the app, the demo seed and custom sensors ----------
+// ---------- for the app, the control plane, the demo seed and custom sensors ----------
 
-export { PROMPTS, TOOLSETS, PROCESSORS, ROLES, KEYS, RESTORE_REASON } from "./shared/config";
+export { PROMPTS, TOOLSETS, PROCESSORS, ROLES, KEYS, LEGACY, RESTORE_REASON } from "./shared/config";
+export { BUILTIN_SKILLS, type BuiltinSkill } from "./shared/skills";
+export { seedBuiltinSkills } from "./shared/seed";
 export { defineSensorCheck, ensureSource, recordCheck, OBSERVATION_NOTE, type SensorHit, type SensorCheckInput, type SourceInit } from "./shared/sensor";
-export { setProjectLifecycleSync } from "./shared/sync";
-export { readCoordinator, awaitsCard, syncItemAfterOwnerChangeSync, type CoordinatorState } from "./shared/coordinator";
-export type { WatcherState } from "./shared/watcher";
-export {
-  singlePlan,
-  fanOutPlan,
-  chasePlan,
-  projectPlan,
-  rootSpec,
-  rootTask,
-  workerChild,
-  watcherChild,
-  childCellId,
-  type ItemPlan,
-  type ItemInfo,
-  type GroupPlan,
-  type ChildPlan,
-  type PartyPlan,
-} from "./shared/plan";
-export { GTD_PAYLOAD, type GtdCommand, type WatchEvent } from "./shared/payloads";
-export type { ReplyItem, ProposalItem } from "./inline-desk/items";
-export { startApprovedProjectSync, ACKNOWLEDGE_ACTION } from "./inline-desk/items";
+export { setProjectLifecycleSync, notifyProjectOfOwnerChangeSync } from "./shared/sync";
+export { startProjectSync, projectLaunch, type ProjectInit, type ProjectLaunch, type ProjectTaskInput, type ProjectSeed, type PlannedAction, type RepoRef, type ProjectMode } from "./project/launch";
+export { startApprovedProjectSync, projectIdForApproval, ACKNOWLEDGE_ACTION, type ReplyItem, type ProposalItem } from "./inline-desk/items";
+export type { WatcherState, ReplyParty, ReplyWatchReport } from "./shared/watcher";

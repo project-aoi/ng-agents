@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createEnvelope, gtdKeys, isNgError, markdownDeliverable, textDeliverable, withTx } from "@ng/protocol";
+import { createEnvelope, gtdKeys, markdownDeliverable, textDeliverable, withTx } from "@ng/protocol";
 import { setup } from "./helpers";
 
 const env = (h: ReturnType<typeof setup>, id: string) =>
@@ -124,15 +124,15 @@ describe("commit atomicity", () => {
     expect(h.inbox.rows()).toEqual([]);
   });
 
-  it("an artifact belongs to its cell", () => {
+  it("another cell may revise an artifact in the same commit as its own state; the artifact keeps its creating cell", () => {
     const h = setup({ cells: [{ id: "desk" }, { id: "w1", parentId: "desk" }] });
     h.store.commitSync("w1", { artifact: { artifactId: "d", content: markdownDeliverable("# x"), updatedBy: "agent" } });
-    let caught: unknown;
-    try {
-      h.store.commitSync("desk", { artifact: { artifactId: "d", content: textDeliverable("y"), updatedBy: "human", expectedVersion: 1 } });
-    } catch (e) {
-      caught = e;
-    }
-    expect(isNgError(caught, "invalid_argument")).toBe(true);
+    const r = h.store.commitSync("desk", {
+      statePatches: { reviewed: true },
+      artifact: { artifactId: "d", content: textDeliverable("y"), updatedBy: "agent", expectedVersion: 1 },
+    });
+    expect(r).toEqual({ ok: true, artifactVersion: 2 });
+    expect(h.store.readStateSync("desk", "reviewed")).toBe(true);
+    expect(h.store.getArtifactSync("d")).toMatchObject({ cellId: "w1", version: 2, content: { body: "y" } });
   });
 });

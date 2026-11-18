@@ -30,5 +30,28 @@ export { claudeAdapter, claudeArgs, claudeBuiltinTools, CLAUDE_SANDBOX_SETTINGS 
 export { codexAdapter, codexArgs, codexSandboxMode } from "./adapters/codex";
 export { agyAdapter, agyArgs, agyPermissionAllowed } from "./adapters/agy";
 export { renderTranscript, tailText, freshPrompt, forkNoteIndex, FORK_NOTE_PREFIX } from "./render";
-export { spawnCli, descendants, probeVersion, type CliProcess } from "./process";
+export {
+  spawnCli,
+  descendants,
+  probeVersion,
+  reapOrphanedCliProcesses,
+  cliProcessAlive,
+  CLI_PROCESS_MARKER,
+  type CliProcess,
+  type CliProcessRegistration,
+  type ReapedCliProcess,
+} from "./process";
 export type { CliAdapter, CliCapabilities, CliDriver, CliEvent, CliModels, CliSessionRecord, DriverIO, LaunchRequest } from "./types";
+export {
+  listCliModels,
+  parseClaudeModels,
+  parseCodexModels,
+  parseAgyModels,
+  preferredEffort,
+  sortEfforts,
+  launchChoice,
+  type CliModelInfo,
+  type CliModelChoice,
+  type CliModelCatalog,
+  type ListCliModelsOptions,
+} from "./models";

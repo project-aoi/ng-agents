@@ -1,4 +1,4 @@
-import { useEffect, useId, useImperativeHandle, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, type Ref } from "react";
+import { useEffect, useId, useImperativeHandle, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, type Ref, type RefObject } from "react";
 import type { ButtonDTO } from "../../shared/api";
 
 export function Spinner({ label }: { label?: string }) {
@@ -44,6 +44,22 @@ export function ConfirmDialog(props: { open: boolean; text: string; confirmLabel
   );
 }
 
+// ==================== popovers ====================
+
+/** While `open`, a pointer press outside `wrap` calls `onOutside` (how menus and panels close on an outside click). */
+export function useOutsidePress(open: boolean, wrap: RefObject<HTMLElement | null>, onOutside: () => void): void {
+  const cb = useRef(onOutside);
+  cb.current = onOutside;
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: PointerEvent) => {
+      if (wrap.current && !wrap.current.contains(e.target as Node)) cb.current();
+    };
+    document.addEventListener("pointerdown", onDown);
+    return () => document.removeEventListener("pointerdown", onDown);
+  }, [open, wrap]);
+}
+
 // ==================== menu ====================
 
 export function Menu(props: { label: ReactNode; title?: string; children: (close: () => void) => ReactNode; align?: "start" | "end"; disabled?: boolean }) {
@@ -51,15 +67,9 @@ export function Menu(props: { label: ReactNode; title?: string; children: (close
   const wrap = useRef<HTMLDivElement>(null);
   const trigger = useRef<HTMLButtonElement>(null);
   const menuId = useId();
+  useOutsidePress(open, wrap, () => setOpen(false));
   useEffect(() => {
-    if (!open) return;
-    const onDown = (e: PointerEvent) => {
-      if (wrap.current && !wrap.current.contains(e.target as Node)) setOpen(false);
-    };
-    document.addEventListener("pointerdown", onDown);
-    const first = wrap.current?.querySelector<HTMLElement>("[role=menuitem]");
-    first?.focus();
-    return () => document.removeEventListener("pointerdown", onDown);
+    if (open) wrap.current?.querySelector<HTMLElement>("[role=menuitem]")?.focus();
   }, [open]);
   const close = () => {
     setOpen(false);

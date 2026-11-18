@@ -1,8 +1,11 @@
 // ===== Demo mode =====
 // With no CLI agent installed and no API model configured (or NG_DESK_DEMO=1), the desk runs on the scripted demo
-// model and, on a fresh data directory, plays docs/03 §四's five scenarios through the real kernel and presets
-// (./demo-seed.ts) so every view has content. Live input still gets an answer: a note or link is saved, a reminder is
-// set, a card can be revised, anything else gets an honest "演示模式" note.
+// model and, on a fresh data directory, plays a few days of the workbench through the real kernel and presets
+// (./demo-seed.ts) so every view has content: notes and reminders, reply cards, a source hit turned into a proposal,
+// persistent projects that dispatch one-shot workers — one running, one waiting on the owner, one waiting on
+// suppliers' replies, one parked as "someday" with its report — and a hub. Live input still gets an answer: a note or
+// link is saved, a reminder is set, a card can be revised, a ticked-off action moves its project on, anything else gets
+// an honest "演示模式" note.
 
 import { existsSync } from "node:fs";
 import { join } from "node:path";
@@ -92,7 +95,7 @@ export function createDemoMode(opts: { timeZone?: string } = {}): DemoMode {
         clock.catchUp();
       }
       kernel.context.commitSync(kernel.deskCellId, { statePatches: { [DEMO_SEED_KEY]: { version: DEMO_SEED_VERSION, at: kernel.clock.now() } } });
-      ctx.log(`demo: seeded docs/03 §四's scenarios in ${((Date.now() - started) / 1000).toFixed(1)} s`);
+      ctx.log(`demo: seeded the demo scenarios in ${((Date.now() - started) / 1000).toFixed(1)} s`);
     },
   };
 }

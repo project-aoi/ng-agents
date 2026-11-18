@@ -13,6 +13,7 @@ import {
   type ScheduleRule,
 } from "@ng/protocol";
 import type { CellSpecInput } from "./types";
+import { normalizeCwd } from "./workdir";
 
 /** A spec with the preset's defaults applied, plus the bounds request to hand to Gate.attenuate. */
 export interface ResolvedSpec {
@@ -53,6 +54,10 @@ export function resolveSpec(registry: Registry, input: CellSpecInput, parent: Ce
   const defaults = (preset?.defaults ?? {}) as Partial<CellSpec>;
 
   const spec = { ...defaults, ...caller } as CellSpec;
+  // docs/05: a cell works where its parent works unless it says otherwise (watchers/sensors keep to themselves).
+  if (typeof spec.cwd === "string" && spec.cwd) spec.cwd = normalizeCwd(spec.cwd);
+  else if (parent?.spec.cwd && preset?.inheritCwd !== false) spec.cwd = parent.spec.cwd;
+  else delete spec.cwd;
   const meta = { ...(defaults.meta ?? {}), ...(caller.meta ?? {}) };
   const inherited = parent?.spec.meta?.["projectCellId"];
   if (typeof inherited === "string" && meta["projectCellId"] === undefined) meta["projectCellId"] = inherited;
@@ -94,9 +99,28 @@ export function validateSpec(registry: Registry, spec: CellSpec): void {
   if (spec.maxParallelRuns !== undefined && (!Number.isInteger(spec.maxParallelRuns) || spec.maxParallelRuns < 1)) {
     throw new NgError("invalid_argument", "maxParallelRuns must be a positive integer");
   }
+  if (spec.cwd !== undefined && (typeof spec.cwd !== "string" || !spec.cwd.startsWith("/"))) throw new NgError("invalid_argument", "cwd must be an absolute path");
+  if (spec.cwdMode !== undefined && spec.cwdMode !== "read" && spec.cwdMode !== "write") {
+    throw new NgError("invalid_argument", `invalid cwdMode "${String(spec.cwdMode)}" (read | write)`);
+  }
+  if (spec.lifetime !== undefined && spec.lifetime !== "one_shot" && spec.lifetime !== "persistent") {
+    throw new NgError("invalid_argument", `invalid lifetime "${String(spec.lifetime)}" (one_shot | persistent)`);
+  }
+  if (spec.lifetime === "one_shot" && spec.claimMode === "competing_workers") {
+    // Drain-then-close needs "nothing else of this cell is running" to be decidable from one claim.
+    throw new NgError("invalid_argument", "a one_shot cell claims serially (claimMode serial_coalesce)");
+  }
+  if (spec.absorbInbound !== undefined && typeof spec.absorbInbound !== "boolean") throw new NgError("invalid_argument", "absorbInbound must be a boolean");
   for (const w of spec.watches ?? []) {
     if (!w || typeof w.threadOrFilter !== "object" || w.threadOrFilter === null || Array.isArray(w.threadOrFilter)) {
       throw new NgError("invalid_argument", "each watch needs a threadOrFilter object");
+    }
+    if (w.coalesceMs !== undefined && (typeof w.coalesceMs !== "number" || !Number.isFinite(w.coalesceMs) || w.coalesceMs < 0)) {
+      throw new NgError("invalid_argument", "watch coalesceMs must be a non-negative number of milliseconds");
+    }
+    for (const [k, v] of Object.entries(w.threadOrFilter)) {
+      const bad = operatorProblem(v);
+      if (bad) throw new NgError("invalid_argument", `watch filter "${k}": ${bad}`);
     }
     const thread = w.threadOrFilter["thread"];
     if (thread !== undefined && (typeof thread !== "string" || !thread)) throw new NgError("invalid_argument", "watch thread must be a non-empty string");
@@ -121,12 +145,60 @@ export function scheduleEnvelopeId(cellId: string, rule: ScheduleRule): string {
   return `${cellId}:schedule:${sha256Hex(stableStringify(rule)).slice(0, 12)}`;
 }
 
-/** Equality filter of a watch over an envelope: top-level fields or `payload.<path>`. `thread` is matched separately. */
+const OPERATORS = ["$in", "$contains", "$anyKeyword"] as const;
+
+function operatorOf(expected: unknown): { op: (typeof OPERATORS)[number]; arg: unknown } | null {
+  if (expected === null || typeof expected !== "object" || Array.isArray(expected)) return null;
+  const keys = Object.keys(expected);
+  if (keys.length !== 1 || !(OPERATORS as readonly string[]).includes(keys[0]!)) return null;
+  return { op: keys[0] as (typeof OPERATORS)[number], arg: (expected as Record<string, unknown>)[keys[0]!] };
+}
+
+/** Why a filter value that looks like an operator is malformed (null = fine, or a plain equality value). */
+function operatorProblem(expected: unknown): string | null {
+  if (expected === null || typeof expected !== "object" || Array.isArray(expected)) return null;
+  const keys = Object.keys(expected);
+  if (!keys.some((k) => k.startsWith("$"))) return null;
+  const o = operatorOf(expected);
+  if (!o) return `unknown operator (use one of ${OPERATORS.join(", ")}, alone)`;
+  if (o.op === "$contains") return typeof o.arg === "string" && o.arg ? null : "$contains needs a non-empty string";
+  if (!Array.isArray(o.arg) || o.arg.length === 0) return `${o.op} needs a non-empty array`;
+  if (o.op === "$anyKeyword" && !o.arg.every((k) => typeof k === "string" && k)) return "$anyKeyword needs non-empty strings";
+  return null;
+}
+
+const lower = (v: string) => v.toLocaleLowerCase();
+
+function operatorMatches(o: { op: (typeof OPERATORS)[number]; arg: unknown }, actual: unknown): boolean {
+  switch (o.op) {
+    case "$in":
+      return Array.isArray(o.arg) && o.arg.some((v) => stableStringify(v) === stableStringify(actual));
+    case "$contains": {
+      if (typeof o.arg !== "string") return false;
+      if (typeof actual === "string") return lower(actual).includes(lower(o.arg));
+      // A list field (mentions, tags, threads): one of its elements is the value.
+      if (Array.isArray(actual)) return actual.some((v) => (typeof v === "string" ? lower(v) === lower(o.arg as string) : stableStringify(v) === stableStringify(o.arg)));
+      return false;
+    }
+    case "$anyKeyword": {
+      if (!Array.isArray(o.arg)) return false;
+      const hay = typeof actual === "string" ? [lower(actual)] : Array.isArray(actual) ? actual.filter((v): v is string => typeof v === "string").map(lower) : [];
+      return o.arg.some((k) => typeof k === "string" && hay.some((h) => h.includes(lower(k))));
+    }
+  }
+}
+
+/**
+ * Filter of a watch over an envelope: top-level fields or `payload.<path>`; a value is compared for equality unless it
+ * is an operator object (`$in`, `$contains`, `$anyKeyword` — see the convention in @ng/protocol contract/cell.ts).
+ * `thread` is matched separately.
+ */
 export function watchFilterMatches(filter: Record<string, unknown>, env: Record<string, unknown>): boolean {
   for (const [key, expected] of Object.entries(filter)) {
     if (key === "thread") continue;
     const actual = key.startsWith("payload.") ? readPath(env["payload"], key.slice("payload.".length).split(".")) : env[key];
-    if (stableStringify(actual) !== stableStringify(expected)) return false;
+    const o = operatorOf(expected);
+    if (o ? !operatorMatches(o, actual) : stableStringify(actual) !== stableStringify(expected)) return false;
   }
   return true;
 }

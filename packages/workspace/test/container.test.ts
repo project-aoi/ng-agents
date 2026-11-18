@@ -144,7 +144,7 @@ describe("container driver (command construction verified with a fake runner; no
     expect(nodeExec.args.slice(nodeExec.args.indexOf("0123456789abcdef") + 1, -1)).toEqual(["node", "--permission", "--input-type=module", "-e"]);
   });
 
-  it("with a repository: works on a private clone, and destroy brings the branch back (snapshot taken inside the container)", async () => {
+  it("with a repository: works on a private clone; stopping the runtime removes only the container", async () => {
     const repo = initRepo();
     const fake = new FakeDocker();
     const h = harness({ runner: fake, container: { image: IMAGE }, defaultRepoPath: repo });
@@ -153,13 +153,16 @@ describe("container driver (command construction verified with a fake runner; no
     expect(readFileSync(`${port.root}/.git/HEAD`, "utf8")).toContain("ng/w1"); // a real .git dir, not a worktree link
     await port.exec("write", { path: "feature.txt", content: "new\n" });
 
-    await h.mgr.destroy("w1");
-    const snap = fake.docker("exec").find((c) => c.args.includes("ng-snapshot"))!;
-    expect(snap.args.slice(0, 4)).toEqual(["exec", "--workdir", "/workspace", "0123456789abcdef"]);
+    await h.mgr.stopRuntime("w1");
     expect(fake.docker("rm").at(-1)!.args).toEqual(["rm", "--force", "0123456789abcdef"]);
-    expect(existsSync(port.root)).toBe(false);
-    expect(git(repo, "show", "ng/w1:feature.txt")).toBe("new");
+    // docs/05: no snapshot commit, no fetch back, no directory removal — the clone keeps the work as the cell left it.
+    expect(fake.docker("exec").some((c) => c.args.includes("ng-snapshot"))).toBe(false);
+    expect(readFileSync(`${port.root}/feature.txt`, "utf8")).toBe("new\n");
     expect(h.mgr.getWorkspaceSync("w1")).toMatchObject({ status: "destroyed", branch: "ng/w1", containerId: null });
+    // Idempotent: nothing left to stop.
+    const rms = fake.docker("rm").length;
+    await h.mgr.stopRuntime("w1");
+    expect(fake.docker("rm")).toHaveLength(rms);
   });
 
   it("a failing docker run is reported and leaves nothing behind", async () => {

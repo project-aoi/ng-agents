@@ -1,4 +1,5 @@
-import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryChannel, UiChannel } from "@ng/channel";
@@ -54,8 +55,8 @@ export type Turn = ScriptTurn | ScriptResponder;
 
 /**
  * One scripted model for the whole kernel. Each request is answered from the queue of the requesting cell's role
- * (`spec.meta.role` — the presets set desk / worker / watcher / sensor / editor), then from that role's default
- * responder; otherwise an empty end_turn.
+ * (`spec.meta.role` — the presets set desk / project / worker / checker / watcher / sensor / hub), then from that
+ * role's default responder; otherwise an empty end_turn.
  */
 export class RoleScript {
   readonly queues = new Map<string, Turn[]>();
@@ -221,7 +222,32 @@ export function continuesRun(req: ModelRequest): boolean {
   return last?.content.at(-1)?.type === "tool_result";
 }
 
-/** The item roots the desk started (one per background item). */
-export function roots(h: Harness): string[] {
-  return h.kernel.listCells({ parentId: "desk" }).filter((c) => c.spec.meta?.["role"] === "coordinator").map((c) => c.id);
+/** The projects the desk started, oldest first. */
+export function projects(h: Harness): string[] {
+  return h.kernel.listCells({ parentId: "desk" }).filter((c) => c.spec.meta?.["role"] === "project").map((c) => c.id);
+}
+
+/** Children of a cell (any status), oldest first. */
+export function childrenOf(h: Harness, cellId: string, role?: string): string[] {
+  return h.kernel
+    .listCells({ parentId: cellId })
+    .filter((c) => role === undefined || c.spec.meta?.["role"] === role)
+    .map((c) => c.id);
+}
+
+/** A git repository with one commit, as a project's directory on "the owner's machine". */
+export function gitRepo(prefix = "repo"): string {
+  const dir = tempDir(prefix);
+  const git = (...args: string[]) => execFileSync("git", ["-C", dir, ...args], { stdio: "ignore", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" } });
+  git("init", "-q", "-b", "main");
+  writeFileSync(join(dir, "README.md"), "# repo\n");
+  git("add", ".");
+  git("commit", "-q", "-m", "init");
+  return dir;
+}
+
+/** The system prompt a cell's latest model request carried. */
+export function systemOf(h: Harness, cellId: string): string {
+  const req = h.script.requests.filter((r) => r.cellId === cellId).at(-1)?.req;
+  return req?.system ?? "";
 }

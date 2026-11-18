@@ -29,7 +29,18 @@ describe("read models", () => {
     await waitFor(() => h.kernel.workspace.listJobsSync({ state: ["running"] }).length === 1, 10_000, "job");
 
     const roster = h.kernel.rosterFor("proj");
-    expect(roster.map((r) => r.cellId)).toEqual(["build", "wait"]);
+    // a one-shot cell sees its direct children; a persistent one (the desk) its whole live subtree in tree order
+    expect(roster.map((r) => [r.cellId, r.depth, r.parentId])).toEqual([
+      ["build", 1, "proj"],
+      ["wait", 1, "proj"],
+    ]);
+    expect(h.kernel.rosterFor("desk").map((r) => [r.cellId, r.depth, r.parentId])).toEqual([
+      ["proj", 1, "desk"],
+      ["build", 2, "proj"],
+      ["wait", 2, "proj"],
+    ]);
+    // nobody gave them a directory: no cwd in the roster (the kernel's own fallback directory is noise)
+    expect(roster.some((r) => "cwd" in r || "cwdMode" in r)).toBe(false);
     expect(roster[0]).toMatchObject({ title: "跑测试", running: false, jobs: [expect.objectContaining({ command: "sleep 30" })] });
     expect(roster[1]).toMatchObject({ statusLine: "已回 (2/3 家)", progress: { done: 2, total: 3 }, waitingOn: { threads: ["memory:q"], nextTimerAt: T0 + DAY, pendingApprovals: 0 } });
 
@@ -62,10 +73,25 @@ describe("read models", () => {
   });
 
   it("a caller narrowing one bounds field keeps the preset's other requests (e.g. its isolation)", async () => {
-    const h = await boot({ setup });
+    const h = await boot({
+      setup(registry: Registry) {
+        setup(registry);
+        // docs/05: no test preset asks for isolation any more (host is the default); one that still opts in explicitly
+        registry.presets.register({
+          name: "sensor",
+          description: "test sensor in an explicit worktree",
+          defaults: { processor: { kind: "code", entry: "test.idle" }, lifetime: "persistent", bounds: { isolation: "git_worktree", tools: new Set(["read", "bash"]) } },
+        });
+      },
+    });
+    h.kernel.spawnCell("desk", { id: "s", preset: "sensor", bounds: { maxTokens: 10_000 } });
+    expect(h.kernel.getCell("s")!.bounds).toMatchObject({ isolation: "git_worktree", maxTokens: 10_000 });
+    expect([...h.kernel.getCell("s")!.bounds.tools].sort()).toEqual(["bash", "read"]);
+    expect(h.kernel.getCell("s")!.spec.bounds).toEqual({ isolation: "git_worktree", tools: ["bash", "read"], maxTokens: 10_000 });
+    // a preset that asks for nothing: the caller's field alone; the isolation is the parent's (the desk: the host)
     h.kernel.spawnCell("desk", { id: "w", preset: "worker", processor: { kind: "code", entry: "test.idle" }, bounds: { maxTokens: 10_000 } });
-    expect(h.kernel.getCell("w")!.bounds).toMatchObject({ isolation: "git_worktree", maxTokens: 10_000 });
-    expect(h.kernel.getCell("w")!.spec.bounds).toEqual({ isolation: "git_worktree", maxTokens: 10_000 });
+    expect(h.kernel.getCell("w")!.bounds).toMatchObject({ isolation: "none", maxTokens: 10_000 });
+    expect(h.kernel.getCell("w")!.spec.bounds).toEqual({ maxTokens: 10_000 });
   });
 
   it("setFocus(false) delivers what focus held back", async () => {

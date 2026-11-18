@@ -1,10 +1,11 @@
-import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type RefObject } from "react";
+import { useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type RefObject } from "react";
 import { relativeTimeZh, type ActivityKind, type ActivityListDTO, type StatusDTO } from "../../shared/api";
 import { api } from "../api";
 import { toFailure, useNow, useResource, useStatus, useToast, useToasts, type ViewKey } from "../state";
 import { clientId, whenText } from "../text";
 import { SourceText } from "./bits";
-import { ButtonRow, Chevron, Kbd, Spinner } from "./controls";
+import { ButtonRow, Chevron, Kbd, Spinner, useOutsidePress } from "./controls";
+import { ModelSwitch } from "./models";
 import { ErrorState, Loading } from "./states";
 
 // ==================== top bar ====================
@@ -51,7 +52,7 @@ export function TopBar(props: { view: ViewKey; status: StatusDTO | null; onView(
         })}
       </nav>
       <div className="topbar-right">
-        {status && (status.demo ? <span className="mode-badge" title={`后端：${status.backend}`}>演示模式</span> : <span className="backend-label" title="处理事项的模型服务">{status.backend}</span>)}
+        {status && (status.demo ? <span className="mode-badge" title={`后端：${status.backend}`}>演示模式</span> : <ModelSwitch status={status} />)}
         <button type="button" className={`drawer-trigger${props.drawerOpen ? " on" : ""}`} aria-expanded={props.drawerOpen} aria-controls="drawer" onClick={props.onDrawer} title="随手记 / 信源（快捷键 4）">
           <span aria-hidden="true">⚡</span> <span className="dt-label">随手记 / 信源</span>
         </button>
@@ -66,15 +67,7 @@ export function StatusLine(props: { view: ViewKey; status: StatusDTO | null; con
   const { status } = props;
   const text = status ? status.statusLine[props.view] : "正在连接工作台…";
   const wrap = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!props.open) return;
-    const onDown = (e: PointerEvent) => {
-      if (wrap.current && !wrap.current.contains(e.target as Node)) props.onClose();
-    };
-    document.addEventListener("pointerdown", onDown);
-    return () => document.removeEventListener("pointerdown", onDown);
-  }, [props.open, props.onClose]);
+  useOutsidePress(props.open, wrap, props.onClose);
 
   return (
     <div className="statusline" ref={wrap}>

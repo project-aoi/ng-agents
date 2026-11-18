@@ -146,12 +146,51 @@ export interface NotificationDTO {
   state: "delivered" | "held";
 }
 
+// ---------- the owner's model switch (CLI backends) ----------
+
+export interface ModelInfoDTO {
+  id: string;
+  label: string;
+  description?: string;
+  /** Reasoning efforts the model offers, weakest first; empty = none to choose. */
+  efforts: string[];
+}
+export interface ModelChoiceDTO {
+  model: string;
+  label: string;
+  effort?: string;
+}
+/** "auto" follows the CLI's own first choice (it changes when the CLI's recommendation does). */
+export type ModelSelectionDTO = { mode: "auto" } | { mode: "fixed"; model: string; effort?: string };
+export type ModelTierDTO = "strong" | "fast";
+
+/** GET /api/models (`?refresh=1` asks the CLI again) and the answer of PUT /api/models. */
+export interface ModelsDTO {
+  /** false: the agents run on an API model or in demo mode — there is nothing to switch. */
+  available: boolean;
+  engine: "claude" | "codex" | "agy" | null;
+  /** As the CLI lists them, its first choice first. Never hard-coded. */
+  models: ModelInfoDTO[];
+  recommended: ModelChoiceDTO | null;
+  fetchedAt: number | null;
+  /** Why asking the CLI failed last time (the previous list, if any, is still shown). */
+  error: string | null;
+  /** strong: the desk, projects, hubs, workers. fast: light checkers and sources. */
+  selection: Record<ModelTierDTO, ModelSelectionDTO>;
+  /** What the next run of each tier is launched with; null = the CLI's own default. */
+  effective: Record<ModelTierDTO, ModelChoiceDTO | null>;
+}
+/** PUT /api/models */
+export type SetModelRequest = { tier: ModelTierDTO; mode: "auto" } | { tier: ModelTierDTO; mode: "fixed"; model: string; effort?: string };
+
 export interface StatusDTO {
   generatedAt: number;
   /** Demo mode (no CLI agent and no API model available, or NG_DESK_DEMO=1): the UI labels itself as a demo. */
   demo: boolean;
   /** What runs the agents: a CLI agent ("claude", "codex", "agy"), an API provider ("anthropic", "openai") or "demo". Display only. */
   backend: string;
+  /** The model the main agents run on right now, e.g. "Opus 5.5 · xhigh" (CLI backends, once the CLI has listed its models). */
+  model?: string;
   auth: { tokenRequired: boolean };
   focus: { on: boolean; buffered: number };
   clarify: { pending: number; snoozed: number };
@@ -503,10 +542,25 @@ export interface ProjectActionDTO {
   dueAt: number | null;
 }
 
+/** A cell working for a project right now (a worker, a watcher): detail of the project's row, never a row itself. */
+export interface ProjectWorkerDTO {
+  cellId: string;
+  title: string;
+  preset: string | null;
+  /** running: a Run or a background command is in flight · waiting: a watch or a timer · paused · idle: asleep. */
+  state: "running" | "waiting" | "paused" | "idle";
+  /** Its own one-line status (what it reported last), if any. */
+  statusLine: string | null;
+}
+
 export interface ProjectRowDTO {
   id: string;
   title: string;
   outcome: string | null;
+  /** The project's own one-line account of where things stand (it keeps it current). */
+  summary: string | null;
+  /** The directory the project's work happens in. */
+  cwd: string | null;
   lifecycle: "active" | "completed" | "cancelled" | "someday";
   paused: boolean;
   /** The single ball label the row shows (🔵 > 🟢 > 🟡); null when nothing is open. */
@@ -517,11 +571,18 @@ export interface ProjectRowDTO {
   openActions: ProjectActionDTO[];
   /** A card about this project waits in Clarify. */
   pendingCardId: string | null;
-  /** No running work, nothing being waited on, no next step: flagged red. */
+  /**
+   * Nothing moves it: no work running or queued, no watch or timer, no wait on a live cell, no card and no open action
+   * of the owner's — the kernel's five-anchor check (it stamps the record with `stalledSince`). Flagged red.
+   */
   stalled: boolean;
   stalledText: string | null;
+  /** Since when it is stalled (null when it is not). */
+  stalledSince: number | null;
   running: number;
   waitingOn: number;
+  /** The cells working for it now. */
+  workers: ProjectWorkerDTO[];
   createdAt: number;
   updatedAt: number;
   buttons: ButtonDTO[];
@@ -536,11 +597,17 @@ export interface RadarDTO {
   review: WeeklyReviewDTO;
 }
 
-export type ProjectOutcome = "paused" | "resumed" | "cancelled" | "completed" | "someday" | "activated" | "reproposed" | "action_added" | "not_applied";
+/**
+ * activated: the same project continues (its records, reports and history are kept). migrated: a parked item from an
+ * older version could not be resumed, so a new project was started from its plan and reports (`projectId`).
+ */
+export type ProjectOutcome = "paused" | "resumed" | "cancelled" | "completed" | "someday" | "activated" | "migrated" | "action_added" | "not_applied";
 
 export interface ProjectMutationResponse extends MutationResult<RadarDTO, ProjectOutcome> {
-  /** reproposed: the new Clarify card. */
-  cardId?: string;
+  /** migrated: the project that continues the parked one. */
+  projectId?: string;
+  /** action_added: the new action. */
+  actionId?: string;
 }
 
 /** POST /api/projects/:projectId/actions — "补上下一步" */

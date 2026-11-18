@@ -15,7 +15,7 @@ export interface VersionedArtifact {    // human-visible deliverables: reply dra
   content: Deliverable;
   updatedBy: "agent" | "human";
   // [ext]
-  cellId: string;                       // owning cell (set at creation, never changes)
+  cellId: string;                       // the cell it was created in (never changes); [docs/05] any internal cell may revise it
   createdAt: number;
   updatedAt: number;
 }
@@ -33,7 +33,7 @@ export interface ContextStore {
   hydrate(cellId: string, batch: ClaimedBatch, mode: "isolated" | "fork_prefix"): Promise<PromptSnapshot>;
   appendEvidence(cellId: string, record: StepOrExternalEvidence): Promise<EvidenceAppendResult>; // [ext] doc returns void; the result is additive
   readResource(cellId: string, uri: string, page?: { offset: number; limit: number }): Promise<string>; // Inline & Spill
-  searchHistory(cellId: string, query: string): Promise<Snippet[]>;
+  searchHistory(cellId: string, query: string, opts?: SearchOptions /* [ext] */): Promise<Snippet[]>;
 
   // 3. Long-term preferences and SKILL.md maintenance (physically separate from business state)
   upsertSkillOrNote(cellId: string, patch: KnowledgePatch): Promise<void>;
@@ -51,7 +51,7 @@ export interface ContextStore {
   hydrateSync(cellId: string, batch: ClaimedBatch, mode: ContextMode): PromptSnapshot;
   appendEvidenceSync(cellId: string, record: StepOrExternalEvidence): EvidenceAppendResult;
   readResourceSync(cellId: string, uri: string, page?: ResourcePage): string;
-  searchHistorySync(cellId: string, query: string, opts?: { limit?: number }): Snippet[];
+  searchHistorySync(cellId: string, query: string, opts?: SearchOptions): Snippet[];
   upsertSkillOrNoteSync(cellId: string, patch: KnowledgePatch): void;
   listStateSync(cellId: string, keyPrefix: string): StateEntry[];
   queryStateSync(q: StateQuery): StateEntry[];
@@ -103,15 +103,30 @@ export interface ContextStore {
 // ==================== [ext] types ====================
 
 export type ArtifactAuthor = VersionedArtifact["updatedBy"];
+
+/**
+ * [docs/05 §5.3] Where searchHistory looks:
+ * - `lineage` (default): the cell's own evidence + its fork_prefix inheritance, knowledge of the cell, its ancestors
+ *   and global — the pre-docs/05 behaviour.
+ * - `subtree`: lineage, plus the evidence, artifacts, state and spilled resources of the cell's whole subtree,
+ *   **closed descendants included** (a finished worker's trace stays searchable from its project).
+ * - `global`: every cell's evidence, artifacts, state and resources, and all knowledge.
+ * In `subtree`/`global`, hits also come from artifact bodies (current version), `cell_state` values and the full
+ * text of spilled resources (not just the inline head kept in evidence).
+ */
+export type SearchScope = "lineage" | "subtree" | "global";
+export interface SearchOptions {
+  limit?: number;
+  scope?: SearchScope;
+}
 export type ContextMode = "isolated" | "fork_prefix";
 /**
  * Resources are addressed `res://<cellId>/<id>`. `offset`/`limit` count UTF-16 characters (JS string indices);
- * default page is the first 8000 chars. A cell may read its own resources, its ancestors' (fork_prefix history
- * can reference them) and its descendants' (a child's report may point at its spilled output); anything else throws
- * NgError("not_found").
+ * default page is the first 8000 chars. [docs/05] Any internal cell may read any cell's resources (a desk checking a
+ * worker's log, a project reading a closed worker's output); an unknown URI throws NgError("not_found").
  * Other URIs readResource serves (same paging): `skill://<name>` (SKILL.md body), `note://<name>`,
  * `preference://<name>` (nearest visible scope: the cell, then its ancestors, then global) and
- * `artifact://<id>[@<version>]` (the Deliverable body; same tree rule as res://).
+ * `artifact://<id>[@<version>]` (the Deliverable body; readable by any internal cell).
  */
 export type ResourcePage = { offset: number; limit: number };
 export const RESOURCE_URI_PREFIX = "res://";
@@ -129,13 +144,13 @@ export type HydrateMode = ContextMode;
 /**
  * Commit semantics (all-or-nothing, one SQLite transaction, nests inside a caller's `withTx`):
  * - `statePatches`: key → JSON value; `null`/`undefined` deletes the key. Keys are free-form; GTD keys live in gtd.ts.
- * - `artifact`: creates (version 1) when the id does not exist (`expectedVersion` must be absent or 0); otherwise
- *   `expectedVersion` must equal the current version. An *agent* write without `expectedVersion` is accepted only if
- *   the current version was also written by the agent. On mismatch the whole commit is rejected with
- *   `{ ok:false, currentArtifact }`; additionally, if the losing write was by the agent and the current version is
- *   human-authored, the agent content is parked (ParkedAddition, returned as `parked`; the parked row is the only
- *   write that survives the rejected commit) — the human draft is never overwritten.
- *   An artifact can only be committed through its owning cellId.
+ * - `artifact`: creates (version 1) when the id does not exist (`expectedVersion` must be absent or 0). Updating an
+ *   existing artifact — by any cell, not only the one that created it (docs/05 guard 3: shared reports) — requires
+ *   `expectedVersion` equal to the current version; absent or different, the whole commit is rejected with
+ *   `{ ok:false, currentArtifact }` and nothing is overwritten. Additionally, if the losing write was by the agent
+ *   and the current version is human-authored, the agent content is parked (ParkedAddition, returned as `parked`; the
+ *   parked row is the only write that survives the rejected commit). The version history records which cell wrote
+ *   each agent version (`ArtifactVersionRecord.cellId`, null for human edits).
  * - `inboxOut`: enqueued via the injected InboxWriter in the same transaction (cellId parsed from `to`).
  * - Emits `state.changed` / `artifact.changed` after commit.
  */
@@ -174,6 +189,8 @@ export interface ArtifactVersionRecord {
   content: Deliverable;
   updatedBy: ArtifactAuthor;
   createdAt: number;
+  /** [docs/05] The cell that wrote this version (null for human edits and for rows written before the column existed). */
+  cellId?: string | null;
 }
 
 export interface ParkedAddition {
@@ -247,8 +264,27 @@ export interface EvidenceAppendResult {
 }
 
 /** Shared wording for spilled output so Context (history) and Loop (current Run) render identically. */
-export function spillNotice(uri: string, totalChars: number, inlineChars: number): string {
-  return `\n…[output truncated: showing ${inlineChars} of ${totalChars} chars; read the rest with read_resource("${uri}", offset, limit)]`;
+/**
+ * Tools whose whole point is to read stored text (a report, a page of a spilled output). Their results stay inline up
+ * to `EXPLICIT_READ_INLINE_CHARS` whatever the normal inline limit is: clipping the middle out of a page the agent
+ * just asked for would make it ask again for the same text, forever.
+ */
+export const EXPLICIT_READ_TOOLS: ReadonlySet<string> = new Set(["read_resource", "read_artifact"]);
+export const EXPLICIT_READ_INLINE_CHARS = 12_000;
+
+/**
+ * What stands in the place of the part that was cut out of a long output. It names the exact range that is missing
+ * and the exact call that reads it — "showing N of M" made agents assume the first N characters were shown and skip
+ * the gap between head and tail.
+ */
+export function spillNotice(uri: string, totalChars: number, headChars: number, tailChars = 0): string {
+  const missing = Math.max(0, totalChars - headChars - tailChars);
+  const shown = tailChars > 0 ? `the first ${headChars} characters are above and the last ${tailChars} below` : `only the first ${headChars} characters are shown`;
+  const how =
+    missing <= DEFAULT_RESOURCE_PAGE_CHARS
+      ? `read_resource("${uri}", offset ${headChars}, limit ${missing})`
+      : `read_resource("${uri}", offset ${headChars}) and go on page by page (up to ${DEFAULT_RESOURCE_PAGE_CHARS} characters each)`;
+  return `\n…[${missing} of ${totalChars} characters are left out here: ${shown}. Read the missing part with ${how}]`;
 }
 
 /**
@@ -270,6 +306,9 @@ export interface EvidenceEntry {
  * A search hit. `source: "evidence"` → an append-only record (seq = evidence seq, kind = EvidenceKind);
  * `source: "knowledge"` → a note/skill/preference (seq = knowledge row seq, kind = KnowledgeKind, cellId = null for
  * global knowledge, `uri` = note://, skill:// or preference://<name>, `title` = its name).
+ * [docs/05] `source: "artifact"` → an artifact body (kind "artifact", uri `artifact://<id>`, title = its title, seq =
+ * its version); `source: "state"` → a cell_state value (kind "state", title = the key, seq 0); `source: "resource"`
+ * → the full text of a spilled resource (kind "resource", uri = its res:// URI, seq 0).
  * searchHistory scope: the cell's own evidence (plus its fork_prefix inheritance up to the fork point), knowledge of
  * the cell and its ancestors, and global knowledge. Queries are split on whitespace; terms of >= 3 characters use the
  * FTS5 trigram index, shorter ones a substring LIKE.
@@ -278,12 +317,12 @@ export interface Snippet {
   seq: number;
   cellId: string | null;                // [ext] null only for global knowledge
   runId: string | null;
-  kind: EvidenceKind | KnowledgeKind;   // [ext] KnowledgeKind for knowledge hits
+  kind: EvidenceKind | KnowledgeKind | "artifact" | "state" | "resource"; // [ext] by source
   text: string;                         // excerpt around the match
   at: number;
   spillUri?: string;
   rank?: number;                        // lower is better (FTS5 bm25); absent for LIKE-only matches
-  source: "evidence" | "knowledge";     // [ext]
+  source: "evidence" | "knowledge" | "artifact" | "state" | "resource"; // [ext]
   uri?: string;                         // [ext] readable with readResource (knowledge hits; spilled evidence → spillUri)
   title?: string;                       // [ext] knowledge name, or an external record's title
 }
@@ -363,6 +402,11 @@ export interface ChildSummary {
   epoch: number;
   lastRunAt: number | null;
   statusLine: string | null;            // from the child's `cell:status` state key (CELL_STATUS_KEY), if any
+  /** [docs/05] 1 = direct child; deeper = a descendant (coordinating cells see their whole subtree). */
+  depth?: number;
+  parentId?: string | null;
+  cwd?: string;
+  cwdMode?: "read" | "write";
 }
 
 /** Conventional state key a cell writes to describe itself in its parent's roster. Value: CellStatusLine. */
@@ -405,6 +449,8 @@ export interface PromptSnapshot {
   tail: {
     roster: ChildSummary[];
     messages: ModelMessage[];
+    /** [docs/05] Extra volatile notes the kernel adds after the roster (active workspaces, open waits). */
+    notes?: string[];
   };
   skills: SkillIndexEntry[];            // the index embedded in `system` (bodies are read on demand)
   createdAt: number;

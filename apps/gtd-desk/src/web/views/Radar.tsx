@@ -11,7 +11,6 @@ export function RadarView() {
   const res = useResource<RadarDTO>("radar", api.radar, ["radar", "review"]);
   const { setStatus } = useStatus();
   const toast = useToast();
-  const navigate = useNavigate();
   const now = useNow();
   const [somedayOpen, setSomedayOpen] = useState(false);
 
@@ -24,11 +23,7 @@ export function RadarView() {
       const r = await callButton<ProjectMutationResponse>(b, input);
       res.set(r.view);
       setStatus(r.status);
-      toast({
-        tone: r.ok ? "success" : "warn",
-        text: r.message,
-        ...(r.outcome === "reproposed" && r.cardId ? { action: { label: "去确认", run: () => navigate({ view: "clarify", cardId: r.cardId! }) } } : {}),
-      });
+      toast({ tone: r.ok ? "success" : "warn", text: r.message });
     } catch (err) {
       toast({ tone: "error", text: toFailure(err).message });
       res.reload();
@@ -114,6 +109,8 @@ function ProjectRow({ row, now, onRun }: { row: ProjectRowDTO; now: number; onRu
           {row.lifecycle === "someday" && <span className="badge">以后再说</span>}
         </div>
         {row.outcome && <p className="project-outcome">{row.outcome}</p>}
+        {row.summary && <p className="muted small">{row.summary}</p>}
+        {row.cwd && <p className="muted small">{row.cwd}</p>}
       </div>
 
       {row.stalled && (

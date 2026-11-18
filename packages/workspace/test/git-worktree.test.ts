@@ -56,48 +56,27 @@ describe("git_worktree isolation", () => {
     expect(h.mgr.getWorkspaceSync("w1")!.error).toMatch(/needs a repository/);
   });
 
-  it("destroy removes the worktree and deletes an untouched branch", async () => {
-    const repo = initRepo();
-    const h = harness({ defaultRepoPath: repo });
-    const a = await h.mgr.acquire("w1", "git_worktree");
-    await h.mgr.destroy("w1");
-    expect(existsSync(a.root)).toBe(false);
-    expect(git(repo, "branch", "--list", "ng/w1")).toBe("");
-    expect(git(repo, "worktree", "list")).not.toContain(a.root);
-    expect(h.mgr.getWorkspaceSync("w1")).toMatchObject({ status: "destroyed", branch: null });
-    await expect(a.exec("read", { op: "list_dir" })).rejects.toSatisfy((e) => isNgError(e, "conflict"));
-  });
-
-  it("destroy keeps the branch when it has commits, and snapshots uncommitted work instead of losing it", async () => {
+  it("stopping the runtime leaves an explicit worktree, its branch and its uncommitted work exactly as they are", async () => {
     const repo = initRepo();
     const h = harness({ defaultRepoPath: repo });
     const a = await h.mgr.acquire("w1", "git_worktree");
     await a.exec("bash", { command: "echo fix > fix.txt && git add fix.txt && git commit -qm 'fix bug'" });
-    const b = await h.mgr.acquire("w2", "git_worktree");
-    await b.exec("write", { path: "draft.md", content: "unfinished\n" });
+    await a.exec("write", { path: "draft.md", content: "unfinished\n" });
+    const head = git(a.root, "rev-parse", "HEAD");
 
-    await h.mgr.destroy("w1");
-    await h.mgr.destroy("w2");
-    expect(existsSync(a.root)).toBe(false);
-    expect(existsSync(b.root)).toBe(false);
+    await h.mgr.stopRuntime("w1");
+    await h.mgr.destroy("w1"); // the deprecated name does the same and no more
+    expect(existsSync(a.root)).toBe(true);
+    expect(git(repo, "worktree", "list")).toContain(a.root);
+    expect(git(repo, "branch", "--list", "ng/w1")).toContain("ng/w1");
+    // No snapshot commit was made on the cell's behalf: HEAD is where the cell left it and the draft is still uncommitted.
+    expect(git(a.root, "rev-parse", "HEAD")).toBe(head);
+    expect(git(a.root, "status", "--porcelain")).toBe("?? draft.md");
+    expect(h.mgr.getWorkspaceSync("w1")).toMatchObject({ status: "active", branch: "ng/w1" });
 
-    expect(git(repo, "log", "--format=%s", "ng/w1")).toContain("fix bug");
-    expect(h.mgr.getWorkspaceSync("w1")).toMatchObject({ status: "destroyed", branch: "ng/w1" });
-    // w2 never committed: its uncommitted file became a snapshot commit on its branch.
-    expect(git(repo, "show", "ng/w2:draft.md")).toBe("unfinished");
-    expect(git(repo, "log", "-1", "--format=%s", "ng/w2")).toMatch(/uncommitted work of cell w2/);
-    expect(h.mgr.getWorkspaceSync("w2")!.branch).toBe("ng/w2");
-  });
-
-  it("re-acquiring after destroy continues on the kept branch", async () => {
-    const repo = initRepo();
-    const h = harness({ defaultRepoPath: repo });
-    const a = await h.mgr.acquire("w1", "git_worktree");
-    await a.exec("bash", { command: "echo v1 > work.txt && git add work.txt && git commit -qm wip" });
-    await h.mgr.destroy("w1");
     const again = await h.mgr.acquire("w1", "git_worktree");
-    expect(readFileSync(join(again.root, "work.txt"), "utf8")).toBe("v1\n");
-    expect(h.mgr.getWorkspaceSync("w1")!.baseRef).toBe(git(repo, "rev-parse", "main"));
+    expect(again.root).toBe(a.root);
+    expect(readFileSync(join(again.root, "draft.md"), "utf8")).toBe("unfinished\n");
   });
 
   it("hibernate removes the worktree but keeps the work; restore brings uncommitted changes back uncommitted", async () => {

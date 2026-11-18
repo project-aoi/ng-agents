@@ -1,19 +1,25 @@
 import { isAbsolute, relative, resolve } from "node:path";
 import type { CliAdapter, CliCapabilities, CliDriver, CliEvent, DriverIO, LaunchRequest } from "../types";
-import { asRecord, contentText, num, str } from "./util";
+import { asRecord, contentText, HOST_UNSANDBOXED, num, str } from "./util";
 
 /**
  * Google Antigravity CLI through its Agent Client Protocol server (`agy acp`, JSON-RPC over stdio). Print mode has no
  * per-invocation MCP or system-prompt option (only global/workspace config files), ACP has both:
  *
  * - `session/new` (or `session/resume`) carries `cwd`, the bridge as a stdio MCP server, and the frozen system text
- *   as `_meta.antigravity.systemPrompt.append`. Nothing is written to ~/.gemini or the workspace.
+ *   as `_meta.antigravity.systemPrompt.append`. Nothing is written to ~/.gemini or the workspace; the owner's agy
+ *   login and settings load as usual.
  * - Permissions: in the default mode agy asks the client before every edit, command and MCP call
- *   (`session/request_permission`); this client answers from the cell's capabilities — kernel MCP tools and reads
- *   allowed, edits/deletes/moves only for writing cells and only inside the workspace, commands only with bash, web
- *   only when enabled, everything else rejected. The owner's own allow rules in agy's settings.json still apply first.
- * - Writing cells with bash run with `--sandbox` (agy's terminal sandbox: Linux namespaces, project folder writable,
- *   no network; agy silently runs without it when user namespaces are unavailable).
+ *   (`session/request_permission`); this client answers from the cell's capabilities (`agyPermissionAllowed`). The
+ *   kernel's MCP tools are always allowed; the owner's own allow rules in agy's settings.json still apply first.
+ *   - Host access, writing (docs/05 default): everything is approved — edits/deletes/moves anywhere, commands, web
+ *     fetches, the ACP catch-all kinds (`switch_mode`, `other`, e.g. the owner's own MCP tools). No `--sandbox`.
+ *   - Host access, read-only: reads/searches anywhere and web fetches approved; edits/deletes/moves, commands, mode
+ *     switches (a switch could stop agy from asking) and unclassified requests rejected. No `--sandbox`.
+ *   - Workspace access: reads allowed, edits/deletes/moves only for writing cells and only inside the workspace,
+ *     commands only with bash, web only when enabled, everything else rejected. Writing cells with bash run with
+ *     `--sandbox` (agy's terminal sandbox: Linux namespaces, project folder writable, no network; agy silently runs
+ *     without it when user namespaces are unavailable).
  * - Steer: `session/cancel` the running prompt, then `session/prompt` with the steer text (same process and session).
  * - Usage: `session/prompt` result `usage.totalTokens` per turn; no cost is reported (cents 0). No native fork.
  */
@@ -21,19 +27,29 @@ export function agyAdapter(): CliAdapter {
   return {
     engine: "agy",
     defaultBin: "agy",
-    defaultModels: { strong: "", fast: "gemini-3.8-flash-medium" },
+    defaultModels: { strong: "", fast: "" },
     canFork: false,
     mcpToolName: (server, tool) => `mcp_${server}_${tool}`,
     createDriver: (req) => new AgyDriver(req),
     describePermissions,
+    readOnlyHowTo: (caps) =>
+      `Read with your file viewing and search tools (any path on this machine)${caps.web ? ", and fetch web pages when needed" : ""}. Requests to edit files or to run commands are rejected in this session.`,
   };
 }
 
 export function agyArgs(req: LaunchRequest): string[] {
-  return ["acp", ...(!req.caps.readOnly && req.caps.bash ? ["--sandbox"] : []), ...req.extraArgs];
+  const { caps } = req;
+  return ["acp", ...(caps.access === "workspace" && !caps.readOnly && caps.bash ? ["--sandbox"] : []), ...req.extraArgs];
 }
 
 function describePermissions(caps: CliCapabilities): string {
+  if (caps.access === "host") {
+    const web = caps.web ? "web fetches, " : "";
+    if (!caps.readOnly) {
+      return `agy: host access, writing — the kernel's ACP client approves every permission request (edits/deletes/moves anywhere, commands, ${web}MCP tools, mode switches); no --sandbox; ${HOST_UNSANDBOXED}.`;
+    }
+    return `agy: host access, read-only — the kernel's ACP client approves reads and searches anywhere, ${web}and the kernel's MCP tools, and rejects every edit/delete/move, command, mode switch and unclassified request (enforced per call by the client; relies on agy asking, which its default mode does unless the owner's agy settings pre-allow a rule); no --sandbox.`;
+  }
   if (caps.readOnly) {
     return `agy: read-only — every edit/command permission request is rejected by the kernel's ACP client (enforced per call by the client; relies on agy asking, which its default mode does unless the owner's agy settings pre-allow a rule).`;
   }
@@ -47,11 +63,19 @@ type Pending = "initialize" | "session" | "model" | "prompt";
 const PERMISSION_KINDS_READ = new Set(["read", "search", "think"]);
 const PERMISSION_KINDS_WRITE = new Set(["edit", "delete", "move"]);
 
-/** Decide one `session/request_permission` from the cell's capabilities (exported for tests). */
+/**
+ * Decide one `session/request_permission` from the cell's capabilities (exported for tests). ACP tool kinds: read,
+ * edit, delete, move, search, execute, think, fetch, switch_mode, other.
+ */
 export function agyPermissionAllowed(toolCall: Record<string, unknown>, caps: CliCapabilities, serverName: string): boolean {
   const prefix = `mcp_${serverName}_`;
   if ((str(toolCall["name"]) ?? "").startsWith(prefix) || (str(toolCall["title"]) ?? "").startsWith(`Run ${prefix}`)) return true;
   const kind = str(toolCall["kind"]) ?? "other";
+  if (caps.access === "host") {
+    if (kind === "fetch") return caps.web;
+    // A writing cell on the host may do anything the owner could; a read-only one reads/searches anywhere.
+    return !caps.readOnly || PERMISSION_KINDS_READ.has(kind);
+  }
   const paths = locationPaths(toolCall);
   const inside = paths.every((p) => isInside(caps.root, p));
   if (PERMISSION_KINDS_READ.has(kind)) return inside || caps.isolation === "none";
@@ -205,7 +229,7 @@ class AgyDriver implements CliDriver {
           break;
         }
         if (error) out.push({ type: "turn_end", ok: false, error: str(error["message"]) ?? "prompt failed" });
-        else if (result["stopReason"] === "refusal") out.push({ type: "turn_end", ok: false, error: "the model refused" });
+        else if (result["stopReason"] === "refusal") out.push({ type: "turn_end", ok: false, refused: true });
         else out.push({ type: "turn_end", ok: true, ...(stopped ? { stopped } : {}) });
         break;
       }

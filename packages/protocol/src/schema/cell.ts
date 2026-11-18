@@ -3,14 +3,47 @@ import type { SchemaModule } from "./types";
 // Owner: @ng/cell. Other packages read through cellsRepo(db); Inbox.control may bump epoch / set status through it.
 export const cellSchema: SchemaModule = {
   owner: "@ng/cell",
-  version: 1,
+  version: 2,
+  migrations: [
+    {
+      // v1 pinned `preset` to the four original names with a CHECK; docs/05 adds presets, and a CHECK can only be
+      // changed by recreating the table.
+      version: 2,
+      rebuild: true,
+      up: /* sql */ `
+CREATE TABLE cells_v2 (
+  id            TEXT PRIMARY KEY,
+  parent_id     TEXT REFERENCES cells(id),
+  root_id       TEXT NOT NULL,
+  depth         INTEGER NOT NULL DEFAULT 0,
+  preset        TEXT,                          -- PresetName, validated by the kernel (PRESET_NAMES)
+  title         TEXT,
+  spec          TEXT NOT NULL,                 -- JSON CellSpec, resolved (preset defaults applied)
+  bounds        TEXT NOT NULL,                 -- JSON SerializedBounds, effective (after attenuate)
+  epoch         INTEGER NOT NULL DEFAULT 0,
+  status        TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','paused','closed')),
+  close_reason  TEXT CHECK (close_reason IS NULL OR close_reason IN ('completed','cancelled')),
+  principal_id  TEXT NOT NULL,                 -- who created it
+  created_at    INTEGER NOT NULL,
+  updated_at    INTEGER NOT NULL,
+  last_run_at   INTEGER,
+  closed_at     INTEGER
+);
+INSERT INTO cells_v2 (id, parent_id, root_id, depth, preset, title, spec, bounds, epoch, status, close_reason, principal_id, created_at, updated_at, last_run_at, closed_at)
+  SELECT id, parent_id, root_id, depth, preset, title, spec, bounds, epoch, status, close_reason, principal_id, created_at, updated_at, last_run_at, closed_at FROM cells;
+DROP TABLE cells;
+ALTER TABLE cells_v2 RENAME TO cells;
+ALTER TABLE cell_watches ADD COLUMN coalesce_ms INTEGER;
+`,
+    },
+  ],
   ddl: /* sql */ `
 CREATE TABLE IF NOT EXISTS cells (
   id            TEXT PRIMARY KEY,
   parent_id     TEXT REFERENCES cells(id),
   root_id       TEXT NOT NULL,
   depth         INTEGER NOT NULL DEFAULT 0,
-  preset        TEXT CHECK (preset IS NULL OR preset IN ('inline','worker','watcher','sensor')),
+  preset        TEXT,                          -- PresetName, validated by the kernel (PRESET_NAMES)
   title         TEXT,
   spec          TEXT NOT NULL,                 -- JSON CellSpec, resolved (preset defaults applied)
   bounds        TEXT NOT NULL,                 -- JSON SerializedBounds, effective (after attenuate)
@@ -35,9 +68,22 @@ CREATE TABLE IF NOT EXISTS cell_watches (
   filter        TEXT NOT NULL DEFAULT '{}',    -- JSON threadOrFilter (full CellSpec.watches entry)
   cancel_group  TEXT,
   active        INTEGER NOT NULL DEFAULT 1,
-  created_at    INTEGER NOT NULL
+  created_at    INTEGER NOT NULL,
+  coalesce_ms   INTEGER                        -- docs/05 §3.3: batching window of what this watch routes (NULL = deliver at once)
 );
 CREATE INDEX IF NOT EXISTS idx_watches_thread ON cell_watches(thread) WHERE active = 1 AND thread IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_watches_cell ON cell_watches(cell_id, active);
+
+-- docs/05 guard 2: what a sleeping cell is waiting on (the "@Waiting(internal)" anchor). One row per (cell, party);
+-- deleted when that party answers, the wait times out, or the cell closes.
+CREATE TABLE IF NOT EXISTS cell_waits (
+  cell_id       TEXT NOT NULL REFERENCES cells(id),
+  waiting_for   TEXT NOT NULL,                 -- an address (inbox:<cellId>, channel:…) or "human" / "external"
+  reason        TEXT NOT NULL,
+  epoch         INTEGER NOT NULL,              -- cell epoch when registered
+  timeout_at    INTEGER,
+  created_at    INTEGER NOT NULL,
+  PRIMARY KEY (cell_id, waiting_for)
+) WITHOUT ROWID;
 `,
 };

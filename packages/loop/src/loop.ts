@@ -57,7 +57,8 @@ export const BUDGET_STOP_OUTPUT = "Not executed: the budget limit was reached an
  *
  * Outcomes: `completed` (also: no tool call, maxSteps reached), `yielded_waiting` (a tool said endRun
  * yielded_waiting, or `awaitsWakeup` on a Run that would otherwise complete), `deferred_for_approval`, `cancelled`
- * (signal), `budget_stopped` (meter → hard_stop, checked once before the first call and after every call).
+ * (signal), `budget_stopped` (meter → hard_stop, checked once before the first call and after every call),
+ * `step_limit` (maxSteps model calls with work left) and `refused` (the model's stop reason is a refusal).
  * Model/transport errors are rethrown for the kernel to release/retry the claim; tool exceptions become error results.
  *
  * code Runs: `script:<path>` runs through the workspace (see script.ts), anything else is a registered CodeProcessor.
@@ -120,6 +121,17 @@ export function createAgentLoop(opts: AgentLoopOptions): AgentLoop {
       return messages.length;
     };
 
+    /**
+     * docs/05 §3.3: messages that reached the cell while this Run works join it (same claim, already recorded as
+     * `inbound` evidence by the kernel) — a follow-up is answered here instead of after a stale report. The port
+     * decides who absorbs (hubs, one-shot cells); for everyone else it returns nothing.
+     */
+    const injectInbound = (): number => {
+      const arrived = ports.drainInbound?.() ?? [];
+      for (const a of arrived) conv.appendUserText(a.text);
+      return arrived.length;
+    };
+
     if (ports.meter({ tokens: 0, billedCents: 0 }) === "hard_stop") return "budget_stopped";
 
     let steps = 0;
@@ -133,8 +145,10 @@ export function createAgentLoop(opts: AgentLoopOptions): AgentLoop {
     for (;;) {
       if (signal.aborted) return "cancelled";
       if (steps >= maxSteps) {
-        await append({ kind: "system_note", text: `[run stopped after ${maxSteps} model calls (step limit); continue on the next wake-up]` });
-        return finish("completed");
+        // Work is left (the model has not answered the latest input): never report that as completed. The kernel
+        // queues a continuation, and asks the owner after a few in a row (docs/05 guard 1).
+        await append({ kind: "system_note", text: `[run stopped after ${maxSteps} model calls (step limit); the kernel wakes you to continue]` });
+        return "step_limit";
       }
 
       const response: ModelResponse = await raceAbort(
@@ -168,10 +182,14 @@ export function createAgentLoop(opts: AgentLoopOptions): AgentLoop {
       }
       if (signal.aborted) return "cancelled";
 
-      if (calls.length === 0 || response.stopReason === "refusal") {
+      if (response.stopReason === "refusal") {
         if (calls.length) await recordUnexecuted(calls, "Not executed: the model declined this turn.");
-        // A steer that arrived while the model was answering gets a reply in this Run rather than a new wake-up.
-        if ((await injectSteer()) > 0 && steps < maxSteps) continue;
+        // A refusal is not a result (docs/05 guard 1): a one-shot cell reports `failed`, a coordinator raises a card.
+        return "refused";
+      }
+      if (calls.length === 0) {
+        // A steer or a follow-up that arrived while the model was answering gets its reply in this Run.
+        if ((await injectSteer()) + injectInbound() > 0) continue;
         return finish("completed");
       }
 
@@ -198,6 +216,7 @@ export function createAgentLoop(opts: AgentLoopOptions): AgentLoop {
       conv.appendToolResults(results);
       if (endRun) return finish(endRun);
       await injectSteer();
+      injectInbound();
     }
 
     async function recordUnexecuted(calls: ToolUseBlock[], output: string): Promise<void> {

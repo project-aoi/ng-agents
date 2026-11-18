@@ -3,6 +3,8 @@ import { join } from "node:path";
 import { serveStatic } from "@hono/node-server/serve-static";
 import type { ChannelHubImpl } from "@ng/channel";
 import { NgError } from "@ng/protocol";
+import type { ModelsDTO, SetModelRequest } from "../shared/api";
+import type { ModelSwitch } from "./models";
 import { Hono, type Context } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { streamSSE } from "hono/streaming";
@@ -10,7 +12,8 @@ import type { ActivityKind, ApiError, DeskEvent, Effort } from "../shared/api";
 import { DeskError, type Desk } from "./desk";
 import type { EventHub } from "./events";
 import { isEffort } from "./projections/engage";
-import { bearerOf, crossSiteReason, hostnameOf, tokenMatches, type SecurityPolicy } from "./security";
+import { mountAgentApi, type AgentControlPlane } from "../agent/routes";
+import { agentAuthFor, bearerOf, crossSiteReason, hostnameOf, tokenMatches, type SecurityPolicy } from "./security";
 
 const MAX_BODY = 1024 * 1024;
 const PING_MS = 25_000;
@@ -21,6 +24,10 @@ export interface DeskAppDeps {
   hub: Pick<ChannelHubImpl, "handleHttp">;
   events: EventHub;
   security: SecurityPolicy;
+  /** docs/05 §5.3: the external main agent's control plane (`/api/agent/*`, also what the MCP server proxies to). */
+  agent?: AgentControlPlane;
+  /** The owner's model switch (CLI backends). */
+  models?: ModelSwitch;
   /** Built web client (index.html + assets); null/missing = API only. */
   webDir?: string | null;
   onError?: (err: unknown, where: string) => void;
@@ -56,6 +63,17 @@ async function body<T>(c: Context): Promise<T> {
  * The HTTP surface: `/api/*` (bearer token when configured, same-site writes only), `/api/events` (SSE),
  * `/hooks/:channelId` (provider webhooks, authenticated by each channel's signature check), and the built web client.
  */
+const NO_MODELS: ModelsDTO = {
+  available: false,
+  engine: null,
+  models: [],
+  recommended: null,
+  fetchedAt: null,
+  error: null,
+  selection: { strong: { mode: "auto" }, fast: { mode: "auto" } },
+  effective: { strong: null, fast: null },
+};
+
 export function createDeskApp(deps: DeskAppDeps): Hono {
   const { desk, events, security } = deps;
   const onError = deps.onError ?? ((err, where) => console.error(`[desk] ${where}:`, err));
@@ -79,6 +97,17 @@ export function createDeskApp(deps: DeskAppDeps): Hono {
     }
     const why = crossSiteReason({ method: c.req.method, url: c.req.url, header: (n) => c.req.header(n) });
     if (why) return apiError(c, why.startsWith("body") ? 415 : 403, "cross_site", `拒绝跨站请求（${why}）`);
+    if (c.req.path.startsWith("/api/agent/")) {
+      // A separate credential and a separate identity: the caller is `agent:<id>`, never the owner (docs/05 guard 3).
+      const auth = agentAuthFor(security, bearerOf(c.req.header("authorization")));
+      if (!auth.ok) {
+        c.header("WWW-Authenticate", 'Bearer realm="gtd-desk-agent"');
+        return apiError(c, 401, "unauthorized", auth.reason);
+      }
+      c.set("agentPrincipal" as never, auth.principalId as never);
+      c.header("Cache-Control", "no-store");
+      return next();
+    }
     if (security.token) {
       const presented = bearerOf(c.req.header("authorization")) ?? (c.req.path === "/api/events" ? (c.req.query("token") ?? null) : null);
       if (!tokenMatches(presented, security.token)) {
@@ -94,7 +123,17 @@ export function createDeskApp(deps: DeskAppDeps): Hono {
   app.use("/hooks/*", limit);
 
   // ---------- top bar ----------
-  app.get("/api/status", (c) => c.json(desk.status()));
+  const withModel = <T extends { model?: string }>(status: T): T => {
+    const label = deps.models?.label();
+    return label ? { ...status, model: label } : status;
+  };
+  app.get("/api/status", (c) => c.json(withModel(desk.status())));
+  // The owner's model switch: the list is whatever the backend CLI reports.
+  app.get("/api/models", async (c) => c.json(await (deps.models ? deps.models.view({ refresh: c.req.query("refresh") === "1" }) : NO_MODELS)));
+  app.put("/api/models", async (c) => {
+    if (!deps.models) throw new DeskError(400, "unsupported", "当前不是由 CLI Agent 驱动，没有可切换的模型");
+    return c.json(await deps.models.set(await body<SetModelRequest>(c)));
+  });
   app.post("/api/capture", async (c) => c.json(await desk.capture(await body(c))));
   app.post("/api/focus", async (c) => c.json(await desk.focus(await body(c))));
 
@@ -190,6 +229,9 @@ export function createDeskApp(deps: DeskAppDeps): Hono {
       }
     }),
   );
+
+  // ---------- external main agent ----------
+  if (deps.agent) mountAgentApi(app, deps.agent, (c) => (c.get("agentPrincipal" as never) as `agent:${string}` | undefined) ?? null);
 
   app.all("/api/*", (c) => apiError(c, 404, "not_found", "没有这个接口"));
 

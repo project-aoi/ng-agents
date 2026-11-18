@@ -8,7 +8,14 @@ export interface Workspace {
   acquire(cellId: string, isolation: PolicyBounds["isolation"], opts?: WorkspaceAcquireOptions /* [ext] */): Promise<WorkspacePort>;
   hibernate?(cellId: string): Promise<string>;
   restore?(snapshotId: string): Promise<WorkspacePort>;
+  /** @deprecated docs/05: nothing on disk is the kernel's to remove. Kept as an alias of `stopRuntime`. */
   destroy(cellId: string): Promise<void>;
+  /**
+   * [ext] docs/05 guard 4 — reclaim the cell's *runtime* only: cancel its Jobs and wait until their process groups are
+   * gone, and remove an explicit (or legacy) container. Never touches a host directory, a branch or a worktree.
+   * Idempotent; resolves once nothing of the cell is still running.
+   */
+  stopRuntime(cellId: string): Promise<void>;
 
   // ---------- [ext] ----------
   /**
@@ -21,6 +28,9 @@ export interface Workspace {
    * only its pid) is re-attached and reports when it ends; a process that is gone is finished from the exit status
    * it recorded, or as `failed` when it recorded none (killed together with the previous kernel). Each such job
    * gets its job.result enqueued exactly once.
+   * [ext] docs/05: a job whose cancellation was requested but not confirmed (`cancelRequestedAt` set, still `running`)
+   * is killed again here and only then recorded `cancelled` — recover() resolves after those processes are gone, so
+   * the dispatcher never starts a second writer in a directory an old process still works in.
    */
   recover(): Promise<void>;
   getJobSync(jobId: string): JobRecord | undefined;
@@ -49,9 +59,13 @@ export interface WorkspacePort {
 // ==================== [ext] types ====================
 
 export interface WorkspaceAcquireOptions {
-  repoPath?: string;                    // repository to base a git_worktree/container on (kernel passes spec.meta.workspace?.repoPath)
+  repoPath?: string;                    // repository to base an explicit git_worktree/container on (spec.meta.workspace?.repoPath)
   baseRef?: string;                     // commit-ish the worktree starts from (default HEAD)
   branch?: string;                      // branch name to create (default derived from cellId)
+  /** [ext] docs/05 — the cell's working directory for isolation "none"/"shared_ro" (absolute; must exist). */
+  cwd?: string;
+  /** [ext] docs/05 — the cell's declared intent ("read" = it did not queue for the work tree's write slot). Informational: the port enforces nothing by it. Default "write". */
+  cwdMode?: "read" | "write";
 }
 
 /**
@@ -83,6 +97,11 @@ export interface JobRecord {
   startedAt: number;
   finishedAt: number | null;
   updatedAt: number;
+  /**
+   * [ext] docs/05 — set when cancellation was requested; the job stays `running` ("cancelling") until its process
+   * group is confirmed gone, then becomes `cancelled`. A crash in between leaves it for recover() to finish.
+   */
+  cancelRequestedAt: number | null;
 }
 
 export type WorkspaceStatus = "active" | "hibernated" | "destroyed" | "failed";

@@ -1,8 +1,11 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { gtdKeys, PAYLOAD, type ActionRecord, type Envelope } from "@ng/protocol";
-import { KEYS } from "../src";
-import { RESTORE_REASON } from "../src/shared/config";
-import { boot, cleanupAll, lastToolResult, roots, tool, type Harness } from "./helpers";
+import { gtdKeys, PAYLOAD, selectRunTools, type ActionRecord, type Envelope } from "@ng/protocol";
+import { BUILTIN_SKILLS, KEYS, PROMPTS, startProjectSync } from "../src";
+import { RESTORE_REASON, resolveConfig } from "../src/shared/config";
+import { promptDefs } from "../src/shared/prompts";
+import { SKILL_DOMAIN_HUB, SKILL_HABIT_DISCOVERY, SKILL_PROJECT_RELAY, SKILL_WORKSPACE_ARBITRATION } from "../src/shared/skills";
+import { replyWatcherSpec } from "../src/shared/watcher";
+import { boot, childrenOf, cleanupAll, lastToolResult, projects, tool, type Harness } from "./helpers";
 
 afterEach(cleanupAll);
 
@@ -111,20 +114,81 @@ describe("conventions the workbench app relies on", () => {
     expect(h.cards()).toEqual([]);
   });
 
-  it("stopping an item the owner had paused still winds it down and marks it cancelled", async () => {
+  it("stopping a project the owner had paused closes it and everything below it; the records say cancelled", async () => {
     const h = await boot();
-    h.script.add("desk", tool("delegate", { title: "整理客户名单", instruction: "整理", research: true }), tool("wait", { reason: "ok" }));
+    h.script.add("desk", tool("start_project", { title: "整理客户名单", outcome: "一份去重后的客户名单", brief: "整理一下客户名单" }), tool("wait", { reason: "ok" }));
+    h.script.add("project", tool("dispatch", { title: "整理名单", instruction: "整理客户名单", cwdMode: "read" }), {});
     h.script.add("worker", tool("wait", { reason: "thinking" }));
     await h.ui.capture({ text: "整理一下客户名单" });
     await h.kernel.idle();
-    const [root] = roots(h);
-    expect(h.kernel.control(root!, { action: "pause" })).toMatchObject({ applied: true });
+    const [project] = projects(h);
+    const [worker] = childrenOf(h, project!);
+    expect(h.kernel.control(project!, { action: "pause" })).toMatchObject({ applied: true });
 
-    h.script.add("desk", tool("stop_item", { itemId: root, reason: "不需要了" }), tool("wait", { reason: "ok" }));
+    h.script.add("desk", tool("stop_item", { itemId: project, reason: "不需要了" }), tool("wait", { reason: "ok" }));
     await h.ui.capture({ text: "客户名单不用整理了" });
     await h.kernel.idle();
-    expect(h.project(root!)).toMatchObject({ lifecycle: "cancelled" });
-    expect(h.actions(root)).toEqual([expect.objectContaining({ status: "cancelled" })]);
-    expect(h.kernel.getCell(root!)).toMatchObject({ status: "closed", closeReason: "cancelled" });
+    expect(h.project(project!)).toMatchObject({ lifecycle: "cancelled" });
+    expect(h.actions(project)).toEqual([expect.objectContaining({ status: "cancelled" })]);
+    expect(h.kernel.getCell(project!)).toMatchObject({ status: "closed", closeReason: "cancelled" });
+    expect(h.kernel.getCell(worker!)).toMatchObject({ status: "closed", closeReason: "cancelled" });
+  });
+});
+
+// ==================== prompts vs tools ====================
+
+/**
+ * Snake_case or `ticked` words that appear in the prompts but are argument values or shell commands, not tools
+ * (the worker's look-only note names git subcommands: `git log` / `diff` / `show`).
+ */
+const NOT_TOOLS = new Set(["research_then_park", "diff", "show"]);
+
+/**
+ * Names a prompt mentions that its role does not have, reported to the prompts' owner (see the presets report). The
+ * test fails when a new one appears — and when one listed here is fixed, so this list never goes stale.
+ */
+const KNOWN_PROMPT_GAPS: Readonly<Record<string, readonly string[]>> = {};
+
+function mentionedTools(text: string): string[] {
+  const snake = text.match(/\b[a-z]+(?:_[a-z0-9]+)+\b/g) ?? [];
+  const ticked = [...text.matchAll(/`([a-z][a-z0-9_]*)`/g)].map((m) => m[1]!);
+  return [...new Set([...snake, ...ticked])].filter((n) => !NOT_TOOLS.has(n) && !n.startsWith("cell_")).sort();
+}
+
+describe("conventions: every prompt names only tools its role has", () => {
+  it("role prompts and the playbooks they rely on", async () => {
+    const h = await boot();
+    const { projectId } = startProjectSync(h.kernel, { title: "p", outcome: "o", brief: "b" });
+    h.kernel.spawnCell(projectId, { preset: "worker", title: "w" });
+    h.kernel.spawnCell(projectId, { preset: "watcher", title: "c" });
+    h.kernel.spawnCell(projectId, replyWatcherSpec({ id: "p1", label: "张三", thread: "memory:t" }, { description: "d", itemTitle: "p", interpret: true }));
+    h.kernel.spawnCell("desk", { preset: "sensor", title: "s" });
+    h.kernel.spawnCell("desk", { preset: "hub", title: "h" });
+    const cells = h.kernel.listCells({ status: ["active"] });
+    const toolsOf = (prompt: string): string[] => {
+      const cell = cells.find((c) => c.spec.processor.kind === "llm" && c.spec.processor.prompt === prompt);
+      if (!cell || cell.spec.processor.kind !== "llm") throw new Error(`no cell runs ${prompt}`);
+      return selectRunTools(h.registry.resolveTools(cell.spec.processor.toolsets ?? []), cell.spec.processor, cell.bounds, cell.spec).map((t) => t.name);
+    };
+    const skill = (name: string) => BUILTIN_SKILLS.find((s) => s.name === name)!.body;
+    const checks: Array<{ prompt: string; text: string; source: string }> = [
+      ...promptDefs(resolveConfig()).map((p) => ({ prompt: p.name, text: p.text, source: p.name })),
+      { prompt: PROMPTS.project, text: skill(SKILL_PROJECT_RELAY), source: SKILL_PROJECT_RELAY },
+      { prompt: PROMPTS.hub, text: skill(SKILL_DOMAIN_HUB), source: SKILL_DOMAIN_HUB },
+      { prompt: PROMPTS.desk, text: skill(SKILL_WORKSPACE_ARBITRATION), source: SKILL_WORKSPACE_ARBITRATION },
+      { prompt: PROMPTS.desk, text: skill(SKILL_HABIT_DISCOVERY), source: SKILL_HABIT_DISCOVERY },
+    ];
+    const missing: Record<string, string[]> = {};
+    for (const c of checks) {
+      const have = new Set(toolsOf(c.prompt));
+      const gaps = mentionedTools(c.text).filter((n) => !have.has(n));
+      if (gaps.length) missing[c.source] = [...(missing[c.source] ?? []), ...gaps];
+    }
+    expect(missing).toEqual(KNOWN_PROMPT_GAPS);
+    // A one-shot worker and the watcher preset's checker get the general primitives too, spawning included: whether
+    // they delegate is their prompt's business, not a filter's.
+    for (const prompt of [PROMPTS.worker, PROMPTS.checker]) expect(toolsOf(prompt)).toEqual(expect.arrayContaining(["spawn_cell", "control_cell", "close_cell", "bash", "write"]));
+    // Every registered role prompt was checked (the legacy stand-in names no tools).
+    expect(new Set(checks.map((c) => c.prompt))).toEqual(new Set(Object.values(PROMPTS)));
   });
 });

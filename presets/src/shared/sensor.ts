@@ -150,6 +150,7 @@ export function sensorToolset(): Toolset {
           summary: z.string().min(1).describe("what was found and why it matters, in Chinese"),
           rawInput: z.string().optional().describe("the original message or data excerpt"),
           uri: z.string().optional(),
+          artifactId: z.string().optional().describe("a draft you prepared for the owner with save_artifact (e.g. this week's report)"),
         }),
         async handler(args, ctx) {
           const due = dueEnvelopes(ctx.snapshot.batch.envelopes);
@@ -158,7 +159,9 @@ export function sensorToolset(): Toolset {
             await ensureSource(ctx.ports, ctx.clock.now());
             return { output: "Nothing has been observed yet; this was only your setup.", endRun: "completed" };
           }
-          const src = await recordCheck(ctx.ports, ctx.clock.now(), { hit: { ...args } }, due[0]!.id);
+          const { artifactId, ...hit } = args;
+          const uri = hit.uri ?? (artifactId ? `artifact://${artifactId}` : undefined);
+          const src = await recordCheck(ctx.ports, ctx.clock.now(), { hit: { ...hit, ...(uri ? { uri } : {}), ...(artifactId ? { data: { artifactId } } : {}) } }, due[0]!.id);
           return { output: src.mode === "observe" ? "Noted (observation mode: no item created)." : "Reported to the desk.", endRun: "completed" };
         },
       }),

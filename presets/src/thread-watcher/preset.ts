@@ -1,26 +1,18 @@
-import type { PresetDef, PromptDef } from "@ng/protocol";
-import { PROMPTS, ROLES } from "../shared/config";
-import { WATCHER_CODE_PROCESSOR } from "../shared/plan";
+import type { PresetDef } from "@ng/protocol";
+import { ROLES } from "../shared/config";
+import { CHECKER_PROCESSOR } from "../shared/processors";
 
-/** Only for watchers that interpret replies with a model (chase_replies interpret: true); the default is zero-token. */
-export function watcherPrompt(): PromptDef {
-  return {
-    name: PROMPTS.watcher,
-    description: "thread watcher (model variant): judges replies, words follow-ups",
-    text: `You wait for one person's reply on the owner's behalf. Their messages on the watched thread reach you directly; your task message says what is awaited.
-
-- A message that answers what is awaited: record_reply with a short Chinese summary of the answer.
-- A message about something else: hand it back to the desk with handback.
-- The wait timed out (a timer wake-up): draft_nudge with a short, polite follow-up in the thread's language (Chinese by default), or without text for the standard wording. The owner decides whether it is sent.
-- Any other wake-up (setup, the owner's decision on a follow-up, instructions from your parent): update_watch.
-Never message anyone yourself.`,
-  };
-}
-
+/**
+ * The `watcher` preset's default is a light one-shot checker run by a fast model: it looks at one outside condition
+ * (with `gh`/`glab`/`git ls-remote`/`test -d` in a directory of its own), keeps looking via its own watches and
+ * reminders, and reports once when the condition holds. The zero-token reply watcher (await_reply) is the same preset
+ * with an explicit processor and lifetime "persistent" (replyWatcherSpec).
+ */
 export function watcherPreset(): PresetDef {
   return {
     name: "watcher",
-    description: "External follow-up: waiting set in state, thread watch, deliverAt timeout with a cancelGroup, drafted nudge on timeout. Zero-token by default.",
-    defaults: { processor: WATCHER_CODE_PROCESSOR, bounds: { isolation: "none", tools: new Set() }, meta: { role: ROLES.watcher } },
+    description: "Light one-shot checker of one outside condition (MR merged, CI green, a path exists, a reply arrived): looks at the current state first, reports when it holds.",
+    defaults: { processor: CHECKER_PROCESSOR, cwdMode: "write", lifetime: "one_shot", meta: { role: ROLES.checker } },
+    inheritCwd: false,
   };
 }

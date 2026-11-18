@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { all } from "@ng/protocol";
+import { all, isNgError } from "@ng/protocol";
 import { exec, expectType, meta, setup, withWorker } from "./helpers";
 
 const alerts = (f: ReturnType<typeof setup>) => f.events.filter((e) => e.topic === "ledger.alert").map((e) => e.data);
@@ -68,6 +68,23 @@ describe("dual ledger", () => {
     expect(alerts(f).filter((a) => (a as { level: string }).level === "hard_stop")).toHaveLength(2);
     expect(() => f.gate.raiseBudgetSync("w1", { tokens: -1 }, "owner")).toThrow(/≥ 0/);
     expect(() => f.gate.raiseBudgetSync("ghost", { tokens: 1 }, "owner")).toThrow(/not found/);
+  });
+
+  it("only the owner may raise a budget: an agent on the control plane cannot spend past a hard stop (docs/05 guard 3)", () => {
+    const f = setup();
+    withWorker(f, "w1", { maxTokens: 1_000, maxCents: 1_000 });
+    f.gate.meter("w1", { tokens: 1_000, billedCents: 0 });
+    let err: unknown;
+    try {
+      f.gate.raiseBudgetSync("w1", { tokens: 4_000 }, "agent:ops");
+    } catch (e) {
+      err = e;
+    }
+    expect(isNgError(err, "bounds_violation")).toBe(true);
+    expect((err as Error).message).toBe("raising a budget needs the owner; agent:ops may not");
+    expect(f.gate.usageSync("w1")).toMatchObject({ raisedTokens: 0, state: "hard_stop" });
+    expect(all(f.db, "SELECT * FROM budget_raises")).toEqual([]);
+    expectType(f.gate.authorizeSync(exec("read"), meta("w1")), "deny");
   });
 
   it("a zero limit is exhausted from the start", () => {

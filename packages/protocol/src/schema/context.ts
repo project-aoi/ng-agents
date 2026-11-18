@@ -1,9 +1,34 @@
 import type { SchemaModule } from "./types";
 
+// v3 (docs/05 §5.3): subtree/global searchHistory also covers artifact bodies, cell_state values and the full text of
+// resources. Same trigram tokenizer as evidence_fts. artifact_fts/state_fts index derived text (the Deliverable body,
+// the string leaves of a JSON value), so they keep their own copy keyed by the source row's rowid; resource_fts is an
+// external-content index over resources.content. Triggers keep all three in the writing statement's transaction.
+const SEARCH_FTS_TABLES = /* sql */ `
+CREATE VIRTUAL TABLE IF NOT EXISTS artifact_fts USING fts5(title, body, tokenize = 'trigram');
+CREATE VIRTUAL TABLE IF NOT EXISTS state_fts USING fts5(key, text, tokenize = 'trigram');
+CREATE VIRTUAL TABLE IF NOT EXISTS resource_fts USING fts5(content, content = 'resources', tokenize = 'trigram');
+`;
+
+/** Searchable body of an artifacts row (`content` is a JSON Deliverable). */
+const artifactBody = (row: string) => `CASE WHEN json_valid(${row}.content) THEN json_extract(${row}.content, '$.body') END`;
+
+/** Searchable text of a cell_state value: its string leaves, one per line (a non-JSON value counts as one string). */
+const stateText = (row: string) =>
+  `(SELECT group_concat(j.value, char(10)) FROM json_tree(CASE WHEN json_valid(${row}.value) THEN ${row}.value ELSE json_quote(${row}.value) END) AS j WHERE j.type = 'text')`;
+
+const SEARCH_FTS_BACKFILL = /* sql */ `
+DELETE FROM artifact_fts;
+INSERT INTO artifact_fts(rowid, title, body) SELECT a.rowid, a.title, ${artifactBody("a")} FROM artifacts a;
+DELETE FROM state_fts;
+INSERT INTO state_fts(rowid, key, text) SELECT s.seq, s.key, ${stateText("s")} FROM cell_state s;
+INSERT INTO resource_fts(resource_fts) VALUES ('rebuild');
+`;
+
 // Owner: @ng/context. Gate/kernel read artifacts through artifactsRepo(db).
 export const contextSchema: SchemaModule = {
   owner: "@ng/context",
-  version: 2,
+  version: 3,
   migrations: [
     {
       version: 2,
@@ -16,16 +41,38 @@ ALTER TABLE prompt_prefixes ADD COLUMN summary_upto_seq INTEGER NOT NULL DEFAULT
 ALTER TABLE prompt_prefixes ADD COLUMN compactions INTEGER NOT NULL DEFAULT 0;
 `,
     },
+    {
+      // cell_state was WITHOUT ROWID; state_fts needs a stable integer key per row, so the table is recreated with one
+      // (nothing references cell_state, so a plain copy-and-rename is enough).
+      version: 3,
+      up: /* sql */ `
+ALTER TABLE artifact_versions ADD COLUMN cell_id TEXT REFERENCES cells(id);
+CREATE TABLE cell_state_v3 (
+  seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+  cell_id     TEXT NOT NULL REFERENCES cells(id),
+  key         TEXT NOT NULL,
+  value       TEXT NOT NULL,
+  updated_at  INTEGER NOT NULL,
+  UNIQUE (cell_id, key)
+);
+INSERT INTO cell_state_v3 (cell_id, key, value, updated_at) SELECT cell_id, key, value, updated_at FROM cell_state ORDER BY cell_id, key;
+DROP TABLE cell_state;
+ALTER TABLE cell_state_v3 RENAME TO cell_state;
+${SEARCH_FTS_TABLES}
+${SEARCH_FTS_BACKFILL}
+`,
+    },
   ],
   ddl: /* sql */ `
 -- Layer 1: business state (single writer per cell via the Inbox serial lock).
 CREATE TABLE IF NOT EXISTS cell_state (
+  seq         INTEGER PRIMARY KEY AUTOINCREMENT, -- v3: stable rowid for state_fts
   cell_id     TEXT NOT NULL REFERENCES cells(id),
   key         TEXT NOT NULL,
   value       TEXT NOT NULL,                   -- JSON
   updated_at  INTEGER NOT NULL,
-  PRIMARY KEY (cell_id, key)
-) WITHOUT ROWID;
+  UNIQUE (cell_id, key)
+);
 -- cross-cell prefix queries (queryState): WHERE key >= :p AND key < :p || char(0x10FFFF)
 CREATE INDEX IF NOT EXISTS idx_state_key ON cell_state(key, cell_id);
 
@@ -49,6 +96,7 @@ CREATE TABLE IF NOT EXISTS artifact_versions (
   content     TEXT NOT NULL,                   -- JSON Deliverable
   updated_by  TEXT NOT NULL CHECK (updated_by IN ('agent','human')),
   created_at  INTEGER NOT NULL,
+  cell_id     TEXT REFERENCES cells(id),       -- v3: the cell that wrote it (NULL for human edits and older rows)
   PRIMARY KEY (artifact_id, version)
 ) WITHOUT ROWID;
 
@@ -112,6 +160,48 @@ CREATE TABLE IF NOT EXISTS resources (
   created_at  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_resources_cell ON resources(cell_id, created_at);
+
+-- v3: full-text indexes for subtree/global searchHistory, kept in sync by the triggers below.
+${SEARCH_FTS_TABLES}
+CREATE TRIGGER IF NOT EXISTS artifact_fts_ai AFTER INSERT ON artifacts
+BEGIN
+  INSERT INTO artifact_fts(rowid, title, body) VALUES (new.rowid, new.title, ${artifactBody("new")});
+END;
+CREATE TRIGGER IF NOT EXISTS artifact_fts_au AFTER UPDATE ON artifacts
+BEGIN
+  DELETE FROM artifact_fts WHERE rowid = old.rowid;
+  INSERT INTO artifact_fts(rowid, title, body) VALUES (new.rowid, new.title, ${artifactBody("new")});
+END;
+CREATE TRIGGER IF NOT EXISTS artifact_fts_ad AFTER DELETE ON artifacts
+BEGIN
+  DELETE FROM artifact_fts WHERE rowid = old.rowid;
+END;
+CREATE TRIGGER IF NOT EXISTS state_fts_ai AFTER INSERT ON cell_state
+BEGIN
+  INSERT INTO state_fts(rowid, key, text) VALUES (new.seq, new.key, ${stateText("new")});
+END;
+CREATE TRIGGER IF NOT EXISTS state_fts_au AFTER UPDATE ON cell_state
+BEGIN
+  DELETE FROM state_fts WHERE rowid = old.seq;
+  INSERT INTO state_fts(rowid, key, text) VALUES (new.seq, new.key, ${stateText("new")});
+END;
+CREATE TRIGGER IF NOT EXISTS state_fts_ad AFTER DELETE ON cell_state
+BEGIN
+  DELETE FROM state_fts WHERE rowid = old.seq;
+END;
+CREATE TRIGGER IF NOT EXISTS resource_fts_ai AFTER INSERT ON resources
+BEGIN
+  INSERT INTO resource_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
+CREATE TRIGGER IF NOT EXISTS resource_fts_ad AFTER DELETE ON resources
+BEGIN
+  INSERT INTO resource_fts(resource_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+END;
+CREATE TRIGGER IF NOT EXISTS resource_fts_au AFTER UPDATE ON resources
+BEGIN
+  INSERT INTO resource_fts(resource_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+  INSERT INTO resource_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
 
 -- Layer 3: SKILL.md bodies, notes and preferences (separate from business state).
 CREATE TABLE IF NOT EXISTS knowledge (

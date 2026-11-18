@@ -27,9 +27,26 @@ describe("authorizeControlSync (the Inbox control bypass)", () => {
     }
   });
 
+  it("an agent on the control plane may pause/resume/steer/cancel any cell, like the owner (docs/05 §5.3)", () => {
+    const f = tree();
+    for (const id of ["desk", "proj", "leaf", "sib"]) {
+      for (const action of ["pause", "resume", "steer", "cancel"] as const) {
+        expect(f.gate.authorizeControlSync(id, "agent:ops", action), `${action} ${id}`).toEqual({ ok: true });
+      }
+    }
+    f.gate.revokeSync("proj");
+    expect(f.gate.authorizeControlSync("leaf", "agent:ops", "cancel")).toEqual({ ok: true });
+    expect(f.gate.authorizeControlSync("ghost", "agent:ops", "pause")).toMatchObject({ ok: false, reason: /unknown cell "ghost"/ });
+    expect(f.gate.authorizeControlSync("leaf", "agent:ops", "delete" as never)).toMatchObject({ ok: false, reason: /unknown control action/ });
+    // not well-formed agent principals
+    for (const p of ["agent:", "agent:a:b"]) {
+      expect(f.gate.authorizeControlSync("leaf", p, "cancel"), p).toMatchObject({ ok: false, reason: /only the owner, an agent on the control plane, or an ancestor cell/ });
+    }
+  });
+
   it("refuses external principals, unknown cells/actions and inactive or revoked actors", () => {
     const f = tree();
-    expect(f.gate.authorizeControlSync("leaf", "feishu:ou_colleague", "cancel")).toMatchObject({ ok: false, reason: /only the owner/ });
+    expect(f.gate.authorizeControlSync("leaf", "feishu:ou_colleague", "cancel")).toMatchObject({ ok: false, reason: /only the owner, an agent/ });
     expect(f.gate.authorizeControlSync("leaf", "", "cancel").ok).toBe(false);
     expect(f.gate.authorizeControlSync("ghost", "owner", "cancel")).toMatchObject({ ok: false, reason: /unknown cell/ });
     expect(f.gate.authorizeControlSync("leaf", "cell:ghost", "cancel")).toMatchObject({ ok: false, reason: /unknown cell/ });
@@ -84,11 +101,26 @@ describe("deliveryAllowed (kernel helper for inboxOut / emitToParent)", () => {
     const leaf = f.cells.require("leaf");
     expect(deliveryAllowed(leaf.bounds, "proj", "inbox:proj")).toBe(true);
     expect(deliveryAllowed(leaf.bounds, "proj", "channel:feishu:oc_7")).toBe(true);
-    expect(deliveryAllowed(leaf.bounds, "proj", "inbox:desk")).toBe(false);
+    // desk holds inbox:*, and inbox patterns pass down the tree: a grandchild may ask the desk to arbitrate
+    expect(deliveryAllowed(leaf.bounds, "proj", "inbox:desk")).toBe(true);
+    expect(deliveryAllowed(leaf.bounds, "proj", "inbox:sib")).toBe(true);
     expect(deliveryAllowed(leaf.bounds, "proj", "channel:ui:owner")).toBe(false);
     expect(deliveryAllowed(leaf.bounds, "proj", "inbox:*")).toBe(false);
     const bare = makeBounds({ canSendTo: ["channel:feishu:*"] });
     expect(deliveryAllowed(bare, "proj", "inbox:proj")).toBe(true);
+    expect(deliveryAllowed(bare, "proj", "inbox:desk")).toBe(false);
     expect(deliveryAllowed(bare, null, "inbox:proj")).toBe(false);
+  });
+
+  it("a root without inbox:* still lets every descendant reach every ancestor's inbox", () => {
+    const f = setup();
+    f.addCell("root", null, { tools: ["read"], canSendTo: ["channel:ui:*"], maxConcurrentChildren: 2, maxTokens: 1000, maxCents: 10, maxDepth: 3 });
+    const mid = f.gate.attenuate(f.cells.require("root").bounds, "root", {});
+    f.cells.insert({ id: "mid", parentId: "root", bounds: mid });
+    const low = f.gate.attenuate(mid, "mid", {});
+    expect(low.canSendTo).toEqual(["inbox:mid", "inbox:root"]);
+    expect(deliveryAllowed(low, "mid", "inbox:root")).toBe(true);
+    expect(deliveryAllowed(low, "mid", "inbox:desk")).toBe(false);
+    expect(deliveryAllowed(low, "mid", "channel:ui:owner")).toBe(false);
   });
 });

@@ -1,12 +1,13 @@
-// The demo seed: docs/03 §四's five scenarios played through the real kernel, the real presets and the app's own
-// endpoints — owner captures through the 随手记 channel, colleagues and suppliers through a MemoryChannel, the desk
-// answering from the DemoBrain's queue, buttons pressed through the Desk (the same functions the HTTP API calls).
-// Nothing is written into the records directly. The story starts three days ago (DemoClock) and catches up with the
-// real time at the end, so timers, deadlines and the morning check really fire on the way.
+// The demo seed: a few days of the workbench (docs/03's inbox scenarios and docs/05's projects) played through the real
+// kernel, the real presets and the app's own endpoints — owner captures through the 随手记 channel, colleagues and
+// suppliers through a MemoryChannel, the desk answering from the DemoBrain's queue, projects and workers from their
+// plans (registerPlans), buttons pressed through the Desk (the same functions the HTTP API calls). Nothing is written
+// into the records directly. The story starts three days ago (DemoClock) and catches up with the real time at the
+// end, so timers, deadlines and the morning check really fire on the way.
 
 import type { Kernel } from "@ng/cell";
 import type { MemoryChannel } from "@ng/channel";
-import { defineSensorCheck, KEYS, type CoordinatorState } from "@ng/presets";
+import { defineSensorCheck } from "@ng/presets";
 import type { ScriptTurn } from "@ng/loop";
 import { subjectKeys, type Clock } from "@ng/protocol";
 import type { Desk } from "./desk";
@@ -14,7 +15,7 @@ import { zonedParts, zonedTime, type DemoBrain } from "./demo-model";
 
 /** Desk state key marking a data directory the demo seeded (never seeded twice, never mixed into real data). */
 export const DEMO_SEED_KEY = "demo:seed";
-export const DEMO_SEED_VERSION = 1;
+export const DEMO_SEED_VERSION = 2;
 export const DEMO_CHANNEL_ID = "demo";
 export const DEMO_METRICS_CHECK = "demo.metrics_check";
 export const DEMO_PAYMENT_CHECK = "demo.payment_callback_check";
@@ -89,31 +90,125 @@ export interface DemoSeedDeps {
   log: (line: string) => void;
 }
 
-/** The fixed outcomes of the demo's background workers (matched by a phrase of their task). */
-function registerWorkers(brain: DemoBrain): void {
-  brain.workers.push(
-    // 调研 5 家 APM：all back at once → one summary card.
-    { key: "对象：SkyWalking", result: "SkyWalking：开源，Java/Go 探针成熟，挂 Agent 即可接入，成本最低；告警基于 OAL 规则，够用但配置界面弱。自建需要 ES 集群，约 2 台 8C16G。" },
-    { key: "对象：Pinpoint", result: "Pinpoint：调用链可视化最好，但依赖 HBase，运维成本高；告警能力弱，要二次开发。Node 服务没有官方探针。" },
-    { key: "对象：Elastic APM", result: "Elastic APM：能复用现有 ELK 集群；Node/Go/Java 都有官方 Agent；告警走 Kibana Alerting。注意部分功能需要付费许可证。" },
-    { key: "对象：Datadog", result: "Datadog：开箱即用、告警最强，但按主机计费，30 台主机每月约 1 万元以上；数据出境需要法务评估。" },
-    { key: "对象：OpenTelemetry", result: "OpenTelemetry + Grafana Tempo：标准化最好、后端可替换；需要改代码埋点（约 3 人日），告警复用现有 Prometheus/Grafana。推荐作为长期方案。" },
-    // Projects' agent actions.
-    { key: "整理新人第一周任务清单", result: "新人第一周任务清单：Day1 开通账号、跑通本地环境；Day2 读订单与支付模块代码；Day3 跟一次发版；Day4 修一个 good-first-issue；Day5 和导师复盘。" },
-    { key: "整理候选议题清单", result: "候选议题 6 个：1. MySQL 8.0 迁移踩坑；2. 支付回调幂等设计；3. 报表导出异步化；4. OpenTelemetry 落地；5. 前端微前端拆分；6. 灰度发布流程。建议选 1、2、4。" },
-    // In progress right now: these take real time.
+const MINIMAL_REPORT = [
+  "# 极简模式调研报告",
+  "",
+  "## 结论",
+  "先做一个“极简档”：只保留最近 3 轮对话上下文、关闭自动预读整个仓库、默认用小模型，预计能省 60% 左右的 Token。",
+  "",
+  "## 其他产品的做法",
+  "- Cursor：Ask 模式只读当前文件和显式 @ 的文件；",
+  "- Aider：/tokens 实时显示消耗，--map-tokens 限制仓库地图大小；",
+  "- Claude Code：/compact 手动压缩上下文，子任务交给子代理以免主会话膨胀。",
+  "",
+  "## 建议的阶段",
+  "1. 极简档开关 + 上下文轮数上限；",
+  "2. 消耗看板（每个事项花了多少）；",
+  "3. 按事项自动选择模型档位。",
+].join("\n");
+
+const HARNESS_REPORT_V1 = [
+  "# Harness 对比报告（v1：trae 部分）",
+  "",
+  "## trae cli / trae ide",
+  "- 工具调用走统一的 ToolRegistry，权限在执行前按工作目录校验；",
+  "- 长任务拆成子会话，主会话只保留摘要；",
+  "- 失败重试由 harness 统一做，最多 3 次。",
+  "",
+  "## Doubao work",
+  "（代码还没拿到，等主人要来后补上）",
+].join("\n");
+
+/** The plans of the demo's projects and the fixed outcomes of their workers (matched by a phrase of their brief / task). */
+function registerPlans(brain: DemoBrain, o: { quoteDue: string }): void {
+  const t = (name: string, input: unknown = {}): ScriptTurn => ({ toolCalls: [{ name, input }] });
+  const quote = (who: string, id: string) =>
+    t("await_reply", {
+      who,
+      description: `等${who}的压测服务器报价`,
+      thread: `${DEMO_CHANNEL_ID}:quote-${id}`,
+      principalId: `${DEMO_CHANNEL_ID}:${id}`,
+      to: `channel:${DEMO_CHANNEL_ID}:${id}`,
+      dueAt: o.quoteDue,
+      nudgeText: "您好，想跟进一下压测服务器（8 核 32G × 6 台，租 3 个月）的报价，方便的话今天回复一下，谢谢！",
+    });
+  brain.projects.push(
+    // An idea for later: research, a report, parked as someday (docs/05 scenario 5).
     {
-      key: "支付回调偶发 500",
-      progress: { text: "已复现：并发回调时幂等键 60 秒就过期，同一笔回调被处理两次", done: 1, total: 2, label: "已定位原因，正在补测试" },
-      result: "已修复：幂等键 TTL 从 60 秒改为 24 小时，并在落库前加唯一索引兜底；新增 3 个并发回调单测，全部通过。改动在后台分支上，等你看过再合入。",
+      key: "极简模式",
+      first: [t("dispatch", { title: "调研其他产品的极简模式", instruction: "调研对象：极简模式。看看其他 AI 编程产品怎么帮用户省 Token，写一份调研报告（存成 artifact），给出建议的阶段。", cwdMode: "read" })],
+      afterResult: [
+        [
+          t("update_project", { summary: "调研报告已完成：建议先做“极简档”（只留最近 3 轮上下文、关闭自动预读）" }),
+          t("finish_project", { outcome: "someday", summary: "调研报告「极简模式调研报告」已存好，先放进以后再说；重新启动时按报告里的三个阶段推进", retro: "none — 这个项目里主人没有追加新的做事习惯" }),
+        ],
+      ],
+    },
+    // Partly runnable now, partly waiting on the owner (docs/05 scenario 1).
+    {
+      key: "Harness 对比",
+      first: [
+        t("track_action", { title: "要 Doubao work 的代码", owner: "human", nextStep: "找张三要 Doubao work 的代码，放到 ~/code/doubao，然后在这里勾掉", effort: "15m" }),
+        t("dispatch", { title: "分析 trae 的 harness 实现", instruction: "分析对象：trae harness。读本地 trae cli / trae ide 的代码，写对比报告的 trae 部分（存成 artifact）。", cwdMode: "read" }),
+        t("update_project", { summary: "trae 部分正在分析；Doubao work 的代码要等你要来" }),
+      ],
+      afterResult: [
+        [
+          t("update_project", { summary: "trae 部分已分析完（报告 v1）；等你要来 Doubao work 的代码再继续" }),
+          t("wait", { reason: "等主人要来 Doubao work 的代码", waitingFor: "human" }),
+        ],
+        [
+          t("update_project", { summary: "两边都分析完了，对比报告已更新到 v2" }),
+          t("track_action", { title: "看 Harness 对比报告 v2", owner: "human", nextStep: "读对比报告（art_demo_harness v2），有要补充的分析告诉我", effort: "45m" }),
+        ],
+      ],
+      afterOwner: [
+        [
+          t("dispatch", {
+            title: "分析 Doubao work 的 harness 实现",
+            instruction: "分析对象：Doubao work harness。主人已把代码放到 ~/code/doubao。读 read_artifact art_demo_harness（v1）后，补上 Doubao work 部分，保存为 v2。",
+            cwdMode: "read",
+          }),
+        ],
+      ],
+    },
+    // Waiting on three suppliers' replies (zero-token reply watchers).
+    {
+      key: "压测服务器采购比价",
+      first: [quote("星河数据", "xinghe"), quote("云桥科技", "yunqiao"), quote("北辰网络", "beichen"), t("update_project", { summary: "已向三家供应商要报价，等回信" })],
+      afterResult: [[t("update_project", { summary: "星河数据已报价（1280 元/台/月），等云桥、北辰" })], [t("update_project", { summary: "星河、云桥已报价（云桥最便宜：1150 元/台/月），等北辰网络" })], [t("update_project", { summary: "三家都报价了，可以比价了" })]],
+    },
+    // Running right now: one worker reported, the next one is still at it.
+    {
+      key: "排查支付回调偶发 500",
+      first: [t("dispatch", { title: "复现并定位支付回调 500", instruction: "排查对象：支付回调偶发 500。复现、定位原因，不改代码，汇报原因和证据。", cwdMode: "read" })],
+      afterResult: [
+        [
+          t("update_project", { summary: "已定位：并发回调时幂等键 60 秒就过期；正在修复并补测试" }),
+          t("dispatch", { title: "修复幂等键过期并补并发测试", instruction: "修复对象：支付回调幂等键。把幂等键 TTL 改为 24 小时，落库前加唯一索引兜底，补并发回调单测；改完汇报分支和验证结果。" }),
+        ],
+        [
+          t("update_project", { summary: "已修复并补了 3 个并发测试，等你看一下改动" }),
+          t("track_action", { title: "看一下支付回调的修复改动", owner: "human", nextStep: "看后台分支上的改动，没问题就合入", effort: "15m" }),
+        ],
+      ],
+    },
+  );
+  brain.workers.push(
+    { key: "调研对象：极简模式", artifact: { id: "art_demo_minimal", title: "极简模式调研报告", body: MINIMAL_REPORT }, result: "调研完成：报告「极简模式调研报告」（art_demo_minimal）。结论：先做极简档，预计省 60% Token；建议分三个阶段。" },
+    { key: "分析对象：trae harness", artifact: { id: "art_demo_harness", title: "Harness 对比报告", body: HARNESS_REPORT_V1 }, result: "trae 部分分析完：报告 art_demo_harness v1。要点：统一 ToolRegistry、长任务拆子会话、harness 统一重试。" },
+    {
+      key: "分析对象：Doubao work harness",
+      artifact: { id: "art_demo_harness", title: "Harness 对比报告", expectedVersion: 1, body: `${HARNESS_REPORT_V1.replace("（代码还没拿到，等主人要来后补上）", "- 工具调用直接走模型的 function calling，没有统一注册表；\n- 没有子会话，长任务靠上下文压缩；\n- 重试由各工具自己做。")}\n\n## 结论\ntrae 的 harness 更适合多阶段长任务；Doubao work 更轻。` },
+      result: "Doubao work 部分已补上，报告 art_demo_harness 更新到 v2。",
+    },
+    { key: "排查对象：支付回调偶发 500", result: "已复现：并发回调时幂等键 60 秒就过期，同一笔回调被处理两次，第二次写库撞唯一约束返回 500。证据：order-service 日志 23:40 的两条同 trade_no 记录。" },
+    {
+      key: "修复对象：支付回调幂等键",
+      progress: { text: "已改好 TTL 和唯一索引，正在跑并发测试", done: 1, total: 2, label: "修复中" },
+      result: "已修复：幂等键 TTL 从 60 秒改为 24 小时，落库前加唯一索引兜底；新增 3 个并发回调单测，全部通过。改动在分支 fix/payment-callback-idempotency 上，等你看过再合入。",
       finishAfterMs: 12 * MIN,
     },
-    { key: "对象：账无忧", result: "账无忧：角色 + 数据范围（按门店/部门）两层，审批流里可以临时授权；没有字段级权限。" },
-    { key: "对象：云算盘", result: "云算盘：经典 RBAC，12 个角色模板可自定义；数据权限只到组织级，不支持按门店。" },
-    { key: "对象：票据通", result: "票据通：权限粒度到字段（金额字段可隐藏），并有权限变更审计日志——这一点我们缺。" },
-    { key: "对象：财小蜜", result: "财小蜜：按岗位预置权限包，新人入职一键分配；不支持自定义角色。", finishAfterMs: 8 * MIN },
-    { key: "对象：账房先生", result: "账房先生：RBAC + ABAC 混合，按金额阈值控制审批权限，配置复杂但灵活。", finishAfterMs: 15 * MIN },
-    { key: "对象：易对账", result: "易对账：只有管理员/普通成员两级，权限模型最简单，客户反馈不够用。", finishAfterMs: 25 * MIN },
   );
   brain.sensorRules.push(
     { match: /导出.*(卡|超时|失败|慢)/, title: "客服反复反馈：报表导出卡住", summary: "本周第 3 次有客户反馈报表导出超过 1 万行就卡住，集中在月底对账场景。" },
@@ -124,12 +219,13 @@ function registerWorkers(brain: DemoBrain): void {
 /** Runs the story. Assumes a fresh data directory and a travelling DemoClock. */
 export async function seedDemo(d: DemoSeedDeps): Promise<void> {
   const { kernel, desk, im, brain, clock, timeZone, log } = d;
-  registerWorkers(brain);
   const end = Date.now();
   const today = zonedParts(end, timeZone);
   /** Local time `h:m` on day `day` relative to today (never later than now). */
   const at = (day: number, h: number, m = 0) => Math.min(zonedTime(timeZone, today.y, today.mo, today.d + day, h, m), end - 5 * MIN);
   const iso = (t: number) => new Date(t).toISOString();
+  const quoteDue = Math.max(zonedTime(timeZone, today.y, today.mo, today.d + 1, 12, 0), end + 6 * HOUR);
+  registerPlans(brain, { quoteDue: iso(quoteDue) });
 
   const idle = () => kernel.idle({ timeoutMs: 30_000 });
   async function step(t: number): Promise<void> {
@@ -169,14 +265,11 @@ export async function seedDemo(d: DemoSeedDeps): Promise<void> {
     if (!r.ok) log(`demo seed: approving "${rec.action.summary}" → ${r.outcome}`);
     await idle();
   };
-  const rootTitled = (title: string) => {
-    const c = kernel.listCells({ parentId: kernel.deskCellId }).find((x) => x.title === title && x.spec.meta?.["role"] === "coordinator");
-    if (!c) throw new Error(`demo seed: no item "${title}"`);
-    return c.id;
-  };
+  const project = (title: string, brief: string, extra: Record<string, unknown> = {}) => t("start_project", { title, outcome: title, brief, ...extra });
+  const projectTitled = (title: string) => projectTitledIn(kernel, title);
   const sensorTitled = (title: string) => kernel.listCells({ parentId: kernel.deskCellId, preset: "sensor" }).find((c) => c.title === title)?.id;
 
-  // ==================== day -3: sources (docs/03 原则 1) ====================
+  // ==================== day -3: sources (docs/03 原则 1) and a hub ====================
   await owner(
     at(-3, 9, 5),
     "每天早上 9 点帮我看一眼核心指标（注册、下单、支付成功率），正常就别打扰我",
@@ -192,20 +285,30 @@ export async function seedDemo(d: DemoSeedDeps): Promise<void> {
     "研发群里帮我盯一下有没有人说支付回调报错。这个探头还不太准，先只记观察笔记，别弹卡",
     t("add_source", { title: "研发群支付报错探头", description: "研发群里提到支付回调报错 / 500", watchThread: "demo:dev-group", mode: "observe" }),
   );
+  await owner(
+    at(-3, 9, 40),
+    "代码评审群里 @我 的 review 请求，以后直接派人去看，不用经过信箱",
+    t("add_hub", {
+      title: "代码评审直通",
+      repos: [{ name: "backend", cwd: "/srv/code/backend", defaultBranch: "develop" }],
+      rules: "评审群里 @我 的 MR：派只读 worker 评审，把意见草稿发回 MR 讨论串（主人确认后发出）。",
+      watch: { thread: "demo:review-group" },
+      coalesceMinutes: 2,
+    }),
+  );
 
   // ==================== day -3: small things (原则 2) and a routine reply ====================
   const qa = await says(at(-3, 10, 10), "chenxiao", "灰度环境的发版窗口还是周四晚上 8 点吗？", { thread: "demo:dm-chenxiao" },
     t("draft_reply", { text: "是的，还是周四晚上 8 点。记得提前在群里同步一下这次的回归范围。", title: "回复陈晓：灰度发版窗口", targetLabel: "陈晓（测试）", prep: { summary: "核对了发布日历，本周没有调整。", checked: [{ label: "发布日历", uri: "https://wiki.example.com/release-calendar" }] } }),
   );
   await approve(subjectKeys.inbound(qa));
-  await says(at(-3, 10, 40), "ci-bot", "【CI】main 分支构建通过 #1287（耗时 6 分 12 秒）", { thread: "demo:ci" },
-    t("archive_notification", { title: "CI：main 分支构建通过 #1287" }),
-  );
+  await says(at(-3, 10, 40), "ci-bot", "【CI】main 分支构建通过 #1287（耗时 6 分 12 秒）", { thread: "demo:ci" }, t("archive_notification", { title: "CI：main 分支构建通过 #1287" }));
   await owner(
     at(-3, 11, 0),
     "https://martinfowler.com/articles/patterns-of-distributed-systems/ 这篇存进阅读清单，周末看",
     t("capture_note", { title: "分布式系统模式（Martin Fowler）", url: "https://martinfowler.com/articles/patterns-of-distributed-systems/", content: "周末看", list: "阅读清单" }),
   );
+
   // ==================== day -2: a reply that waits, a source hit → proposal, observe-mode notes ====================
   await says(at(-2, 9, 30), "wangmin", "订单导出接口下周能支持按门店筛选吗？客户那边在催", { thread: "demo:dm-wangmin" },
     t("draft_reply", {
@@ -227,7 +330,6 @@ export async function seedDemo(d: DemoSeedDeps): Promise<void> {
         { title: "压测验证 5 万行导出", owner: "agent" },
       ],
       prep: { summary: "看了客服群近一周的反馈和导出接口的慢查询日志：瓶颈在一次性加载全部明细。", checked: [{ label: "慢查询日志（近 7 天）", uri: "https://grafana.example.com/d/slow-sql" }] },
-      research: true,
     }),
   );
   for (const [i, [who, text]] of ([
@@ -239,48 +341,17 @@ export async function seedDemo(d: DemoSeedDeps): Promise<void> {
     await says(at(-2, 11, 10 * i), who, text, { thread: "demo:dev-group", to: "dev-group" });
   }
 
-  // ==================== day -2: research fan-out (all back) and two projects ====================
+  // ==================== day -2: an idea for later, and work that waits on the owner ====================
   await owner(
     at(-2, 14, 0),
-    "调研一下 5 家 APM 监控方案（SkyWalking、Pinpoint、Elastic APM、Datadog、OpenTelemetry + Tempo），对比接入成本和告警能力",
-    t("fan_out", {
-      title: "调研 5 家 APM 监控方案",
-      instruction: "调研下面这个 APM 监控方案，重点写清接入成本（人日、机器）和告警能力，结论一两句话。",
-      items: ["SkyWalking", "Pinpoint", "Elastic APM", "Datadog", "OpenTelemetry + Tempo"].map((name) => ({ title: name, instruction: `对象：${name}` })),
-      label: "正在并发调研 APM 方案",
-      research: true,
-    }),
+    "/todo 最近 Token 用得有点多，以后可能做个极简模式，先记一下",
+    project("极简模式", "主人的原话：最近 Token 用得有点多，以后可能做个极简模式，先记一下。先调研其他产品怎么做，出一份报告就停，放进以后再说。", { mode: "research_then_park", outcome: "一份极简模式的调研报告，说明该做成什么样" }),
   );
-  const onboarding = await owner(
+  await owner(
     at(-2, 15, 30),
-    "后端新同学 12 月 1 号入职，帮我把入职准备排一下",
-    t("propose_project", {
-      title: "后端新人入职准备",
-      outcome: "新同学入职当天账号、环境、第一周任务都就绪",
-      actions: [
-        { title: "申请 GitLab、VPN 和堡垒机账号", owner: "human", effort: "15m", nextStep: "在 IT 服务台提三个账号申请" },
-        { title: "挑 3 篇必读文档发给新同学", owner: "human", effort: "45m", nextStep: "从 Wiki 里挑架构总览、发版流程、值班手册" },
-        { title: "整理新人第一周任务清单", owner: "agent" },
-      ],
-      prep: { summary: "参考了上次前端新人入职的清单。" },
-      research: true,
-    }),
+    "Harness 对比的事明天开始做：trae cli / trae ide 的代码本地有，Doubao work 的代码我还没有，要找张三要",
+    project("Harness 对比", "主人的原话：Harness 对比的事明天开始做：trae cli / trae ide 的代码本地有，Doubao work 的代码我还没有，要找张三要。先把能做的 trae 部分分析了，Doubao 的部分等主人要来代码再做；最后给一份对比报告。", { outcome: "一份 trae 与 Doubao work 的 harness 对比报告" }),
   );
-  await approve(subjectKeys.inbound(onboarding));
-  const talks = await owner(
-    at(-2, 16, 10),
-    "下周五团队技术分享会，帮我规划一下",
-    t("propose_project", {
-      title: "Q4 技术分享会",
-      outcome: "下周五下午的分享会议题、讲者、场地都定下来",
-      actions: [
-        { title: "整理候选议题清单", owner: "agent" },
-        { title: "等行政确认 3 楼大会议室", owner: "waiting" },
-      ],
-      research: true,
-    }),
-  );
-  await approve(subjectKeys.inbound(talks));
 
   // ==================== day -1: the CTO's question → 我来处理, edited, a follow-up parked beside it ====================
   await step(at(-1, 9, 30));
@@ -308,10 +379,7 @@ export async function seedDemo(d: DemoSeedDeps): Promise<void> {
     const r = await desk.toHuman(rec.actionId, {});
     if (!r.ok) log(`demo seed: 转给我来处理 → ${r.outcome}`);
     const art = kernel.context.getArtifactSync(rec.artifactId!)!;
-    desk.saveArtifact(art.artifactId, {
-      expectedVersion: art.version,
-      body: art.content.body.replace("我倾向 B，", "我倾向 B（DBA 也建议双写），"),
-    });
+    desk.saveArtifact(art.artifactId, { expectedVersion: art.version, body: art.content.body.replace("我倾向 B，", "我倾向 B（DBA 也建议双写），") });
   }
   await says(at(-1, 10, 30), "lizong", "补充一下：下周六有大促，停机窗口必须避开", { thread: "demo:dm-lizong" },
     t("draft_reply", {
@@ -329,73 +397,34 @@ export async function seedDemo(d: DemoSeedDeps): Promise<void> {
     }),
   );
 
-  // ==================== day -1: a question someone else answered; chases ====================
+  // ==================== day -1: a question someone else answered; quotes; reminders ====================
   await says(at(-1, 11, 0), "zhaolei", "@我 网关限流阈值现在是多少？压测要用", { thread: "demo:backend-group", to: "backend-group" },
     t("draft_reply", { text: "目前网关限流是每实例 100 QPS，压测环境可以临时调到 500。", title: "回复后端群：网关限流阈值", targetLabel: "后端群", prep: { summary: "查了网关配置。", checked: [{ label: "gateway.yaml", uri: "https://git.example.com/infra/gateway.yaml" }] } }),
   );
-  await says(at(-1, 11, 6), "sunhao", "每实例 100 QPS，压测环境我已经帮你调到 500 了", { thread: "demo:backend-group", to: "backend-group" },
-    t("withdraw_card", { reason: "孙浩已经在后端群里回答了" }),
-  );
-  const quoteDue = Math.max(zonedTime(timeZone, today.y, today.mo, today.d + 1, 12, 0), end + 6 * HOUR);
+  await says(at(-1, 11, 6), "sunhao", "每实例 100 QPS，压测环境我已经帮你调到 500 了", { thread: "demo:backend-group", to: "backend-group" }, t("withdraw_card", { reason: "孙浩已经在后端群里回答了" }));
   await owner(
     at(-1, 14, 0),
-    "帮我盯一下三家供应商的压测服务器报价，后天中午前要齐",
-    t("chase_replies", {
-      title: "压测服务器采购比价",
-      description: "等待供应商报价回信",
-      parties: [
-        ["星河数据", "xinghe"],
-        ["云桥科技", "yunqiao"],
-        ["北辰网络", "beichen"],
-      ].map(([label, id]) => ({ label, to: `channel:${DEMO_CHANNEL_ID}:${id}`, thread: `${DEMO_CHANNEL_ID}:quote-${id}`, principalId: `${DEMO_CHANNEL_ID}:${id}` })),
-      dueAt: iso(quoteDue),
-      nudgeText: "您好，想跟进一下压测服务器（8 核 32G × 6 台，租 3 个月）的报价，方便的话今天回复一下，谢谢！",
-    }),
+    "帮我盯一下三家供应商的压测服务器报价（星河数据、云桥科技、北辰网络），后天中午前要齐",
+    project("压测服务器采购比价", "主人的原话：帮我盯一下三家供应商的压测服务器报价（星河数据、云桥科技、北辰网络），后天中午前要齐。需求：8 核 32G × 6 台，租 3 个月。", { outcome: "三家报价齐了，可以比价" }),
   );
   await says(at(-1, 14, 30), "xinghe", "星河数据报价：8 核 32G 每台每月 1280 元，含 200G SSD，起租 1 个月", { thread: `${DEMO_CHANNEL_ID}:quote-xinghe` });
-  await owner(
-    at(-1, 15, 0),
-    "三位组长的 Q4 OKR 自评今晚 8 点前要交，帮我盯一下，没交的到点提醒",
-    t("chase_replies", {
-      title: "收齐 Q4 OKR 自评",
-      description: "等三位组长提交 Q4 OKR 自评",
-      parties: [
-        ["赵磊（前端）", "zhaolei"],
-        ["陈晓（测试）", "chenxiao"],
-        ["孙浩（运维）", "sunhao"],
-      ].map(([label, id]) => ({ label, to: `channel:${DEMO_CHANNEL_ID}:${id}`, thread: `${DEMO_CHANNEL_ID}:okr-${id}`, principalId: `${DEMO_CHANNEL_ID}:${id}` })),
-      dueAt: iso(at(-1, 20, 0)),
-      nudgeText: "孙浩，Q4 OKR 自评今晚截止，方便的话今天提交一下，周一要汇总给李总，谢谢！",
-    }),
-  );
   const zl = await says(at(-1, 15, 40), "zhaolei", "登录接口的错误码文档在哪？前端要对一下提示文案", { thread: "demo:dm-zhaolei" },
     t("draft_reply", { text: "在 Wiki 上。", title: "回复赵磊：登录错误码文档", targetLabel: "赵磊（前端）", prep: { summary: "找到了 Wiki 上的错误码页面。", checked: [{ label: "登录错误码", uri: "https://wiki.example.com/auth/error-codes" }] } }),
   );
   await says(at(-1, 16, 0), "yunqiao", "云桥科技：每台每月 1150 元，起租 3 个月，带宽另算", { thread: `${DEMO_CHANNEL_ID}:quote-yunqiao` });
-  await says(at(-1, 16, 20), "zhaolei", "OKR 自评已经提交到系统了", { thread: `${DEMO_CHANNEL_ID}:okr-zhaolei` });
   const hrAt = Math.max(at(-1, 16, 31) + HOUR, Math.min(zonedTime(timeZone, today.y, today.mo, today.d, 10, 0), end - 20 * MIN));
   await owner(at(-1, 16, 30), "明早 10 点提醒我给 HR 回电话，确认后端候选人周五的面试时间", t("remind_me", { text: "给 HR 回电话，确认后端候选人周五的面试时间", at: iso(hrAt), effort: "15m" }));
-  await says(at(-1, 17, 5), "chenxiao", "交了～", { thread: `${DEMO_CHANNEL_ID}:okr-chenxiao` });
   await says(at(-1, 18, 0), "monitor-bot", "【监控】order-service P99 延迟 820ms，持续 3 分钟后已自动恢复", { thread: "demo:alerts" },
     t("archive_notification", { title: "监控：order-service P99 短暂升高，已自动恢复", detail: "持续 3 分钟，820ms" }),
   );
-  // The OKR deadline passes on the way (20:00): the watcher drafts a nudge and the item raises its one card.
-  await step(at(-1, 21, 0));
 
   // ==================== today: the morning inbox ====================
-  await says(at(0, 8, 20), "ci-bot", "【CI】nightly 全量回归通过（1532 个用例，耗时 41 分钟）", { thread: "demo:ci" },
-    t("archive_notification", { title: "CI：nightly 全量回归通过", detail: "1532 个用例" }),
-  );
-  await says(at(0, 8, 25), "admin-bot", "【行政】本周五下午 3 楼大会议室已被市场部预订", { thread: "demo:admin" },
-    t("archive_notification", { title: "行政：周五下午 3 楼大会议室已被预订", detail: "市场部预订" }),
-  );
+  await says(at(0, 8, 20), "ci-bot", "【CI】nightly 全量回归通过（1532 个用例，耗时 41 分钟）", { thread: "demo:ci" }, t("archive_notification", { title: "CI：nightly 全量回归通过", detail: "1532 个用例" }));
   await owner(
     at(0, 8, 30),
     "https://opentelemetry.io/docs/languages/js/ 存一下，APM 选型要看",
     t("capture_note", { title: "OpenTelemetry JS 文档（APM 选型）", url: "https://opentelemetry.io/docs/languages/js/", list: "阅读清单" }),
   );
-  await approve(subjectKeys.project(rootTitled("后端新人入职准备")));
-  await approve(subjectKeys.project(rootTitled("Q4 技术分享会")));
   {
     // The owner rewrites a too-short draft before sending it (what the weekly review learns from).
     const rec = card(subjectKeys.inbound(zl));
@@ -408,9 +437,7 @@ export async function seedDemo(d: DemoSeedDeps): Promise<void> {
   }
   await step(at(0, 9, 10));
   await says(at(0, 9, 30), "wangmin", "补充：客户还想按日期区间筛选，能一起做吗？", { thread: "demo:dm-wangmin" },
-    t("draft_reply", {
-      text: "可以，下周三前一起上线：按门店（store_ids，可多选）和日期区间（start_date / end_date，最长 92 天）筛选。超过 5 万行的导出走异步任务，完成后发站内信通知。",
-    }),
+    t("draft_reply", { text: "可以，下周三前一起上线：按门店（store_ids，可多选）和日期区间（start_date / end_date，最长 92 天）筛选。超过 5 万行的导出走异步任务，完成后发站内信通知。" }),
   );
   const s3 = sensorTitled("研发群支付报错探头");
   await owner(
@@ -423,47 +450,27 @@ export async function seedDemo(d: DemoSeedDeps): Promise<void> {
       body: "- 直接给出页面路径和链接，不要只说“在 Wiki 上”\n- 指出以哪一列 / 哪一节为准\n- 最近改过的条目单独点名提醒",
       reason: "本周你把「在 Wiki 上。」改成了带页面路径、链接和注意事项的回复。",
     }),
-    ...(s3
-      ? [t("suggest_code_check", { sourceId: s3, entry: DEMO_PAYMENT_CHECK, reason: "这个探头每次都用模型判断，其实规则很固定：消息里同时出现“回调”和“500/报错”就算命中，换成脚本检查零成本。" })]
-      : []),
+    ...(s3 ? [t("suggest_code_check", { sourceId: s3, entry: DEMO_PAYMENT_CHECK, reason: "这个探头每次都用模型判断，其实规则很固定：消息里同时出现“回调”和“500/报错”就算命中，换成脚本检查零成本。" })] : []),
   );
   await owner(at(0, 10, 0), "周五下午 3 点提醒我约牙医", t("remind_me", { text: "约牙医", at: iso(fridayAt(timeZone, end, 15)), effort: "15m" }));
 
-  // ==================== now: work that is still running ====================
+  // ==================== now: a project whose second worker is still at it ====================
   clock.catchUp();
   await idle();
   brain.queueDesk(
-    t("delegate", {
-      title: "排查支付回调偶发 500",
-      instruction: "支付回调偶发 500，看日志像是幂等键冲突。复现、定位原因并修掉，补上并发回调的测试，修好后汇报改动和验证结果。",
-      outcome: "回调不再报 500，改动可以合入",
-    }),
+    project("排查支付回调偶发 500", "主人的原话：支付回调偶发 500，看日志像是幂等键冲突。帮我查一下原因并修掉，修好给我看改动。", { outcome: "回调不再报 500，改动等主人看过后合入" }),
   );
   await desk.capture({ text: "支付回调偶发 500，看日志像是幂等键冲突。帮我查一下原因并修掉，修好给我看改动" });
-  await until(() => kernel.listCells({ parentId: kernel.deskCellId }).some((c) => c.title === "排查支付回调偶发 500"), "the bug-fix item");
-  await until(() => !kernel.activeRuns().some((r) => r.cellId === kernel.deskCellId), "the desk");
-  drained("delegate");
-  const rivals = ["账无忧", "云算盘", "票据通", "财小蜜", "账房先生", "易对账"];
-  brain.queueDesk(
-    t("fan_out", {
-      title: "整理 6 家竞品的权限模型",
-      instruction: "整理下面这家竞品的权限模型（角色、数据范围、字段级权限、审计），对照我们的 RBAC 指出差距。",
-      items: rivals.map((name) => ({ title: name, instruction: `对象：${name}` })),
-      label: "正在并发整理竞品权限模型",
-      research: true,
-    }),
-  );
-  await desk.capture({ text: "并行整理 6 家竞品的权限模型，看看我们的 RBAC 还要补什么" });
-  await until(
-    () => {
-      const c = kernel.listCells({ parentId: kernel.deskCellId }).find((x) => x.title === "整理 6 家竞品的权限模型");
-      const st = c ? kernel.context.readStateSync<CoordinatorState>(c.id, KEYS.coordinator) : null;
-      return st !== null && Object.values(st.slots).filter((s) => s.status === "done").length >= 3;
-    },
-    "the first competitor results",
-  );
-  await until(() => !kernel.activeRuns().some((r) => r.cellId === kernel.deskCellId), "the desk");
-  drained("fan_out");
+  const bug = await until(() => projectTitled("排查支付回调偶发 500"), "the bug-fix project");
+  await until(() => !kernel.activeRuns().some((r) => r.cellId === kernel.deskCellId) || null, "the desk");
+  drained("start_project");
+  // The first worker reports; the project dispatches the fix, which takes a while (it is the "running" row).
+  await until(() => kernel.listCells({ parentId: bug, status: ["active"] }).some((c) => c.title === "修复幂等键过期并补并发测试") || null, "the fix worker");
+}
+
+/** The project cell started for `title` under the desk, if any. */
+function projectTitledIn(kernel: Kernel, title: string): string | null {
+  return kernel.listCells({ parentId: kernel.deskCellId }).find((x) => x.title === title && x.spec.meta?.["role"] === "project")?.id ?? null;
 }
 
 /** The coming Friday at `hour` local time (next week's if this one has passed). */
@@ -474,10 +481,12 @@ function fridayAt(timeZone: string, now: number, hour: number): number {
   return t;
 }
 
-/** Real-time polling for work the seed cannot idle() on (runs that take minutes on purpose). */
-async function until(cond: () => boolean, what: string, timeoutMs = 20_000): Promise<void> {
+/** Real-time polling for work the seed cannot idle() on (runs that take minutes on purpose); resolves with the value. */
+async function until<T>(read: () => T | null | false, what: string, timeoutMs = 20_000): Promise<T> {
   const deadline = Date.now() + timeoutMs;
-  while (!cond()) {
+  for (;;) {
+    const v = read();
+    if (v !== null && v !== false) return v;
     if (Date.now() > deadline) throw new Error(`demo seed: timed out waiting for ${what}`);
     await new Promise((r) => setTimeout(r, 20));
   }

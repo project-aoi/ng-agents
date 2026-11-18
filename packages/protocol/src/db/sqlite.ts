@@ -151,6 +151,38 @@ export function applySchemas(db: Db, modules: readonly SchemaModule[]): void {
     version    INTEGER NOT NULL,
     applied_at INTEGER NOT NULL
   )`);
+  const stamp = (owner: string, version: number) =>
+    run(
+      db,
+      `INSERT INTO schema_versions(owner, version, applied_at) VALUES (?, ?, ?)
+       ON CONFLICT(owner) DO UPDATE SET version = excluded.version, applied_at = excluded.applied_at`,
+      // Schema bookkeeping is wall-clock metadata, not domain time, so it does not take an injected Clock.
+      [owner, version, Date.now()],
+    );
+  // Table rebuilds first (see SchemaMigration.rebuild): foreign keys off, own transaction, checked before commit.
+  for (const m of modules) {
+    const row = get<{ version: number }>(db, "SELECT version FROM schema_versions WHERE owner = ?", [m.owner]);
+    if (!row || row.version >= m.version) continue;
+    const pending = [...(m.migrations ?? [])].filter((x) => x.version > row.version && x.version <= m.version).sort((a, b) => a.version - b.version);
+    if (!pending.some((x) => x.rebuild)) continue;
+    if (db.isTransaction) throw new NgError("tx_misuse", `${m.owner}: a table-rebuild migration cannot run inside an open transaction`);
+    db.exec("PRAGMA foreign_keys = OFF");
+    try {
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        for (const mig of pending) db.exec(mig.up);
+        const broken = db.prepare("PRAGMA foreign_key_check").all();
+        if (broken.length > 0) throw new NgError("schema", `${m.owner}: migration to v${m.version} left ${broken.length} dangling foreign key(s)`);
+        stamp(m.owner, m.version);
+        db.exec("COMMIT");
+      } catch (err) {
+        db.exec("ROLLBACK");
+        throw err;
+      }
+    } finally {
+      db.exec("PRAGMA foreign_keys = ON");
+    }
+  }
   withTx(db, () => {
     for (const m of modules) {
       const row = get<{ version: number }>(db, "SELECT version FROM schema_versions WHERE owner = ?", [m.owner]);
@@ -163,15 +195,7 @@ export function applySchemas(db: Db, modules: readonly SchemaModule[]): void {
         for (const mig of pending) db.exec(mig.up);
       }
       db.exec(m.ddl);
-      if (!row || row.version !== m.version) {
-        run(
-          db,
-          `INSERT INTO schema_versions(owner, version, applied_at) VALUES (?, ?, ?)
-           ON CONFLICT(owner) DO UPDATE SET version = excluded.version, applied_at = excluded.applied_at`,
-          // Schema bookkeeping is wall-clock metadata, not domain time, so it does not take an injected Clock.
-          [m.owner, m.version, Date.now()],
-        );
-      }
+      if (!row || row.version !== m.version) stamp(m.owner, m.version);
     }
   });
 }

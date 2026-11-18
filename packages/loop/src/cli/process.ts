@@ -1,5 +1,6 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { readdirSync, readFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 
 export interface CliProcess {
@@ -21,10 +22,18 @@ const STDERR_KEEP = 8_192;
  * Spawns a CLI in its own process group with piped stdio and calls `onLine` for every stdout line. CLIs start helpers
  * in groups of their own (MCP servers, sandbox hosts), so kill() also walks the descendant tree.
  */
-export function spawnCli(argv: readonly string[], opts: { cwd: string; env: Record<string, string>; onLine(line: string): void }): CliProcess {
+export function spawnCli(
+  argv: readonly string[],
+  opts: { cwd: string; env: Record<string, string>; onLine(line: string): void; registry?: CliProcessRegistration },
+): CliProcess {
   const [file, ...args] = argv;
   if (!file) throw new Error("empty argv");
-  const child = spawn(file, args, { cwd: opts.cwd, env: opts.env, stdio: ["pipe", "pipe", "pipe"], detached: true, windowsHide: true });
+  const reg = opts.registry;
+  const marker = reg ? `${reg.runId}:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 10)}` : null;
+  const env = marker ? { ...opts.env, [CLI_PROCESS_MARKER]: marker } : opts.env;
+  const child = spawn(file, args, { cwd: opts.cwd, env, stdio: ["pipe", "pipe", "pipe"], detached: true, windowsHide: true });
+  const record = reg && marker && child.pid ? registerCliProcess(reg, { pid: child.pid, marker, cwd: opts.cwd, bin: file }) : null;
+  if (record) child.once("exit", () => rmSync(record, { force: true }));
   let stderr = "";
   let inputOpen = true;
   const decoder = new StringDecoder("utf8");
@@ -101,6 +110,105 @@ export function spawnCli(argv: readonly string[], opts: { cwd: string; env: Reco
       if (!gone) await Promise.race([exited, new Promise((r) => setTimeout(r, 1_000))]);
     },
   };
+}
+
+// ---------- orphans of a kernel that died (docs/05 guard 4) ----------
+// A CLI agent runs in its own process group so that a Run can stop its whole tree. The price: when the kernel itself is
+// killed, the CLI is not — it finishes its turn alone, still editing files, while a restarted kernel would start a
+// second agent in the same directory for the batch it took back. So every CLI process is put on record when it starts
+// and taken off when it exits, and the next kernel kills what is still on record before it dispatches anything.
+
+/** Environment variable carrying the per-process marker (pid reuse cannot fool the reaper: it checks the marker). */
+export const CLI_PROCESS_MARKER = "NG_CLI_PROC";
+
+export interface CliProcessRegistration {
+  /** Directory of the records (`<dataDir>/cli-procs`). */
+  dir: string;
+  runId: string;
+  cellId: string;
+}
+
+interface CliProcessRecord {
+  pid: number;
+  marker: string;
+  runId: string;
+  cellId: string;
+  cwd: string;
+  bin: string;
+  startedAt: number;
+}
+
+function registerCliProcess(reg: CliProcessRegistration, p: { pid: number; marker: string; cwd: string; bin: string }): string | null {
+  try {
+    mkdirSync(reg.dir, { recursive: true });
+    const path = join(reg.dir, `${p.pid}.json`);
+    const rec: CliProcessRecord = { pid: p.pid, marker: p.marker, runId: reg.runId, cellId: reg.cellId, cwd: p.cwd, bin: p.bin, startedAt: Date.now() };
+    writeFileSync(path, JSON.stringify(rec), { mode: 0o600 });
+    return path;
+  } catch {
+    return null; // a record that cannot be written must not stop the Run
+  }
+}
+
+/** Is `pid` still the process that was started with `marker`? (Linux: its environment says so; elsewhere unknown → false.) */
+export function cliProcessAlive(pid: number, marker: string): boolean {
+  try {
+    return readFileSync(`/proc/${pid}/environ`, "utf8").split("\0").includes(`${CLI_PROCESS_MARKER}=${marker}`);
+  } catch {
+    return false;
+  }
+}
+
+export interface ReapedCliProcess {
+  pid: number;
+  cellId: string;
+  runId: string;
+  cwd: string;
+  /** false: the record was stale (the process had already exited, or the pid belongs to someone else now). */
+  killed: boolean;
+}
+
+/**
+ * Call once at kernel start, before any Run is dispatched: every CLI process a previous kernel left on record and that
+ * is verifiably still that process is stopped with its whole tree (SIGTERM, then SIGKILL after `graceMs`), and the
+ * call resolves only when they are gone. Records of processes that already exited are just removed.
+ */
+export async function reapOrphanedCliProcesses(dir: string, opts: { graceMs?: number } = {}): Promise<ReapedCliProcess[]> {
+  const graceMs = opts.graceMs ?? 3_000;
+  let files: string[];
+  try {
+    files = readdirSync(dir).filter((f) => f.endsWith(".json"));
+  } catch {
+    return [];
+  }
+  const out: ReapedCliProcess[] = [];
+  await Promise.all(
+    files.map(async (f) => {
+      const path = join(dir, f);
+      let rec: CliProcessRecord;
+      try {
+        rec = JSON.parse(readFileSync(path, "utf8")) as CliProcessRecord;
+      } catch {
+        rmSync(path, { force: true });
+        return;
+      }
+      // Our own live children (a second loop instance in this process) are not orphans.
+      const alive = typeof rec.pid === "number" && rec.pid > 0 && cliProcessAlive(rec.pid, rec.marker);
+      if (alive) {
+        const tree = descendants(rec.pid);
+        signalAll(rec.pid, tree, "SIGTERM");
+        const deadline = Date.now() + graceMs;
+        while (Date.now() < deadline && cliProcessAlive(rec.pid, rec.marker)) await new Promise((r) => setTimeout(r, 50));
+        const still = cliProcessAlive(rec.pid, rec.marker);
+        signalAll(rec.pid, [...tree, ...descendants(rec.pid)], "SIGKILL", !still);
+        const hard = Date.now() + 2_000;
+        while (Date.now() < hard && cliProcessAlive(rec.pid, rec.marker)) await new Promise((r) => setTimeout(r, 25));
+      }
+      rmSync(path, { force: true });
+      out.push({ pid: rec.pid, cellId: rec.cellId, runId: rec.runId, cwd: rec.cwd, killed: alive });
+    }),
+  );
+  return out;
 }
 
 function signalAll(pid: number, tree: readonly number[], sig: NodeJS.Signals, leaderGone = false): void {

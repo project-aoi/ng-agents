@@ -22,6 +22,22 @@ const PRIMARY_FIELD: Readonly<Record<string, string>> = {
   "source.hit": "summary",
   "approval.revise": "instruction",
   handback: "reason",
+  "cell.task": "instruction",
+  "cell.message": "text",
+  "kernel.stalled_check": "detail",
+  "kernel.wait_timeout": "reason",
+};
+/**
+ * Kernel notices are instructions as much as data: a fixed sentence says what the cell is expected to do with them
+ * (docs/05 guards 1 and 2), then the payload follows as usual.
+ */
+const LEAD: Readonly<Record<string, string>> = {
+  "kernel.stalled_check":
+    "Nothing is moving this project forward any more. Look at where it stands and do exactly one of these now: start the next step; record what it waits for (a card or an action for the owner, a watcher for an outside event, a wait on a cell that will answer); park it (pause_self); or finish it (complete_self). You get this notice once per stall — if you end this run without doing one of them, the project just stays stalled.",
+  "kernel.continue":
+    "Your previous run stopped at its step limit before the work was finished. Continue from where you stopped — do not start over, and do not repeat what is already done.",
+  "kernel.wait_timeout":
+    "Nobody answered the wait below in time. Check the current state yourself first (it may have been resolved without a message), then decide: ask again, raise it to the owner, or go on without it.",
 };
 
 /** Adapter-specific raw events are noise for the model and can be large. */
@@ -66,7 +82,11 @@ export function renderEnvelope(env: Envelope): string {
   if (env.delivery === "silent_inject") head.push("background");
   if (env.producerModel) head.push(`model ${env.producerModel}`);
   head.push(`at ${isoTime(env.createdAt)}`);
-  const body = renderPayload(env);
+  // A message from outside can be handed back or answered one by one, also when several arrive in one batch.
+  if (env.type === "user.message" && env.from.startsWith("channel:")) head.push(`id ${env.id}`);
+  const payload = renderPayload(env);
+  const lead = LEAD[env.type];
+  const body = lead ? (payload ? `${lead}\n${payload}` : lead) : payload;
   return body ? `[${head.join(" · ")}]\n${body}` : `[${head.join(" · ")}]`;
 }
 
@@ -203,13 +223,16 @@ export function summaryMessage(summary: string, uptoSeq: number): ModelMessage {
   );
 }
 
+/** Entries without depth/cwd render exactly as before those fields existed (the roster text is part of the prompt). */
 export function rosterMessage(roster: readonly ChildSummary[]): ModelMessage {
   const lines = roster.map((c) => {
     const parts = [c.cellId];
     if (c.title) parts.push(`"${c.title}"`);
     if (c.preset) parts.push(c.preset);
     parts.push(c.status);
-    return `- ${parts.join(" · ")}${c.statusLine ? `: ${c.statusLine}` : ""}`;
+    if (c.cwd) parts.push(`cwd ${c.cwd}${c.cwdMode ? ` (${c.cwdMode})` : ""}`);
+    const indent = "  ".repeat(Math.max(0, (c.depth ?? 1) - 1));
+    return `${indent}- ${parts.join(" · ")}${c.statusLine ? `: ${c.statusLine}` : ""}`;
   });
   return textMessage("user", `[in-flight child cells: live status, not part of the conversation]\n${lines.join("\n")}`);
 }

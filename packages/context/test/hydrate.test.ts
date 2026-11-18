@@ -5,6 +5,7 @@ import {
   makeBounds,
   mergeAdjacentMessages,
   steerNoteText,
+  type ChildSummary,
   type Envelope,
   type ModelMessage,
   type PromptSnapshot,
@@ -49,7 +50,7 @@ function expectPrefixStable(prev: PromptSnapshot, next: PromptSnapshot): void {
   expect(next.system.hash).toBe(prev.system.hash);
   expect(next.history.length).toBeGreaterThanOrEqual(prev.history.length);
   for (let i = 0; i < prev.history.length; i++) expect(json(next.history[i])).toBe(json(prev.history[i]));
-  const batchMsgs = prev.tail.messages.slice(prev.tail.roster.length > 0 ? 1 : 0);
+  const batchMsgs = prev.tail.messages.slice((prev.tail.roster.length > 0 ? 1 : 0) + (prev.tail.notes?.length ?? 0));
   for (let i = 0; i < batchMsgs.length; i++) expect(json(next.history[prev.history.length + i])).toBe(json(batchMsgs[i]));
   // What the provider sees: merged history(n) minus its last message is identical, and that last message is a block prefix.
   const a = mergeAdjacentMessages(prev.history.map(clone));
@@ -143,8 +144,16 @@ describe("hydrate: history and tail", () => {
     const silent = userEnvelope(h.clock, "背景：上周已付定金", { delivery: "silent_inject" });
     const s1 = simulateRun(h, "desk", [env, silent], reply("好的"));
     expect(s1.tail.messages.map((m) => (m.content[0] as { text: string }).text)).toEqual([renderEnvelope(env), renderEnvelope(silent)]);
-    expect(renderEnvelope(env)).toMatch(/^\[user\.message · from channel:feishu:oc_1 · principal owner · thread feishu:oc_1 · at 2025-11-17T08:00:00\.000Z\]\n帮我回一下供应商$/);
+    // A user.message from a channel carries its envelope id after the time, so it can be handed back or answered by id.
+    expect(renderEnvelope(env)).toBe(
+      `[user.message · from channel:feishu:oc_1 · principal owner · thread feishu:oc_1 · at 2025-11-17T08:00:00.000Z · id ${env.id}]\n帮我回一下供应商`,
+    );
     expect(renderEnvelope(silent)).toContain("· background ·");
+    expect(renderEnvelope(silent)).toMatch(new RegExp(`· at [^·\\]]+ · id ${silent.id}\\]\\n背景：上周已付定金$`));
+    // Only a message from outside (a channel) carries the id; one relayed by a cell does not.
+    const relayed = userEnvelope(h.clock, "转述", { from: "inbox:w1" });
+    expect(renderEnvelope(relayed)).not.toContain(relayed.id);
+    expect(renderEnvelope(relayed)).toMatch(/· at [^·\]]+\]\n转述$/);
     const s2 = h.store.hydrateSync("desk", batchOf("desk", []), "isolated");
     expectPrefixStable(s1, s2);
     expect(s2.history.map((m) => m.role)).toEqual(["user", "user", "assistant"]);
@@ -171,6 +180,60 @@ describe("hydrate: history and tail", () => {
     expect(json(s2.history)).not.toContain("in-flight child cells");
     const custom = h.makeStore({ rosterProvider: () => [] });
     expect(custom.hydrateSync("desk", batchOf("desk", []), "isolated").tail.messages).toEqual([]);
+  });
+
+  it("renders a provider's deeper roster: descendants indented by depth, cwd and its mode appended", () => {
+    const base: Omit<ChildSummary, "cellId"> = { title: null, preset: "worker", status: "active", epoch: 0, lastRunAt: null, statusLine: null };
+    const h = deskHarness({
+      store: {
+        rosterProvider: () => [
+          { ...base, cellId: "proj", preset: "project", title: "Harness 对比", depth: 1, parentId: "desk", cwd: "/src/trae", cwdMode: "read" },
+          { ...base, cellId: "w1", depth: 2, parentId: "proj", cwd: "/src/trae/docs", cwdMode: "write", statusLine: "写报告 (1/3)" },
+          { ...base, cellId: "w1a", preset: null, depth: 3, parentId: "w1" },
+          { ...base, cellId: "watch", preset: "watcher", status: "paused", depth: 1, cwd: "/tmp/probe" },
+          { ...base, cellId: "plain" },
+        ],
+      },
+    });
+    const snap = h.store.hydrateSync("desk", batchOf("desk", []), "isolated");
+    expect((snap.tail.messages[0]!.content[0] as { text: string }).text).toBe(
+      [
+        "[in-flight child cells: live status, not part of the conversation]",
+        '- proj · "Harness 对比" · project · active · cwd /src/trae (read)',
+        "  - w1 · worker · active · cwd /src/trae/docs (write): 写报告 (1/3)",
+        "    - w1a · active",
+        "- watch · watcher · paused · cwd /tmp/probe",
+        "- plain · worker · active",
+      ].join("\n"),
+    );
+    expect(snap.tail.roster.map((c) => c.depth)).toEqual([1, 2, 3, 1, undefined]);
+  });
+
+  it("puts the kernel's tail notes verbatim after the roster and before the batch, never into history", () => {
+    let notes: string[] = ["[active workspace] /src/trae (read) · /src/doubao (write)", "", "  \n", "[waiting] inbox:w1 since 10:00"];
+    const h = deskHarness({ store: { tailNotesProvider: () => notes } });
+    h.cells.insert({ id: "w1", parentId: "desk", preset: "worker", title: "竞品资料整理" });
+    const env = userEnvelope(h.clock, "进度如何？");
+    const s1 = simulateRun(h, "desk", [env], reply("还在等 w1"));
+    const texts = s1.tail.messages.map((m) => (m.content[0] as { text: string }).text);
+    expect(texts.slice(1)).toEqual([notes[0], notes[3], renderEnvelope(env)]);
+    expect(texts[0]).toContain("in-flight child cells");
+    expect(s1.tail.notes).toEqual([notes[0], notes[3]]);
+    expect(s1.tail.messages.every((m) => m.role === "user")).toBe(true);
+
+    notes = ["[waiting] nothing"];
+    const s2 = simulateRun(h, "desk", [userEnvelope(h.clock, "现在呢？")], reply("ok"));
+    expectPrefixStable(s1, s2);
+    expect(json(s2.history)).not.toContain("[active workspace]");
+    expect(json(s2.history)).not.toContain("[waiting]");
+    expect(s2.tail.notes).toEqual(["[waiting] nothing"]);
+    expect(assertWireInvariants([...s2.history, ...s2.tail.messages])).toEqual([]);
+
+    // No provider, or nothing to say: no field and no messages.
+    notes = ["", " "];
+    expect("notes" in h.store.hydrateSync("desk", batchOf("desk", []), "isolated").tail).toBe(false);
+    const bare = h.makeStore({ tailNotesProvider: undefined, rosterProvider: () => [] }).hydrateSync("desk", batchOf("desk", []), "isolated");
+    expect(bare.tail).toEqual({ roster: [], messages: [] });
   });
 
   it("answers tool calls of a crashed run with a synthetic error at a position that never moves", () => {

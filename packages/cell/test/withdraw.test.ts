@@ -29,12 +29,14 @@ describe("RunPorts.withdrawApproval", () => {
         registry.codeProcessors.register(proc);
       },
     });
-    const spec = (id: string) => ({ id, preset: "worker" as const, processor: { kind: "code" as const, entry: proc.name } });
+    // persistent: both are talked to again after their first Run (a one-shot cell is closed once its Run completes)
+    const spec = (id: string) => ({ id, preset: "worker" as const, lifetime: "persistent" as const, processor: { kind: "code" as const, entry: proc.name } });
     h.kernel.spawnCell("desk", spec("a"), "raise");
     h.kernel.spawnCell("desk", spec("b"), "other");
     await h.kernel.idle();
     const card = h.kernel.gate.findPendingBySubjectSync("s:a")!;
     expect(card.cellId).toBe("a");
+    expect([h.kernel.getCell("a")!.status, h.kernel.getCell("b")!.status]).toEqual(["active", "active"]);
 
     const say = (cellId: string, text: string) =>
       h.kernel.inbox.enqueueSync(cellId, { id: `${cellId}-${text}`, from: "inbox:desk", principalId: "cell:desk", kind: "event", type: PAYLOAD.userMessage, payload: { text }, createdAt: h.clock.now() });

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { ManualClock, PAYLOAD, type CodeProcessor, type JobResultPayload, type Registry } from "@ng/protocol";
+import { finalResultEnvelopeId, ManualClock, PAYLOAD, type CodeProcessor, type JobResultPayload, type Registry } from "@ng/protocol";
 import { boot, cleanupAll, HOUR, registerTestPresets, T0, tempDir, tool, waitFor } from "./helpers";
 
 afterEach(cleanupAll);
@@ -50,7 +50,8 @@ describe("restart on the same database", () => {
     // ---------- first life ----------
     const a = await boot({ dataDir, clock, setup });
     a.kernel.spawnCell("desk", { id: "job", preset: "worker", processor: { kind: "code", entry: "test.job_worker" } }, "build");
-    a.kernel.spawnCell("desk", { id: "sensor", preset: "worker", processor: { kind: "code", entry: "test.counter" }, schedules: [{ cron: "0 * * * *" }] });
+    // a sensor lives on its cron (a one-shot cell would be closed — its cron cancelled — after its first Run)
+    a.kernel.spawnCell("desk", { id: "sensor", preset: "worker", lifetime: "persistent", processor: { kind: "code", entry: "test.counter" }, schedules: [{ cron: "0 * * * *" }] });
     a.script.add("desk", tool("set_reminder", { label: "给牙医打电话", inSeconds: 2 * 3600 }), { text: "reminder set" });
     await a.ui.capture({ text: "两小时后提醒我给牙医打电话" });
     await a.kernel.idle();
@@ -82,6 +83,9 @@ describe("restart on the same database", () => {
     await b.kernel.idle({ jobs: true });
     await b.kernel.idle();
     expect(b.kernel.context.readStateSync("job", "job")).toEqual({ state: "succeeded", tail: "survived-restart" });
+    // the one-shot job worker then settled through the second kernel: one final result, closed
+    expect(b.kernel.getCell("job")).toMatchObject({ status: "closed", closeReason: "completed" });
+    expect(b.kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.cellResult }).map((m) => m.envelope.id)).toEqual([finalResultEnvelopeId("job", 0)]);
 
     // timers and cron set by the first life fire in the second
     clock.advance(2 * HOUR);

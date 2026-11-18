@@ -1,9 +1,8 @@
-import { existsSync, mkdirSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { NgError, type IsolationLevel, type WorkspaceAcquireOptions, type WorkspaceRecord } from "@ng/protocol";
 import { addWorktree, retireWorktree } from "../git";
 import type { SpawnRequest } from "../types";
-import { isInside } from "../util";
 import type { DriverDeps, IsolationDriver, ProcessRequest, Provisioned, ReleaseResult } from "./types";
 
 function hostPlan(req: ProcessRequest): SpawnRequest {
@@ -57,26 +56,24 @@ abstract class HostDriver implements IsolationDriver {
   abstract release(ws: WorkspaceRecord, mode: "destroy" | "hibernate"): Promise<ReleaseResult>;
 }
 
-/** No isolation: the configured directory (or a per-cell scratch directory) on the host; paths may leave it. */
+/**
+ * No isolation (docs/05: the default): the cell's `cwd` on the owner's machine, used as it is. Paths may leave it. A
+ * cell without a cwd gets the kernel's own per-cell directory under the data dir. Nothing is ever removed.
+ */
 export class NoneDriver extends HostDriver {
   readonly level = "none" as const;
   readonly readOnly = false;
   override readonly confine = false;
 
   async provision(cellId: string, opts: WorkspaceAcquireOptions): Promise<Provisioned> {
-    const configured = opts.repoPath ?? this.deps.defaultRepoPath;
-    if (configured) return { path: existingDir(configured, "workspace directory"), baseRepo: resolve(configured), baseRef: null, branch: null, containerId: null };
-    const scratch = join(this.deps.dataDir, "scratch", this.deps.slugOf(cellId));
-    mkdirSync(scratch, { recursive: true });
-    return { path: scratch, baseRepo: null, baseRef: null, branch: null, containerId: null };
+    const configured = opts.cwd ?? opts.repoPath ?? this.deps.defaultRepoPath;
+    if (configured) return { path: existingDir(configured, "working directory"), baseRepo: null, baseRef: null, branch: null, containerId: null };
+    const own = this.deps.cellDirOf(cellId);
+    mkdirSync(own, { recursive: true });
+    return { path: own, baseRepo: null, baseRef: null, branch: null, containerId: null };
   }
 
-  async release(ws: WorkspaceRecord): Promise<ReleaseResult> {
-    // Only a scratch directory the manager created is removed; a configured directory is never touched.
-    const scratchRoot = join(this.deps.dataDir, "scratch");
-    if (ws.baseRepo === null && ws.path && isInside(scratchRoot, ws.path) && ws.path !== scratchRoot) {
-      rmSync(ws.path, { recursive: true, force: true });
-    }
+  async release(): Promise<ReleaseResult> {
     return { branchKept: false, snapshot: null, warnings: [] };
   }
 }
@@ -87,8 +84,8 @@ export class SharedRoDriver extends HostDriver {
   readonly readOnly = true;
 
   async provision(_cellId: string, opts: WorkspaceAcquireOptions): Promise<Provisioned> {
-    const configured = opts.repoPath ?? this.deps.defaultRepoPath;
-    if (!configured) throw new NgError("invalid_argument", "shared_ro needs a directory: pass repoPath or configure defaultRepoPath");
+    const configured = opts.cwd ?? opts.repoPath ?? this.deps.defaultRepoPath;
+    if (!configured) throw new NgError("invalid_argument", "shared_ro needs a directory: pass cwd or configure defaultRepoPath");
     const path = existingDir(configured, "shared directory");
     return { path, baseRepo: path, baseRef: null, branch: null, containerId: null };
   }
@@ -98,7 +95,11 @@ export class SharedRoDriver extends HostDriver {
   }
 }
 
-/** One `git worktree` per cell on its own branch under `<dataDir>/worktrees/`. */
+/**
+ * Explicit opt-in only (docs/05: the kernel never makes a worktree on its own): one `git worktree` per cell on its own
+ * branch under `<dataDir>/worktrees/`. `release("destroy")` is no longer called by the kernel — closing a cell leaves
+ * the worktree and its branch exactly as the cell left them; only `hibernate` (an explicit request) still packs it.
+ */
 export class GitWorktreeDriver extends HostDriver {
   readonly level = "git_worktree" as const;
   readonly readOnly = false;

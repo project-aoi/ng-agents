@@ -1,0 +1,338 @@
+import { z } from "zod";
+import {
+  CELL_STATUS_KEY,
+  cellIdOf,
+  defineTool,
+  gtdKeys,
+  isChannelAddr,
+  isNgError,
+  newId,
+  type ActionRecord,
+  type BallOwner,
+  type CellSpec,
+  type ChannelAddr,
+  type InboxAddr,
+  type ProcessorSpec,
+  type ProjectRecord,
+  type ToolContext,
+  type ToolDef,
+  type ToolResult,
+  type Toolset,
+} from "@ng/protocol";
+import { TOOLSETS, type PresetsConfig } from "../shared/config";
+import { errorText, isCwdError, parseIso, scheduleInput, toSchedule, toWatch, watchInput } from "../shared/inputs";
+import { notifyOwner } from "../shared/notify";
+import { CHECKER_PROCESSOR, WORKER_PROCESSOR } from "../shared/processors";
+import { clip, newAction, newProject, patchAction, patchProject, statusLine } from "../shared/records";
+import { replyWatcherSpec, type ReplyParty } from "../shared/watcher";
+import { readActions, readProject, waitingFor } from "./books";
+
+// `gtd.project`: the project cell's own records — dispatch, track_action, await_reply, update_project,
+// finish_project. Records live in the project's state (gtd:project, gtd:action:<id>); every result says in plain
+// words what was recorded and what happens next.
+
+const effort = z.enum(["15m", "45m", "low_energy"]);
+const OWNER_LABEL: Readonly<Record<BallOwner, string>> = { agent: "agent", human: "the owner", waiting: "waiting" };
+
+const hasParent = ({ spec }: { spec?: CellSpec }) => spec === undefined || Boolean(spec.parentId);
+
+function describe(a: ActionRecord): string {
+  return `${a.id}「${a.title}」(${OWNER_LABEL[a.owner]}${a.cellId ? `, carried by ${a.cellId}` : ""})`;
+}
+
+/** The record, created from the cell when a project was started without a seed (plain spawn_cell). */
+async function projectOf(ctx: ToolContext): Promise<ProjectRecord> {
+  const p = await readProject(ctx.ports);
+  if (p) return p;
+  const spec = ctx.ports.self.spec;
+  return newProject({ title: spec.title ?? ctx.ports.self.cellId, ...(spec.cwd ? { cwd: spec.cwd } : {}) }, ctx.clock.now());
+}
+
+async function save(ctx: ToolContext, patches: Record<string, unknown>): Promise<void> {
+  await ctx.ports.context.commit(ctx.ports.self.cellId, { statePatches: patches });
+}
+
+function spawnRefusal(err: unknown): ToolResult {
+  if (isCwdError(err)) {
+    return {
+      output: `Not started: ${errorText(err)} Ask the owner for the right absolute path (send_message to the owner, then wait with waitingFor "human") — never guess one.`,
+      isError: true,
+    };
+  }
+  return { output: `Not started: ${errorText(err)}`, isError: true };
+}
+
+export function projectToolset(cfg: PresetsConfig): Toolset {
+  function tool<S extends z.ZodType>(def: { name: string; description: string; input: S; run(args: z.output<S>, ctx: ToolContext): Promise<ToolResult | string> }): ToolDef {
+    return defineTool({ name: def.name, kind: "kernel", description: def.description, input: def.input, availableFor: hasParent, handler: (args, ctx) => def.run(args, ctx) });
+  }
+  const self = (ctx: ToolContext) => ctx.ports.self.cellId;
+
+  const dispatch = tool({
+    name: "dispatch",
+    description: [
+      "Hand one piece of work to a new one-shot child and put it on the books in the same step.",
+      'preset "worker" (default): reads or changes code, runs tests, researches — it reports once and closes. preset "watcher": a light checker of one outside condition (an MR merged, CI green, a path exists); it looks now, keeps checking, and reports when the condition holds.',
+      "The child sees nothing of your conversation: the instruction carries everything. Its result wakes you, and the action it carries is closed for you when it reports.",
+    ].join(" "),
+    input: z.object({
+      title: z.string().min(1).describe("short Chinese title of this piece of work (shown to the owner)"),
+      instruction: z
+        .string()
+        .min(1)
+        .describe("the goal; the directory; what the previous step left (branch, commits, uncommitted changes); material (paths, links, artifact id and version); the owner's preferences; how to verify; what to report"),
+      preset: z.enum(["worker", "watcher"]).optional(),
+      cwd: z.string().optional().describe("absolute path of the directory it works in. Default: the project's for a worker; a private directory of its own for a watcher (name the paths, repositories and links it must check in the instruction)"),
+      cwdMode: z.enum(["read", "write"]).optional().describe('"write" (default): it queues for that work tree, one writer at a time. "read": it only looks (analysis, review) and runs in parallel with anything'),
+      actionId: z.string().optional().describe("an action already on the books that this carries out (e.g. a planned step); default: a new action"),
+      phase: z.number().int().min(1).optional().describe("phase of a staged project"),
+      modelTier: z.enum(["fast", "strong"]).optional(),
+      watches: z.array(watchInput).optional().describe("watcher: messages to route to it (e.g. the MR's thread)"),
+      schedules: z.array(scheduleInput).optional().describe("watcher: when to look again"),
+    }),
+    async run(args, ctx) {
+      const preset = args.preset ?? "worker";
+      const project = await readProject(ctx.ports);
+      const actions = await readActions(ctx.ports);
+      const existing = args.actionId !== undefined ? actions.find((a) => a.id === args.actionId) : undefined;
+      const base: ProcessorSpec = preset === "watcher" ? CHECKER_PROCESSOR : WORKER_PROCESSOR;
+      const actionId = existing?.id ?? newId("act", ctx.clock);
+      const spec: CellSpec = { preset, title: args.title, processor: args.modelTier && base.kind === "llm" ? { ...base, modelTier: args.modelTier } : base, meta: { gtd: { actionId } } };
+      // Defaults only: a worker works where the project works; a watcher has a private directory of its own (so it
+      // does not queue for the project's work tree). Whatever the project passes explicitly is what the child gets.
+      const cwd = args.cwd ?? (preset === "worker" && project?.cwd && project.cwd !== ctx.ports.self.spec.cwd ? project.cwd : undefined);
+      if (cwd) spec.cwd = cwd;
+      if (args.cwdMode) spec.cwdMode = args.cwdMode;
+      let addr: InboxAddr;
+      try {
+        if (args.watches?.length) spec.watches = args.watches.map((w) => toWatch(w));
+        if (args.schedules?.length) spec.schedules = args.schedules.map(toSchedule);
+        addr = await ctx.ports.spawnCell(spec, args.instruction);
+      } catch (err) {
+        return spawnRefusal(err);
+      }
+      const childId = cellIdOf(addr);
+      const owner: BallOwner = preset === "watcher" ? "waiting" : "agent";
+      const now = ctx.clock.now();
+      const action = existing
+        ? patchAction(existing, { title: args.title, owner, cellId: childId, nextStep: null, ...(existing.status !== "open" ? { status: "open" as const, completedAt: null } : {}), ...(args.phase ? { phase: args.phase } : {}), ...(owner === "waiting" ? { waiting: waitingFor(args.title) } : {}) }, now)
+        : newAction(
+            { id: actionId, title: args.title, owner, cellId: childId, projectCellId: self(ctx), ...(args.phase ? { phase: args.phase } : {}), ...(owner === "waiting" ? { waiting: waitingFor(args.title) } : {}) },
+            now,
+          );
+      await save(ctx, { [gtdKeys.action(actionId)]: action });
+      const queued = preset === "worker" && (args.cwdMode ?? "write") === "write" ? " If another writer is in that work tree, it starts when that one is done." : "";
+      return {
+        output: `Started ${preset} ${childId} for action ${actionId}「${args.title}」 (recorded as ${owner === "agent" ? "being handled by an agent" : "waiting"}).${queued} Its result wakes you and closes the action.`,
+        data: { cellId: childId, actionId },
+        awaitsWakeup: true,
+      };
+    },
+  });
+
+  const trackAction = tool({
+    name: "track_action",
+    description: [
+      "Create or update an action on the project's books — who has the ball for each open piece.",
+      'Create (no id): title and owner are required; for owner "human" give a concrete nextStep the owner can act on. Update (id): give only what changes; status "done"/"cancelled" closes it, "open" reopens it.',
+    ].join(" "),
+    input: z.object({
+      id: z.string().optional().describe("the action to update; omit to create one"),
+      title: z.string().min(1).optional(),
+      owner: z.enum(["agent", "human", "waiting"]).optional(),
+      status: z.enum(["open", "done", "cancelled"]).optional(),
+      nextStep: z.string().min(1).optional().describe('the next physical step, e.g. "向张三要 Doubao work 的代码，放到 ~/code/doubao"'),
+      phase: z.number().int().min(1).optional(),
+      artifactId: z.string().optional(),
+      effort: effort.optional(),
+      dueAt: z.string().optional().describe("ISO 8601 with offset"),
+    }),
+    async run(args, ctx) {
+      const now = ctx.clock.now();
+      const due = args.dueAt !== undefined ? parseIso(args.dueAt, "dueAt") : undefined;
+      if (typeof due === "string") return { output: due, isError: true };
+      const fields = {
+        ...(args.title ? { title: args.title } : {}),
+        ...(args.owner ? { owner: args.owner } : {}),
+        ...(args.nextStep ? { nextStep: args.nextStep } : {}),
+        ...(args.phase ? { phase: args.phase } : {}),
+        ...(args.artifactId ? { artifactId: args.artifactId } : {}),
+        ...(args.effort ? { effort: args.effort } : {}),
+        ...(due !== undefined ? { dueAt: due } : {}),
+      };
+      let action: ActionRecord;
+      if (args.id === undefined) {
+        if (!args.title || !args.owner) return { output: "A new action needs title and owner.", isError: true };
+        action = newAction(
+          { ...fields, id: newId("act", ctx.clock), title: args.title, owner: args.owner, projectCellId: self(ctx), ...(args.status ? { status: args.status } : {}), ...(args.owner === "waiting" ? { waiting: waitingFor(args.title) } : {}) },
+          now,
+        );
+      } else {
+        const cur = (await readActions(ctx.ports)).find((a) => a.id === args.id);
+        if (!cur) return { output: `There is no action ${args.id}; leave id out to create one.`, isError: true };
+        action = patchAction(cur, { ...fields, ...(args.status ? { status: args.status } : {}), ...(args.status === "open" ? { completedAt: null } : {}) }, now);
+      }
+      await save(ctx, { [gtdKeys.action(action.id)]: action });
+      const next =
+        action.status !== "open"
+          ? "It is closed."
+          : action.owner === "human"
+            ? `${action.nextStep ? "" : "It has no nextStep yet: the owner sees it on their list without knowing what to do — add the concrete step. "}Tell the owner once (send_message), then wait with waitingFor "human"; you are woken when they tick it off or answer.`
+            : action.owner === "agent" && !action.cellId
+              ? "Nobody is on it yet: dispatch it with this actionId when it is time."
+              : "";
+      return { output: `Recorded action ${action.id}「${action.title}」: ${OWNER_LABEL[action.owner]}, ${action.status}. ${next}`.trim(), data: { id: action.id } };
+    },
+  });
+
+  const awaitReply = tool({
+    name: "await_reply",
+    description: [
+      "Wait for one person's reply on a thread without spending a model: their reply on the watched thread (or from that sender) is recorded and wakes you with what they said.",
+      "If nothing comes by the deadline, a polite follow-up is drafted and put on the owner's card; the owner decides whether it is sent. Recorded as a waiting action.",
+    ].join(" "),
+    input: z.object({
+      who: z.string().min(1).describe('as the owner names them, e.g. "张三" or "供应商 C"'),
+      description: z.string().min(1).describe('what is awaited, e.g. "等张三给 Doubao work 的代码地址"'),
+      thread: z.string().optional().describe('thread their reply arrives on, "<channelId>:<threadId>"'),
+      principalId: z.string().optional().describe("only this sender counts as their reply (alone: any message from them)"),
+      to: z.string().optional().describe("channel address a follow-up would go to"),
+      dueAt: z.string().optional().describe("deadline, ISO 8601 with offset"),
+      waitHours: z.number().positive().optional().describe("deadline in hours from now (default 24)"),
+      nudgeText: z.string().optional().describe("the follow-up to draft at the deadline"),
+      interpret: z.boolean().optional().describe("judge each message with a small model (default: any message from them is the reply)"),
+    }),
+    async run(args, ctx) {
+      if (!args.thread && !args.principalId) return { output: "Give thread or principalId, so their reply can reach the watcher.", isError: true };
+      if (args.to !== undefined && !isChannelAddr(args.to)) return { output: "to must be channel:<channelId>:<target>.", isError: true };
+      const now = ctx.clock.now();
+      const parsed = args.dueAt !== undefined ? parseIso(args.dueAt, "dueAt") : now + (args.waitHours !== undefined ? args.waitHours * 3_600_000 : cfg.defaultWaitMs);
+      if (typeof parsed === "string") return { output: parsed, isError: true };
+      const project = await projectOf(ctx);
+      const party: ReplyParty = {
+        id: "p1",
+        label: args.who,
+        ...(args.to ? { to: args.to as ChannelAddr } : {}),
+        ...(args.thread ? { thread: args.thread } : {}),
+        ...(args.principalId ? { principalId: args.principalId } : {}),
+        dueAt: parsed,
+      };
+      const actionId = newId("act", ctx.clock);
+      const spec = replyWatcherSpec(party, {
+        description: args.description,
+        itemTitle: project.title,
+        actionId,
+        ...(args.nudgeText ? { nudgeText: args.nudgeText } : {}),
+        ...(args.interpret ? { interpret: true } : {}),
+        ...(project.source ? { source: project.source } : {}),
+        rawInput: { text: args.description, kind: "system" },
+      });
+      let addr: InboxAddr;
+      try {
+        addr = await ctx.ports.spawnCell(spec, { instruction: `等待${args.who}回复：${args.description}`, input: { party } });
+      } catch (err) {
+        return spawnRefusal(err);
+      }
+      const watcherId = cellIdOf(addr);
+      const action = newAction(
+        {
+          id: actionId,
+          title: args.description,
+          owner: "waiting",
+          projectCellId: self(ctx),
+          cellId: watcherId,
+          dueAt: parsed,
+          waiting: waitingFor(args.description, [{ id: party.id, label: args.who, replied: false, dueAt: parsed }], { dueAt: parsed, cancelGroup: "timeout" }),
+          progress: { done: 0, total: 1, label: "已回" },
+        },
+        now,
+      );
+      await save(ctx, { [gtdKeys.action(actionId)]: action });
+      return {
+        output: `Waiting for ${args.who} until ${new Date(parsed).toISOString()} (action ${actionId}, watcher ${watcherId}). Their reply wakes you with what they said; at the deadline the owner gets a follow-up to confirm.`,
+        data: { cellId: watcherId, actionId },
+        awaitsWakeup: true,
+      };
+    },
+  });
+
+  const updateProject = tool({
+    name: "update_project",
+    description: "Keep the project's record current: the one-line summary on the owner's board (where things stand), and if they changed, its title, outcome or directory.",
+    input: z.object({
+      summary: z.string().min(1).optional().describe("one line in Chinese: where things stand"),
+      outcome: z.string().min(1).optional().describe("what done looks like"),
+      title: z.string().min(1).optional(),
+      cwd: z.string().optional().describe("absolute path where the project's work happens now"),
+    }),
+    async run(args, ctx) {
+      if (args.cwd !== undefined && !args.cwd.startsWith("/")) return { output: "cwd must be an absolute path; ask the owner if you do not know it.", isError: true };
+      const now = ctx.clock.now();
+      const patch: Partial<ProjectRecord> = {
+        ...(args.summary ? { summary: args.summary } : {}),
+        ...(args.outcome ? { outcome: args.outcome } : {}),
+        ...(args.title ? { title: args.title } : {}),
+        ...(args.cwd ? { cwd: args.cwd } : {}),
+      };
+      if (Object.keys(patch).length === 0) return { output: "Nothing to update.", isError: true };
+      const next = patchProject(await projectOf(ctx), patch, now);
+      await save(ctx, { [gtdKeys.project]: next, ...(args.summary ? { [CELL_STATUS_KEY]: statusLine(clip(args.summary, 200), now) } : {}) });
+      if (args.title) await ctx.ports.updateCell(self(ctx), { title: args.title });
+      return `Project record updated${args.summary ? "; the owner's board shows the new summary" : ""}.`;
+    },
+  });
+
+  const finishProject = tool({
+    name: "finish_project",
+    description: [
+      "Record the project's end on the owner's board and close (or park) the project cell in one step.",
+      '"completed": done and accepted. "someday": parked with everything kept, to be brought back later. "cancelled": stopped; what is still running under the project is stopped with it.',
+      "Nothing is checked for you: whether the owner has accepted, whether every piece of accepted work has reported, and whether a habit the owner taught you should be saved first are yours to judge (the result lists the actions that were still open). Child cells still open are named instead of closed, unless closeChildren is true.",
+    ].join(" "),
+    input: z.object({
+      outcome: z.enum(["completed", "cancelled", "someday"]),
+      summary: z.string().min(1).describe("what was delivered and where it is (artifact, MR link), or why it stops — plain Chinese"),
+      retro: z.string().optional().describe("the reusable habits of the owner you saved as preferences during this project, by name — kept on the record"),
+      closeChildren: z.boolean().optional().describe("true: also stop child cells that are still open (always the case for cancelled)"),
+    }),
+    async run(args, ctx) {
+      const { ports } = ctx;
+      const now = ctx.clock.now();
+      const project = await projectOf(ctx);
+      const open = (await readActions(ports)).filter((a) => a.status === "open");
+      const force = args.outcome === "cancelled" || args.closeChildren === true;
+      try {
+        await ports.settleSelf?.({ action: args.outcome === "completed" ? "complete" : args.outcome === "cancelled" ? "cancel" : "pause", summary: args.summary, ...(force ? { force: true } : {}) });
+      } catch (err) {
+        if (isNgError(err, "conflict")) return { output: `Nothing was recorded or closed: ${errorText(err)} Call again with closeChildren: true if stopping them is what you mean.`, isError: true };
+        throw err;
+      }
+      const patches: Record<string, unknown> = {};
+      // The books follow what happened: a cancelled project's open actions are cancelled with it. For the other
+      // outcomes they are left as the project left them and only reported back.
+      if (args.outcome === "cancelled") for (const a of open) patches[gtdKeys.action(a.id)] = patchAction(a, { status: "cancelled" }, now);
+      const record = patchProject(project, { lifecycle: args.outcome, summary: args.summary }, now) as ProjectRecord & { retro?: string };
+      if (args.retro) record.retro = args.retro;
+      patches[gtdKeys.project] = record;
+      const label = args.outcome === "completed" ? "已完成" : args.outcome === "cancelled" ? "已停止" : "已放进以后再说";
+      patches[CELL_STATUS_KEY] = statusLine(`${label}：${clip(args.summary.split("\n")[0]!, 150)}`, now);
+      await save(ctx, patches);
+      if (args.outcome === "completed") await notifyOwner(ports, cfg.ownerAddress, `「${project.title}」已完成：${clip(args.summary.split("\n")[0]!, 120)}`, `finished:${self(ctx)}`);
+      const what =
+        args.outcome === "completed"
+          ? "Recorded as completed and the owner's board shows it; the project closes when this turn ends"
+          : args.outcome === "cancelled"
+            ? "Recorded as cancelled; everything still running was stopped and the project closes when this turn ends"
+            : "Recorded as someday; the project is parked with everything kept when this turn ends and wakes when the owner brings it back";
+      const left = args.outcome !== "cancelled" && open.length > 0 ? ` Note: these actions were still open on the books — ${open.map(describe).join("; ")}.` : "";
+      return { output: `${what}; stop here.${left}`, endRun: "completed" };
+    },
+  });
+
+  return {
+    name: TOOLSETS.project,
+    description: "A project's own books: dispatch work, track who has the ball, wait for a reply, keep the record current, finish.",
+    tools: [dispatch, trackAction, awaitReply, updateProject, finishProject],
+  };
+}
+

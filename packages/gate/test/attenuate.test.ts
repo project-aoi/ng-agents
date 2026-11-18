@@ -120,6 +120,9 @@ describe("attenuateBounds — property: the child is always ⊆ the parent", () 
       if (requested?.maxDepth === undefined) expect(child.maxDepth).toBe(parent.maxDepth - 1);
       expect(child.maxDepth).toBeLessThanOrEqual(parent.maxDepth - 1);
       if (parentCellId) expect(anyCovers(child.canSendTo, `inbox:${parentCellId}`)).toBe(true);
+      // inbox reachability is inherited whatever the request; channels only on request
+      for (const p of parent.canSendTo) if (p.startsWith("inbox:")) expect(anyCovers(child.canSendTo, p), JSON.stringify(ctx)).toBe(true);
+      if (requested?.canSendTo === undefined) expect(child.canSendTo.filter((a) => !a.startsWith("inbox:"))).toEqual([]);
       if (remaining) {
         expect(child.maxTokens).toBeLessThanOrEqual(remaining.tokens);
         expect(child.maxCents).toBeLessThanOrEqual(remaining.cents);
@@ -171,10 +174,10 @@ describe("attenuateBounds — field rules", () => {
     maxDepth: 2,
   });
 
-  it("omitted fields: parent's tools/isolation/limits, only the parent inbox, no secrets, depth − 1", () => {
+  it("omitted fields: parent's tools/isolation/limits, the parent inbox plus the parent's inboxes (no channels), no secrets, depth − 1", () => {
     const c = attenuateBounds(parent, "proj");
     expect([...c.tools].sort()).toEqual(["bash", "read", "write"]);
-    expect(c.canSendTo).toEqual(["inbox:proj"]);
+    expect(c.canSendTo).toEqual(["inbox:desk", "inbox:p1", "inbox:proj"]);
     expect(c.secretRefs.size).toBe(0);
     expect(c.isolation).toBe("git_worktree");
     expect([c.maxConcurrentChildren, c.maxTokens, c.maxCents, c.maxDepth]).toEqual([4, 50_000, 300, 1]);
@@ -193,7 +196,7 @@ describe("attenuateBounds — field rules", () => {
     });
     expect(serializeBounds(c)).toEqual({
       tools: ["read"],
-      canSendTo: ["channel:feishu:oc_1", "inbox:proj"],
+      canSendTo: ["channel:feishu:oc_1", "inbox:desk", "inbox:p1", "inbox:proj"],
       secretRefs: ["github"],
       isolation: "container",
       maxConcurrentChildren: 1,
@@ -235,7 +238,24 @@ describe("attenuateBounds — field rules", () => {
     const c = attenuateBounds(parent, "p", { tools: {} as never, secretRefs: "github" as never, canSendTo: 5 as never });
     expect(c.tools.size).toBe(0);
     expect(c.secretRefs.size).toBe(0);
-    expect(c.canSendTo).toEqual(["inbox:p"]);
+    expect(c.canSendTo).toEqual(["inbox:desk", "inbox:p", "inbox:p1"]);
+  });
+
+  it("inbox patterns are inherited whatever the request; channel addresses need a request within the parent's", () => {
+    const wide = makeBounds({ ...serializeBounds(parent), canSendTo: ["inbox:*", "channel:feishu:*", "channel:ui:*"] });
+    // inbox:* passes down as inbox:* (it covers the parent inbox too), even when the request lists nothing
+    expect(attenuateBounds(wide, "proj").canSendTo).toEqual(["inbox:*"]);
+    expect(attenuateBounds(wide, "proj", { canSendTo: [] }).canSendTo).toEqual(["inbox:*"]);
+    expect(attenuateBounds(wide, "proj", { canSendTo: ["inbox:proj"] }).canSendTo).toEqual(["inbox:*"]);
+    expect(attenuateBounds(wide, "proj", { canSendTo: ["channel:feishu:oc_1", "channel:slack:C1"] }).canSendTo).toEqual(["channel:feishu:oc_1", "inbox:*"]);
+    // a parent that can only reach the desk passes on just that
+    const deskOnly = makeBounds({ ...serializeBounds(parent), canSendTo: ["inbox:desk", "channel:feishu:*"] });
+    expect(attenuateBounds(deskOnly, "proj").canSendTo).toEqual(["inbox:desk", "inbox:proj"]);
+    expect(attenuateBounds(deskOnly, "proj", { canSendTo: ["inbox:*"] }).canSendTo).toEqual(["inbox:desk", "inbox:proj"]);
+    expect(attenuateBounds(deskOnly, "proj", { canSendTo: ["channel:feishu:*"] }).canSendTo).toEqual(["channel:feishu:*", "inbox:desk", "inbox:proj"]);
+    // a parent with no inbox patterns gives only its own inbox
+    const channelsOnly = makeBounds({ ...serializeBounds(parent), canSendTo: ["channel:feishu:*"] });
+    expect(attenuateBounds(channelsOnly, "proj").canSendTo).toEqual(["inbox:proj"]);
   });
 
   it("garbage numbers clamp to 0 and infinities to the parent's value", () => {
@@ -292,7 +312,8 @@ describe("Gate.attenuate — persisted state", () => {
     const wide = makeBounds({ tools: TOOL_KINDS, canSendTo: ["inbox:*", "channel:*" as Address], secretRefs: ["github"], isolation: "none", maxConcurrentChildren: 9, maxTokens: 1e6, maxCents: 1e6, maxDepth: 5 });
     const c = f.gate.attenuate(wide, "narrow", { tools: new Set(TOOL_KINDS), canSendTo: ["channel:feishu:x"], secretRefs: new Set(["github"]) });
     expect(isSubsetBounds(c, f.cells.require("narrow").bounds, { parentCellId: "narrow" })).toBe(true);
-    expect(serializeBounds(c)).toMatchObject({ tools: ["read"], canSendTo: ["inbox:narrow"], secretRefs: [], isolation: "container", maxDepth: 0 });
+    // the request's channel is outside the stored parent; the stored parent's own inbox reach is inherited
+    expect(serializeBounds(c)).toMatchObject({ tools: ["read"], canSendTo: ["inbox:desk", "inbox:narrow"], secretRefs: [], isolation: "container", maxDepth: 0 });
   });
 
   it("randomized: always ⊆ the passed parent and the stored parent, budget ≤ remaining", () => {

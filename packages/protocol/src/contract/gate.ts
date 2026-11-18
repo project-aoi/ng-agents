@@ -29,10 +29,14 @@ export interface Gate {
   meter(cellId: string, usage: { tokens: number; billedCents: number }): "ok" | "warn" | "hard_stop";
 
   // [ext] attenuate semantics (never widens, clamps instead of failing):
-  //   omitted field → tools = parent.tools, canSendTo = [inbox:<parentCellId>], secretRefs = ∅,
+  //   omitted field → tools = parent.tools, secretRefs = ∅,
   //   isolation = parent.isolation, maxConcurrentChildren / maxTokens / maxCents = parent's, maxDepth = parent.maxDepth − 1;
   //   requested field → intersected with / clamped to the parent's (isolation = the stronger of the two; an unknown
-  //   level clamps to the strongest). `inbox:<parentCellId>` is always kept in canSendTo (a child can always report back).
+  //   level clamps to the strongest).
+  //   canSendTo [docs/05]: internal messaging is free inside the tree — the child always gets `inbox:<parentCellId>`
+  //   (it can always report back) plus every `inbox:` pattern the parent holds, whether or not requested (a parent with
+  //   `inbox:*` passes on `inbox:*`; transitively every ancestor's inbox, so a deep worker can reach `inbox:desk` to ask
+  //   for arbitration). `channel:` entries only on request, intersected with the parent's.
   //   maxTokens / maxCents are further capped by what the parent and every ancestor still have left in the ledger.
   //   When parentCellId is a stored cell, the passed bounds are first met with its stored bounds.
   //   Throws NgError("bounds_violation") only when parent.maxDepth < 1. Result satisfies
@@ -44,9 +48,18 @@ export interface Gate {
   //   maxDepth 0 or at maxConcurrentChildren, control of a non-descendant) → deny with feedback; ledger hard_stop of the
   //   cell or any ancestor → deny; draft artifact unknown / outside the cell's lineage / version out of range → deny;
   //   effective sideEffect = max(declared, derived from the action) (a channel.send outside the owner's addresses is
-  //   always external; project.start is always external); an enabled matching PolicyRule decides (most specific first);
-  //   otherwise none/internal/notify_owner → allow, external → defer (approval row + card).
+  //   always external; project.start is always external; [docs/05] workspace.exec with a mutating tool and job.start
+  //   are internal whatever the isolation — work in the owner's real directories is guarded by cwdMode, the
+  //   dispatcher's per-directory write queue and the prompts' red lines); an enabled matching PolicyRule decides (most
+  //   specific first); otherwise none/internal/notify_owner → allow, external → defer (approval row + card).
   //   Every allow mints a single-use token bound to hashAction(action).
+  //
+  // [ext] deciders [docs/05 guard 3]: the owner principal decides everything. An external main agent (`agent:<id>`)
+  //   may approve any card except an owner-only one (`ownerOnlyApproval` in @ng/gate: a channel.send outside the
+  //   owner's addresses, a budget_exhausted escalation) and may always deny (snoozeSync / withdrawSync take no
+  //   principal); it may never raise a budget or author a policy rule. Cells and other principals decide nothing. A refused
+  //   decider throws NgError("bounds_violation"); a missing one NgError("invalid_argument"). Only the owner's
+  //   decisions count toward ApprovalStat.
 
   // ---------- [ext] sync twins (the async methods delegate to these) ----------
   authorizeSync(action: ProposedAction, meta: AuthorizeMeta): AuthorizeResult;
@@ -85,12 +98,12 @@ export interface Gate {
   injectSecretSync(token: string, expectedSecretRef?: string): string;
 
   // ---------- [ext] control bypass authorization (implements ControlAuthorizer) ----------
-  /** owner principal: any cell; `cell:<id>`: only its strict descendants; anyone else: refused. */
+  /** owner principal and `agent:<id>`: any cell; `cell:<id>`: only its strict descendants; anyone else: refused. */
   authorizeControlSync(cellId: string, principalId: string, action: ControlAction): { ok: true } | { ok: false; reason: string };
 
   // ---------- [ext] dual ledger ----------
   usageSync(cellId: string): LedgerUsage;
-  /** Human-granted extra allowance for one cell ("追加额度继续"). */
+  /** Human-granted extra allowance for one cell ("追加额度继续"). Owner principal only. */
   raiseBudgetSync(cellId: string, add: { tokens?: number; cents?: number }, approverId: string): LedgerUsage;
 
   // ---------- [ext] policy rules: trust grows gradually (docs/03 principle 4) ----------

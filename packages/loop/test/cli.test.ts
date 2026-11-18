@@ -171,12 +171,13 @@ describe.each(ENGINES)("CLI loop with a fake %s", (engine) => {
         ],
       },
     ]);
-    const r = s.run({ bounds: writerBounds(), spec: { processor: { kind: "llm", toolsets: TOOLSETS } } });
+    // an explicitly isolated (git_worktree) writer: the pre-docs/05 confinement ("workspace" access)
+    const r = s.run({ bounds: writerBounds(), spec: { processor: { kind: "llm", toolsets: TOOLSETS }, cwdMode: "write" } });
     // job_start arranged a wake-up, so a run that would complete yields instead (same as the API loop)
     expect(await runOf(s, r)).toBe("yielded_waiting");
     expect(r.ports.log.jobs.map((j) => j.command)).toEqual(["sleep 1"]);
     const launch = launches(s)[0]!;
-    expect(launch.caps).toMatchObject({ readOnly: false, write: true, edit: true, bash: true });
+    expect(launch.caps).toMatchObject({ readOnly: false, write: true, edit: true, bash: true, isolation: "git_worktree", access: "workspace", web: false });
     const argv = launch.argv.join(" ");
     if (engine === "claude") {
       expect(argv).toContain("--tools Read,Grep,Glob,Write,Edit,NotebookEdit,Bash ");
@@ -195,8 +196,105 @@ describe.each(ENGINES)("CLI loop with a fake %s", (engine) => {
       ]);
     }
     const tools = s.fake.log().find((e) => e.type === "mcp_ready")!["tools"] as string[];
-    expect(tools).toEqual(expect.arrayContaining(["job_start", "job_observe", "code_rpc"]));
+    expect(tools).toEqual(expect.arrayContaining(["job_start", "job_observe"]));
+    // code_rpc is for API models without a shell: a CLI agent has its own and is not offered it.
+    expect(tools).not.toContain("code_rpc");
     expect(tools).not.toEqual(expect.arrayContaining(["write"]));
+  });
+
+  it("runs a writing cell on the host (isolation none) unsandboxed with web tools, keeping job tools on MCP", async () => {
+    const s = setup(engine, [
+      {
+        actions: [
+          { native: "Edit", kind: "edit", path: "/etc/hosts", input: {} },
+          { mcp: "job_start", args: { command: "sleep 1" } },
+          { text: "Started." },
+        ],
+      },
+    ]);
+    const bounds = makeBounds({ ...writerBounds(), tools: [...writerBounds().tools], isolation: "none" });
+    const r = s.run({ bounds, spec: { processor: { kind: "llm", toolsets: TOOLSETS }, cwdMode: "write" } });
+    expect(await runOf(s, r)).toBe("yielded_waiting");
+    expect(r.ports.log.jobs.map((j) => j.command)).toEqual(["sleep 1"]);
+    const launch = launches(s)[0]!;
+    expect(launch.cwd).toBe(s.root);
+    // capabilitiesOf: host access, and web on for every host cell even though the loop's web option is off
+    expect(launch.caps).toEqual({ root: s.root, isolation: "none", write: true, edit: true, bash: true, readOnly: false, web: true, access: "host", cwdMode: "write" });
+    const argv = launch.argv;
+    if (engine === "claude") {
+      expect(argv[argv.indexOf("--permission-mode") + 1]).toBe("bypassPermissions");
+      for (const f of ["--restricted", "--strict-mcp-config", "--tools", "--settings"]) expect(argv).not.toContain(f);
+    } else if (engine === "codex") {
+      expect(argv[argv.indexOf("-s") + 1]).toBe("danger-full-access");
+      expect(argv.join(" ")).not.toContain("network_access=false");
+      expect(argv).not.toContain("--ignore-rules");
+    } else {
+      expect(argv).not.toContain("--sandbox");
+      // an edit outside the cwd is the owner's machine: allowed for a writing host cell
+      expect(s.fake.log().filter((e) => e.type === "permission").map((e) => [e["tool"], e["allowed"]])).toEqual([["Edit", true]]);
+    }
+    const tools = s.fake.log().find((e) => e.type === "mcp_ready")!["tools"] as string[];
+    expect(tools).toEqual(expect.arrayContaining(["job_start", "job_observe"]));
+    // code_rpc is for API models without a shell: a CLI agent has its own and is not offered it.
+    expect(tools).not.toContain("code_rpc");
+  });
+
+  it("runs a read cell (cwdMode read) on the host exactly like a writing one; only the directory note says it is here to look", async () => {
+    const turn = (text: string): FakeCliTurn => ({ actions: [{ native: "Edit", kind: "edit", path: "/etc/hosts", input: {} }, { text }] });
+    const s = setup(engine, [turn("Looked."), turn("Changed.")]);
+    const bounds = makeBounds({ ...writerBounds(), tools: [...writerBounds().tools], isolation: "none" });
+    const reader = s.run({ bounds, spec: { processor: { kind: "llm", toolsets: TOOLSETS }, cwdMode: "read" } });
+    // as the kernel's ports do: every tool in bounds, plus the cell's cwdMode
+    const access = reader.ports.workspaceAccess!.bind(reader.ports);
+    reader.ports.workspaceAccess = async () => ({ ...(await access()), cwdMode: "read" });
+    expect(await runOf(s, reader)).toBe("completed");
+    const writer = s.run({ bounds, spec: { processor: { kind: "llm", toolsets: TOOLSETS }, cwdMode: "write" } });
+    expect(await runOf(s, writer)).toBe("completed");
+    const [lr, lw] = launches(s);
+    // cwdMode is reported, nothing is taken away: the same write/edit/bash, the same host access and launch
+    expect(lr!.caps).toEqual({ root: s.root, isolation: "none", write: true, edit: true, bash: true, readOnly: false, web: true, access: "host", cwdMode: "read" });
+    expect(lr!.caps).toEqual({ ...lw!.caps, cwdMode: "read" });
+    expect(lr!.permissions).toBe(lw!.permissions);
+    expect(lr!.cwd).toBe(lw!.cwd);
+    // run-specific values (temp dirs, the bridge port) and codex's inline system text (compared below) set aside
+    const normalize = (argv: readonly string[]) =>
+      argv.map((a) =>
+        a.startsWith("developer_instructions=")
+          ? "developer_instructions=<system>"
+          : a.replace(/ng-(cli-[a-z]+|bridge)-[A-Za-z0-9]+/g, "<tmp>").replace(/NG_BRIDGE_PORT = "\d+"/, "NG_BRIDGE_PORT = <port>"),
+      );
+    expect(normalize(lr!.argv)).toEqual(normalize(lw!.argv));
+    if (engine === "claude") expect(lr!.argv[lr!.argv.indexOf("--permission-mode") + 1]).toBe("bypassPermissions");
+    else if (engine === "codex") expect(lr!.argv[lr!.argv.indexOf("-s") + 1]).toBe("danger-full-access");
+    else {
+      expect(lr!.argv).not.toContain("--sandbox");
+      // the read cell's edit outside the cwd is allowed exactly as the writer's is
+      expect(s.fake.log().filter((e) => e.type === "permission").map((e) => [e["tool"], e["allowed"]])).toEqual([["Edit", true], ["Edit", true]]);
+    }
+    const ready = s.fake.log().filter((e) => e.type === "mcp_ready").map((e) => e["tools"] as string[]);
+    expect(ready).toHaveLength(2);
+    expect(ready[0]).toEqual(ready[1]);
+    expect(ready[0]).toEqual(expect.arrayContaining(["job_start", "job_observe"]));
+    // the only difference is the "How this cell runs" directory note (claude's system file is removed after the run)
+    const systems =
+      engine === "codex"
+        ? s.fake.log().filter((e) => e.type === "codex_config").map((e) => e["developerInstructions"] as string)
+        : engine === "agy"
+          ? s.fake.log().filter((e) => e.type === "acp_session").map((e) => e["systemPrompt"] as string)
+          : [];
+    if (engine !== "claude") {
+      const [readText, writeText] = systems;
+      expect(readText).toContain("## How this cell runs");
+      expect(readText).toContain("You are here to look, not to change");
+      expect(readText).not.toContain("While you run, no other cell writes in this work tree.");
+      expect(writeText).toContain("While you run, no other cell writes in this work tree.");
+      expect(writeText).not.toContain("You are here to look, not to change");
+      const withoutNote = (t: string) =>
+        t
+          .replace(/ You are here to look, not to change:[^\n]*/, "")
+          .replace(" While you run, no other cell writes in this work tree.", "");
+      expect(withoutNote(readText!)).toBe(withoutNote(writeText!));
+    }
   });
 
   it("ends the Run when a kernel tool says so, refuses later calls and stops the CLI", async () => {

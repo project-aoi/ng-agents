@@ -7,6 +7,8 @@ import {
   RESOURCE_URI_PREFIX,
   run,
   spillNotice,
+  EXPLICIT_READ_TOOLS,
+  EXPLICIT_READ_INLINE_CHARS,
   withTx,
   type EvidenceAppendResult,
   type EvidenceEntry,
@@ -77,7 +79,7 @@ function validate(r: StepOrExternalEvidence): void {
   }
 }
 
-/** Plain text indexed by FTS5 (inline form only: spilled bodies are not indexed beyond their head/tail). */
+/** Plain text indexed by FTS5 (inline form only: a spilled body's full text is indexed with its resource, resource_fts). */
 function searchableText(r: StepOrExternalEvidence, spilledInline: string | null): string {
   switch (r.kind) {
     case "inbound":
@@ -102,9 +104,8 @@ export interface EvidenceModule {
   list(cellId: string, opts?: { afterSeq?: number; uptoSeq?: number; limit?: number; runId?: string }): StoredEvidence[];
   lastSeq(cellId: string): number;
   writeResource(cellId: string, content: string, meta?: { runId?: string; mime?: string; source?: string }): string;
-  readResource(cellId: string, uri: string, page?: ResourcePage): string;
-  /** Throws NgError("not_found") unless `requester` is `owner`, an ancestor of it, or a descendant of it. */
-  assertSameLineage(requester: string, owner: string, what: string): void;
+  /** [docs/05] Any cell may read any cell's resource; throws NgError("not_found") for an unknown URI. */
+  readResource(uri: string, page?: ResourcePage): string;
 }
 
 export function pageOf(text: string, page: ResourcePage | undefined): string {
@@ -116,7 +117,7 @@ export function pageOf(text: string, page: ResourcePage | undefined): string {
 }
 
 export function createEvidence(deps: Deps): EvidenceModule {
-  const { db, clock, cells, limits } = deps;
+  const { db, clock, limits } = deps;
 
   function writeResource(cellId: string, content: string, meta: { runId?: string; mime?: string; source?: string } = {}): string {
     if (typeof content !== "string") throw new NgError("invalid_argument", "resource content must be a string");
@@ -131,14 +132,6 @@ export function createEvidence(deps: Deps): EvidenceModule {
     return uri;
   }
 
-  function assertSameLineage(requester: string, owner: string, what: string): void {
-    if (requester === owner) return;
-    if (!cells.get(requester)) throw new NgError("not_found", `cell "${requester}" not found`);
-    if (cells.ancestors(requester).some((c) => c.id === owner)) return;
-    if (cells.ancestors(owner).some((c) => c.id === requester)) return;
-    throw new NgError("not_found", `${what} not found`);
-  }
-
   function append(cellId: string, record: StepOrExternalEvidence): EvidenceAppendResult {
     validate(record);
     return withTx(db, () => {
@@ -147,7 +140,9 @@ export function createEvidence(deps: Deps): EvidenceModule {
       let spilledInline: string | null = null;
       if (record.kind === "tool_result" || record.kind === "external") {
         const big = record.kind === "tool_result" ? record.output : record.text;
-        if (big.length > limits.inlineChars) {
+        const inlineLimit =
+          record.kind === "tool_result" && EXPLICIT_READ_TOOLS.has(record.name) ? Math.max(limits.inlineChars, EXPLICIT_READ_INLINE_CHARS) : limits.inlineChars;
+        if (big.length > inlineLimit) {
           const uri = writeResource(cellId, big, {
             ...(record.runId ? { runId: record.runId } : {}),
             source: record.kind === "tool_result" ? `tool:${record.name}` : `external:${record.source}`,
@@ -155,7 +150,7 @@ export function createEvidence(deps: Deps): EvidenceModule {
           const head = safeHead(big, limits.spillHeadChars);
           const tail = safeTail(big, limits.spillTailChars);
           const inlineChars = head.length + tail.length;
-          const inline = `${head}${spillNotice(uri, big.length, inlineChars)}${tail ? `\n${tail}` : ""}`;
+          const inline = `${head}${spillNotice(uri, big.length, head.length, tail.length)}${tail ? `\n${tail}` : ""}`;
           spilledInline = tail ? `${head}\n${tail}` : head;
           stored =
             record.kind === "tool_result" ? { ...record, output: inline, spillUri: uri } : { ...record, text: inline, spillUri: uri };
@@ -205,13 +200,11 @@ export function createEvidence(deps: Deps): EvidenceModule {
       return get<{ m: number | null }>(db, "SELECT MAX(seq) AS m FROM evidence WHERE cell_id = ?", [cellId])?.m ?? 0;
     },
     writeResource,
-    readResource(cellId, uri, page) {
-      const row = get<{ cell_id: string; content: string }>(db, "SELECT cell_id, content FROM resources WHERE uri = ?", [uri]);
+    readResource(uri, page) {
+      const row = get<{ content: string }>(db, "SELECT content FROM resources WHERE uri = ?", [uri]);
       if (!row) throw new NgError("not_found", `resource "${uri}" not found`);
-      assertSameLineage(cellId, row.cell_id, `resource "${uri}"`);
       return pageOf(row.content, page);
     },
-    assertSameLineage,
   };
 }
 

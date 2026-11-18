@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { defineTool, newId, type Deliverable, type Toolset, type VersionedArtifact } from "@ng/protocol";
+import { DEFAULT_RESOURCE_PAGE_CHARS, defineTool, newId, type Deliverable, type Toolset, type VersionedArtifact } from "@ng/protocol";
 import { clip, firstLine, json, selfId } from "./util";
 
 export const CONTEXT_TOOLSET = "kernel.context";
@@ -14,19 +14,20 @@ function describeArtifact(a: VersionedArtifact, withBody: boolean): string {
 const readState = defineTool({
   name: "read_state",
   kind: "kernel",
-  description: "Read this cell's saved state: one key, or every key under a prefix.",
-  input: z.object({ key: z.string().min(1).optional(), prefix: z.string().optional() }),
+  description:
+    "Read saved state: one key, or every key under a prefix. Yours by default; pass cellId to read another cell's (a child's records, a project's `gtd:project` and `gtd:action:` entries, the desk's ledger). Reading is open; writing is always your own.",
+  input: z.object({ key: z.string().min(1).optional(), prefix: z.string().optional(), cellId: z.string().min(1).optional().describe("default: this cell") }),
   async handler(args, ctx) {
+    const cellId = args.cellId ?? selfId(ctx);
     if (args.key !== undefined) {
-      const v = await ctx.ports.context.readState(selfId(ctx), args.key);
+      const v = await ctx.ports.context.readState(cellId, args.key);
       return v === null ? `${args.key}: (not set)` : `${args.key} = ${json(v)}`;
     }
-    const entries = await ctx.ports.context.listState(selfId(ctx), args.prefix ?? "");
-    if (entries.length === 0) return `No state under "${args.prefix ?? ""}".`;
+    const entries = await ctx.ports.context.listState(cellId, args.prefix ?? "");
+    if (entries.length === 0) return `No state under "${args.prefix ?? ""}"${args.cellId ? ` in ${args.cellId}` : ""}.`;
     return entries.map((e) => `${e.key} = ${json(e.value)}`).join("\n");
   },
 });
-
 const setState = defineTool({
   name: "set_state",
   kind: "kernel",
@@ -43,24 +44,24 @@ const setState = defineTool({
 const readArtifact = defineTool({
   name: "read_artifact",
   kind: "kernel",
-  description: "Read a draft/document (artifact) with its current version, or list this cell's artifacts when no id is given.",
-  input: z.object({ artifactId: z.string().min(1).optional() }),
+  description:
+    "Read a draft/document (artifact) with its current version — any cell's, by id. Without an id: list the artifacts of this cell, or of cellId (e.g. the reports a project's workers saved).",
+  input: z.object({ artifactId: z.string().min(1).optional(), cellId: z.string().min(1).optional().describe("list this cell's artifacts instead of yours") }),
   async handler(args, ctx) {
     if (args.artifactId) {
       const a = await ctx.ports.context.getArtifact(args.artifactId);
       return a ? { output: describeArtifact(a, true), data: { version: a.version } } : { output: `No artifact ${args.artifactId}.`, isError: true };
     }
-    const list = await ctx.ports.context.listArtifacts(selfId(ctx));
-    return list.length ? list.map((a) => describeArtifact(a, false)).join("\n") : "This cell has no artifacts.";
+    const list = await ctx.ports.context.listArtifacts(args.cellId ?? selfId(ctx));
+    return list.length ? list.map((a) => describeArtifact(a, false)).join("\n") : `${args.cellId ?? "This cell"} has no artifacts.`;
   },
 });
-
 const saveArtifact = defineTool({
   name: "save_artifact",
   kind: "kernel",
   description: [
     "Create or revise a human-visible draft (reply, proposal, report). Omit artifactId to create one.",
-    "To revise, pass the expectedVersion you last read: if someone (often the human) saved a newer version, nothing is overwritten — you get the current version back to rework, and your text is kept beside the human's draft as a suggestion.",
+    "To revise an existing one — yours or one another cell created, such as a project's shared report — read it first and pass the expectedVersion you read (required): if someone saved a newer version in between, nothing is overwritten — you get the current version back to rework (and when that newer version is the human's, your text is kept beside it as a suggestion).",
   ].join(" "),
   input: z.object({
     artifactId: z.string().min(1).optional(),
@@ -155,21 +156,29 @@ const saveSkill = defineTool({
 const searchHistory = defineTool({
   name: "search_history",
   kind: "kernel",
-  description: "Full-text search (Chinese and English) over this cell's past messages, tool output and notes, including its ancestors' shared notes.",
-  input: z.object({ query: z.string().min(1) }),
+  description: [
+    "Full-text search (Chinese and English) over what was said, done and saved.",
+    "scope lineage (default): this cell's own messages, tool output and notes, plus shared notes. scope subtree: also everything below you — closed workers included — with their artifacts, state and the full text of long tool outputs. scope global: every cell on the workbench — use it before starting something new (is there already a project, a report or a preference about this?) and to find how something was done before.",
+  ].join(" "),
+  input: z.object({ query: z.string().min(1), scope: z.enum(["lineage", "subtree", "global"]).optional() }),
   async handler(args, ctx) {
-    const hits = (await ctx.ports.context.searchHistory(selfId(ctx), args.query)).slice(0, 20);
-    if (hits.length === 0) return `No matches for "${args.query}".`;
+    const hits = (await ctx.ports.context.searchHistory(selfId(ctx), args.query, args.scope ? { scope: args.scope } : undefined)).slice(0, 20);
+    if (hits.length === 0) return `No matches for "${args.query}"${args.scope ? ` (scope ${args.scope})` : ""}.`;
     return hits
       .map((h) => {
-        const where = h.source === "knowledge" ? `${h.kind} ${h.title ?? ""}`.trim() : `#${h.seq} ${h.kind} ${new Date(h.at).toISOString()}`;
+        const cell = h.cellId && h.cellId !== selfId(ctx) ? ` cell ${h.cellId}` : "";
+        const where =
+          h.source === "knowledge"
+            ? `${h.kind} ${h.title ?? ""}`.trim()
+            : h.source === "evidence"
+              ? `#${h.seq} ${h.kind} ${new Date(h.at).toISOString()}${cell}`
+              : `${h.source}${h.title ? ` ${h.title}` : ""}${cell}`;
         const full = h.spillUri ?? h.uri;
         return `- [${where}] ${clip(h.text.replace(/\s+/g, " "), 300)}${full ? ` (full: ${full})` : ""}`;
       })
       .join("\n");
   },
 });
-
 const readResource = defineTool({
   name: "read_resource",
   kind: "kernel",
@@ -178,11 +187,16 @@ const readResource = defineTool({
   input: z.object({
     uri: z.string().min(1),
     offset: z.number().int().min(0).optional().describe("character offset"),
-    limit: z.number().int().min(1).optional().describe("characters (default 8000)"),
+    limit: z.number().int().min(1).optional().describe("characters (default and maximum 8000)"),
   }),
   async handler(args, ctx) {
-    const page = args.offset !== undefined || args.limit !== undefined ? { offset: args.offset ?? 0, limit: args.limit ?? 8000 } : undefined;
-    return await ctx.ports.context.readResource(selfId(ctx), args.uri, page);
+    // One page never exceeds what stays inline (see EXPLICIT_READ_INLINE_CHARS), and it always says whether more
+    // follows and where — so a long text is read by walking the offsets, never by guessing.
+    const offset = args.offset ?? 0;
+    const limit = Math.min(args.limit ?? DEFAULT_RESOURCE_PAGE_CHARS, DEFAULT_RESOURCE_PAGE_CHARS);
+    const text = await ctx.ports.context.readResource(selfId(ctx), args.uri, { offset, limit: limit + 1 });
+    if (text.length <= limit) return offset > 0 && text.length === 0 ? `(nothing at offset ${offset}: the resource ends before it)` : text;
+    return `${text.slice(0, limit)}\n…[characters ${offset}–${offset + limit} shown; more follows: read_resource("${args.uri}", offset ${offset + limit})]`;
   },
 });
 

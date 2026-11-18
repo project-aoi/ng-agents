@@ -53,6 +53,7 @@ import {
   actionShapeFeedback,
   boundsFeedback,
   effectiveSideEffect,
+  ownerOnlyApproval,
   parseActionClass,
   pickRule,
   type BoundsContext,
@@ -545,11 +546,25 @@ export function createGate(opts: GateOptions): GateService {
     return all<RuleRow>(db, "SELECT * FROM policy_rules ORDER BY created_at, id").map(toRule);
   }
 
-  function assertHumanPrincipal(principalId: unknown, what: string): asserts principalId is string {
+  // ---------- deciders ----------
+
+  /** Owner-only decisions: raising a budget, authoring policy rules, approving an `ownerOnlyApproval` card. */
+  function assertOwner(principalId: unknown, what: string): asserts principalId is string {
     if (!isNonEmptyString(principalId)) throw new NgError("invalid_argument", `${what}: principal required`);
-    if (parsePrincipal(principalId, ownerPrincipal).kind === "cell") {
-      throw new NgError("invalid_argument", `${what}: a cell principal may not do this`);
+    if (principalId !== ownerPrincipal) throw new NgError("bounds_violation", `${what} needs the owner; ${principalId} may not`);
+  }
+
+  /**
+   * Decisions an external main agent (`agent:*`) may take besides the owner: declining, and approving what is not
+   * owner-only. Cells and everyone else are refused. Returns which of the two decided.
+   */
+  function assertOwnerOrAgent(principalId: unknown, what: string): "owner" | "agent" {
+    if (!isNonEmptyString(principalId)) throw new NgError("invalid_argument", `${what}: principal required`);
+    const kind = parsePrincipal(principalId, ownerPrincipal).kind;
+    if (kind !== "owner" && kind !== "agent") {
+      throw new NgError("bounds_violation", `${what} needs the owner or an agent on the control plane; ${principalId} may not`);
     }
+    return kind;
   }
 
   // ==================== the Gate ====================
@@ -647,10 +662,15 @@ export function createGate(opts: GateOptions): GateService {
     },
 
     approveSync(actionId, approverId, seenArtifactVersion): ApproveResult {
-      assertHumanPrincipal(approverId, "approve");
+      const decider = assertOwnerOrAgent(approverId, "approving a card");
       return withTx(db, (): ApproveResult => {
         const row = approvalRow(actionId);
         if (!row) return "not_found";
+        const action = fromJson<ProposedAction>(row.action);
+        if (decider !== "owner") {
+          const ownerOnly = ownerOnlyApproval({ ...action, card: fromJson<Deliverable>(row.card) }, ownerAddresses);
+          if (ownerOnly !== null) throw new NgError("bounds_violation", `approving this card needs the owner (${ownerOnly}); ${approverId} may not`);
+        }
         if (row.status === "approved" || row.status === "executed" || row.status === "failed" || row.status === "unknown") return "approved";
         if (row.status !== "pending") return "already_cancelled";
         const cancel = (reason: string): ApproveResult => {
@@ -663,7 +683,6 @@ export function createGate(opts: GateOptions): GateService {
         const inactive = inactiveReason(chainOf(cell), { allowPaused: true });
         if (inactive) return cancel(inactive);
         if (cell.epoch !== row.epoch) return cancel("task was cancelled or restarted");
-        const action = fromJson<ProposedAction>(row.action);
         const outOfBounds = boundsFeedback(action, boundsContext(cell));
         if (outOfBounds) return cancel(`no longer within the task's permissions: ${outOfBounds}`);
 
@@ -690,7 +709,8 @@ export function createGate(opts: GateOptions): GateService {
              resolved_at = ?, updated_at = ? WHERE action_id = ?`,
           [approverId, bound, humanEdited ? 1 : 0, now, now, row.action_id],
         );
-        bumpStat(actionClassOf(action), { approved: true, edited: humanEdited });
+        // Trust statistics describe the owner's own judgement (what the weekly review offers to auto-allow).
+        if (decider === "owner") bumpStat(actionClassOf(action), { approved: true, edited: humanEdited });
         emitApproval(row, "approved");
         return "approved";
       });
@@ -837,7 +857,8 @@ export function createGate(opts: GateOptions): GateService {
     },
 
     denySync(actionId, approverId, reason) {
-      assertHumanPrincipal(approverId, "deny");
+      // Declining is never an escalation of privilege: an agent may deny even an owner-only card.
+      const decider = assertOwnerOrAgent(approverId, "denying a card");
       return withTx(db, () => {
         const row = approvalRow(actionId);
         if (!row || row.status !== "pending") return "not_pending";
@@ -847,7 +868,7 @@ export function createGate(opts: GateOptions): GateService {
           "UPDATE approvals SET status = 'denied', status_reason = ?, approver_id = ?, resolved_at = ?, updated_at = ? WHERE action_id = ?",
           [reason === undefined ? null : redact(reason), approverId, now, now, actionId],
         );
-        bumpStat(actionClassOf(fromJson<ProposedAction>(row.action)), { approved: false });
+        if (decider === "owner") bumpStat(actionClassOf(fromJson<ProposedAction>(row.action)), { approved: false });
         emitApproval(row, "denied");
         return "denied";
       });
@@ -1000,8 +1021,9 @@ export function createGate(opts: GateOptions): GateService {
       if (!target) return { ok: false, reason: `unknown cell "${cellId}"` };
       if (!isNonEmptyString(principalId)) return { ok: false, reason: "principal required" };
       const p = parsePrincipal(principalId, ownerPrincipal);
-      if (p.kind === "owner") return { ok: true };
-      if (p.kind !== "cell") return { ok: false, reason: "only the owner or an ancestor cell may control a cell" };
+      // An external main agent orchestrates like the owner (docs/05 §5.3); it is only kept from owner-only decisions.
+      if (p.kind === "owner" || p.kind === "agent") return { ok: true };
+      if (p.kind !== "cell") return { ok: false, reason: "only the owner, an agent on the control plane, or an ancestor cell may control a cell" };
       const actor = cells.get(p.cellId);
       if (!actor) return { ok: false, reason: `unknown cell "${p.cellId}"` };
       const inactive = inactiveReason(chainOf(actor), { allowPaused: false });
@@ -1017,7 +1039,7 @@ export function createGate(opts: GateOptions): GateService {
     },
 
     raiseBudgetSync(cellId, add, approverId) {
-      assertHumanPrincipal(approverId, "raiseBudget");
+      assertOwner(approverId, "raising a budget");
       const tokens = add?.tokens ?? 0;
       const cents = add?.cents ?? 0;
       if (!Number.isFinite(tokens) || tokens < 0 || !Number.isFinite(cents) || cents < 0) {
@@ -1061,7 +1083,8 @@ export function createGate(opts: GateOptions): GateService {
       if (input.effect !== "allow" && input.effect !== "defer" && input.effect !== "deny") {
         throw new NgError("invalid_argument", `policy rule: invalid effect ${JSON.stringify(input.effect)}`);
       }
-      assertHumanPrincipal(input.createdBy, "policy rule");
+      // A rule is a standing approval (an allow rule can open external sends), so it is the owner's alone.
+      assertOwner(input.createdBy, "authoring a policy rule");
       const maxUses = input.maxUses ?? null;
       if (maxUses !== null && (!Number.isInteger(maxUses) || maxUses < 0)) {
         throw new NgError("invalid_argument", "policy rule: maxUses must be an integer ≥ 0 or null");

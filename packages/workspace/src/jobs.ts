@@ -52,6 +52,8 @@ interface LiveJob {
   isDone: boolean;
   cancelReason: string | null;
   cancelSilent: boolean;
+  /** The cancel in flight (request written, signals sent, waiting for the group to go). */
+  cancelling: Promise<void> | null;
   pendingOutcome: Outcome | null;       // completion transaction failed; being retried
   retry: NodeJS.Timeout | null;
   attempts: number;
@@ -173,12 +175,13 @@ export class JobManager {
         killGroup(pid, "SIGTERM");
         setTimeout(() => groupAlive(pid) && killGroup(pid, "SIGKILL"), this.d.limits.killGraceMs).unref();
       }
+      if (live.cancelReason !== null) {
+        // cancel() records the outcome itself, once the whole process group is confirmed gone (not just the leader).
+        this.#markExited(live);
+        return;
+      }
       const outcome: Outcome =
-        live.cancelReason !== null
-          ? { state: "cancelled", exitCode: null, error: live.cancelReason, silent: live.cancelSilent }
-          : code === 0
-            ? { state: "succeeded", exitCode: 0, error: null }
-            : { state: "failed", exitCode: code, error: signal ? `terminated by ${signal}` : null };
+        code === 0 ? { state: "succeeded", exitCode: 0, error: null } : { state: "failed", exitCode: code, error: signal ? `terminated by ${signal}` : null };
       this.#settle(live, outcome);
     });
     // The log was created empty just above; output written before the poller starts must not be skipped.
@@ -210,6 +213,7 @@ export class JobManager {
       isDone: false,
       cancelReason: null,
       cancelSilent: false,
+      cancelling: null,
       pendingOutcome: null,
       retry: null,
       attempts: 0,
@@ -272,11 +276,14 @@ export class JobManager {
     });
   }
 
+  #markExited(live: LiveJob): void {
+    if (live.isDone) return;
+    live.isDone = true;
+    live.markDone();
+  }
+
   #settle(live: LiveJob, outcome: Outcome): void {
-    if (!live.isDone) {
-      live.isDone = true;
-      live.markDone();
-    }
+    this.#markExited(live);
     if (live.poller) clearInterval(live.poller);
     live.poller = null;
     if (live.preview) {
@@ -382,24 +389,43 @@ export class JobManager {
 
   // ---------- cancel ----------
 
-  /** Records `cancelled` (with its job.result) first, then TERM → grace → KILL on the process group. */
+  /**
+   * Request → kill → confirm → record, in that order (docs/05 guard 4):
+   * 1. the request is written to the row (`cancel_requested_at`, the job stays `running` = "cancelling");
+   * 2. TERM → grace → KILL on the process group (and inside a container);
+   * 3. only when nothing of the job is alive any more does it become `cancelled`, with its job.result.
+   * Whoever counts running jobs (the dispatcher's per-directory write slot) therefore never sees the directory as free
+   * while an old process can still write to it, and a kernel that dies between 1 and 3 leaves a row `recover()`
+   * finishes the same way. Resolves when the job is recorded; false when it was not running.
+   */
   async cancel(jobId: string, reason = "cancelled", opts: { silent?: boolean } = {}): Promise<boolean> {
     const job = this.d.store.getJob(jobId);
     if (!job || job.state !== "running") return false;
     const live = this.#live.get(jobId);
-    if (live) {
-      live.cancelReason = reason;
-      live.cancelSilent = opts.silent === true;
+    if (live?.cancelling) {
+      await live.cancelling;
+      return true;
     }
-    try {
-      this.finalizeSync(jobId, { state: "cancelled", exitCode: null, error: reason, silent: opts.silent === true });
-    } catch (err) {
-      // A live job is finished as cancelled by its exit handler (with retries); otherwise the caller must know.
-      if (!live) throw err;
-      console.error(`[workspace] recording cancel of ${jobId} failed; will retry after exit:`, err);
-    }
-    await this.#terminate(job, live);
-    return true;
+    const first = this.d.store.requestJobCancel(jobId, reason);
+    const silent = opts.silent === true;
+    const work = (async () => {
+      if (live) {
+        live.cancelReason ??= reason;
+        live.cancelSilent = silent;
+      }
+      const gone = await this.#terminate(job, live);
+      const outcome: Outcome = {
+        state: "cancelled",
+        exitCode: null,
+        error: gone ? reason : `${reason} (the process did not exit after SIGKILL; pid ${job.pid ?? "?"})`,
+        silent,
+      };
+      if (live) this.#settle(live, outcome);
+      else this.finalizeSync(jobId, outcome);
+    })();
+    if (live) live.cancelling = work.finally(() => (live.cancelling = null));
+    await work;
+    return first;
   }
 
   async cancelForCell(cellId: string, reason: string): Promise<number> {
@@ -408,11 +434,12 @@ export class JobManager {
     return results.filter(Boolean).length;
   }
 
-  async #terminate(job: JobRecord, live: LiveJob | undefined): Promise<void> {
+  /** True when nothing of the job is alive afterwards. */
+  async #terminate(job: JobRecord, live: LiveJob | undefined): Promise<boolean> {
     const pid = job.pid;
-    if (!pid) return;
+    if (!pid) return true;
     const ours = !!live?.child;
-    if (!ours && !markedAlive(pid, JOB_MARKER, job.jobId)) return; // gone, or the pid now belongs to someone else
+    if (!ours && !markedAlive(pid, JOB_MARKER, job.jobId)) return true; // gone, or the pid now belongs to someone else
     const target = this.d.workspaceOf(job.cellId);
     const marker = { name: JOB_MARKER, value: job.jobId };
     const signalAll = (sig: "TERM" | "KILL") => {
@@ -420,9 +447,9 @@ export class JobManager {
       if (target?.driver.killInside) void target.driver.killInside(target.ws, marker, sig).catch(() => {});
     };
     signalAll("TERM");
-    if (await this.#waitGone(job, live, this.d.limits.killGraceMs)) return;
+    if (await this.#waitGone(job, live, this.d.limits.killGraceMs)) return true;
     signalAll("KILL");
-    await this.#waitGone(job, live, 2000);
+    return this.#waitGone(job, live, 2000);
   }
 
   /**
@@ -470,6 +497,18 @@ export class JobManager {
           this.finalizeSync(job.jobId, { state: "failed", exitCode: null, error: "the kernel stopped before the job process was started" });
           continue;
         }
+        if (job.cancelRequestedAt !== null) {
+          // The previous kernel asked for this cancel and died before it could confirm the exit: finish the kill here.
+          // Awaited, so recover() returns only when no cancelled job can still be writing to its directory.
+          const reason = job.error ?? "cancelled";
+          const gone = await this.#terminate(job, undefined);
+          this.finalizeSync(job.jobId, {
+            state: "cancelled",
+            exitCode: null,
+            error: gone ? reason : `${reason} (the process did not exit after SIGKILL; pid ${job.pid})`,
+          });
+          continue;
+        }
         if (markedAlive(job.pid, JOB_MARKER, job.jobId)) {
           this.#reattach(job);
           continue;
@@ -494,11 +533,12 @@ export class JobManager {
     const live = this.#register(job.jobId, job.cellId, pid, job.logPath ?? "", null);
     live.poller = setInterval(() => {
       if (markedAlive(pid, JOB_MARKER, job.jobId)) return;
-      const outcome: Outcome =
-        live.cancelReason !== null
-          ? { state: "cancelled", exitCode: null, error: live.cancelReason, silent: live.cancelSilent }
-          : (this.#outcomeFromExitFile(job) ?? { state: "failed", exitCode: null, error: "the job process ended without recording an exit status" });
-      this.#settle(live, outcome);
+      if (live.cancelReason !== null) {
+        // cancel() is waiting on the same condition and records the outcome.
+        this.#markExited(live);
+        return;
+      }
+      this.#settle(live, this.#outcomeFromExitFile(job) ?? { state: "failed", exitCode: null, error: "the job process ended without recording an exit status" });
     }, this.d.limits.jobPollMs);
     live.poller.unref();
     if (job.streamPreview && job.logPath) this.#startPreview(live);

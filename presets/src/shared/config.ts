@@ -5,45 +5,65 @@ import type { ChannelAddr } from "@ng/protocol";
 export const PROMPTS = {
   desk: "gtd.desk",
   worker: "gtd.worker",
+  /** The reply watcher's model variant (await_reply interpret: true). The name predates docs/05 and is stored in specs. */
   watcher: "gtd.watcher",
   sensor: "gtd.sensor",
-  editor: "gtd.editor",
+  /** docs/05: the persistent project coordinator. */
+  project: "gtd.project",
+  /** docs/05: the `watcher` preset's default — a light one-shot checker of one outside condition. */
+  checker: "gtd.checker",
+  /** docs/05: the persistent router of one stream of direct messages. */
+  hub: "gtd.hub",
 } as const;
 
 export const TOOLSETS = {
   desk: "gtd.desk",
   watcher: "gtd.watcher",
   sensor: "gtd.sensor",
-  editor: "gtd.editor",
+  /** docs/05: dispatch, track_action, await_reply, update_project, finish_project. */
+  project: "gtd.project",
 } as const;
 
 export const PROCESSORS = {
-  /** Project/item root: zero-token join over its children; holds gtd:project and the item's actions. */
-  joinAll: "gtd.join_all",
-  /** Same coordinator, groups default to "any" (first result wins). */
-  joinAny: "gtd.join_any",
-  /** Watcher bookkeeping: one party, reply/timeout/nudge. */
+  /** Reply watcher bookkeeping (await_reply): one party, reply/timeout/nudge. */
   waitMatch: "gtd.wait_match",
   /** Sensor that runs a script through its workspace (args.script). */
   sensorScript: "gtd.sensor_script",
 } as const;
 
+/**
+ * Names that cells created before docs/05 may still carry in their stored specs. They stay registered (as stand-ins
+ * that wind such a cell down) so an old database never fails to load; nothing new is created with them.
+ */
+export const LEGACY = {
+  /** The zero-token item root that ran every project before docs/05. */
+  joinAll: "gtd.join_all",
+  joinAny: "gtd.join_any",
+  /** The redraft helper of the old item root (prompt and toolset share the name). */
+  editor: "gtd.editor",
+} as const;
+
 /** `spec.meta.role` of every cell the presets create (handy for routing a scripted model by role). */
 export const ROLES = {
   desk: "desk",
-  coordinator: "coordinator",
+  project: "project",
+  hub: "hub",
   worker: "worker",
+  /** The one-shot checker (preset `watcher`'s default). */
+  checker: "checker",
+  /** The reply watcher (await_reply). */
   watcher: "watcher",
   sensor: "sensor",
-  editor: "editor",
 } as const;
 
 export const STD = STANDARD_TOOLSETS;
 
 /** Internal (non-GTD) state keys. GTD records use `gtdKeys` from @ng/protocol. */
 export const KEYS = {
-  coordinator: "coord:state",
+  /** In a reply watcher (await_reply): WatcherState. */
   watcher: "watch:state",
+  /** In the desk: its own notes on the shared blockers it is arbitrating (kept by the model with set_state; no code reads it). */
+  arbitration: "desk:arbitration",
   reply: (subjectKey: string) => `desk:reply:${subjectKey}`,
   replyPrefix: "desk:reply:",
   proposal: (artifactId: string) => `desk:proposal:${artifactId}`,
@@ -68,9 +88,9 @@ export interface RegisterPresetsOptions {
   ownerAddress?: ChannelAddr;
   /** IANA zone for times shown to the owner ("已设好 11月20日周五 15:00 提醒"). Default "Asia/Shanghai". */
   timeZone?: string;
-  /** How long a watcher waits after a nudge before checking again (default 1 day). */
+  /** How long a reply watcher waits after a nudge before checking again (default 1 day). */
   followUpMs?: number;
-  /** Default wait before a chase times out when the desk gives no deadline (default 1 day). */
+  /** Default wait before await_reply times out when the project gives no deadline (default 1 day). */
   defaultWaitMs?: number;
   /**
    * When the desk wakes for its weekly review (skill and code-check suggestions): a 5-field cron in `timeZone`.

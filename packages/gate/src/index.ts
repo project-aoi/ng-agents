@@ -18,6 +18,7 @@ export {
   derivedSideEffect,
   effectiveSideEffect,
   maxSideEffect,
+  ownerOnlyApproval,
   parseActionClass,
   pickRule,
   ruleApplies,

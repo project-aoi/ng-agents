@@ -196,6 +196,13 @@ export class ContainerDriver implements IsolationDriver {
     await this.docker(["exec", ws.containerId, "/bin/sh", "-c", KILL_BY_MARKER_SCRIPT, "ng-kill", `${marker.name}=${marker.value}`, sig], 30_000);
   }
 
+  /** docs/05 guard 4: stop the long-running container; the clone directory and its branch stay where they are. */
+  async stopRuntime(ws: WorkspaceRecord): Promise<string[]> {
+    if (!ws.containerId) return [];
+    const r = await this.docker(["rm", "--force", ws.containerId]);
+    return r.code !== 0 ? [`docker rm failed: ${(r.error?.message ?? r.stderr).trim()}`] : [];
+  }
+
   async release(ws: WorkspaceRecord, mode: "destroy" | "hibernate"): Promise<ReleaseResult> {
     if (mode === "hibernate") throw new NgError("unsupported", "hibernate is implemented for git_worktree only");
     const warnings: string[] = [];

@@ -1,10 +1,14 @@
+import { ownerOnlyApproval } from "@ng/gate";
 import {
+  cellPrincipal,
   createEnvelope,
   KERNEL_FROM,
   newId,
   NgError,
+  parsePrincipal,
   PAYLOAD,
   timerFrom,
+  type RunContinuePayload,
   type ApprovalOutcome,
   type ApprovalRecord,
   type ApprovalResolvedPayload,
@@ -178,6 +182,7 @@ export function createApprovals(core: KernelCore): Approvals {
     const approverId = d.approverId ?? core.ownerPrincipal;
     const before = gate.getApprovalSync(actionId);
     if (!before) return { status: "not_found", actionId };
+    assertMayDecide(before, approverId, "approving this card");
     const r = gate.approveSync(actionId, approverId, d.seenArtifactVersion);
     if (r === "not_found") return { status: "not_found", actionId };
     const rec = gate.getApprovalSync(actionId)!;
@@ -199,6 +204,17 @@ export function createApprovals(core: KernelCore): Approvals {
       default:
         return { status: "already_cancelled", actionId };
     }
+  }
+
+  /**
+   * docs/05 guard 3: an agent on the control plane may decide ordinary cards, but letting something leave through a
+   * channel, or continuing past an exhausted budget, is the owner's alone — refused here for every entry point (the
+   * Gate refuses the same on approve; "continue" would otherwise reach raiseBudget).
+   */
+  function assertMayDecide(rec: ApprovalRecord, approverId: string, what: string): void {
+    if (parsePrincipal(approverId, core.ownerPrincipal).kind === "owner") return;
+    const why = ownerOnlyApproval({ ...rec.action, card: rec.card }, core.ownerAddresses);
+    if (why) throw new NgError("bounds_violation", `${what} needs the owner (${why}); ${approverId} may not`);
   }
 
   function pendingOrResult(actionId: string): { rec: ApprovalRecord } | { result: ResolveApprovalResult } {
@@ -281,6 +297,7 @@ export function createApprovals(core: KernelCore): Approvals {
       }
 
       case "continue": {
+        assertMayDecide(rec, approverId, "continuing this card");
         const kernelArgs = isKernelEscalation(rec.action) ? rec.action.args : null;
         const reason = kernelArgs?.reason ?? escalationReason(rec);
         if (reason === "budget_exhausted") {
@@ -301,7 +318,8 @@ export function createApprovals(core: KernelCore): Approvals {
         gate.approveSync(actionId, approverId);
         recordOutcome(actionId, "executed", { note: d.note ?? "continued by the owner" });
         if (kernelArgs?.reason === "retry_limit") {
-          requeueDead(kernelArgs.cellId, kernelArgs.envelopeIds ?? []);
+          if (kernelArgs.stepLimit) continueSteps(kernelArgs.cellId, actionId);
+          else requeueDead(kernelArgs.cellId, kernelArgs.envelopeIds ?? []);
           deliverResolved(rec, "executed", approverId, { decision: "continue", silent: true });
         } else {
           deliverResolved(rec, "executed", approverId, { decision: "continue", ...(d.note ? { note: d.note } : {}), ...(d.until ? { until: d.until } : {}) });
@@ -334,6 +352,20 @@ export function createApprovals(core: KernelCore): Approvals {
     if (data?.cardType === "escalation" && typeof data.escalation?.reason === "string") return data.escalation.reason;
     if (rec.action.type === "custom" && rec.action.name.startsWith("escalation.")) return rec.action.name.slice("escalation.".length);
     return null;
+  }
+
+  /** "Continue" on a step-limit card: one fresh continuation (the consecutive count starts over). */
+  function continueSteps(cellId: string, actionId: string): void {
+    const cell = cells.get(cellId);
+    if (!cell || cell.status === "closed") return;
+    const payload: RunContinuePayload = { reason: "step_limit", count: 1 };
+    inbox.enqueueSync(
+      cellId,
+      createEnvelope<RunContinuePayload>(
+        { id: `${actionId}:continue`, from: KERNEL_FROM.dispatcher, principalId: cellPrincipal(cellId), kind: "event", type: PAYLOAD.runContinue, payload, expectedEpoch: cell.epoch },
+        clock,
+      ),
+    );
   }
 
   /** "Continue" on a dead letter: the same messages again, under new ids (the old rows stay `dead` for the record). */

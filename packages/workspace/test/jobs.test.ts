@@ -1,4 +1,4 @@
-import { existsSync, fstatSync } from "node:fs";
+import { existsSync, fstatSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { isNgError, run, validatePayload, type JobResultPayload } from "@ng/protocol";
@@ -253,15 +253,79 @@ describe("jobs", () => {
     await expect(p1.startJob({ command: "  " })).rejects.toSatisfy((e) => isNgError(e, "invalid_argument"));
   });
 
-  it("destroy stops the cell's jobs and removes their logs", async () => {
+  it("stopRuntime stops the cell's jobs and waits for them; logs and the directory stay", async () => {
+    const h = harness();
+    const port = await h.mgr.acquire("w1", "none");
+    const { jobId } = await port.startJob({ command: "echo started; sleep 30" });
+    const job = h.mgr.getJobSync(jobId)!;
+    await waitFor(() => readFileSync(job.logPath!, "utf8").includes("started"));
+    await h.mgr.stopRuntime("w1");
+    // Resolved = recorded AND gone: no window in which the row says cancelled while the process still runs.
+    expect(h.mgr.getJobSync(jobId)!.state).toBe("cancelled");
+    expect(pidGone(job.pid!)).toBe(true);
+    expect(readFileSync(job.logPath!, "utf8")).toContain("started");
+    expect(existsSync(port.root)).toBe(true);
+  });
+
+  it("a cancel is 'cancelling' (still running, request recorded) until the whole process group is gone", async () => {
+    const h = harness({ limits: { killGraceMs: 400 } });
+    const port = await h.mgr.acquire("w1", "none");
+    // Ignores TERM, so the cancel has to wait out the grace period before SIGKILL.
+    const { jobId } = await port.startJob({ command: "trap '' TERM; echo up; sleep 30 & wait" });
+    const job = h.mgr.getJobSync(jobId)!;
+    await waitFor(() => readFileSync(job.logPath!, "utf8").includes("up"));
+    const cancelling = h.mgr.cancelJobsForCell("w1");
+    await waitFor(() => h.mgr.getJobSync(jobId)!.cancelRequestedAt !== null);
+    const mid = h.mgr.getJobSync(jobId)!;
+    // What the dispatcher's write-slot check sees while the process is being killed: a running job.
+    expect(mid.state).toBe("running");
+    expect(h.mgr.listJobsSync({ cellId: "w1", state: ["running"] }).map((j) => j.jobId)).toEqual([jobId]);
+    expect(h.inbox.list("w1")).toHaveLength(0);
+    expect(await cancelling).toBe(1);
+    expect(h.mgr.getJobSync(jobId)).toMatchObject({ state: "cancelled", error: "cancelled with the cell" });
+    expect(() => process.kill(-job.pid!, 0)).toThrow();
+    expect(h.inbox.list("w1").map((e) => (e.payload as JobResultPayload).state)).toEqual(["cancelled"]);
+    // A second request while (or after) cancelling changes nothing.
+    expect(await h.mgr.cancelJobsForCell("w1")).toBe(0);
+    expect(h.inbox.list("w1")).toHaveLength(1);
+  });
+
+  it("the kernel dies between the cancel request and the kill: recover() kills the survivor before it returns, then records cancelled once", async () => {
+    const h = harness();
+    const port = await h.mgr.acquire("w1", "none");
+    const { jobId } = await port.startJob({ command: "echo up; sleep 30" });
+    const job = h.mgr.getJobSync(jobId)!;
+    await waitFor(() => readFileSync(job.logPath!, "utf8").includes("up"));
+    // The request reached the database, then the process was gone before any signal was sent.
+    run(h.db, "UPDATE jobs SET cancel_requested_at = 5, error = 'cancelled with the cell' WHERE job_id = ?", [jobId]);
+    h.mgr.close();
+    expect(pidGone(job.pid!)).toBe(false);
+
+    const next = h.restart();
+    // Still counted as running at startup, so its directory is not handed to another writer yet.
+    expect(next.listJobsSync({ state: ["running"] }).map((j) => j.jobId)).toEqual([jobId]);
+    await next.recover();
+    // Nothing of the job can run any more (the group is empty). In this test the "old kernel" is this very process, so
+    // the dead leader lingers as a zombie until Node reaps it — hence the group probe rather than the pid probe.
+    await waitFor(() => pidGone(job.pid!));
+    expect(() => process.kill(-job.pid!, 0)).toThrow();
+    expect(next.getJobSync(jobId)).toMatchObject({ state: "cancelled", error: "cancelled with the cell", resultEnvelopeId: `${jobId}:result` });
+    await next.recover();
+    expect(h.inbox.list("w1")).toHaveLength(1);
+  });
+
+  it("the kernel dies after the kill but before recording it: recover() records cancelled, not a failure", async () => {
     const h = harness();
     const port = await h.mgr.acquire("w1", "none");
     const { jobId } = await port.startJob({ command: "sleep 30" });
-    const job = h.mgr.getJobSync(jobId)!;
-    await h.mgr.destroy("w1");
-    expect(h.mgr.getJobSync(jobId)!.state).toBe("cancelled");
-    await waitFor(() => pidGone(job.pid!));
-    expect(existsSync(dirname(job.logPath!))).toBe(false);
-    expect(existsSync(port.root)).toBe(false);
+    const pid = h.mgr.getJobSync(jobId)!.pid!;
+    run(h.db, "UPDATE jobs SET cancel_requested_at = 5, error = 'stopped by the owner' WHERE job_id = ?", [jobId]);
+    h.mgr.close();
+    process.kill(-pid, "SIGKILL");
+    await waitFor(() => pidGone(pid));
+    const next = h.restart();
+    await next.recover();
+    expect(next.getJobSync(jobId)).toMatchObject({ state: "cancelled", error: "stopped by the owner" });
+    expect((h.inbox.list("w1")[0]!.payload as JobResultPayload).state).toBe("cancelled");
   });
 });

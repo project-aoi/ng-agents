@@ -1,16 +1,22 @@
+import { renderEnvelope } from "@ng/context";
 import { deliveryAllowed } from "@ng/gate";
 import {
+  CELL_RESULT_CANDIDATE_KEY,
   cellPrincipal,
   createEnvelope,
   inboxAddr,
   isChannelAddr,
   newId,
+  parseAddress,
+  withTx,
   NgError,
   PAYLOAD,
   TOOL_KINDS,
   timerFrom,
   type CancelScope,
   type CellRecord,
+  type CellResultCandidate,
+  type CellResultPayload,
   type ClaimedBatch,
   type CommitTx,
   type Envelope,
@@ -22,9 +28,10 @@ import {
   type WorkspaceAcquireOptions,
 } from "@ng/protocol";
 import type { ManagedWorkspacePort } from "@ng/workspace";
-import { HOST_MUTATING_TOOLS, hostWriteRefusal } from "./constants";
 import type { KernelCore } from "./core";
 import type { RunHandle } from "./dispatcher";
+import { sendCellMessage } from "./messages";
+import { cwdModeOf, ensureCwd } from "./workdir";
 
 export interface RunContext {
   cell: CellRecord;
@@ -36,20 +43,26 @@ export interface RunContext {
 /** Lease heartbeat from inside the Run: at most every leaseMs/4 of (possibly manual) clock time. */
 const RENEW_FRACTION = 4;
 
-/** The isolation, base repository and branch a cell's workspace is acquired with. */
-export async function acquireOptionsFor(core: KernelCore, cell: CellRecord): Promise<WorkspaceAcquireOptions> {
+/**
+ * What a cell's workspace is acquired with: its directory and mode (docs/05), plus `meta.workspace` for a cell that
+ * explicitly asked for an isolated workspace.
+ */
+export function acquireOptionsFor(core: KernelCore, cell: CellRecord): WorkspaceAcquireOptions {
   const meta = cell.spec.meta?.["workspace"];
   const opts: WorkspaceAcquireOptions = meta && typeof meta === "object" ? { ...(meta as WorkspaceAcquireOptions) } : {};
   const iso = cell.bounds.isolation;
-  if ((iso === "git_worktree" || iso === "container") && !opts.repoPath && !core.repoPath) opts.repoPath = await core.ensureScratchRepo();
+  if (iso === "none" || iso === "shared_ro") opts.cwd = ensureCwd(core, cell);
+  else if (!opts.repoPath) opts.repoPath = cell.spec.cwd ?? core.repoPath;
+  opts.cwdMode = cwdModeOf(cell);
   return opts;
 }
 
 /**
  * RunPorts bound to (cell, epoch, run, principal `cell:<id>`). Ports are the capability boundary — tools are not
  * trusted: every mutating port re-checks that this Run is still the cell's current one, workspace use is limited to
- * the cell's bounds (and refused on the owner's real directory), sends need a Gate token and an allowed target,
- * Context access is pinned to the cell, and cell management is limited to its own descendants.
+ * the cell's bounds and its cwdMode (a "read" cell cannot change anything), sends need a Gate token and an allowed
+ * target, Context *writes* are pinned to the cell (reads are open across internal cells, docs/05), and cell management
+ * is limited to its own descendants plus the few things a cell may change about itself.
  */
 export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
   const { cells, inbox, gate, context, hub, clock } = core;
@@ -89,11 +102,14 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
   }
 
   const isDescendant = (id: string) => id !== cellId && cells.ancestors(id).some((a) => a.id === cellId);
-  const ownOrDescendant = (id: string) => id === cellId || isDescendant(id);
-  const sameLineage = (id: string) => ownOrDescendant(id) || cells.ancestors(cellId).some((a) => a.id === id);
 
-  function pinned(id: string, what: string, allow: (id: string) => boolean = (x) => x === cellId): void {
-    if (!allow(id)) throw new NgError("invalid_argument", `${what}: a cell may only use its own context (got "${id}", this cell is "${cellId}")`);
+  function pinned(id: string, what: string): void {
+    if (id !== cellId) throw new NgError("invalid_argument", `${what}: a cell may only write its own context (got "${id}", this cell is "${cellId}")`);
+  }
+
+  /** docs/05 §5.1.3: any internal cell may *read* another cell's state and artifacts (a desk auditing a worker, a project reading its predecessor). */
+  function readable(id: string, what: string): void {
+    if (id !== cellId && !cells.get(id)) throw new NgError("not_found", `${what}: no cell "${id}"`);
   }
 
   function requireDescendant(id: string, what: string): void {
@@ -111,15 +127,10 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
 
   function acquire(): Promise<ManagedWorkspacePort> {
     acquiring ??= (async () => {
-      const port = await core.workspace.acquire(cellId, bounds.isolation, await acquireOptionsFor(core, cell));
+      const port = await core.workspace.acquire(cellId, bounds.isolation, acquireOptionsFor(core, cell));
       root = port.root;
-      try {
-        assertLive("workspace");
-      } catch (err) {
-        // Closed while the workspace was being created: the close cleanup may already have run, so remove it here.
-        void core.track(core.workspace.destroy(cellId).catch((e: unknown) => core.onError(e, `destroy late workspace of ${cellId}`)));
-        throw err;
-      }
+      // Closed while the workspace was being acquired: nothing was created that would need undoing.
+      assertLive("workspace");
       return port;
     })().catch((err: unknown) => {
       acquiring = null;
@@ -137,9 +148,6 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
     if (tool === "code_rpc" && !(["write", "edit", "bash"] as const).every((t) => bounds.tools.has(t))) {
       // code_rpc scripts call write/edit/bash through the workspace host, past this port.
       throw new NgError("bounds_violation", "code_rpc can write files and run commands, so it needs write, edit and bash in this cell's bounds");
-    }
-    if (bounds.isolation === "none" && !core.allowHostWrites && HOST_MUTATING_TOOLS.has(tool)) {
-      throw new NgError("bounds_violation", hostWriteRefusal(what));
     }
   }
 
@@ -188,11 +196,11 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
 
   const ctx: RunPorts["context"] = {
     async readState(id, key) {
-      pinned(id, "readState", ownOrDescendant);
+      readable(id, "readState");
       return context.readStateSync(id, key);
     },
     async listState(id, prefix) {
-      pinned(id, "listState", ownOrDescendant);
+      readable(id, "listState");
       return context.listStateSync(id, prefix);
     },
     async commit(id, tx) {
@@ -208,9 +216,9 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
       pinned(id, "readResource");
       return context.readResourceSync(cellId, uri, page);
     },
-    async searchHistory(id, query) {
+    async searchHistory(id, query, o) {
       pinned(id, "searchHistory");
-      return context.searchHistorySync(cellId, query);
+      return context.searchHistorySync(cellId, query, o);
     },
     async upsertSkillOrNote(id, patch) {
       pinned(id, "upsertSkillOrNote");
@@ -218,11 +226,10 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
       context.upsertSkillOrNoteSync(cellId, patch);
     },
     async getArtifact(artifactId) {
-      const a = context.getArtifactSync(artifactId);
-      return a && sameLineage(a.cellId) ? a : null;
+      return context.getArtifactSync(artifactId);
     },
     async listArtifacts(id) {
-      pinned(id, "listArtifacts", ownOrDescendant);
+      readable(id, "listArtifacts");
       return context.listArtifactsSync(id);
     },
   };
@@ -273,7 +280,8 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
 
     async updateCell(targetId, patch) {
       assertLive("updateCell");
-      requireDescendant(targetId, "updateCell");
+      // Its own watches/schedules/title/meta are the cell's to change (lifecycle refuses anything else on itself).
+      if (targetId !== cellId) requireDescendant(targetId, "updateCell");
       core.lifecycle.updateCell(targetId, patch, { principalId });
     },
 
@@ -306,6 +314,21 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
     async emitToParent(type, payload, o = {}) {
       if (!cell.parentId) throw new NgError("invalid_argument", "a root cell has no parent to report to");
       assertLive("emitToParent");
+      if (type === PAYLOAD.cellResult && cell.spec.lifetime === "one_shot") {
+        // docs/05 guard 1: a one-shot cell's final result has exactly one sender — the settle transaction. Whatever
+        // reaches this port (a code processor, a preset tool) becomes the candidate that transaction delivers; sent
+        // from here as well, the parent would get two results, and one of them before the inbox was drained.
+        const p = (payload ?? {}) as Partial<CellResultPayload>;
+        const candidate: CellResultCandidate = {
+          status: p.status ?? "completed",
+          summary: typeof p.summary === "string" && p.summary ? p.summary : "Finished without a report.",
+          ...(p.artifactId ? { artifactId: p.artifactId } : {}),
+          ...(p.data !== undefined ? { data: p.data } : {}),
+          at: clock.now(),
+        };
+        context.commitSync(cellId, { statePatches: { [CELL_RESULT_CANDIDATE_KEY]: candidate } });
+        return;
+      }
       const parent = cells.require(cell.parentId);
       const to = inboxAddr(parent.id);
       const envelope = createEnvelope(
@@ -375,11 +398,92 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
       assertLive("workspace");
       const port = await acquire();
       const b = liveBounds();
+      const mode = cwdModeOf(cell);
+      // cwdMode is reported, not enforced: "read" means the cell did not queue for the work tree's write slot.
       let tools = TOOL_KINDS.filter((t) => b.tools.has(t));
-      // The same refusals checkTool and the read-only drivers apply to the kernel's own workspace tools.
-      if (b.isolation === "none" && !core.allowHostWrites) tools = tools.filter((t) => !HOST_MUTATING_TOOLS.has(t));
       if (b.isolation === "shared_ro") tools = tools.filter((t) => t === "read");
-      return { root: port.root, isolation: b.isolation, tools };
+      return { root: port.root, isolation: b.isolation, tools, cwdMode: mode };
+    },
+
+    // ---------- docs/05 ----------
+
+    async sendToCell(to, message) {
+      assertLive("sendToCell");
+      const parsed = parseAddress(to);
+      if (!parsed || parsed.kind !== "inbox") return { status: "refused", reason: `"${to}" is not an inbox address (inbox:<cellId>)` };
+      if (parsed.cellId === cellId) return { status: "refused", reason: "that is this cell's own inbox; use a reminder to wake yourself" };
+      if (!deliveryAllowed(liveBounds(), cell.parentId, parsed.addr)) {
+        return { status: "refused", reason: `${to} is outside this cell's send permissions` };
+      }
+      return sendCellMessage(core, {
+        from: inboxAddr(cellId),
+        principalId,
+        sender: cellId,
+        toCellId: parsed.cellId,
+        id: message.id ?? `${runId}:msg:${++emitCounter}`,
+        message,
+      });
+    },
+
+    drainInbound() {
+      heartbeat();
+      if (runSignal.aborted) return [];
+      const spec = cell.spec;
+      // Hubs absorb by design; a one-shot cell absorbs so that a follow-up is answered before it reports and closes.
+      if (!spec.absorbInbound && spec.lifetime !== "one_shot") return [];
+      if ((spec.claimMode ?? "serial_coalesce") !== "serial_coalesce") return [];
+      return withTx(core.db, () => {
+        const rows = inbox.drainInboundSync(cellId, runId);
+        if (rows.length === 0) return [];
+        const at = clock.now();
+        const batches = rc.snapshot.batch === batch ? [batch] : [batch, rc.snapshot.batch];
+        const out = rows.map(({ envelope, seq }) => {
+          // In the claim (handback and crash-release cover it), in the batch the tools search, and in the record.
+          for (const b of batches) {
+            b.envelopes.push(envelope);
+            b.seqs.push(seq);
+          }
+          context.appendEvidenceSync(cellId, { kind: "inbound", envelope, runId, at });
+          return { envelope, text: renderEnvelope(envelope) };
+        });
+        core.waits.answeredBy(cellId, rows.map((r) => r.envelope));
+        // Real work arrived: whatever started this Run, it now counts as an anchor.
+        handle.stallOnly = false;
+        return out;
+      });
+    },
+
+    async registerWait(wait) {
+      assertLive("wait");
+      core.waits.register({ id: cellId, epoch: self.epoch }, wait);
+    },
+
+    async clearWait(waitingFor) {
+      return core.waits.clear(cellId, waitingFor);
+    },
+
+    async settleSelf(request) {
+      assertLive("settleSelf");
+      if (request.action !== "complete" && request.action !== "cancel" && request.action !== "pause") {
+        throw new NgError("invalid_argument", `unknown self action "${String(request.action)}"`);
+      }
+      if (!cell.parentId) throw new NgError("invalid_argument", "a root cell cannot close or park itself");
+      if (!request.force) {
+        const open = cells.children(cellId, { status: ["active", "paused"] });
+        if (open.length > 0) {
+          // docs/05 §4.2: closing (or pausing) cascades — never pull the plug on work that is still running.
+          throw new NgError(
+            "conflict",
+            `${open.length} child cell(s) are still open (${open.map((c) => `${c.id}${c.title ? ` "${c.title}"` : ""}`).join(", ")}). ` +
+              `Wait for their results (or close the ones that are no longer needed) before you ${request.action === "pause" ? "park" : "finish"}.`,
+          );
+        }
+      }
+      handle.selfSettle = { ...request };
+    },
+
+    activeWorkspaces() {
+      return core.readModel.activeWorkspaces();
     },
   };
   return ports;

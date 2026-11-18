@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { all, get, hashAction, sha256Hex, type ProposedAction } from "@ng/protocol";
+import { ISOLATION_LEVELS, all, get, hashAction, makeBounds, sha256Hex, type ProposedAction } from "@ng/protocol";
+import { derivedSideEffect } from "../src";
 import { OWNER_UI, exec, expectType, meta, putArtifact, secretUse, send, setup, withWorker } from "./helpers";
 
 const tokenRows = (f: ReturnType<typeof setup>) => all<{ action_hash: string; cell_id: string }>(f.db, "SELECT * FROM action_tokens");
@@ -175,6 +176,21 @@ describe("authorize — allow (single-use token, no card)", () => {
     expect(f.events.filter((e) => e.topic === "approval.changed")).toEqual([]);
   });
 
+  it("host work is internal whatever the isolation: mutating tools and jobs in the owner's real directory need no card (docs/05)", () => {
+    const f = setup();
+    expect(f.cells.require("desk").bounds.isolation).toBe("none");
+    for (const tool of ["write", "edit", "bash", "code_rpc"]) expectType(f.gate.authorizeSync(exec(tool, { subjectKey: tool }), meta("desk")), "allow");
+    const job: ProposedAction = { type: "job.start", summary: "", subjectKey: "j", sideEffect: "internal", command: "pnpm build" };
+    expectType(f.gate.authorizeSync(job, meta("desk")), "allow");
+    expect(approvalRows(f)).toEqual([]);
+    for (const isolation of ISOLATION_LEVELS) {
+      const bounds = makeBounds({ isolation });
+      expect(derivedSideEffect(exec("bash"), bounds, ["channel:ui:*"]), isolation).toBe("internal");
+      expect(derivedSideEffect(exec("read"), bounds, ["channel:ui:*"]), isolation).toBe("none");
+      expect(derivedSideEffect(job, bounds, ["channel:ui:*"]), isolation).toBe("internal");
+    }
+  });
+
   it("secret.use returns only the ref — never the value", () => {
     const f = setup();
     withWorker(f);
@@ -224,9 +240,9 @@ describe("authorize — defer (external side effects become one Clarify card)", 
       proposal: { title: "竞品调研", outcome: "一份对比表", actions: [] },
     };
     expectType(f.gate.authorizeSync(project, meta("desk")), "defer");
-    // mutating tools on the owner's real directory (isolation "none")
-    expectType(f.gate.authorizeSync(exec("bash", { subjectKey: "e" }), meta("desk")), "defer");
-    expectType(f.gate.authorizeSync({ type: "job.start", summary: "", subjectKey: "f", sideEffect: "internal", command: "rm -rf build" }, meta("desk")), "defer");
+    // host work is internal by itself, but a declared external side effect is respected
+    expectType(f.gate.authorizeSync(exec("bash", { subjectKey: "e", sideEffect: "external" }), meta("desk")), "defer");
+    expectType(f.gate.authorizeSync({ type: "job.start", summary: "", subjectKey: "f", sideEffect: "external", command: "git push" }, meta("desk")), "defer");
     expectType(f.gate.authorizeSync(exec("read", { subjectKey: "g" }), meta("desk")), "allow");
     expectType(f.gate.authorizeSync({ type: "custom", name: "x", summary: "", subjectKey: "h", sideEffect: "external" }, meta("desk")), "defer");
   });
@@ -373,11 +389,13 @@ describe("authorize — policy rules", () => {
     expectType(f.gate.authorizeSync(exec("bash", { subjectKey: "z" }), meta("w1")), "allow");
   });
 
-  it("rejects malformed rules and rules authored by a cell", () => {
+  it("rejects malformed rules and rules authored by anyone but the owner (a cell, an agent on the control plane)", () => {
     const f = setup();
     expect(() => f.gate.upsertPolicyRuleSync({ match: { type: "rm" as never }, effect: "allow", createdBy: "owner" })).toThrow(/unknown action type/);
     expect(() => f.gate.upsertPolicyRuleSync({ match: { type: "*" }, effect: "maybe" as never, createdBy: "owner" })).toThrow(/invalid effect/);
-    expect(() => f.gate.upsertPolicyRuleSync({ match: { type: "*" }, effect: "allow", createdBy: "cell:desk" })).toThrow(/cell principal/);
+    for (const who of ["cell:desk", "agent:ops"]) {
+      expect(() => f.gate.upsertPolicyRuleSync({ match: { type: "*" }, effect: "allow", createdBy: who })).toThrow(`authoring a policy rule needs the owner; ${who} may not`);
+    }
     expect(() => f.gate.upsertPolicyRuleSync({ match: { type: "*" }, effect: "allow", maxUses: -1, createdBy: "owner" })).toThrow(/maxUses/);
     expect(() => f.gate.upsertPolicyRuleSync({ match: { type: "*" }, effect: "allow", scopeCellId: "ghost", createdBy: "owner" })).toThrow(/not found/);
     const r = f.gate.upsertPolicyRuleSync({ match: { type: "*" }, effect: "deny", createdBy: "owner" });

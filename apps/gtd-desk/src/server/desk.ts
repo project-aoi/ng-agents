@@ -2,7 +2,17 @@ import type { Kernel, ResolveApprovalResult } from "@ng/cell";
 import type { UiChannel } from "@ng/channel";
 import { ruleInputForClass } from "@ng/gate";
 import { SCRIPT_PREFIX } from "@ng/loop";
-import { startApprovedProjectSync, syncItemAfterOwnerChangeSync } from "@ng/presets";
+import {
+  KEYS,
+  LEGACY,
+  notifyProjectOfOwnerChangeSync,
+  projectIdForApproval,
+  setProjectLifecycleSync,
+  startApprovedProjectSync,
+  startProjectSync,
+  type ProjectInit,
+  type ProposalItem,
+} from "@ng/presets";
 import {
   asClarifyCard,
   cellPrincipal,
@@ -24,12 +34,9 @@ import {
   type Effort,
   type Envelope,
   type HandbackPayload,
-  type ItemSource,
   type ProjectProposal,
-  type ProjectProposalCard,
   type ProjectRecord,
   type SourceRecord,
-  type ToolKind,
 } from "@ng/protocol";
 import type {
   ActivityKind,
@@ -127,12 +134,28 @@ export interface DeskDeps {
   onError?: (err: unknown, where: string) => void;
 }
 
+/**
+ * Who presses the button. The web client is the owner (the default); the external main agent's control plane passes
+ * its own `agent:<id>` principal, and every kernel call of the operation is made as that principal — the kernel and
+ * the Gate decide what it may do, never a fallback to the owner.
+ */
+export interface DeskActor {
+  principalId?: string;
+  /** The owner's words that go with the operation (passed on to the project, e.g. on "activate"). */
+  note?: string;
+}
+
+export type ProjectOp = "pause" | "resume" | "cancel" | "complete" | "someday" | "activate";
+
 export type Desk = ReturnType<typeof createDesk>;
 
 /**
  * The synchronous transaction API behind the endpoints (docs/04 "同步事务接口"): each method calls Context / Gate /
- * Inbox / kernel directly and answers with the refreshed view. Only capture, revise and "移回待确认" deliver a message
- * to a Loop; approvals the kernel hands back to a cell are the kernel's business.
+ * Inbox / kernel directly and answers with the refreshed view. Messages to a Loop: capture, revise and "移回待确认" go
+ * to the desk; a change the owner makes to a project's books (an action ticked off, taken over or added, the project
+ * brought back from someday) is told to that project cell (docs/05), so it wakes and decides what comes next.
+ * Approvals the kernel hands back to a cell are the kernel's business. The project and card operations take a
+ * DeskActor: the external main agent's control plane calls them as `agent:<id>`.
  */
 export function createDesk({ kernel, ui, settings, onError = (err, where) => console.error(`[desk] ${where}:`, err) }: DeskDeps) {
   const { context, gate, clock } = kernel;
@@ -143,9 +166,17 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
 
   // ==================== reads ====================
 
-  const status = (): StatusDTO => projectStatus(input());
+  // Status and Radar show the kernel's stall stamps (docs/05 guard 2); the check runs right after every change, but a
+  // request that follows a change synchronously could otherwise see the previous stamp.
+  const status = (): StatusDTO => {
+    restamp();
+    return projectStatus(input());
+  };
   const clarify = (): ClarifyQueueDTO => projectClarify(input());
-  const radar = (): RadarDTO => projectRadar(input());
+  const radar = (): RadarDTO => {
+    restamp();
+    return projectRadar(input());
+  };
   const review = (): WeeklyReviewDTO => projectReview(input());
   const sources = (): SourcesDTO => projectSources(input());
   const activity = (kind?: ActivityKind): ActivityListDTO => projectActivity(input(), kind);
@@ -201,27 +232,38 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     return n;
   }
 
-  /** Cells that were closed: their open actions are finished and a project they hold is completed. */
-  function settleClosedCells(cellIds: readonly string[], how: "done" | "cancelled"): void {
-    if (cellIds.length === 0) return;
-    const set = new Set(cellIds);
-    finishActions(readActions(kernel).filter((a) => set.has(a.cellId)), how);
-    const t = now();
-    for (const p of readProjects(kernel)) {
-      if (!set.has(p.cellId) || p.record.lifecycle !== "active") continue;
-      commitState(p.cellId, {
-        [gtdKeys.project]: { ...p.record, lifecycle: how === "done" ? "completed" : "cancelled", updatedAt: t, ...(how === "done" ? { completedAt: t } : {}) },
-      });
-    }
+  const actorOf = (as: DeskActor) => (as.principalId ? { principalId: as.principalId } : {});
+  const principalOf = (as: DeskActor) => as.principalId ?? owner;
+  const byAgent = (as: DeskActor) => as.principalId !== undefined && as.principalId !== owner;
+
+  /** The live project an action belongs to (a cell holding `gtd:project` that is not closed), if any. */
+  function liveProjectOf(a: Located<ActionRecord>): string | null {
+    const projectCells = new Set(readProjects(kernel).map((p) => p.cellId));
+    const pid = projectOfAction(kernel, a, projectCells);
+    if (!pid || !projectCells.has(pid)) return null;
+    const cell = kernel.getCell(pid);
+    return cell && cell.status !== "closed" ? pid : null;
   }
 
   /**
-   * The kernel tells a card's cell about a dismissal only silently; an item root or watcher that keeps the item's books
-   * is woken so they reflect it now (the result was not wanted → the item completes; a nudge was dropped → the next
-   * check is set). A model-run cell (the desk) picks it up with its next wake-up instead.
+   * docs/05: the owner changed a project's books from outside (ticked off their action, added a step): the project is
+   * told in plain words, as whoever acted, so it wakes and decides what comes next — its wait on "human" is answered by
+   * it. A paused project reads it when it is resumed. In the caller's transaction.
    */
-  function wakeBookkeeper(cellId: string): void {
-    syncItemAfterOwnerChangeSync(context, cellId, { principalId: owner, now: now(), id: newId("sync", clock) });
+  function tellProject(projectCellId: string, text: string, as: DeskActor): void {
+    notifyProjectOfOwnerChangeSync(kernel, projectCellId, text, { principalId: principalOf(as), id: newId("own", clock) });
+  }
+
+  /** The words a project hears: "主人…" from the UI, "主人（经主 Agent）…" from the control plane. */
+  const whoText = (as: DeskActor) => (byAgent(as) ? "主人（经主 Agent）" : "主人");
+
+  /** The GTD records changed here: re-run the kernel's stall check now, so the view answered with is current. */
+  function restamp(): void {
+    try {
+      kernel.checkStalls();
+    } catch (err) {
+      onError(err, "stall check");
+    }
   }
 
   /** The inbound message an item came from (unwrapping handbacks), if the inbox still has it. */
@@ -297,10 +339,14 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     not_found: "找不到这张卡",
   };
 
-  async function runApprove(cardId: string, seenVersion: number | null | undefined) {
+  async function runApprove(cardId: string, seenVersion: number | null | undefined, as: DeskActor = {}) {
     if (seenVersion !== undefined && seenVersion !== null && (!Number.isInteger(seenVersion) || seenVersion < 1)) throw bad("seenVersion 必须是正整数");
     const before = gate.getApprovalSync(cardId);
-    const r = await kernel.resolveApproval(cardId, { decision: "approve", ...(seenVersion != null ? { seenArtifactVersion: seenVersion } : {}) });
+    const r = await kernel.resolveApproval(cardId, {
+      decision: "approve",
+      ...(as.principalId ? { approverId: as.principalId } : {}),
+      ...(seenVersion != null ? { seenArtifactVersion: seenVersion } : {}),
+    });
     let outcome: ApproveOutcome;
     switch (r.status) {
       case "sent":
@@ -329,10 +375,10 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     };
   }
 
-  async function approve(cardId: string, req: ApproveRequest) {
-    const r = await runApprove(cardId, req?.seenVersion);
-    // "✓ 确认立项并让 Agent 开工" creates the project root right here (docs/04 §2.2 B); the desk's own wake-up on the
-    // approval finds it started (same root id) and only keeps the books.
+  async function approve(cardId: string, req: ApproveRequest, as: DeskActor = {}) {
+    const r = await runApprove(cardId, req?.seenVersion, as);
+    // "✓ 确认立项并让 Agent 开工" creates the project cell right here (docs/04 §2.2 B); the desk's own wake-up on the
+    // approval finds it started (same id) and only keeps the books.
     if (r.outcome === "approved") {
       try {
         startApprovedProjectSync(kernel, cardId);
@@ -355,12 +401,12 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     return clarifyResult("revising", true, "收到，正在按你的意见重拟", cardId);
   }
 
-  async function snooze(cardId: string, req: SnoozeRequest): Promise<ClarifyMutationResponse> {
+  async function snooze(cardId: string, req: SnoozeRequest, as: DeskActor = {}): Promise<ClarifyMutationResponse> {
     const t = now();
     const until = req?.until ?? afternoonSlot(t, settings.snoozeAfternoonHour);
     if (!Number.isFinite(until) || until <= t) throw bad("推迟时间必须在将来");
     approval(cardId);
-    const r = await kernel.resolveApproval(cardId, { decision: "snooze", until });
+    const r = await kernel.resolveApproval(cardId, { decision: "snooze", until, ...(as.principalId ? { approverId: as.principalId } : {}) });
     if (r.status !== "snoozed") return kernelRefusal(r, cardId);
     return clarifyResult("snoozed", true, `已推迟到 ${whenText(until, t)}，到点回到待确认`, cardId);
   }
@@ -372,30 +418,67 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     return data && typeof data.outcome === "string" && Array.isArray(data.actions) ? ({ ...card.proposal, ...data } as ProjectProposal) : card.proposal;
   }
 
-  async function someday(cardId: string, _req: NoteRequest): Promise<ClarifyMutationResponse> {
+  /**
+   * "📦 先放进以后再说" on a project proposal (docs/05 §3.1 Someday): the real project cell is created right away (same
+   * id an approval would give it) and paused in the same synchronous call, before the dispatcher could run it — its
+   * first task stays queued and is its brief when the owner activates it. Its record says someday and keeps the plan.
+   * Nothing is closed, nothing runs, and activating it later is the normal "activate".
+   */
+  async function someday(cardId: string, _req: NoteRequest, as: DeskActor = {}): Promise<ClarifyMutationResponse> {
     const { rec, card } = pendingCard(cardId);
     const proposal = proposalOf(rec, card);
-    const r = await kernel.resolveApproval(cardId, { decision: "dismiss", reason: "someday" });
+    const draftId = rec.artifactId ?? (card?.cardType === "project_proposal" ? card.draft?.artifactId : undefined);
+    const remembered = draftId ? context.readStateSync<ProposalItem>(rec.cellId, KEYS.proposal(draftId)) : null;
+    const r = await kernel.resolveApproval(cardId, { decision: "dismiss", reason: "someday", ...(as.principalId ? { approverId: as.principalId } : {}) });
     if (r.status !== "dismissed") return kernelRefusal(r, cardId);
-    // The project record needs a cell to live in; a closed one costs nothing and keeps the plan for "重新启动".
-    const projectId = newId("proj", clock);
+    const holder = kernel.getCell(rec.cellId);
+    const parentId = holder && holder.status !== "closed" ? holder.id : desk;
     const t = now();
-    const record: ProjectRecord & { proposal: ProjectProposal } = {
+    const source = remembered?.source ?? card?.source ?? { label: "以后再说", at: t };
+    const init: ProjectInit = {
+      id: projectIdForApproval(cardId),
+      title: proposal.title,
+      outcome: proposal.outcome,
+      brief: parkedBrief(proposal),
+      proposal,
+      source,
+      ...(remembered?.rawInput.text ? { rawInput: remembered.rawInput.text } : card?.rawInput.text ? { rawInput: card.rawInput.text } : {}),
+      ...(remembered?.cwd ? { cwd: remembered.cwd } : {}),
+      ...(remembered?.repos?.length ? { repos: remembered.repos } : {}),
+      ...(remembered?.phases?.length ? { phases: remembered.phases } : {}),
+    };
+    const record: ProjectRecord = {
       title: proposal.title,
       outcome: proposal.outcome,
       lifecycle: "someday",
-      ...(card?.source ? { source: card.source } : {}),
+      source,
+      ...(remembered?.cwd ? { cwd: remembered.cwd } : {}),
+      summary: "主人把这个方案放进了以后再说，还没有开始推进",
+      proposal,
       createdAt: t,
       updatedAt: t,
-      proposal,
     };
-    withTx(kernel.db, () => {
-      kernel.spawnCell(rec.cellId, { id: projectId, preset: "worker", title: proposal.title, meta: { projectCellId: projectId, someday: true } });
-      commitState(projectId, { [gtdKeys.project]: record });
+    const projectId = withTx(kernel.db, () => {
+      const started = startProjectSync(kernel, init, { parentId, ...actorOf(as) });
+      const paused = kernel.control(started.projectId, { action: "pause" }, actorOf(as));
+      if (!paused.applied) throw new Error(`could not park the new project: ${paused.reason ?? "pause refused"}`);
+      // The project's books seed its record on its first run only when there is none: this one is kept as it is.
+      commitState(started.projectId, { [gtdKeys.project]: record });
+      return started.projectId;
     });
-    // Closed by its parent: nobody needs to be woken for a holder that never ran.
-    await kernel.closeCell(projectId, "cancelled", { principalId: cellPrincipal(rec.cellId) });
     return clarifyResult("someday", true, `「${proposal.title}」已放进以后再说`, cardId, { projectId });
+  }
+
+  /** The first message of a project parked straight from its proposal: the plan the owner saw, as text. */
+  function parkedBrief(proposal: ProjectProposal): string {
+    const owners: Record<BallOwner, string> = { agent: "交给 worker", human: "主人来做", waiting: "等外部" };
+    return [
+      "主人在立项卡上点了“先放进以后再说”：这个项目先停着，什么都不做。你读到这条消息时，主人已经把它重新启动了——按下面的方案开始推进（方案也在你的项目记录里，proposal 字段）。",
+      proposal.background ?? "",
+      proposal.actions.length ? ["方案里的步骤（还没有记进行动记录，需要时用 track_action / dispatch 记下）：", ...proposal.actions.map((a) => `- [${owners[a.owner]}] ${a.title}${a.nextStep ? `：${a.nextStep}` : ""}`)].join("\n") : "",
+    ]
+      .filter(Boolean)
+      .join("\n\n");
   }
 
   async function savePlan(cardId: string, req: PlanSaveRequest): Promise<ClarifyMutationResponse> {
@@ -434,7 +517,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     return clarifyResult("saved", true, `已保存方案 v${r.artifactVersion}`, cardId);
   }
 
-  async function extend(cardId: string, req: ExtendRequest): Promise<ClarifyMutationResponse> {
+  async function extend(cardId: string, req: ExtendRequest, as: DeskActor = {}): Promise<ClarifyMutationResponse> {
     const { rec, card } = pendingCard(cardId);
     if (card?.cardType !== "escalation" && rec.action.type !== "custom") throw wrongState("只有受阻 / 超时的卡可以“继续”");
     const t = now();
@@ -445,14 +528,14 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     if (reason === "waiting_timeout") {
       const until = req?.until ?? t + DAY;
       if (!Number.isFinite(until) || until <= t) throw bad("等待时间必须在将来");
-      r = await kernel.resolveApproval(cardId, { decision: "continue", until, ...(note ? { note } : {}) });
+      r = await kernel.resolveApproval(cardId, { decision: "continue", until, ...(note ? { note } : {}), ...(as.principalId ? { approverId: as.principalId } : {}) });
       message = `好的，再等到 ${whenText(until, t)}`;
     } else {
       const raise = req?.raise;
       if (raise !== undefined && (typeof raise !== "object" || [raise.tokens, raise.cents].some((v) => v !== undefined && (!Number.isFinite(v) || v < 0)))) {
         throw bad("raise 需要非负的 tokens / cents");
       }
-      r = await kernel.resolveApproval(cardId, { decision: "continue", ...(raise ? { raise } : {}), ...(note ? { note } : {}) });
+      r = await kernel.resolveApproval(cardId, { decision: "continue", ...(raise ? { raise } : {}), ...(note ? { note } : {}), ...(as.principalId ? { approverId: as.principalId } : {}) });
       message = reason === "budget_exhausted" ? "已追加额度，继续推进" : reason === "retry_limit" ? "已重新开始处理" : "好的，继续推进";
     }
     if (r.status !== "continued") return kernelRefusal(r, cardId);
@@ -462,13 +545,13 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
   async function resolveOffline(cardId: string, req: NoteRequest): Promise<ClarifyMutationResponse> {
     approval(cardId);
     const r = await kernel.resolveApproval(cardId, { decision: "resolve_offline", ...(req?.note ? { note: req.note } : {}) });
+    // The kernel settles the records of the cells it closed (their open actions are done).
     if (r.status !== "resolved_offline") return kernelRefusal(r, cardId);
-    settleClosedCells(r.closedCellIds, "done");
     const n = r.closedCellIds.length;
     return clarifyResult("resolved_offline", true, n > 0 ? `已完结，并结束了 ${n} 项相关后台任务` : "已完结", cardId);
   }
 
-  async function toHuman(cardId: string, req: ToHumanRequest): Promise<ClarifyMutationResponse> {
+  async function toHuman(cardId: string, req: ToHumanRequest, as: DeskActor = {}): Promise<ClarifyMutationResponse> {
     const { rec, card } = pendingCard(cardId);
     if (req?.effort !== undefined && !isEffort(req.effort)) throw bad(`未知的精力标签 ${String(req.effort)}`);
     const t = now();
@@ -504,26 +587,30 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
       ...(isReply ? { approvalActionId: rec.actionId } : {}),
     };
     if (!isReply) {
-      const r = await kernel.resolveApproval(cardId, { decision: "dismiss", reason: "the owner handles it personally" });
+      const r = await kernel.resolveApproval(cardId, { decision: "dismiss", reason: "the owner handles it personally", ...(as.principalId ? { approverId: as.principalId } : {}) });
       if (r.status !== "dismissed") return kernelRefusal(r, cardId);
     }
+    const live = projectCellId ? kernel.getCell(projectCellId) : undefined;
     withTx(kernel.db, () => {
       commitState(rec.cellId, { [gtdKeys.action(action.id)]: action });
-      if (!isReply) wakeBookkeeper(rec.cellId);
+      // A project's card the owner takes over is now their action on its books: the project hears it (its card was
+      // withdrawn silently) and plans around it.
+      if (!isReply && projectCellId && live && live.status !== "closed" && context.readStateSync(projectCellId, gtdKeys.project) !== null) {
+        tellProject(projectCellId, `${whoText(as)}决定亲自处理这件事：${title}${nextStep ? `\n下一步：${nextStep}` : ""}\n这张卡已经撤下；主人办完会勾掉这个动作（${action.id}），你会收到通知。`, as);
+      }
     });
     return clarifyResult("to_human", true, "已转给你处理，在专注工作区里", cardId, { engageItem: { cellId: rec.cellId, actionId: action.id } });
   }
 
-  async function dismiss(cardId: string, req: NoteRequest): Promise<ClarifyMutationResponse> {
+  async function dismiss(cardId: string, req: NoteRequest, as: DeskActor = {}): Promise<ClarifyMutationResponse> {
     const { rec, card } = pendingCard(cardId);
-    const r = await kernel.resolveApproval(cardId, { decision: "dismiss", reason: req?.note || "dismissed by the owner" });
+    const r = await kernel.resolveApproval(cardId, { decision: "dismiss", reason: req?.note || (byAgent(as) ? "dismissed by the owner's agent" : "dismissed by the owner"), ...(as.principalId ? { approverId: as.principalId } : {}) });
     if (r.status !== "dismissed") return kernelRefusal(r, cardId);
-    wakeBookkeeper(rec.cellId);
     const env = originalEnvelope(card?.source.envelopeId);
     addActivity({
       kind: "card_withdrawn",
       title: card?.title ?? rec.card.title ?? rec.action.summary,
-      detail: "你选择了不处理",
+      detail: byAgent(as) ? "主 Agent 按你的意思撤下了" : "你选择了不处理",
       ...(card?.source ? { source: card.source } : {}),
       ...(card?.rawInput.text ? { rawInput: card.rawInput.text } : {}),
       ...(env ? { envelope: env } : {}),
@@ -533,9 +620,9 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     return clarifyResult("dismissed", true, env ? "已归档，可在记录里移回待确认" : "已归档", cardId);
   }
 
-  async function deny(cardId: string, req: NoteRequest): Promise<ClarifyMutationResponse> {
+  async function deny(cardId: string, req: NoteRequest, as: DeskActor = {}): Promise<ClarifyMutationResponse> {
     approval(cardId);
-    const r = await kernel.resolveApproval(cardId, { decision: "deny", ...(req?.note ? { reason: req.note } : {}) });
+    const r = await kernel.resolveApproval(cardId, { decision: "deny", ...(req?.note ? { reason: req.note } : {}), ...(as.principalId ? { approverId: as.principalId } : {}) });
     if (r.status !== "denied") return kernelRefusal(r, cardId);
     return clarifyResult("denied", true, "已拒绝", cardId);
   }
@@ -570,38 +657,44 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     return { ok, outcome, message, view: engage(), status: status(), ...extra };
   }
 
-  /** The cells that existed only for this action: not a root, not a project root, nothing else open in them. */
+  /** The cells that existed only for this action: not a root, not a project, not a source or hub, nothing else open in them. */
   function dedicatedCells(a: Located<ActionRecord>): string[] {
     const cell = kernel.getCell(a.cellId);
     if (!cell || cell.status === "closed" || cell.parentId === null) return [];
-    if (context.readStateSync(a.cellId, gtdKeys.project) !== null) return [];
+    if (context.readStateSync(a.cellId, gtdKeys.project) !== null || context.readStateSync(a.cellId, gtdKeys.source) !== null) return [];
     const others = readActions(kernel).some((x) => x.cellId === a.cellId && x.record.id !== a.record.id && x.record.status === "open");
     return others ? [] : [a.cellId];
   }
 
-  async function completeAction(a: Located<ActionRecord>, detail: string, activityId?: string): Promise<number> {
+  /**
+   * The owner's action is done: the record, one line in the activity drawer, and — for an action on a project's books —
+   * the project is told what was done (with the owner's note), so it wakes and continues with whatever waited on it.
+   * The desk's own quick to-dos tell nobody.
+   */
+  async function completeAction(a: Located<ActionRecord>, detail: string, activityId?: string, as: DeskActor = {}, note?: string): Promise<number> {
     const toClose = dedicatedCells(a);
+    const project = liveProjectOf(a);
     withTx(kernel.db, () => {
       finishActions([a], "done");
       const rec = { kind: "action_completed" as const, title: a.record.title, detail, ...(a.record.source ? { source: a.record.source } : {}), restorable: false };
       if (activityId) commitState(desk, { [gtdKeys.activity(activityId)]: { ...rec, id: activityId, at: now() } satisfies ActivityRecord });
       else addActivity(rec);
-      // An item root keeps its project's books: tell it, so the item completes when this was its last open action.
-      wakeBookkeeper(a.cellId);
+      if (project) tellProject(project, `${whoText(as)}已完成：${a.record.title}（动作 ${a.record.id}）${note?.trim() ? `\n${whoText(as)}的说明：${note.trim()}` : ""}`, as);
     });
     let closed = 0;
-    for (const id of toClose) closed += (await kernel.closeCell(id, "completed")).closed.length;
+    for (const id of toClose) closed += (await kernel.closeCell(id, "completed", actorOf(as))).closed.length;
     return closed;
   }
 
-  async function done(cellId: string, actionId: string, req: DoneRequest): Promise<EngageMutationResponse> {
+  async function done(cellId: string, actionId: string, req: DoneRequest, as: DeskActor = {}): Promise<EngageMutationResponse> {
     const a = findAction(cellId, actionId);
     if (a.record.status !== "open") return engageResult("already_done", true, "这件事已经办完了");
     const linked = linkedApprovalId(a.record);
     if (linked && gate.getApprovalSync(linked)?.status === "pending") {
-      await kernel.resolveApproval(linked, { decision: "dismiss", reason: "the owner handled it personally" });
+      await kernel.resolveApproval(linked, { decision: "dismiss", reason: "the owner handled it personally", ...(as.principalId ? { approverId: as.principalId } : {}) });
     }
-    const closedTasks = await completeAction(a, req?.note || "你勾选了已办完");
+    const note = typeof req?.note === "string" ? req.note : undefined;
+    const closedTasks = await completeAction(a, note || (byAgent(as) ? "主 Agent 代你勾选了已办完" : "你勾选了已办完"), undefined, as, note);
     return engageResult("done", true, closedTasks > 0 ? `已办完，并结束了 ${closedTasks} 项相关后台任务` : "已办完", { closedTasks });
   }
 
@@ -675,8 +768,8 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
 
   // ==================== 🧭 Radar ====================
 
-  function projectRecord(projectId: string): ProjectRecord & { proposal?: ProjectProposal } {
-    const v = context.readStateSync<ProjectRecord & { proposal?: ProjectProposal }>(projectId, gtdKeys.project);
+  function projectRecord(projectId: string): ProjectRecord {
+    const v = context.readStateSync<ProjectRecord>(projectId, gtdKeys.project);
     if (!v || typeof v !== "object" || typeof v.title !== "string") throw missing("找不到这个项目");
     return v;
   }
@@ -691,134 +784,189 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
   }
 
   /** Cards about the project held outside its own cells (e.g. by the desk) go with it. */
-  async function withdrawProjectCards(projectId: string, reason: string): Promise<void> {
+  async function withdrawProjectCards(projectId: string, reason: string, as: DeskActor): Promise<void> {
     const rec = gate.findPendingBySubjectSync(subjectKeys.project(projectId));
-    if (rec) await kernel.resolveApproval(rec.actionId, { decision: "dismiss", reason });
+    if (rec && kernel.getCell(rec.cellId)?.status !== "closed") await kernel.resolveApproval(rec.actionId, { decision: "dismiss", reason, ...(as.principalId ? { approverId: as.principalId } : {}) });
   }
 
-  function setLifecycle(projectId: string, record: ProjectRecord, lifecycle: ProjectRecord["lifecycle"]): void {
-    const t = now();
-    const { stalledSince: _s, ...rest } = record;
-    commitState(projectId, { [gtdKeys.project]: { ...rest, lifecycle, updatedAt: t, ...(lifecycle === "completed" ? { completedAt: t } : {}) } });
-  }
-
-  async function projectOp(projectId: string, op: "pause" | "resume" | "cancel" | "complete" | "someday" | "activate"): Promise<ProjectMutationResponse> {
+  /**
+   * Radar's project buttons, and the control plane's set_project_state (same code, the caller's principal):
+   * - pause / resume: kernel.control on the project cell (its whole subtree follows).
+   * - someday: pause + lifecycle "someday". Nothing is closed or deleted: records, reports and history stay.
+   * - activate: a parked project cell is resumed with lifecycle "active" and told the owner's words, so it wakes and
+   *   continues from its records and report. A parked item from before docs/05 (its cell closed, or an old zero-token
+   *   item root) is migrated to a new project.
+   * - cancel / complete: closeCell — the kernel settles the project's records; the project's actions held elsewhere
+   *   (e.g. a card taken over on the desk) and cards about it on the desk follow here.
+   */
+  async function projectOp(projectId: string, op: ProjectOp, as: DeskActor = {}): Promise<ProjectMutationResponse> {
     const record = projectRecord(projectId);
     const cell = kernel.getCell(projectId);
     const open = cell !== undefined && cell.status !== "closed";
-    const control = (action: "pause" | "resume" | "cancel") => kernel.control(projectId, { action });
+    const control = (action: "pause" | "resume") => kernel.control(projectId, { action }, actorOf(as));
     switch (op) {
       case "pause": {
         if (!open) return projectResult("not_applied", false, "这个项目没有在运行的任务");
+        if (cell.status === "paused") return projectResult("paused", true, `「${record.title}」已经暂停了`);
         const r = control("pause");
         return r.applied ? projectResult("paused", true, `已暂停「${record.title}」`) : projectResult("not_applied", false, r.reason ?? "暂停没有生效");
       }
       case "resume": {
         if (!open) return projectResult("not_applied", false, "这个项目没有可以继续的任务");
+        if (record.lifecycle === "someday") return projectResult("not_applied", false, `「${record.title}」在以后再说里：用“重新启动”让它继续`);
+        if (cell.status === "active") return projectResult("resumed", true, `「${record.title}」正在推进`);
         const r = control("resume");
         return r.applied ? projectResult("resumed", true, `「${record.title}」继续推进`) : projectResult("not_applied", false, r.reason ?? "继续没有生效");
       }
-      case "cancel": {
-        if (open) {
-          const r = control("cancel");
-          if (!r.applied) return projectResult("not_applied", false, r.reason ?? "取消没有生效");
-        }
-        setLifecycle(projectId, record, "cancelled");
-        finishActions(projectActions(projectId), "cancelled");
-        await withdrawProjectCards(projectId, "the project was cancelled");
-        return projectResult("cancelled", true, `已取消「${record.title}」，后台任务已全部停止`);
-      }
+      case "cancel":
       case "complete": {
-        if (open) await kernel.closeCell(projectId, "completed");
-        setLifecycle(projectId, record, "completed");
-        finishActions(projectActions(projectId), "done");
-        await withdrawProjectCards(projectId, "the project was completed");
-        return projectResult("completed", true, `「${record.title}」已完结`);
+        if (record.lifecycle === "completed" || record.lifecycle === "cancelled") {
+          return projectResult("not_applied", false, `「${record.title}」已经${record.lifecycle === "completed" ? "完结" : "取消"}了`);
+        }
+        const how = op === "cancel" ? "cancelled" : "completed";
+        if (open) await kernel.closeCell(projectId, how, actorOf(as));
+        // A cell closed before docs/05 (a parked item) has nothing to close: only its record ends.
+        else setProjectLifecycleSync(context, projectId, how, now());
+        finishActions(
+          projectActions(projectId).filter((a) => a.record.status === "open"),
+          op === "cancel" ? "cancelled" : "done",
+        );
+        await withdrawProjectCards(projectId, `the project was ${how}`, as);
+        return op === "cancel"
+          ? projectResult("cancelled", true, `已取消「${record.title}」，后台任务已全部停止（文件和分支都留在原处）`)
+          : projectResult("completed", true, `「${record.title}」已完结`);
       }
       case "someday": {
         if (record.lifecycle === "someday") return projectResult("someday", true, "已经在以后再说里了");
-        if (open && cell.status === "active") control("pause");
-        setLifecycle(projectId, record, "someday");
-        return projectResult("someday", true, `「${record.title}」已移进以后再说，后台任务已暂停`);
+        if (!open || record.lifecycle !== "active") return projectResult("not_applied", false, "只有进行中的项目可以移进以后再说");
+        if (cell.status === "active") {
+          const r = control("pause");
+          if (!r.applied) return projectResult("not_applied", false, r.reason ?? "暂停没有生效");
+        }
+        setProjectLifecycleSync(context, projectId, "someday", now());
+        return projectResult("someday", true, `「${record.title}」已移进以后再说，后台任务已暂停，记录和报告都留着`);
       }
       case "activate": {
         if (record.lifecycle !== "someday") return projectResult("not_applied", false, "这个项目不在以后再说里");
-        if (open) {
-          if (cell.status === "paused") control("resume");
-          setLifecycle(projectId, record, "active");
-          return projectResult("activated", true, `「${record.title}」重新开始推进`);
+        // Before docs/05 a parked item was either a closed holder cell, or a paused item root run by the old zero-token
+        // coordinator (which now only winds itself down): neither can be resumed as a project.
+        if (!open || isLegacyRoot(cell)) {
+          const projectId2 = await migrateParked(projectId, record, as);
+          return projectResult("migrated", true, `「${record.title}」是旧版本停靠的事项，已按原方案和报告新建项目继续推进`, { projectId: projectId2 });
         }
-        const cardId = repropose(projectId, record);
-        return projectResult("reproposed", true, "已重新放进待确认，确认后 Agent 开工", { cardId });
+        withTx(kernel.db, () => {
+          // The project's own books flip it too when it wakes; doing it here makes the row move at once.
+          setProjectLifecycleSync(context, projectId, "active", now());
+          if (cell.status === "paused") {
+            const r = control("resume");
+            if (!r.applied) throw wrongState(r.reason ?? "继续没有生效");
+          }
+          tellProject(projectId, activateText(record, as), as);
+        });
+        return projectResult("activated", true, `「${record.title}」重新开始推进，接着之前的记录和报告做`);
       }
     }
   }
 
-  /** A someday project that never started goes back to Clarify as a proposal card, so the agent plans it for real. */
-  function repropose(projectId: string, record: ProjectRecord & { proposal?: ProjectProposal }): string {
-    const parentId = kernel.getCell(projectId)?.parentId ?? desk;
-    const holder = kernel.getCell(parentId);
-    if (!holder || holder.status === "closed") throw wrongState("原来负责这个项目的主台已经不在了");
-    const t = now();
-    const proposal: ProjectProposal = record.proposal ?? { title: record.title, outcome: record.outcome ?? record.title, actions: [] };
-    const artifactId = newId("art", clock);
-    const subjectKey = subjectKeys.cell(projectId);
-    const source: ItemSource = { label: "以后再说", at: t };
+  function isLegacyRoot(cell: { spec: { processor: { kind: string; entry?: string } } }): boolean {
+    const p = cell.spec.processor;
+    return p.kind === "code" && (p.entry === LEGACY.joinAll || p.entry === LEGACY.joinAny);
+  }
+
+  function activateText(record: ProjectRecord, as: DeskActor): string {
+    const lines = [`${whoText(as)}点了启动：「${record.title}」从以后再说里拿出来了，现在开始推进。先看你的记录和已有报告（read_artifact），从那里接着做，不要从头再来；范围有变化先和主人确认。`];
+    if (as.note?.trim()) lines.push(`${whoText(as)}的话：${as.note.trim()}`);
+    return lines.join("\n");
+  }
+
+  /**
+   * A parked item from before docs/05 lives in a closed cell, which cannot be resumed: start a new project from its
+   * plan, its outcome and its reports (named by id, so the new project reads them instead of redoing the work). The old
+   * record is ended as "cancelled" with `migratedTo` pointing at its successor, so it leaves the someday list; it is
+   * never deleted.
+   */
+  async function migrateParked(oldId: string, record: ProjectRecord, as: DeskActor): Promise<string> {
+    // Its own reports and those of the cells that worked for it (closed with it).
+    const cells = [oldId];
+    for (let i = 0; i < cells.length; i++) for (const c of kernel.listCells({ parentId: cells[i]! })) cells.push(c.id);
+    const artifacts = cells.flatMap((id) => context.listArtifactsSync(id));
+    const proposal = record.proposal;
+    const owners: Record<BallOwner, string> = { agent: "交给 worker", human: "主人来做", waiting: "等外部" };
+    const brief = [
+      `这件事是主人以前放进“以后再说”的（旧版本的记录 ${oldId}，无法原地恢复），现在主人把它重新启动了，由你接着推进。`,
+      proposal?.background ?? "",
+      proposal?.actions.length ? ["当时的方案：", ...proposal.actions.map((a) => `- [${owners[a.owner]}] ${a.title}${a.nextStep ? `：${a.nextStep}` : ""}`)].join("\n") : "",
+      record.summary ? `当时的进展：${record.summary}` : "",
+      artifacts.length
+        ? [
+            "当时留下的报告和草稿（先用 read_artifact 读，接着它们做，不要重做）：",
+            ...artifacts.map((a) => `- ${a.artifactId} v${a.version}${a.content.title ? `「${a.content.title}」` : ""}（read_artifact artifactId "${a.artifactId}"）`),
+          ].join("\n")
+        : "",
+      as.note?.trim() ? `${whoText(as)}的话：${as.note.trim()}` : "",
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+    const init: ProjectInit = {
+      title: record.title,
+      outcome: record.outcome ?? proposal?.outcome ?? record.title,
+      brief,
+      source: record.source ?? { label: "以后再说", at: now() },
+      ...(proposal ? { proposal } : {}),
+      ...(record.cwd ? { cwd: record.cwd } : {}),
+    };
+    // A legacy item root still open is closed (runtime only; its records and reports stay) before its successor starts.
+    if (kernel.getCell(oldId)?.status !== "closed") await kernel.closeCell(oldId, "cancelled", actorOf(as));
     return withTx(kernel.db, () => {
-      const saved = context.commitSync(parentId, {
-        artifact: { artifactId, content: { format: "json", title: proposal.title, body: JSON.stringify(proposal, null, 2), data: proposal }, updatedBy: "human" },
-      });
-      if (!saved.ok) throw new Error("could not save the plan");
-      const version = saved.artifactVersion ?? 1;
-      const card: ProjectProposalCard = {
-        cardType: "project_proposal",
-        subjectKey,
-        title: proposal.title,
-        source,
-        rawInput: { text: record.outcome ?? record.title, kind: "system" },
-        prep: { summary: "你把它从“以后再说”里重新拿了出来，确认后按这个方案开工。", checked: [] },
-        proposal,
-        draft: { artifactId, version },
-      };
-      const r = gate.authorizeSync(
-        {
-          type: "project.start",
-          proposal,
-          summary: `重新启动：${proposal.title}`,
-          subjectKey,
-          sideEffect: "external",
-          artifactId,
-          card: { format: "card", title: proposal.title, body: `${proposal.title}\n\n${proposal.outcome}`, data: card },
-        },
-        { cellId: parentId, principalId: owner, epoch: holder.epoch, artifactVersion: version },
-      );
-      if (r.type !== "defer") throw wrongState(r.type === "deny" ? `无法重新提出：${r.feedback}` : "已有自动规则放行立项，请在待确认之外处理");
-      // The holder's record is replaced by the card; the approved project gets a fresh cell.
-      commitState(projectId, { [gtdKeys.project]: null });
-      return r.actionId;
+      const started = startProjectSync(kernel, init, actorOf(as));
+      const t = now();
+      const { stalledSince: _s, stalledNotifiedAt: _n, ...rest } = record;
+      const ended: ProjectRecord & { migratedTo: string } = { ...rest, lifecycle: "cancelled", summary: `已重新启动为新项目 ${started.projectId}`, migratedTo: started.projectId, updatedAt: t };
+      commitState(oldId, { [gtdKeys.project]: ended });
+      return started.projectId;
     });
   }
 
-  async function addProjectAction(projectId: string, req: AddActionRequest): Promise<ProjectMutationResponse> {
+  /**
+   * "补上下一步" (Radar) and add_action (control plane): an open action on the project's books — the owner's own
+   * ("human", on their to-do list) or something to wait for ("waiting") — and the project is told.
+   */
+  async function addProjectAction(projectId: string, req: AddActionRequest & { owner?: "human" | "waiting" }, as: DeskActor = {}): Promise<ProjectMutationResponse> {
     const record = projectRecord(projectId);
     const title = typeof req?.title === "string" ? req.title.trim() : "";
     if (!title) throw bad("下一步需要一个标题");
     if (req.effort !== undefined && !isEffort(req.effort)) throw bad(`未知的精力标签 ${String(req.effort)}`);
+    if (req.owner !== undefined && req.owner !== "human" && req.owner !== "waiting") throw bad("owner 只能是 human 或 waiting");
+    const owner: "human" | "waiting" = req.owner ?? "human";
     const t = now();
+    const nextStep = typeof req.nextStep === "string" && req.nextStep.trim() ? req.nextStep.trim() : undefined;
     const action: ActionRecord = {
       id: newId("act", clock),
       title,
-      owner: "human",
+      owner,
       status: "open",
       projectCellId: projectId,
-      nextStep: typeof req.nextStep === "string" && req.nextStep.trim() ? req.nextStep.trim() : title,
+      ...(owner === "human" ? { nextStep: nextStep ?? title } : nextStep ? { nextStep } : {}),
+      ...(owner === "waiting" ? { waiting: { description: title, parties: [], join: "all" as const } } : {}),
       ...(req.effort ? { effort: req.effort } : {}),
+      source: { label: byAgent(as) ? "主 Agent" : "项目全局", ...(as.principalId ? { principalId: as.principalId } : {}), at: t },
       createdAt: t,
       updatedAt: t,
     };
-    const { stalledSince: _s, ...rest } = record;
-    commitState(projectId, { [gtdKeys.action(action.id)]: action, ...(record.stalledSince !== undefined ? { [gtdKeys.project]: { ...rest, updatedAt: t } } : {}) });
-    return projectResult("action_added", true, `已补上下一步：${title}`);
+    const cell = kernel.getCell(projectId);
+    withTx(kernel.db, () => {
+      commitState(projectId, { [gtdKeys.action(action.id)]: action });
+      if (cell && cell.status !== "closed") {
+        tellProject(
+          projectId,
+          owner === "human"
+            ? `${whoText(as)}在项目上补了一个自己来做的动作：${title}（${action.id}）${action.nextStep && action.nextStep !== title ? `\n下一步：${action.nextStep}` : ""}\n主人办完会勾掉它，你会收到通知。`
+            : `${whoText(as)}在项目上加了一个要等的事：${title}（${action.id}）${nextStep ? `\n说明：${nextStep}` : ""}\n需要的话派一个 watcher 盯住它，达成后用 track_action 关掉这个动作。`,
+          as,
+        );
+      }
+    });
+    return projectResult("action_added", true, `已补上${owner === "human" ? "下一步" : "要等的事"}：${title}`, { actionId: action.id });
   }
 
   // ==================== weekly review ====================
@@ -865,13 +1013,6 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     return reviewResult("dismissed", true, "好的，这类操作仍然每次请你确认");
   }
 
-  /** A script check runs bash, which the kernel refuses on the owner's real directory: it gets its own worktree. */
-  function sensorBounds(entry: string | undefined): { isolation: "none" | "git_worktree"; tools: ReadonlySet<ToolKind> } {
-    return entry?.startsWith(SCRIPT_PREFIX)
-      ? { isolation: "git_worktree", tools: new Set<ToolKind>(["read", "bash"]) }
-      : { isolation: "none", tools: new Set<ToolKind>(["read"]) };
-  }
-
   function checkEntry(entry: unknown): string {
     if (typeof entry !== "string" || !entry.trim()) throw bad("需要脚本路径或检查名");
     const e = entry.trim();
@@ -888,7 +1029,8 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     const cell = kernel.getCell(sensorId);
     if (!src || !cell || cell.status === "closed") throw missing("找不到这个信源");
     const entry = checkEntry(req?.entry);
-    kernel.updateCell(sensorId, { processor: { kind: "code", entry }, bounds: sensorBounds(entry) });
+    // cwdMode cannot change after spawn; the sensor preset gives every source write mode in its own directory.
+    kernel.updateCell(sensorId, { processor: { kind: "code", entry } });
     commitState(sensorId, { [gtdKeys.source]: { ...src, processor: "code", updatedAt: now() } });
     commitState(desk, { [`${SENSOR_SUGGESTION_PREFIX}${sensorId}`]: null });
     return reviewResult("switched_to_code", true, `「${src.title}」已改为零 Token 的脚本检查`);
@@ -993,7 +1135,17 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
       // Same shape as the desk's own add_source: the first task runs the check once; meta.gtd.source seeds the record.
       kernel.spawnCell(
         desk,
-        { id, preset: "sensor", title, schedules: [schedule], ...(processor ? { processor } : {}), bounds: sensorBounds(processor?.entry), meta: { gtd: { source: init } } },
+        {
+          id,
+          preset: "sensor",
+          title,
+          schedules: [schedule],
+          ...(processor ? { processor } : {}),
+          // A script check runs commands: write mode, in the source's own directory (sources never inherit a cwd, so
+          // never the owner's repository) — no worktree, no sandbox (docs/05).
+          ...(processor?.entry.startsWith(SCRIPT_PREFIX) ? { cwdMode: "write" as const } : {}),
+          meta: { gtd: { source: init } },
+        },
         { instruction, title },
       );
       commitState(id, { [gtdKeys.source]: record });

@@ -2,9 +2,10 @@ import { TOOL_KINDS, type Address, type BoundsInit, type ToolKind } from "@ng/pr
 
 /**
  * What a root cell (the desk) holds when its creator does not say otherwise. The desk delegates, so it holds the
- * top-level authority (every tool, any channel with Gate approval) while its own processor exposes only read-only
- * tools; isolation "none" is a floor children can raise (workers ask for git_worktree). Budgets are cumulative and
- * must be positive: a zero budget is exhausted from the start (the owner raises them from an escalation card).
+ * top-level authority (every tool, any channel with Gate approval, every inbox) while its own cwdMode is "read";
+ * isolation "none" (docs/05: the owner's real machine) is a floor a child may raise explicitly. Budgets are
+ * cumulative and must be positive: a zero budget is exhausted from the start (the owner raises them from a card).
+ * maxConcurrentChildren counts active one-shot children only (docs/05 §3.1), so parked projects never fill it.
  */
 export const DEFAULT_ROOT_BOUNDS: Readonly<Required<Omit<BoundsInit, "secretRefs">>> & Pick<BoundsInit, "secretRefs"> = {
   tools: [...TOOL_KINDS],
@@ -13,7 +14,7 @@ export const DEFAULT_ROOT_BOUNDS: Readonly<Required<Omit<BoundsInit, "secretRefs
   maxConcurrentChildren: 16,
   maxTokens: 20_000_000,
   maxCents: 5_000,
-  maxDepth: 3,
+  maxDepth: 4,
 };
 
 /** `ProposedAction.custom.name` of the escalation cards the kernel itself raises (dead letters, budget stops). */
@@ -22,9 +23,6 @@ export const KERNEL_ESCALATION = "kernel.escalation";
 export const KERNEL_ESCALATION_PRINCIPAL = "kernel:escalation";
 /** `timer.fired` payload.data.kernel marker of a snoozed card's resurfacing wake-up (handled by the kernel, no Run). */
 export const RESURFACE_MARKER = "approval.resurface";
-
-/** Tools that change files or run processes; refused on isolation "none" unless allowHostWrites. */
-export const HOST_MUTATING_TOOLS: ReadonlySet<ToolKind> = new Set<ToolKind>(["write", "edit", "bash", "code_rpc"]);
 
 export const DEFAULTS = {
   ownerPrincipal: "owner",
@@ -35,12 +33,9 @@ export const DEFAULTS = {
   retryBackoffMs: 5_000,
   maxRetryBackoffMs: 5 * 60_000,
   idleTimeoutMs: 15_000,
+  /** docs/05 guard 1: consecutive step-limit continuations before the owner is asked. */
+  maxStepContinuations: 3,
+  /** docs/05 guard 2: how long a project may sit without any anchor before its single stalled_check goes out. */
+  stallGraceMs: 2_000,
 } as const;
 
-export function hostWriteRefusal(what: string): string {
-  return (
-    `${what} is refused: this cell has no isolated workspace (isolation "none" works directly in the owner's real directory). ` +
-    `Delegate the change to a worker with an isolated workspace — spawn_cell with preset "worker" ` +
-    `(isolation "git_worktree") — and have it report back.`
-  );
-}

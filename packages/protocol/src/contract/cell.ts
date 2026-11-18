@@ -1,7 +1,7 @@
 import type { Clock } from "../clock";
 import type { Channel } from "./channel";
 import type { ContextStore, PromptSnapshot } from "./context";
-import type { EnvelopeDraft, EnvelopeKind, InboxAddr, IsolationLevel, PolicyBounds, Delivery, ToolKind } from "./envelope";
+import type { Envelope, EnvelopeDraft, EnvelopeKind, InboxAddr, IsolationLevel, PolicyBounds, Delivery, ToolKind } from "./envelope";
 import type { AuthorizeResult, MeterResult, ProposedAction, Usage } from "./gate";
 import type { ControlAction, ControlResult, EnqueueResult, Inbox, ScheduleRule } from "./inbox";
 import type { ProcessorSpec } from "./loop";
@@ -13,8 +13,8 @@ import type { WorkspacePort } from "./workspace";
 export interface CellSpec {
   id?: string;
   parentId?: string;                    // forms the supervision tree; closing/cancelling the parent recursively reclaims the subtree
-  preset?: "inline" | "worker" | "watcher" | "sensor";
-  watches?: Array<{ threadOrFilter: Record<string, unknown>; cancelGroup?: string }>;
+  preset?: "inline" | "worker" | "watcher" | "sensor" | "project" | "hub"; // [ext] project, hub (docs/05)
+  watches?: Array<{ threadOrFilter: Record<string, unknown>; cancelGroup?: string; coalesceMs?: number /* [ext] */ }>;
   schedules?: ScheduleRule[];
   contextMode?: "isolated" | "fork_prefix";
   processor: ProcessorSpec;
@@ -30,6 +30,33 @@ export interface CellSpec {
    */
   claimMode?: "serial_coalesce" | "competing_workers";
   maxParallelRuns?: number;
+  /**
+   * [ext] docs/05 — the directory this cell works in, on the owner's real machine (absolute path). The kernel never
+   * creates, snapshots or removes it. A child without `cwd` inherits its parent's. Absent everywhere up the tree = the
+   * kernel's `repoPath` (or its process cwd).
+   */
+  cwd?: string;
+  /**
+   * [ext] docs/05 — what the cell may do in `cwd`. `"read"`: truly read-only (the kernel's workspace port and the CLI
+   * adapters refuse write/edit/bash/code_rpc). `"write"`: may change files and run commands, and takes the
+   * directory's write slot: the dispatcher runs at most one writing cell per work tree (`git toplevel` of the cwd, or
+   * its real path) at a time, counting a cell's running Jobs. Default: the preset's (`worker` → write; everything else
+   * → read).
+   */
+  cwdMode?: "read" | "write";
+  /**
+   * [ext] docs/05 guard 1 — `"one_shot"` (the `worker` preset's default): when a Run ends `completed` (or `refused`)
+   * with the inbox drained, the kernel delivers the cell's single final `cell.result` (id
+   * `${cellId}:${epoch}:cell.result`) to its parent and closes the cell, in the transaction that completes the claim.
+   * `"persistent"` (default): the cell lives until someone closes it (or it calls complete_self).
+   */
+  lifetime?: "one_shot" | "persistent";
+  /**
+   * [ext] docs/05 §3.3 — the running Loop takes messages that arrive mid-Run into the same Run (`RunPorts.drainInbound`)
+   * instead of leaving them for the next one. On for hubs; any cell absorbs what arrives before it settles when it is
+   * one_shot (so a follow-up is never answered with a stale result).
+   */
+  absorbInbound?: boolean;
 }
 
 export interface CellPorts {            // the controlled capability surface a Loop sees at run time
@@ -39,10 +66,13 @@ export interface CellPorts {            // the controlled capability surface a L
   context: Pick<ContextStore, "readState" | "commit" | "appendEvidence" | "readResource" | "searchHistory" | "upsertSkillOrNote"
     | "listState" | "getArtifact" | "listArtifacts">; // [ext] listState/getArtifact/listArtifacts
   cancelScheduled: Inbox["cancelScheduled"];
-  spawnCell(spec: CellSpec, initialPayload?: unknown): Promise<InboxAddr>;
-  updateCell(cellId: string, patch: Partial<CellSpec>): Promise<void>;
+  spawnCell(spec: SpawnSpec /* [ext] the processor may come from the preset */, initialPayload?: unknown): Promise<InboxAddr>;
+  updateCell(cellId: string, patch: Partial<CellSpec>): Promise<void>; // [ext] own id allowed for watches/schedules/title/meta
   closeCell(cellId: string, reason?: "completed" | "cancelled"): Promise<void>;
 }
+
+/** [ext] A spec as a spawner writes it: `processor` may be left to the preset's defaults. */
+export type SpawnSpec = Omit<CellSpec, "processor"> & { processor?: ProcessorSpec };
 
 // ==================== [ext] ====================
 // How the kernel materializes a spec (conventions every package relies on):
@@ -60,9 +90,16 @@ export interface CellPorts {            // the controlled capability surface a L
 //   `instruction`; an object with a string `instruction` (and optional `input`/`title`) is spread; anything else is
 //   `input`. No initialPayload → no cell.task (the child sleeps until a watch, schedule or message wakes it).
 // - meta.projectCellId is copied from the parent when the child does not set it (gtd.ts projectCellIdOf).
+// - [docs/05] watch filters: besides plain equality, a filter value may be an operator object:
+//   `{ $in: [...] }` (the field equals one of them), `{ $contains: "x" }` (string field contains it, or array field
+//   has it as an element, case-insensitive for strings) and `{ $anyKeyword: [...] }` (string field contains at least
+//   one of them, case-insensitive). `coalesceMs` on a watch batches what it routes: see ScheduleRule.coalesce.
+// - [docs/05] cwd is inherited from the parent when absent; cwdMode and lifetime come from the preset's defaults.
 
 export type PresetName = NonNullable<CellSpec["preset"]>;
-export const PRESET_NAMES = ["inline", "worker", "watcher", "sensor"] as const satisfies readonly PresetName[];
+export const PRESET_NAMES = ["inline", "worker", "watcher", "sensor", "project", "hub"] as const satisfies readonly PresetName[];
+export type CwdMode = NonNullable<CellSpec["cwdMode"]>;
+export type CellLifetime = NonNullable<CellSpec["lifetime"]>;
 export type CellStatus = "active" | "paused" | "closed";
 export type CloseReason = "completed" | "cancelled";
 export type CellWatch = NonNullable<CellSpec["watches"]>[number];
@@ -93,7 +130,11 @@ export interface RunPorts extends CellPorts {
   meter(usage: Usage): MeterResult;
   /** Steer messages that arrived since the Run started; the Loop checks between model steps and appends them as user text. */
   drainSteer(): string[];
-  /** Commit with inboxOut to `inbox:<parentId>` (envelope from `inbox:<selfId>`, expectedEpoch = parent's epoch). Throws for root cells. */
+  /**
+   * Commit with inboxOut to `inbox:<parentId>` (envelope from `inbox:<selfId>`, expectedEpoch = parent's epoch). Throws
+   * for root cells. [docs/05] A `cell.result` from a `one_shot` cell is not sent from here: it is stored as the cell's
+   * result candidate and delivered once by the kernel when the cell settles (CELL_RESULT_CANDIDATE_KEY).
+   */
   emitToParent(type: string, payload: unknown, opts?: EmitOptions): Promise<void>;
   /** Enqueue to this cell's own inbox (reminders, timeout nudges with cancelGroup, cron); expectedEpoch = self.epoch. */
   scheduleSelf(env: EnvelopeDraft, rule: ScheduleRule): Promise<EnqueueResult>;
@@ -117,19 +158,123 @@ export interface RunPorts extends CellPorts {
    * agents) instead of going through `workspace.exec`. Optional in the type only so hand-written fakes stay valid.
    */
   workspaceAccess?(): Promise<WorkspaceAccess>;
+
+  // ---------- [ext] docs/05 (optional in the type only so hand-written fakes stay valid; the kernel provides all) ----------
+  /**
+   * Deliver a message to another cell's inbox (`cell.message`, wakeup) — a parent forwarding a follow-up to a child, a
+   * worker asking `inbox:desk` to arbitrate, the desk answering it. Checked and enqueued in one transaction:
+   * `"closed"` when the target is closed (nothing is stored: re-dispatch instead), `"not_found"` for an unknown cell,
+   * `"refused"` when the address is outside this cell's `canSendTo`. Idempotent per `id`.
+   */
+  sendToCell?(to: InboxAddr, message: CellMessageDraft): Promise<SendToCellResult>;
+  /**
+   * Take the wakeup messages that reached this cell since the Run started into this Run: each row joins the active
+   * claim (so `handback` and a crash-release cover it), gets its `inbound` evidence and is appended to
+   * `snapshot.batch.envelopes`. Returns the rendered texts to feed the model, [] when nothing arrived. Steer messages
+   * are not taken here (drainSteer).
+   */
+  drainInbound?(): DrainedInbound[];
+  /**
+   * Record that this cell is waiting on `waitingFor` (an address such as `inbox:desk`, a child's `inbox:<id>`, or the
+   * literals `"human"` / `"external"`). The record survives unrelated wake-ups and is cleared only by a message from
+   * that party, a timeout (`timeoutAt` → a `kernel.wait_timeout` wake-up) or `clearWait`. `"human"` is answered by the
+   * owner (or their agent) speaking or deciding a card; `"external"` by an outside message, a source hit, or one of the
+   * cell's own arranged events (a timer, a job result, a child's result). A wait on a live cell is one of the five
+   * anchors of the stall check.
+   */
+  registerWait?(wait: { waitingFor: string; reason: string; timeoutAt?: number }): Promise<void>;
+  clearWait?(waitingFor: string): Promise<boolean>;
+  /**
+   * What the kernel does with this cell when the Run has settled (after it left the run table, in the claim's
+   * transaction). `complete` / `cancel`: close the cell (refused with a thrown `conflict` when it still has open
+   * children, unless `force`); `pause`: status → paused. The last call of a Run wins; the Run should end right after.
+   */
+  settleSelf?(request: SelfSettleRequest): Promise<void>;
+  /** Directory occupancy across the whole kernel (docs/05 §3.2): who is writing/queued in which work tree. */
+  activeWorkspaces?(): WorkspaceOccupancy[];
+}
+
+/** [ext] RunPorts.sendToCell input. */
+export interface CellMessageDraft {
+  text: string;
+  summary?: string;
+  data?: unknown;
+  /** Idempotency id (default derived from the Run and a counter). */
+  id?: string;
+  threads?: string[];
+}
+export type SendToCellResult =
+  | { status: "delivered"; envelopeId: string; targetStatus: "active" | "paused" }
+  | { status: "closed"; closeReason: CloseReason | null }
+  | { status: "not_found" }
+  | { status: "refused"; reason: string };
+
+export interface DrainedInbound {
+  envelope: Envelope;
+  /** The envelope rendered exactly as the next hydrate will show it. */
+  text: string;
+}
+
+export interface SelfSettleRequest {
+  action: "complete" | "cancel" | "pause";
+  /** Final text for the parent's `cell.result` when the cell closes without a stashed candidate. */
+  summary?: string;
+  force?: boolean;
+}
+
+/** One work tree and the cells using it. `key` = `git rev-parse --show-toplevel` of the cwd, else its real path. */
+export interface WorkspaceOccupancy {
+  key: string;
+  /** The writing cell that holds the slot now (a Run or a Job of it is in flight), if any. */
+  holder: WorkspaceUser | null;
+  /** Writing cells with due work waiting for the slot, in arrival order. */
+  queued: WorkspaceUser[];
+  /** Writing cells that are idle (sleeping/waiting) and read-mode cells with a Run in flight. */
+  others: WorkspaceUser[];
+}
+export interface WorkspaceUser {
+  cellId: string;
+  title: string | null;
+  preset: PresetName | null;
+  parentId: string | null;
+  cwd: string;
+  cwdMode: CwdMode;
+  state: "running" | "job" | "queued" | "waiting" | "paused";
+  statusLine: string | null;
+}
+
+/**
+ * [ext] docs/05 guard 1 — state key where a one_shot cell's `report_to_parent(kind: "result")` stashes its candidate
+ * result (CellResultCandidate). The kernel reads it when the cell settles and is the only sender of the final
+ * `cell.result`.
+ */
+export const CELL_RESULT_CANDIDATE_KEY = "cell:result";
+export interface CellResultCandidate {
+  status: "completed" | "failed" | "cancelled" | "budget_stopped";
+  summary: string;
+  artifactId?: string;
+  data?: unknown;
+  at: number;
+}
+
+/** [ext] Id of the single final result a cell delivers to its parent. */
+export function finalResultEnvelopeId(cellId: string, epoch: number): string {
+  return `${cellId}:${epoch}:cell.result`;
 }
 
 /** [ext] See RunPorts.workspaceAccess. */
 export interface WorkspaceAccess {
-  /** Absolute host path of the working directory (the worktree, or the owner's directory for none/shared_ro). */
+  /** Absolute host path of the working directory (the cell's `cwd`; a container's mount source). */
   root: string;
   isolation: IsolationLevel;
   /**
-   * Workspace tool kinds the kernel's own workspace port would allow this Run right now: `bounds.tools`, minus the
-   * mutating kinds (write, edit, bash, code_rpc) on isolation "none" without the kernel's allowHostWrites, and minus
-   * everything but read on "shared_ro". `processor.allowedTools` is not applied here (the Loop applies it).
+   * Workspace tool kinds the kernel's own workspace port would allow this Run right now: `bounds.tools`, minus
+   * everything but read on "shared_ro". `cwdMode` removes nothing (it is a scheduling declaration, reported below).
+   * `processor.allowedTools` is not applied here (the Loop applies it).
    */
   tools: ToolKind[];
+  /** [ext] docs/05 — the cell's effective cwdMode. */
+  cwdMode?: CwdMode;
 }
 
 export interface EmitOptions {
@@ -152,6 +297,12 @@ export interface PresetDef {
   description: string;
   defaults: Partial<Omit<CellSpec, "id" | "parentId" | "preset" | "fork">>;
   requestBounds?(ctx: { parentCellId: string; parentBounds: PolicyBounds }): Partial<PolicyBounds>;
+  /**
+   * [ext] docs/05 — false: cells of this preset do not inherit their parent's `cwd` (watchers and sensors: they check
+   * things with commands in a private directory of their own instead of queueing for the project's work tree).
+   * Default true.
+   */
+  inheritCwd?: boolean;
   /**
    * [ext] Deterministic bookkeeping the kernel runs at the start of every Run of a cell of this preset, after the
    * batch is recorded and before the Loop — whichever engine executes it — so records that follow mechanically from

@@ -9,6 +9,7 @@ import {
   createAgentLoop,
   createCliAgentLoop,
   createRoutingLoop,
+  reapOrphanedCliProcesses,
   registerStandardToolsets,
   resolveAgentBackend,
   STANDARD_TOOLSETS,
@@ -17,6 +18,8 @@ import {
 import {
   cellPrincipal,
   cellsRepo,
+  KERNEL_FROM,
+  newId,
   createBus,
   createRegistry,
   NgError,
@@ -26,6 +29,7 @@ import {
   type AgentLoop,
   type Clock,
   type Db,
+  type CliEngine,
 } from "@ng/protocol";
 import { createWorkspaceManager } from "@ng/workspace";
 import { createApprovals } from "./approvals";
@@ -34,10 +38,13 @@ import type { KernelCore } from "./core";
 import { createDispatcher } from "./dispatcher";
 import { createEscalations } from "./escalations";
 import { createLifecycle } from "./lifecycle";
+import { createModelSettings, type ModelSettings } from "./models";
 import { createReadModel } from "./readmodel";
+import { sendCellMessage } from "./messages";
 import { ingest } from "./routing";
-import { scratchRepo } from "./scratch";
+import { createStallMonitor } from "./stall";
 import type { Kernel, KernelOptions } from "./types";
+import { createWaits } from "./waits";
 
 interface SubscribableClock extends Clock {
   subscribe(listener: (now: number) => void): () => void;
@@ -120,6 +127,7 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     dataDir,
     registry,
     rosterProvider: (cellId) => core.readModel.childSummaries(cellId),
+    tailNotesProvider: (cellId) => core.readModel.tailNotes(cellId),
     ...opts.context,
   });
   const workspace = createWorkspaceManager({
@@ -130,7 +138,6 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     dataDir: join(dataDir, "workspace"),
     inbox,
     resources: context,
-    ...(opts.repoPath ? { defaultRepoPath: opts.repoPath } : {}),
     // Host-side secret proxy: the Gate decides (secret.use within bounds), the value never enters the sandbox.
     injectSecret: (secretRef, ctx) => {
       const r = gate.authorizeSync(
@@ -159,12 +166,40 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
       return r.ok ? { ok: true } : { ok: false, reason: r.reason };
     },
   });
+  // ---------- the owner's model switch (one per CLI engine, created on first use) ----------
+  const modelSwitch = opts.modelSwitch ? (opts.modelSwitch === true ? {} : opts.modelSwitch) : null;
+  const modelSettingsByEngine = new Map<CliEngine, ModelSettings>();
+  const modelSettingsOf = (engine: CliEngine): ModelSettings | null => {
+    if (!modelSwitch) return null;
+    let s = modelSettingsByEngine.get(engine);
+    if (!s) {
+      const cli = opts.cli?.[engine];
+      s = createModelSettings({
+        engine,
+        dataDir,
+        clock,
+        ...(cli?.bin ? { bin: cli.bin } : {}),
+        ...(cli?.env ? { env: cli.env } : {}),
+        ...(cli?.models ? { initial: cli.models } : {}),
+        ...modelSwitch,
+        onError: (err, where) => onError(err, where),
+      });
+      modelSettingsByEngine.set(engine, s);
+    }
+    return s;
+  };
+
+  /** Running CLI agent processes are on record here, so a restart can stop the ones a crashed kernel left behind. */
+  const cliProcDir = join(dataDir, "cli-procs");
   const loop: AgentLoop =
     opts.loop ??
     createRoutingLoop({
       api: createAgentLoop({ model: opts.model ?? new UnconfiguredModelClient(), registry, clock, ...opts.loopOptions }),
       defaultEngine: agentBackend,
-      cliLoop: (engine) => createCliAgentLoop({ ...opts.cli?.[engine], engine, registry, clock }),
+      cliLoop: (engine) => {
+        const settings = modelSettingsOf(engine);
+        return createCliAgentLoop({ procDir: cliProcDir, ...opts.cli?.[engine], ...(settings ? { resolveModel: (tier) => settings.resolve(tier) } : {}), engine, registry, clock });
+      },
     });
 
   // ---------- background work tracking (for idle()) ----------
@@ -192,31 +227,35 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     deskCellId,
     ownerPrincipal,
     ownerAddresses,
-    allowHostWrites: opts.allowHostWrites ?? false,
     rootBounds: { ...DEFAULT_ROOT_BOUNDS, ...Object.fromEntries(Object.entries(opts.rootBounds ?? {}).filter(([, v]) => v !== undefined)) },
     repoPath: opts.repoPath,
     leaseMs: opts.leaseMs ?? DEFAULTS.leaseMs,
     maxConcurrentRuns: Math.max(1, opts.maxConcurrentRuns ?? DEFAULTS.maxConcurrentRuns),
     retryBackoffMs: opts.retryBackoffMs ?? DEFAULTS.retryBackoffMs,
     maxRetryBackoffMs: opts.maxRetryBackoffMs ?? DEFAULTS.maxRetryBackoffMs,
+    maxStepContinuations: Math.max(0, opts.maxStepContinuations ?? DEFAULTS.maxStepContinuations),
+    stallGraceMs: Math.max(0, opts.stallGraceMs ?? DEFAULTS.stallGraceMs),
     onError,
     track,
     pendingTasks: () => tasks.size,
     tasksSettled: async () => {
       await Promise.allSettled([...tasks]);
     },
-    ensureScratchRepo: scratchRepo(join(dataDir, "base-repo")),
     lifecycle: undefined as never,
     dispatcher: undefined as never,
     escalations: undefined as never,
     approvals: undefined as never,
     readModel: undefined as never,
+    waits: undefined as never,
+    stall: undefined as never,
   };
+  core.waits = createWaits(core);
   core.lifecycle = createLifecycle(core);
   core.dispatcher = createDispatcher(core, { idleTimeoutMs: DEFAULTS.idleTimeoutMs });
   core.escalations = createEscalations(core);
   core.approvals = createApprovals(core);
   core.readModel = createReadModel(core);
+  core.stall = createStallMonitor(core);
   const { dispatcher, lifecycle } = core;
 
   for (const ch of opts.channels ?? []) hub.register(ch);
@@ -227,6 +266,12 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
   // ---------- wiring ----------
   const unsubscribe: Array<() => void> = [];
   unsubscribe.push(bus.on("inbox.enqueued", (e) => dispatcher.notify(e.cellId)));
+  // A Job that ended frees its work tree's write slot for whoever is queued behind it (docs/05 §3.2).
+  unsubscribe.push(
+    bus.on("job.changed", (e) => {
+      if (e.state !== "running") dispatcher.slotsChanged();
+    }),
+  );
   unsubscribe.push(
     bus.on("inbox.dead", (e) => {
       core.escalations.deadLetter(e);
@@ -253,6 +298,20 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     }),
   );
 
+  // Preferences live in each cell's frozen system prefix. A preference saved today must reach the cells that are
+  // already alive (the desk, running projects), not only the ones created afterwards — "the owner stops repeating
+  // themselves" (docs/05 §4.2). Their prefix is rebuilt at their next Run; that costs each of them one cache miss.
+  unsubscribe.push(
+    bus.on("knowledge.changed", (e) => {
+      if (e.kind !== "preference") return;
+      try {
+        const affected = e.scope === "global" || e.cellId === null ? cells.list({ status: ["active", "paused"] }) : [cells.get(e.cellId), ...cells.descendants(e.cellId, { status: ["active", "paused"] })];
+        for (const c of affected) if (c && c.status !== "closed") context.refreshPrefixSync(c.id);
+      } catch (err) {
+        onError(err, "refresh prefixes after a preference change");
+      }
+    }),
+  );
   let started = false;
   let stopped = false;
   let heartbeat: ReturnType<typeof setInterval> | undefined;
@@ -270,6 +329,10 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     hub,
     loop,
     agentBackend,
+    modelSettings(engine) {
+      const e = engine ?? (agentBackend && agentBackend !== "api" ? agentBackend : null);
+      return e ? modelSettingsOf(e) : null;
+    },
     dataDir,
     deskCellId,
     ownerPrincipal,
@@ -279,15 +342,31 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
       if (started) return;
       if (stopped) throw new NgError("conflict", "this kernel was stopped; create a new one on the same database to continue");
       started = true;
+      // Ask the backend CLI for its models now, so the first Run does not have to wait for the list.
+      if (agentBackend && agentBackend !== "api") modelSettingsOf(agentBackend)?.warm();
       // A previous process's in-flight Runs died with it; their batches go back to the queue (one attempt each).
       inbox.recoverClaimsSync({ reason: "recovered at startup: the previous kernel stopped during this run" });
       hub.recoverInterruptedSync();
       core.approvals.reconcile();
       try {
+        // A kernel that was killed leaves its CLI agents running (they have their own process groups) while their
+        // batches were just taken back above: stop them before anything is dispatched into the same directories.
+        for (const r of await reapOrphanedCliProcesses(cliProcDir)) {
+          if (r.killed) onError(new Error(`stopped a CLI agent (pid ${r.pid}) of cell "${r.cellId}" left running in ${r.cwd} by the previous kernel`), "recovery");
+        }
+      } catch (err) {
+        onError(err, "CLI process recovery");
+      }
+      try {
+        // Resolves only after every job whose cancel was interrupted by the previous kernel's death is really gone.
         await workspace.recover();
       } catch (err) {
         onError(err, "workspace recovery");
       }
+      // A cell that was closed (its settle transaction committed) just before the previous kernel died may have left
+      // Jobs running: their runtime is stopped before the dispatcher hands anyone that directory (docs/05 guard 4).
+      const orphaned = new Set(workspace.listJobsSync({ state: ["running"] }).filter((j) => cells.get(j.cellId)?.status === "closed").map((j) => j.cellId));
+      await Promise.all([...orphaned].map((id) => workspace.stopRuntime(id).catch((err: unknown) => onError(err, `stop runtime of closed cell ${id}`))));
       // Leases are renewed before the inbox looks at a moved ManualClock, so a live Run is never expired by a test step.
       if (isSubscribable(clock)) unsubscribeClock = clock.subscribe(() => dispatcher.renewAll());
       heartbeat = setInterval(() => dispatcher.renewAll(), Math.max(1_000, Math.floor(core.leaseMs / 3)));
@@ -295,11 +374,13 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
       dispatcher.start();
       inbox.start();
       for (const id of inbox.dueCellIdsSync()) dispatcher.notify(id);
+      core.stall.start();
     },
 
     async stop() {
       if (stopped) return;
       stopped = true;
+      core.stall.stop();
       inbox.stop();
       unsubscribeClock?.();
       if (heartbeat) clearInterval(heartbeat);
@@ -351,6 +432,14 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     tree: (o) => core.readModel.tree(o),
     stats: () => core.readModel.stats(),
     activeRuns: () => dispatcher.activeRuns(),
+    activeWorkspaces: () => core.readModel.activeWorkspaces(),
+    anchorsOf: (cellId) => core.readModel.anchorsOf(cellId),
+    listWaits: (cellIds) => core.waits.list(cellIds),
+    sendToCell: (cellId, message, o) => {
+      const principalId = o?.principalId ?? ownerPrincipal;
+      return sendCellMessage(core, { from: KERNEL_FROM.control, principalId, sender: principalId, toCellId: cellId, id: message.id ?? newId("msg", clock), message });
+    },
+    checkStalls: () => void core.stall.evaluate(),
   };
   return kernel;
 }

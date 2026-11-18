@@ -1,10 +1,13 @@
 import { z } from "zod";
 import {
   anyCovers,
+  CELL_STATUS_KEY,
+  cellIdOf,
   defineTool,
   gtdKeys,
   isChannelAddr,
   isEnvelopeOfType,
+  isNgError,
   newId,
   subjectKeys,
   type ActivityRecord,
@@ -14,18 +17,20 @@ import {
   type ChannelSendAction,
   type ProcessorSpec,
   type ProjectProposal,
+  type ProjectRecord,
   type ProjectStartAction,
+  type SendToCellResult,
   type ToolContext,
   type ToolDef,
   type ToolResult,
   type Toolset,
 } from "@ng/protocol";
+import type { ProjectInit } from "../project/launch";
 import { cardDeliverable, prep as cardPrep, proposalCard, responseCard } from "../shared/cards";
 import { KEYS, PROCESSORS, ROLES, TOOLSETS, type PresetsConfig } from "../shared/config";
-import { readCoordinator } from "../shared/coordinator";
+import { errorText, isCwdError, repoInput, watchFilterInput } from "../shared/inputs";
 import { notifyOwner } from "../shared/notify";
-import { GTD_PAYLOAD, type GtdCommand } from "../shared/payloads";
-import { chasePlan, fanOutPlan, SENSOR_LLM_PROCESSOR, singlePlan, toolKinds, type PartyPlan } from "../shared/plan";
+import { HUB_PROCESSOR, SENSOR_LLM_PROCESSOR, WORKER_PROCESSOR } from "../shared/processors";
 import { clip, formatWhen, itemRawInput, itemSource, newActivity } from "../shared/records";
 import type { SourceInit } from "../shared/sensor";
 import {
@@ -33,17 +38,17 @@ import {
   closeLinkedActions,
   currentItem,
   isRestored,
-  itemInfo,
+  launchProject,
   readReplyItems,
   replyAddressOf,
   SETTLE_ERROR,
   settleDesk,
-  startItem,
   type DeskBooks,
   type ProposalItem,
   type ReminderData,
   type ReplyItem,
 } from "./items";
+
 
 const effort = z.enum(["15m", "45m", "low_energy"]);
 const prepInput = z
@@ -92,7 +97,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
   const now = (ctx: ToolContext) => ctx.clock.now();
   const self = (ctx: ToolContext) => ctx.ports.self.cellId;
   const restoredRefusal = {
-    output: "The owner moved this item back from the archive on purpose: it needs a card (present_to_owner, draft_reply, propose_project, or hand it off). Do not file it away again.",
+    output: "The owner moved this item back from the archive on purpose: it needs a card (present_to_owner, draft_reply, propose_project) or a project (start_project). Do not file it away again.",
     isError: true,
   };
 
@@ -423,13 +428,80 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
     },
   });
 
-  // ---------- projects and background work ----------
+  // ---------- projects ----------
+
+  const planInput = z
+    .array(
+      z.object({
+        title: z.string().min(1),
+        owner: z.enum(["agent", "human", "waiting"]),
+        nextStep: z.string().optional(),
+        phase: z.number().int().min(1).optional(),
+      }),
+    )
+    .describe("first steps, if you already know them (recorded on the project's books; the project plans the rest)");
+
+  const cwdRefusal = (err: unknown): ToolResult => ({
+    output: `Not started: ${errorText(err)} Ask the owner for the absolute path of the repository on this machine (send_message to ${owner}, then wait with waitingFor "human") — never guess one.`,
+    isError: true,
+  });
+
+  const startProject = tool({
+    name: "start_project",
+    description: [
+      "Start a project for anything that takes more than a quick lookup (a task, a todo, a code change, research, an idea). A persistent project cell plans it, keeps its records and its report, and hands every piece of heavy work to one-shot workers; it starts at once and the owner gets a short notice.",
+      "Put everything it needs into brief: the owner's exact words, constraints, links, what to deliver. cwd is the absolute path of the repository on this machine — ask the owner when you do not know it.",
+      'mode "research_then_park" for an idea the owner only wants to keep for later: the project researches what it should be, saves a report and parks itself as someday.',
+    ].join(" "),
+    input: z.object({
+      title: z.string().min(1).describe("short Chinese title shown in the owner's project list"),
+      outcome: z.string().min(1).describe("what done looks like"),
+      brief: z.string().min(1).describe("the request in full: the owner's words, constraints, links, what to deliver"),
+      cwd: z.string().optional().describe("absolute path of the directory the work happens in"),
+      repos: z.array(repoInput).optional().describe("the repositories involved, when there are several"),
+      mode: z.enum(["now", "research_then_park"]).optional(),
+      phases: z.array(z.string().min(1)).optional().describe("staged work: phases in order; the project runs one at a time, each after the owner's go-ahead"),
+      plan: planInput.optional(),
+      replyTo: replyToInput,
+      replyLabel: z.string().optional(),
+      continueConversation: z.boolean().optional().describe("the project continues from this conversation (it sees what you just discussed)"),
+    }),
+    async run(args, ctx) {
+      if (args.replyTo !== undefined && !isChannelAddr(args.replyTo)) return { output: "replyTo must be channel:<channelId>:<target>.", isError: true };
+      const env = currentItem(ctx);
+      const raw = itemRawInput(env).text;
+      const init: ProjectInit = {
+        title: args.title,
+        outcome: args.outcome,
+        brief: args.brief,
+        source: itemSource(env, now(ctx)),
+        ...(raw ? { rawInput: raw } : {}),
+        ...(args.cwd ? { cwd: args.cwd } : {}),
+        ...(args.repos?.length ? { repos: args.repos.map((r) => ({ name: r.name, cwd: r.cwd, ...(r.defaultBranch ? { defaultBranch: r.defaultBranch } : {}) })) } : {}),
+        ...(args.mode ? { mode: args.mode } : {}),
+        ...(args.phases?.length ? { phases: args.phases } : {}),
+        ...(args.plan?.length ? { plan: args.plan.map((a) => ({ title: a.title, owner: a.owner, ...(a.nextStep ? { nextStep: a.nextStep } : {}), ...(a.phase ? { phase: a.phase } : {}) })) } : {}),
+        ...(args.replyTo ? { replyTo: args.replyTo as ChannelAddr, replyLabel: args.replyLabel ?? args.replyTo } : {}),
+        ...(args.continueConversation ? { continueConversation: true } : {}),
+      };
+      let r: { projectId: string; started: boolean };
+      try {
+        r = await launchProject(ctx.ports, init, ctx.clock);
+      } catch (err) {
+        if (isCwdError(err)) return cwdRefusal(err);
+        return { output: `Not started: ${errorText(err)}`, isError: true };
+      }
+      const park = args.mode === "research_then_park";
+      await notifyOwner(ctx.ports, owner, park ? `已记下：${args.title}，先做个调研，完成后放进以后再说` : `已立项：${args.title}，后台开始推进`, `start:${r.projectId}`);
+      return `Started project ${r.projectId}「${args.title}」 and told the owner. Pass later changes to it with steer_item; stop it with stop_item.`;
+    },
+  });
 
   const proposeProject = tool({
     name: "propose_project",
     description: [
-      "Propose a project for something that needs several steps: the owner gets one proposal card and can edit the plan, approve it, or park it for later.",
-      "On approval (you are woken; call apply_updates) the project starts: agent actions each get a background worker, human and waiting actions are listed for the owner.",
+      "Propose a project whose plan needs the owner's sign-off first (large, costly, or built on assumptions): one proposal card where the owner can edit the plan, approve it, or park it for later.",
+      "On approval the project starts with the plan they approved (you are woken; apply_updates shows it).",
     ].join(" "),
     input: z.object({
       title: z.string().min(1),
@@ -437,8 +509,9 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
       background: z.string().optional(),
       actions: z.array(z.object({ title: z.string().min(1), owner: z.enum(["agent", "human", "waiting"]), effort: effort.optional(), nextStep: z.string().optional() })).min(1),
       prep: prepInput.optional(),
-      research: z.boolean().optional().describe("agent actions only read and report (no repository changes)"),
-      repoPath: z.string().optional().describe("repository the agent actions work in"),
+      cwd: z.string().optional().describe("absolute path of the directory the work happens in"),
+      repos: z.array(repoInput).optional(),
+      phases: z.array(z.string().min(1)).optional(),
     }),
     async run(args, ctx) {
       const { ports } = ctx;
@@ -460,8 +533,9 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
         source: itemSource(env, t),
         rawInput: itemRawInput(env),
         ...(env ? { envelope: env } : {}),
-        ...(args.research !== undefined ? { research: args.research } : {}),
-        ...(args.repoPath ? { repoPath: args.repoPath } : {}),
+        ...(args.cwd ? { cwd: args.cwd } : {}),
+        ...(args.repos?.length ? { repos: args.repos.map((r) => ({ name: r.name, cwd: r.cwd, ...(r.defaultBranch ? { defaultBranch: r.defaultBranch } : {}) })) } : {}),
+        ...(args.phases?.length ? { phases: args.phases } : {}),
       };
       await ports.context.commit(self(ctx), { statePatches: { [KEYS.proposal(artifactId)]: remembered } });
       const card = proposalCard(
@@ -475,139 +549,154 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
       const r = await ports.authorize(action, { artifactVersion: version });
       if (r.type === "deny") return { output: `Not allowed: ${r.feedback}`, isError: true };
       if (r.type === "allow") return "A standing rule allowed it; call apply_updates to start it.";
-      return { output: "Proposal card is waiting for the owner. You will be woken with the decision.", endRun: "deferred_for_approval", data: { actionId: r.actionId, artifactId } };
+      return { output: "The proposal card is waiting for the owner; you are woken with the decision.", endRun: "deferred_for_approval", data: { actionId: r.actionId, artifactId } };
     },
   });
 
-  const delegate = tool({
-    name: "delegate",
-    description: [
-      "Hand one piece of slow or multi-step work (look into code, fix a bug, write a document, research a question) to a background worker right away; it shows to the owner as 🟢 being handled and the owner gets a short acknowledgement.",
-      "When it is done, its result comes back as one card. continueConversation lets the worker continue from this conversation (e.g. fix the bug you just discussed).",
-    ].join(" "),
-    input: z.object({
-      title: z.string().min(1).describe("short Chinese title shown in the owner's lists"),
-      instruction: z.string().min(1).describe("what to do, what done looks like, what to report"),
-      outcome: z.string().optional(),
-      research: z.boolean().optional().describe("read-only research: no repository checkout, no file changes"),
-      repoPath: z.string().optional(),
-      continueConversation: z.boolean().optional(),
-      directLine: z.boolean().optional().describe("let the worker talk with the owner directly while it works"),
-      replyTo: replyToInput,
-      replyLabel: z.string().optional(),
-    }),
-    async run(args, ctx) {
-      const rootId = newId("prj", ctx.clock);
-      if (args.replyTo !== undefined && !isChannelAddr(args.replyTo)) return { output: "replyTo must be channel:<channelId>:<target>.", isError: true };
-      const item = itemInfo(ctx, args.title, {
-        ...(args.outcome ? { outcome: args.outcome } : {}),
-        ...(args.replyTo ? { replyTo: args.replyTo as ChannelAddr, replyLabel: args.replyLabel ?? args.replyTo } : {}),
-      });
-      const plan = singlePlan(rootId, item, {
-        instruction: args.instruction,
-        ...(args.research !== undefined ? { research: args.research } : {}),
-        ...(args.repoPath ? { repo: { repoPath: args.repoPath } } : {}),
-        ...(args.continueConversation ? { fork: true } : {}),
-        ...(args.directLine ? { directLine: { ownerAddress: owner, thread: `ui:${rootId}` } } : {}),
-      });
-      await startItem(ctx.ports, cfg, plan, { ...(args.continueConversation ? { fork: true } : {}), notice: `已交给后台处理：${args.title}`, noticeKey: `start:${rootId}` });
-      return `Started item ${rootId} ("${args.title}"); the owner was told. Steer it with steer_item, stop it with stop_item.${args.directLine ? ` Direct line thread: ui:${rootId}.` : ""}`;
-    },
-  });
+  // ---------- items in flight: steer, stop, bring back ----------
 
-  const fanOut = tool({
-    name: "fan_out",
+  const closedItem = (id: string) =>
+    `${id} has finished (it is closed): nothing was delivered. For more work on the same subject, start_project with a brief that names what it delivered (read_artifact with its cellId lists its reports); if you meant a parked item, use reactivate_item.`;
+
+  function sendResult(id: string, r: SendToCellResult, delivered: string): ToolResult {
+    switch (r.status) {
+      case "delivered":
+        return r.targetStatus === "paused"
+          ? { output: `${id} is parked: it reads this when it is resumed (reactivate_item resumes it now).` }
+          : { output: delivered };
+      case "closed":
+        return { output: closedItem(id), isError: true };
+      case "not_found":
+        return { output: `There is no item ${id}; check the id in the in-flight list.`, isError: true };
+      case "refused":
+        return { output: `Not allowed: ${r.reason}.`, isError: true };
+    }
+  }
+
+  const steerItem = tool({
+    name: "steer_item",
     description:
-      "Run the same kind of work over many items in parallel (e.g. research 15 competitors). One row for the owner with progress k/N; when all are back, one summary card. Each item gets its own background worker.",
+      "Pass the owner's new instruction or extra requirement to a project (or hub) in flight; it carries it out at its next turn, with a new worker if needed. urgent: it interrupts what the item is doing right now.",
     input: z.object({
-      title: z.string().min(1),
-      instruction: z.string().min(1).describe("what each worker does and reports"),
-      items: z.array(z.object({ title: z.string().min(1), instruction: z.string().optional(), input: z.unknown().optional() })).min(2),
-      label: z.string().optional().describe('progress label, e.g. "正在并发整理竞品资料"'),
-      outcome: z.string().optional(),
-      research: z.boolean().optional(),
-      repoPath: z.string().optional(),
-      replyTo: replyToInput,
-      replyLabel: z.string().optional(),
+      itemId: z.string().min(1),
+      message: z.string().min(1).describe("the owner's words and anything the project needs with them"),
+      urgent: z.boolean().optional(),
     }),
     async run(args, ctx) {
-      if (args.replyTo !== undefined && !isChannelAddr(args.replyTo)) return { output: "replyTo must be channel:<channelId>:<target>.", isError: true };
-      const rootId = newId("prj", ctx.clock);
-      const item = itemInfo(ctx, args.title, {
-        ...(args.outcome ? { outcome: args.outcome } : {}),
-        ...(args.replyTo ? { replyTo: args.replyTo as ChannelAddr, replyLabel: args.replyLabel ?? args.replyTo } : {}),
-      });
-      const plan = fanOutPlan(rootId, item, {
-        instruction: args.instruction,
-        items: args.items,
-        ...(args.label ? { label: args.label } : {}),
-        ...(args.research !== undefined ? { research: args.research } : {}),
-        ...(args.repoPath ? { repo: { repoPath: args.repoPath } } : {}),
-      });
-      await startItem(ctx.ports, cfg, plan, { notice: `已开始并行处理 ${args.items.length} 项：${args.title}`, noticeKey: `start:${rootId}` });
-      return `Started item ${rootId} with ${args.items.length} workers; the owner was told.`;
+      const { ports } = ctx;
+      if (args.urgent) {
+        let r;
+        try {
+          r = await ports.controlCell(args.itemId, { action: "steer", steerMessage: args.message });
+        } catch (err) {
+          return { output: `There is no item ${args.itemId} under the desk (${errorText(err)}).`, isError: true };
+        }
+        if (r.applied) return `Passed on to ${args.itemId} at once; it takes it between its current steps.`;
+        if (r.reason === "closed") return { output: closedItem(args.itemId), isError: true };
+        return { output: `Not passed on: ${r.reason ?? "refused"}.`, isError: true };
+      }
+      if (!ports.sendToCell) return { output: "Messages to items are not available in this environment.", isError: true };
+      const r = await ports.sendToCell(`inbox:${args.itemId}`, { text: args.message, summary: "主人的新要求", id: `${ctx.snapshot.runId}:${ctx.toolUseId}:steer` });
+      return sendResult(args.itemId, r, `Passed on to ${args.itemId}; it takes it at its next turn.`);
     },
   });
 
-  const chaseReplies = tool({
-    name: "chase_replies",
+  const stopItem = tool({
+    name: "stop_item",
+    description: "Stop a project (or hub) for good — the owner said stop, or it is no longer needed: its workers, waits and pending cards are cleared and its records are marked cancelled.",
+    input: z.object({ itemId: z.string().min(1), reason: z.string().optional() }),
+    async run(args, ctx) {
+      const noItem = { output: `There is no item ${args.itemId} under the desk.`, isError: true };
+      let before: ProjectRecord | null;
+      try {
+        before = await ctx.ports.context.readState<ProjectRecord>(args.itemId, gtdKeys.project);
+        await ctx.ports.closeCell(args.itemId, "cancelled");
+      } catch (err) {
+        if (isNgError(err, "bounds_violation") || isNgError(err, "not_found")) return noItem;
+        throw err;
+      }
+      const ended = before ? before.lifecycle === "completed" || before.lifecycle === "cancelled" : !ctx.snapshot.tail.roster.some((c) => c.cellId === args.itemId);
+      if (ended) return `${args.itemId} had already ended${before ? ` (${before.lifecycle})` : ""}; nothing changed.`;
+      return `Stopped ${args.itemId}${args.reason ? `（${args.reason}）` : ""}: everything it had running is cleared and its records say cancelled.`;
+    },
+  });
+
+  const reactivateItem = tool({
+    name: "reactivate_item",
+    description:
+      "Bring a parked project (someday, or paused) back: it is resumed and gets the owner's words; it continues from its records and its report instead of starting over.",
+    input: z.object({ itemId: z.string().min(1), message: z.string().min(1).describe("what the owner said: go ahead, the changed scope, the next phase") }),
+    async run(args, ctx) {
+      const { ports } = ctx;
+      let r;
+      try {
+        r = await ports.controlCell(args.itemId, { action: "resume" });
+      } catch (err) {
+        return { output: `There is no item ${args.itemId} under the desk (${errorText(err)}).`, isError: true };
+      }
+      if (!r.applied && r.reason === "closed") {
+        const arts = await ports.context.listArtifacts(args.itemId).catch(() => []);
+        const p = await ports.context.readState<ProjectRecord>(args.itemId, gtdKeys.project).catch(() => null);
+        const left = [
+          arts.length ? `its artifacts: ${arts.map((a) => `${a.artifactId} v${a.version}${a.content.title ? `「${a.content.title}」` : ""}`).join(", ")}` : "",
+          p?.proposal ? `its plan: ${p.proposal.outcome}; ${p.proposal.actions.map((a) => a.title).join("、")}` : "",
+          p?.summary ? `where it stood: ${p.summary}` : "",
+        ].filter(Boolean);
+        return {
+          output: `${args.itemId} is closed (an item from before projects could be parked), so it cannot be resumed. Start a new project with start_project and name in its brief what the old one left${left.length ? ` — ${left.join("; ")}` : ""}, so nothing is redone.`,
+          isError: true,
+        };
+      }
+      if (!r.applied) return { output: `Not resumed: ${r.reason ?? "refused"}.`, isError: true };
+      if (!ports.sendToCell) return { output: "Messages to items are not available in this environment.", isError: true };
+      const s = await ports.sendToCell(`inbox:${args.itemId}`, { text: args.message, summary: "主人要继续推进", id: `${ctx.snapshot.runId}:${ctx.toolUseId}:resume` });
+      return sendResult(args.itemId, s, `Resumed ${args.itemId} and passed on the owner's words; it continues from its records and report.`);
+    },
+  });
+
+  // ---------- hubs and sources ----------
+
+  const addHub = tool({
+    name: "add_hub",
     description: [
-      "Wait for replies from one or more people (e.g. three suppliers' quotes): their replies on the given threads come straight in and are counted (已回 2/3);",
-      "anyone late gets a prepared follow-up the owner confirms on one card. When all (or, with join any, the first) are in, one summary card.",
+      "Add a hub: a persistent front door for one stream of direct messages (code review requests, incident pings, task requests for a set of repositories).",
+      "Messages matching watch go straight to it instead of the desk, batched over coalesceMinutes; it sends each topic to a worker in the right repository and forwards follow-ups. Off-topic messages come back to you.",
     ].join(" "),
     input: z.object({
-      title: z.string().min(1),
-      description: z.string().min(1).describe('what is awaited, e.g. "等待供应商报价回信"'),
-      parties: z
-        .array(
-          z.object({
-            label: z.string().min(1),
-            to: z.string().optional().describe("channel address follow-ups go to"),
-            thread: z.string().optional().describe('thread their reply arrives on, "<channelId>:<threadId>"'),
-            principalId: z.string().optional().describe("only this sender counts as their reply"),
-            dueAt: z.string().optional().describe("ISO 8601, if different from the overall deadline"),
-          }),
-        )
-        .min(1),
-      dueAt: z.string().optional().describe("deadline, ISO 8601 with offset"),
-      waitHours: z.number().min(0).optional(),
-      join: z.enum(["all", "any"]).optional(),
-      interpret: z.boolean().optional().describe("judge each reply with a small model (default: any message from them counts)"),
-      nudgeText: z.string().optional(),
-      replyTo: replyToInput,
-      replyLabel: z.string().optional(),
+      title: z.string().min(1).describe('short Chinese name, e.g. "代码评审直通"'),
+      repos: z.array(repoInput).min(1),
+      rules: z.string().min(1).describe("what belongs to it and how each kind of request is handled (review, investigate, fix), in plain words"),
+      watch: z.object({ thread: z.string().optional().describe('"<channelId>:<threadId>"'), filter: watchFilterInput.optional() }),
+      coalesceMinutes: z.number().min(0).max(60).optional().describe("batching window (default 2)"),
     }),
     async run(args, ctx) {
-      const t = now(ctx);
-      const due = args.dueAt !== undefined ? Date.parse(args.dueAt) : t + (args.waitHours !== undefined ? args.waitHours * 3_600_000 : cfg.defaultWaitMs);
-      if (Number.isNaN(due)) return { output: `Cannot parse dueAt "${args.dueAt}".`, isError: true };
-      const parties: PartyPlan[] = [];
-      for (const [i, p] of args.parties.entries()) {
-        if (p.to !== undefined && !isChannelAddr(p.to)) return { output: `parties[${i}].to must be channel:<channelId>:<target>.`, isError: true };
-        const pd = p.dueAt !== undefined ? Date.parse(p.dueAt) : undefined;
-        if (pd !== undefined && Number.isNaN(pd)) return { output: `Cannot parse parties[${i}].dueAt.`, isError: true };
-        parties.push({
-          id: `p${i + 1}`,
-          label: p.label,
-          ...(p.to ? { to: p.to as ChannelAddr } : {}),
-          ...(p.thread ? { thread: p.thread } : {}),
-          ...(p.principalId ? { principalId: p.principalId } : {}),
-          ...(pd !== undefined ? { dueAt: pd } : {}),
-        });
+      if (!args.watch.thread && !args.watch.filter) return { output: "watch needs a thread or a filter (otherwise nothing reaches the hub).", isError: true };
+      const id = newId("hub", ctx.clock);
+      const coalesceMs = Math.round((args.coalesceMinutes ?? 2) * 60_000);
+      const repos = args.repos.map((r) => ({ name: r.name, cwd: r.cwd, ...(r.defaultBranch ? { defaultBranch: r.defaultBranch } : {}) }));
+      const source: SourceInit = { title: args.title, description: args.rules, kind: "channel", mode: "active", processor: "llm" };
+      const spec: CellSpec = {
+        id,
+        preset: "hub",
+        title: args.title,
+        processor: HUB_PROCESSOR,
+        watches: [{ threadOrFilter: { ...(args.watch.filter ?? {}), ...(args.watch.thread ? { thread: args.watch.thread } : {}) }, ...(coalesceMs > 0 ? { coalesceMs } : {}) }],
+        meta: { role: ROLES.hub, gtd: { source } },
+      };
+      const instruction = [
+        `你是「${args.title}」的直通入口。`,
+        "## 负责的仓库",
+        ...repos.map((r) => `- ${r.name}：${r.cwd}${r.defaultBranch ? `（默认分支 ${r.defaultBranch}）` : ""}`),
+        "## 规则",
+        args.rules,
+      ].join("\n");
+      try {
+        await ctx.ports.spawnCell(spec, { instruction, input: { repos, rules: args.rules } });
+      } catch (err) {
+        return { output: `Not added: ${errorText(err)}`, isError: true };
       }
-      if (args.replyTo !== undefined && !isChannelAddr(args.replyTo)) return { output: "replyTo must be channel:<channelId>:<target>.", isError: true };
-      const rootId = newId("prj", ctx.clock);
-      const item = itemInfo(ctx, args.title, args.replyTo ? { replyTo: args.replyTo as ChannelAddr, replyLabel: args.replyLabel ?? args.replyTo } : {});
-      const plan = chasePlan(rootId, item, {
-        description: args.description,
-        parties,
-        dueAt: due,
-        ...(args.join ? { join: args.join } : {}),
-        ...(args.interpret ? { interpret: true } : {}),
-        ...(args.nudgeText ? { nudgeText: args.nudgeText } : {}),
-      });
-      await startItem(ctx.ports, cfg, plan, { notice: `已开始跟进：${args.description}（${parties.length} 方，${formatWhen(due, cfg.timeZone)} 到期）`, noticeKey: `start:${rootId}` });
-      return `Started item ${rootId}: waiting on ${parties.length} replies until ${new Date(due).toISOString()}; the owner was told.`;
+      await notifyOwner(ctx.ports, owner, `已添加直通入口：${args.title}`, `hub:${id}`);
+      return `Hub ${id} added and the owner was told: matching messages now go straight to it${coalesceMs > 0 ? `, batched over ${args.coalesceMinutes ?? 2} minute(s)` : ""}.`;
     },
   });
 
@@ -643,14 +732,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
         mode: args.mode ?? "active",
         processor: processor.kind,
       };
-      const spec: CellSpec = {
-        id: newId("src", ctx.clock),
-        preset: "sensor",
-        title: args.title,
-        processor,
-        bounds: args.script ? { isolation: "git_worktree", tools: toolKinds("read", "bash") } : { isolation: "none", tools: toolKinds("read") },
-        meta: { role: ROLES.sensor, gtd: { source } },
-      };
+      const spec: CellSpec = { id: newId("src", ctx.clock), preset: "sensor", title: args.title, processor, meta: { role: ROLES.sensor, gtd: { source } } };
       if (args.cron) spec.schedules = [{ cron: args.cron, ...(args.tz ? { tz: args.tz } : {}) }];
       if (args.watchThread) spec.watches = [{ threadOrFilter: { thread: args.watchThread } }];
       const addr = await ctx.ports.spawnCell(spec, { instruction: args.description ?? args.title });
@@ -659,46 +741,10 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
     },
   });
 
-  // ---------- steering items in flight ----------
-
-  const steerItem = tool({
-    name: "steer_item",
-    description: "Pass the owner's new instruction to a background item while it works (takes effect at once, even mid-task).",
-    input: z.object({ itemId: z.string().min(1), message: z.string().min(1) }),
-    async run(args, ctx) {
-      const st = await readCoordinator(ctx.ports, args.itemId).catch(() => null);
-      if (!st) return { output: `No background item ${args.itemId} (see the in-flight list).`, isError: true };
-      const targets = Object.values(st.slots).filter((s) => s.status === "running" && !s.partyId).map((s) => s.cellId);
-      if (st.editor) targets.push(st.editor.cellId);
-      if (targets.length === 0) return { output: "Nothing of that item is working right now.", isError: true };
-      for (const id of targets) await ctx.ports.controlCell(id, { action: "steer", steerMessage: args.message });
-      return `Passed on to ${targets.length} worker(s).`;
-    },
-  });
-
-  const stopItem = tool({
-    name: "stop_item",
-    description: "Stop a background item for good (the owner said stop / no longer needed): its work, waits and pending card are cleared and it is marked cancelled.",
-    input: z.object({ itemId: z.string().min(1), reason: z.string().optional() }),
-    async run(args, ctx) {
-      const st = await readCoordinator(ctx.ports, args.itemId).catch(() => null);
-      if (!st) return { output: `No background item ${args.itemId}.`, isError: true };
-      if (st.finished) return "It has already finished.";
-      // A paused item (paused from the owner's project list) must run once more to wind itself down.
-      if (ctx.snapshot.tail.roster.some((c) => c.cellId === args.itemId && c.status === "paused")) await ctx.ports.controlCell(args.itemId, { action: "resume" });
-      const cmd: GtdCommand = { command: "stop", ...(args.reason ? { reason: args.reason } : {}) };
-      const to = `inbox:${args.itemId}` as const;
-      await ctx.ports.context.commit(self(ctx), {
-        inboxOut: [{ to, envelope: { id: `${args.itemId}:stop`, from: `inbox:${self(ctx)}`, to, principalId: ctx.ports.self.principalId, kind: "event", type: GTD_PAYLOAD.command, payload: cmd, createdAt: now(ctx) } }],
-      });
-      return "Stopping it now; its records are marked cancelled.";
-    },
-  });
-
   const applyUpdates = tool({
     name: "apply_updates",
     description:
-      "Background events (reminders that came due, approved proposals, finished background items, sent replies) are applied to the owner's lists automatically when you wake. This shows what was applied and retries anything that failed.",
+      "Background events (reminders that came due, approved proposals, sent replies, finished projects) are applied to the owner's lists automatically when you wake. This shows what was applied and retries anything that failed.",
     input: z.object({}),
     async run(_args, ctx, settled) {
       const lines = [...books.take(ctx.snapshot.runId), ...settled];
@@ -709,7 +755,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
 
   return {
     name: TOOLSETS.desk,
-    description: "The desk's GTD tools: captures, reminders, replies on cards, projects and background items.",
+    description: "The desk's GTD tools: captures, reminders, replies on cards, projects, hubs and sources, arbitration.",
     tools: [
       captureNote,
       remindMe,
@@ -717,13 +763,13 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
       draftReply,
       withdrawCard,
       presentToOwner,
+      startProject,
       proposeProject,
-      delegate,
-      fanOut,
-      chaseReplies,
-      addSource,
       steerItem,
       stopItem,
+      reactivateItem,
+      addHub,
+      addSource,
       applyUpdates,
       reviewWeek,
       suggestSkill,

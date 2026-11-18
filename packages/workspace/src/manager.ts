@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
   cellsRepo,
@@ -11,8 +11,8 @@ import {
   type WorkspaceRecord,
 } from "@ng/protocol";
 import { ContainerDriver, COW_MICROVM_UNAVAILABLE, CowMicrovmDriver } from "./drivers/container";
-import { GitWorktreeDriver, keepBranchIfAhead, NoneDriver, SharedRoDriver } from "./drivers/host";
-import type { DriverDeps, IsolationDriver, Provisioned, ReleaseResult } from "./drivers/types";
+import { GitWorktreeDriver, NoneDriver, SharedRoDriver } from "./drivers/host";
+import type { DriverDeps, IsolationDriver, Provisioned } from "./drivers/types";
 import { DEFAULT_ENV_ALLOWLIST, defaultCommandRunner, pickHostEnv } from "./exec/process";
 import { detectRipgrep } from "./exec/search";
 import { Git } from "./git";
@@ -70,8 +70,21 @@ export function createWorkspaceManager(opts: WorkspaceManagerOptions): Workspace
   const jobsDirOf = (cellId: string) => join(dataDir, "jobs", slugOf(cellId));
   const homeOf = (cellId: string) => join(dataDir, "home", slugOf(cellId));
 
-  /** What every sandboxed host process gets: allow-listed host variables, a per-cell HOME, a git identity. */
+  const cellDirOf = (cellId: string) => join(dataDir, "cells", slugOf(cellId));
+  /**
+   * Environment of a cell's processes.
+   * - isolation "none" / "shared_ro" (docs/05: the owner's real machine): the kernel's own environment as the owner
+   *   started it — real HOME, PATH, git identity, ssh agent, CLI logins — minus the kernel's configuration and secrets
+   *   (`NG_*`). Nothing is redirected: `git commit` is the owner's, `git push` finds their keys.
+   * - explicit isolation (git_worktree / container): allow-listed variables, a per-cell HOME and a neutral identity.
+   */
   const sandboxEnv = (cellId: string): Record<string, string> => {
+    const isolation = store.getWorkspace(cellId)?.isolation ?? "none";
+    if (isolation === "none" || isolation === "shared_ro") {
+      const env: Record<string, string> = {};
+      for (const [k, v] of Object.entries(process.env)) if (v !== undefined && !k.startsWith("NG_")) env[k] = v;
+      return { ...env, ...opts.env };
+    }
     const home = homeOf(cellId);
     mkdirSync(join(home, "tmp"), { recursive: true });
     return {
@@ -86,7 +99,6 @@ export function createWorkspaceManager(opts: WorkspaceManagerOptions): Workspace
       ...opts.env,
     };
   };
-
   const deps: DriverDeps = {
     dataDir,
     runner,
@@ -96,6 +108,7 @@ export function createWorkspaceManager(opts: WorkspaceManagerOptions): Workspace
     hostNode: process.execPath,
     slugOf,
     jobsDirOf,
+    cellDirOf,
   };
   const gitDriver = new GitWorktreeDriver(deps);
   const drivers: Record<IsolationLevel, IsolationDriver> = {
@@ -185,7 +198,9 @@ export function createWorkspaceManager(opts: WorkspaceManagerOptions): Workspace
         if (live && prev.isolation !== isolation) {
           throw new NgError("conflict", `cell "${cellId}" already has a ${prev.isolation} workspace; destroy it before acquiring ${isolation}`);
         }
-        if (prev?.status === "active" && prev.path && existsSync(prev.path)) return makePort(prev);
+        // A host cell works where its spec says; a row from an earlier acquire with another directory is replaced.
+        const moved = (isolation === "none" || isolation === "shared_ro") && acquireOpts.cwd !== undefined && prev?.path !== resolve(acquireOpts.cwd);
+        if (prev?.status === "active" && prev.path && existsSync(prev.path) && !moved) return makePort(prev);
         if (prev?.status === "hibernated" && prev.isolation === "git_worktree") return revive(prev);
 
         const driver = drivers[isolation];
@@ -223,39 +238,27 @@ export function createWorkspaceManager(opts: WorkspaceManagerOptions): Workspace
       });
     },
 
-    async destroy(cellId: string) {
+    async stopRuntime(cellId: string) {
       await cellLock.run(cellId, async () => {
-        await jobs.cancelForCell(cellId, "workspace destroyed");
+        // Resolves when every job's process group is confirmed gone (see JobManager.cancel).
+        await jobs.cancelForCell(cellId, "cancelled with the cell");
         const ws = store.getWorkspace(cellId);
-        if (ws && ws.status !== "destroyed") {
-          let r: ReleaseResult = { branchKept: ws.branch !== null, snapshot: null, warnings: [] };
-          try {
-            if (ws.status === "hibernated") {
-              // The worktree is already gone; only the branch decision is left.
-              if (ws.baseRepo && ws.baseRef && ws.branch) {
-                r.branchKept = await withRepoLock(() => keepBranchIfAhead(deps, ws.baseRepo!, ws.baseRef!, ws.branch!));
-              }
-            } else if (ws.path || ws.containerId) {
-              const driver = drivers[ws.isolation];
-              r = needsRepoLock(ws.isolation) ? await withRepoLock(() => driver.release(ws, "destroy")) : await driver.release(ws, "destroy");
-            }
-          } catch (err) {
-            store.patchWorkspace(cellId, { status: "failed", error: `destroy failed: ${errorMessage(err)}` });
-            throw err;
-          }
-          store.patchWorkspace(cellId, {
-            status: "destroyed",
-            branch: r.branchKept ? ws.branch : null,
-            containerId: null,
-            snapshotId: null,
-            error: r.warnings.join("; ") || null,
-          });
+        if (!ws || !ws.containerId) return;
+        // Only a container is the kernel's to stop. Directories, branches and worktrees — the owner's or ones a cell
+        // made for itself — are never touched here (docs/05 principle 3).
+        const driver = drivers[ws.isolation];
+        try {
+          const warnings = (await driver.stopRuntime?.(ws)) ?? [];
+          store.patchWorkspace(cellId, { status: "destroyed", containerId: null, error: warnings.join("; ") || null });
+        } catch (err) {
+          store.patchWorkspace(cellId, { status: "failed", error: `stopping the container failed: ${errorMessage(err)}` });
+          throw err;
         }
-        rmSync(jobsDirOf(cellId), { recursive: true, force: true });
-        rmSync(homeOf(cellId), { recursive: true, force: true });
       });
     },
-
+    destroy(cellId: string) {
+      return manager.stopRuntime(cellId);
+    },
     cancelJobsForCell(cellId: string) {
       return jobs.cancelForCell(cellId, "cancelled with the cell");
     },

@@ -73,6 +73,7 @@ export interface HydrateDeps extends Deps {
   knowledge: KnowledgeModule;
   resolvePrompt(cell: CellRecord): string;
   roster(cellId: string): ChildSummary[];
+  tailNotes(cellId: string): string[];
 }
 
 export function createHydrate(deps: HydrateDeps): HydrateModule {
@@ -327,8 +328,10 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
     const row = ensurePrefix(cell, mode);
     const history = renderHistory(cell, row, undefined, "error");
     const roster = deps.roster(cellId);
+    const notes = (deps.tailNotes(cellId) ?? []).filter((n) => typeof n === "string" && n.trim() !== "");
     const tail: ModelMessage[] = [];
     if (roster.length > 0) tail.push(rosterMessage(roster));
+    for (const note of notes) tail.push(textMessage("user", note));
     for (const env of batch.envelopes) tail.push(textMessage("user", renderEnvelope(env)));
     return {
       cellId,
@@ -341,7 +344,7 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
       system: { text: row.text, hash: row.hash },
       history: history.messages,
       historyUptoSeq: history.uptoSeq,
-      tail: { roster, messages: tail },
+      tail: notes.length > 0 ? { roster, messages: tail, notes } : { roster, messages: tail },
       skills: JSON.parse(row.skills) as SkillIndexEntry[],
       createdAt: clock.now(),
     };

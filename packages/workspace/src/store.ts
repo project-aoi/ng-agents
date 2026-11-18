@@ -45,6 +45,7 @@ interface JobRow {
   started_at: number;
   finished_at: number | null;
   updated_at: number;
+  cancel_requested_at: number | null;
 }
 
 function toWorkspace(r: WorkspaceRow): WorkspaceRecord {
@@ -81,6 +82,7 @@ function toJob(r: JobRow): JobRecord {
     startedAt: r.started_at,
     finishedAt: r.finished_at,
     updatedAt: r.updated_at,
+    cancelRequestedAt: r.cancel_requested_at ?? null,
   };
 }
 
@@ -191,6 +193,22 @@ export class WorkspaceStore {
 
   setJobPid(jobId: string, pid: number): void {
     run(this.db, "UPDATE jobs SET pid = ?, updated_at = ? WHERE job_id = ?", [pid, this.clock.now(), jobId]);
+  }
+
+  /**
+   * "Cancelling": the request and its reason are on the row before any signal is sent, so a kernel that dies between
+   * the request and the confirmed exit leaves a row `recover()` knows it must still kill. First request wins.
+   */
+  requestJobCancel(jobId: string, reason: string): boolean {
+    const now = this.clock.now();
+    return (
+      run(this.db, "UPDATE jobs SET cancel_requested_at = ?, error = ?, updated_at = ? WHERE job_id = ? AND state = 'running' AND cancel_requested_at IS NULL", [
+        now,
+        reason,
+        now,
+        jobId,
+      ]).changes > 0
+    );
   }
 
   /** Conditional on `running`: returns false when another path already finished the job. */

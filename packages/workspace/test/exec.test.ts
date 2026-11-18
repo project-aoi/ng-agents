@@ -1,9 +1,9 @@
-import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { isNgError } from "@ng/protocol";
-import { cleanupAll, harness, initRepo, tempDir } from "./helpers";
+import { cleanupAll, harness, initRepo, tempDir, waitFor } from "./helpers";
 
 afterEach(() => {
   delete process.env.NG_SECRET_TEST_TOKEN;
@@ -23,8 +23,9 @@ describe("bash", () => {
     await expect(port.exec("bash", { command: "" })).rejects.toSatisfy((e) => isNgError(e, "invalid_argument"));
   });
 
-  it("does not inherit host environment variables or secrets, and gets its own HOME", async () => {
+  it("isolation none is the owner's own environment (real HOME, PATH, git identity) minus the kernel's NG_* configuration and secrets", async () => {
     process.env.NG_SECRET_TEST_TOKEN = "s3cr3t-value-123";
+    process.env.NGWS_TEST_OWNER_VAR = "owner-setting";
     const h = harness();
     const port = await h.mgr.acquire("w1", "none");
     const r = await port.exec("bash", { command: "env" });
@@ -36,9 +37,30 @@ describe("bash", () => {
         .split("\n")
         .map((l) => [l.slice(0, l.indexOf("=")), l.slice(l.indexOf("=") + 1)]),
     );
+    // docs/05: nothing is redirected — the owner's dotfiles, ssh keys and CLI logins are where the tools expect them.
+    expect(vars.HOME).toBe(process.env.HOME ?? homedir());
+    expect(vars.PATH).toBe(process.env.PATH);
+    expect(vars.NGWS_TEST_OWNER_VAR).toBe("owner-setting");
+    expect(Object.keys(vars).some((k) => k.startsWith("GIT_AUTHOR") || k.startsWith("GIT_COMMITTER"))).toBe(Boolean(process.env.GIT_AUTHOR_NAME || process.env.GIT_COMMITTER_NAME));
+    expect(Object.keys(vars).filter((k) => k.startsWith("NG_") && k !== "NG_EXEC_ID")).toEqual([]);
+    delete process.env.NGWS_TEST_OWNER_VAR;
+  });
+
+  it("an explicitly isolated workspace still gets a private HOME, a neutral identity and only allow-listed variables", async () => {
+    process.env.NG_SECRET_TEST_TOKEN = "s3cr3t-value-123";
+    const repo = initRepo();
+    const h = harness({ defaultRepoPath: repo });
+    const port = await h.mgr.acquire("w1", "git_worktree");
+    const r = await port.exec("bash", { command: "env" });
+    expect(r.output).not.toContain("s3cr3t-value-123");
+    const vars = Object.fromEntries(
+      r.output
+        .trim()
+        .split("\n")
+        .map((l) => [l.slice(0, l.indexOf("=")), l.slice(l.indexOf("=") + 1)]),
+    );
     expect(vars.HOME).not.toBe(homedir());
     expect(vars.HOME!.startsWith(h.dataDir)).toBe(true);
-    expect(vars.PATH).toBe(process.env.PATH);
     const allowed = new Set(["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "HOME", "TMPDIR", "NG_EXEC_ID", "PWD", "SHLVL", "_", "OLDPWD"]);
     for (const k of Object.keys(vars)) if (!k.startsWith("GIT_")) expect(allowed.has(k), `unexpected variable ${k}`).toBe(true);
   });
@@ -157,25 +179,56 @@ describe("isolation levels", () => {
     expect(readFileSync(join(shared, "notes.md"), "utf8")).toBe("项目进度：完成\n");
   });
 
-  it("none uses the configured directory without confinement and never deletes it; without one it uses a scratch dir", async () => {
+  it("none works in the cell's cwd without confinement; nothing on disk is removed when the runtime is stopped", async () => {
     const dir = tempDir("plain");
     const elsewhere = tempDir("elsewhere");
     writeFileSync(join(elsewhere, "x.txt"), "outside\n");
     const h = harness();
-    const port = await h.mgr.acquire("w1", "none", { repoPath: dir });
+    const port = await h.mgr.acquire("w1", "none", { cwd: dir });
     expect(port.root).toBe(dir);
     expect((await port.exec("read", { op: "read_file", path: join(elsewhere, "x.txt") })).output).toBe("outside\n");
-    await h.mgr.destroy("w1");
+    await port.exec("write", { path: "made-by-cell.txt", content: "keep me\n" });
+    await h.mgr.stopRuntime("w1");
+    expect(readFileSync(join(dir, "made-by-cell.txt"), "utf8")).toBe("keep me\n");
     expect(readFileSync(join(elsewhere, "x.txt"), "utf8")).toBe("outside\n");
-    mkdirSync(join(dir, "still-here"));
+    // The same cell, re-acquired, is back in the same directory with its file.
+    expect((await (await h.mgr.acquire("w1", "none", { cwd: dir })).exec("read", { op: "read_file", path: "made-by-cell.txt" })).output).toBe("keep me\n");
 
-    const scratch = await h.mgr.acquire("w2", "none");
-    expect(scratch.root.startsWith(join(h.dataDir, "scratch"))).toBe(true);
-    await scratch.exec("write", { path: "tmp.txt", content: "t" });
-    await h.mgr.destroy("w2");
-    await expect(h.mgr.acquire("w2", "none").then((p) => p.exec("read", { op: "read_file", path: "tmp.txt" }))).rejects.toSatisfy((e) =>
-      isNgError(e, "not_found"),
-    );
+    // No cwd: the kernel's own per-cell directory under the data dir — also never removed.
+    const own = await h.mgr.acquire("w2", "none");
+    expect(own.root).toBe(join(h.dataDir, "cells", "w2"));
+    await own.exec("write", { path: "tmp.txt", content: "t" });
+    await h.mgr.stopRuntime("w2");
+    expect((await (await h.mgr.acquire("w2", "none")).exec("read", { op: "read_file", path: "tmp.txt" })).output.trim()).toBe("t");
+    await expect(h.mgr.acquire("w2", "none", { cwd: join(dir, "missing") })).rejects.toSatisfy((e) => isNgError(e, "invalid_argument"));
+  });
+
+  it("cwdMode read is only a scheduling declaration: the port reads, searches, writes, edits, runs bash and starts jobs", async () => {
+    const dir = tempDir("ro");
+    writeFileSync(join(dir, "a.txt"), "alpha\n");
+    const h = harness();
+    const port = await h.mgr.acquire("w1", "none", { cwd: dir, cwdMode: "read" });
+    expect(port.root).toBe(dir);
+    expect((await port.exec("read", { op: "read_file", path: "a.txt" })).output).toBe("alpha\n");
+    expect((await port.exec("read", { op: "search", pattern: "alpha" })).output).toBe("a.txt:1:alpha\n");
+    // Nothing is refused: the port does not police a read cell (only shared_ro is a read-only workspace).
+    await port.exec("write", { path: "b.txt", content: "x" });
+    await port.exec("edit", { path: "a.txt", oldText: "alpha", newText: "beta" });
+    expect(await port.exec("bash", { command: "touch c.txt" })).toMatchObject({ exitCode: 0 });
+    const { jobId } = await port.startJob({ command: "touch d.txt" });
+    await waitFor(() => {
+      const j = h.mgr.getJobSync(jobId);
+      return j && j.state !== "running" ? j : undefined;
+    });
+    expect(readFileSync(join(dir, "a.txt"), "utf8")).toBe("beta\n");
+    expect(readFileSync(join(dir, "b.txt"), "utf8")).toBe("x");
+    expect(existsSync(join(dir, "c.txt"))).toBe(true);
+    expect(existsSync(join(dir, "d.txt"))).toBe(true);
+    // Re-acquired with cwdMode "write", the same cell keeps the same directory and behaves the same.
+    const rw = await h.mgr.acquire("w1", "none", { cwd: dir, cwdMode: "write" });
+    expect(rw.root).toBe(dir);
+    await rw.exec("write", { path: "e.txt", content: "y" });
+    expect(readFileSync(join(dir, "e.txt"), "utf8")).toBe("y");
   });
 
   it("cow_microvm and an unconfigured container are refused with a clear error", async () => {

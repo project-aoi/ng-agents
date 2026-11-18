@@ -4,6 +4,7 @@
 export { createKernel } from "./kernel";
 export type {
   ActorOptions,
+  AnchorReport,
   ApprovalDecision,
   CellNode,
   CellSpecInput,
@@ -22,11 +23,12 @@ export type {
 } from "./types";
 export {
   DEFAULT_ROOT_BOUNDS,
-  HOST_MUTATING_TOOLS,
   KERNEL_ESCALATION,
   KERNEL_ESCALATION_PRINCIPAL,
   RESURFACE_MARKER,
-  hostWriteRefusal,
 } from "./constants";
+export { WAIT_EXTERNAL, WAIT_HUMAN, type WaitRecord } from "./waits";
+export { cwdModeOf, effectiveCwd, forgetWorkTreeKeys, workTreeKey } from "./workdir";
 export { isKernelEscalation, type KernelEscalationArgs } from "./escalations";
 export { scheduleEnvelopeId, watchFilterMatches } from "./spec";
+export { createModelSettings, type ModelSettings, type ModelSettingsOptions, type ModelSettingsView, type ModelSelection } from "./models";

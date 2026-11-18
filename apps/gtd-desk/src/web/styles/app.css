@@ -155,6 +155,7 @@ code {
 /* ==================== top bar ==================== */
 
 .topbar {
+  position: relative;
   display: flex;
   align-items: center;
   gap: var(--sp-4);
@@ -246,17 +247,177 @@ code {
   gap: var(--sp-3);
 }
 
-.mode-badge,
-.backend-label {
+.mode-badge {
   font-size: var(--fs-xs);
   color: var(--text-3);
   white-space: nowrap;
-}
-
-.mode-badge {
   padding: 1px 8px;
   border: 1px dashed var(--border-strong);
   border-radius: var(--r-pill);
+}
+
+/* the model switch (CLI backends): the top bar's backend · model label opens it */
+.model-switch {
+  display: inline-flex;
+  min-width: 0;
+}
+
+.model-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 300px;
+  height: 30px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: var(--r-pill);
+  background: transparent;
+  color: var(--text-2);
+  font-size: var(--fs-xs);
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    background var(--t-fast) var(--ease),
+    color var(--t-fast) var(--ease);
+}
+
+.model-trigger:hover,
+.model-trigger[aria-expanded="true"] {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.mt-backend {
+  color: var(--text-3);
+}
+
+.mt-model {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* narrow windows: the trigger says only 模型 (the model is in its title) so the tabs keep their room */
+.mt-short {
+  display: none;
+}
+
+/* anchored to the top bar (not the trigger) so it can span a narrow window like the status panel */
+.model-panel {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% - 4px);
+  right: var(--sp-5);
+  width: min(440px, calc(100vw - 2 * var(--sp-4)));
+  max-height: min(78vh, 680px);
+  overflow-y: auto;
+  padding: var(--sp-4) var(--sp-5) var(--sp-5);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-3);
+  animation: drop var(--t-med) var(--ease);
+  outline: none;
+}
+
+.model-panel .state {
+  padding: var(--sp-6) var(--sp-3);
+}
+
+.mp-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+}
+
+.mp-head h2 {
+  font-size: var(--fs-md);
+  font-weight: var(--fw-bold);
+}
+
+.mp-meta {
+  margin-top: 2px;
+  color: var(--text-3);
+  font-size: var(--fs-xs);
+}
+
+.mp-warn {
+  margin-top: var(--sp-3);
+  padding: 6px 10px;
+  border-radius: var(--r-sm);
+  background: var(--waiting-soft);
+  color: var(--text);
+  font-size: var(--fs-sm);
+  overflow-wrap: anywhere;
+}
+
+.mp-error {
+  margin-top: var(--sp-2);
+  color: var(--danger);
+  font-size: var(--fs-sm);
+  overflow-wrap: anywhere;
+}
+
+.mp-none {
+  margin-top: var(--sp-2);
+  color: var(--text-2);
+  font-size: var(--fs-sm);
+}
+
+.mp-tier {
+  display: grid;
+  gap: var(--sp-2);
+  margin-top: var(--sp-4);
+  padding-top: var(--sp-4);
+  border-top: 1px solid var(--border);
+}
+
+.mp-tier h3 {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-bold);
+}
+
+.mp-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 9em);
+  gap: var(--sp-2);
+}
+
+.mp-row.single {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.mp-row .field > span {
+  margin-bottom: 0;
+  font-size: var(--fs-xs);
+}
+
+.mp-desc,
+.mp-effective {
+  color: var(--text-3);
+  font-size: var(--fs-xs);
+}
+
+.mp-effective strong {
+  color: var(--text-2);
+  font-weight: var(--fw-medium);
+}
+
+.mp-tier .mp-error {
+  margin-top: 0;
+}
+
+.mp-note {
+  margin-top: var(--sp-4);
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--border);
+  color: var(--text-2);
+  font-size: var(--fs-xs);
 }
 
 .drawer-trigger {
@@ -2539,12 +2700,18 @@ textarea:focus-visible {
   .tab-en {
     display: none;
   }
-  .backend-label {
+  .mt-backend {
     display: none;
+  }
+  .model-trigger {
+    max-width: 10em;
   }
 }
 
 @media (max-width: 960px) {
+  .model-trigger {
+    max-width: 8.5em;
+  }
   .split-8-4,
   .split-7-5 {
     grid-template-columns: minmax(0, 1fr);
@@ -2577,10 +2744,20 @@ textarea:focus-visible {
     justify-content: flex-start;
     padding: 0 var(--sp-3) 6px;
   }
-  .status-panel {
+  .status-panel,
+  .model-panel {
     right: var(--sp-3);
     left: var(--sp-3);
     width: auto;
+  }
+  .model-trigger {
+    padding: 0 6px;
+  }
+  .mt-model {
+    display: none;
+  }
+  .mt-short {
+    display: inline;
   }
   .stage {
     padding: var(--sp-5) var(--sp-4) var(--sp-8);
@@ -2639,7 +2816,8 @@ textarea:focus-visible {
 }
 
 @media (max-width: 480px) {
-  .mode-badge {
+  .mode-badge,
+  .model-switch {
     display: none;
   }
   .tab {

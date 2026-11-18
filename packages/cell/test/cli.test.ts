@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { CLI_FORK_SESSION_KEY, CLI_SESSION_KEY, type CliSessionRecord } from "@ng/loop";
 import { installFakeCli } from "@ng/loop/testing";
-import { createEnvelope, inboxAddr, PAYLOAD, type StepOrExternalEvidence } from "@ng/protocol";
-import { createKernel } from "../src";
-import { boot, cleanupAll, tempDir, tool, TOOLSETS, type Harness } from "./helpers";
+import { join } from "node:path";
+import { createEnvelope, finalResultEnvelopeId, inboxAddr, PAYLOAD, type StepOrExternalEvidence } from "@ng/protocol";
+import { createKernel, cwdModeOf } from "../src";
+import { boot, cleanupAll, initRepo, tempDir, tool, TOOLSETS, type Harness } from "./helpers";
 
 afterEach(cleanupAll);
 
@@ -46,16 +47,23 @@ describe("kernel with CLI engines", () => {
     const rec = h.kernel.context.readStateSync<CliSessionRecord>("clicell", CLI_SESSION_KEY)!;
     expect(rec.engine).toBe("claude");
 
-    // a root cell on isolation "none" without allowHostWrites is read-only for the CLI, in the owner's directory
+    // docs/05: a root cell without cwdMode is a read cell on the host. cwdMode "read" only means it takes no write slot:
+    // it is launched like any host cell — every built-in tool, unconfined, unsandboxed — in the kernel's own directory
+    // for it (nobody gave it one); only its system note says it is there to look
+    expect(cwdModeOf(h.kernel.getCell("clicell")!)).toBe("read");
     const launch = claude.launches()[0]!;
-    expect(launch.join(" ")).toContain("--tools Read,Grep,Glob ");
-    expect(launch.join(" ")).toContain("--permission-mode dontAsk");
+    const after = (flag: string) => launch[launch.indexOf(flag) + 1];
+    expect(launch).not.toContain("--tools");
+    expect(after("--permission-mode")).toBe("bypassPermissions");
+    for (const f of ["--restricted", "--strict-mcp-config", "--settings"]) expect(launch).not.toContain(f);
+    expect(claude.log().find((e) => e.type === "argv")!["cwd"]).toBe(join(h.dataDir, "cells", "clicell"));
   });
 
-  it("gives a writing worker its git worktree as cwd and workspace-write; a fork_prefix child forks the parent's CLI session", async () => {
+  it("runs a writing worker on the host in its cwd (unsandboxed) and an explicit git_worktree one in its worktree (workspace-write); a fork_prefix child forks the parent's CLI session", async () => {
     const fakes = tempDir("fake-cli");
     const codex = installFakeCli(fakes, "codex", [
       { actions: [{ native: "shell", input: { command: "make" }, output: "built" }, { mcp: "report_to_parent", args: { kind: "result", text: "built it" } }] },
+      { actions: [{ mcp: "report_to_parent", args: { kind: "result", text: "built in the worktree" } }] },
     ]);
     const claude = installFakeCli(fakes, "claude", [
       { actions: [{ mcp: "set_state", args: { patches: { parent: 1 } } }] },
@@ -64,16 +72,33 @@ describe("kernel with CLI engines", () => {
     ]);
     const h = await boot({ kernel: { cli: { codex: cliOpts(codex), claude: cliOpts(claude) } } });
     h.script.add("desk", { text: "noted" }, { text: "noted" });
+    const repo = initRepo();
+    const codexProcessor = { kind: "llm" as const, engine: "codex" as const, toolsets: [TOOLSETS.workspace, TOOLSETS.context, TOOLSETS.comms] };
 
-    // worker on codex
-    h.kernel.spawnCell("desk", { preset: "worker", title: "build", processor: { kind: "llm", engine: "codex", toolsets: [TOOLSETS.workspace, TOOLSETS.context, TOOLSETS.comms] } }, "build it");
+    // worker on codex, docs/05 default: the owner's real directory, no OS sandbox
+    h.kernel.spawnCell("desk", { id: "build", preset: "worker", title: "build", cwd: repo, processor: codexProcessor }, "build it");
     await h.kernel.idle();
-    const log = codex.log();
-    const argv = log.find((e) => e.type === "argv")!;
-    expect(String(argv["cwd"])).toContain(`${h.dataDir}/workspace/worktrees/`);
-    expect(log.find((e) => e.type === "codex_config")).toMatchObject({ sandbox: "workspace-write", approval: "never", mcpApproval: "approve" });
+    const argvs = () => codex.log().filter((e) => e.type === "argv");
+    const configs = () => codex.log().filter((e) => e.type === "codex_config");
+    expect(argvs()[0]!["cwd"]).toBe(repo);
+    expect(configs()[0]).toMatchObject({ sandbox: "danger-full-access", approval: "never", mcpApproval: "approve" });
+    // the one-shot worker's single result reached the desk and the kernel closed it
+    expect(h.kernel.getCell("build")).toMatchObject({ status: "closed", closeReason: "completed" });
     const deskEv = evidence(h, "desk");
-    expect(deskEv.some((e) => e.kind === "inbound" && e.envelope.type === PAYLOAD.cellResult)).toBe(true);
+    expect(deskEv.filter((e) => e.kind === "inbound" && e.envelope.type === PAYLOAD.cellResult).map((e) => e.kind === "inbound" && e.envelope.id)).toEqual([
+      finalResultEnvelopeId("build", 0),
+    ]);
+
+    // an explicitly isolated worker (opt-in, from a named repository): its own worktree, sandboxed
+    h.kernel.spawnCell(
+      "desk",
+      { id: "iso", preset: "worker", title: "isolated build", bounds: { isolation: "git_worktree" }, meta: { workspace: { repoPath: repo } }, processor: codexProcessor },
+      "build it",
+    );
+    await h.kernel.idle();
+    expect(String(argvs()[1]!["cwd"])).toContain(`${h.dataDir}/workspace/worktrees/`);
+    expect(configs()[1]).toMatchObject({ sandbox: "workspace-write", approval: "never", mcpApproval: "approve" });
+    expect(h.kernel.getCell("iso")).toMatchObject({ status: "closed", closeReason: "completed" });
 
     // a CLI-run parent spawning a fork_prefix child: the kernel hands the child the parent's session to fork
     h.kernel.createRootCell({ id: "lead", processor: { kind: "llm", engine: "claude", toolsets: [TOOLSETS.context, TOOLSETS.comms, TOOLSETS.cells] } });

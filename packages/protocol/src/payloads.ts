@@ -56,6 +56,11 @@ export const PAYLOAD = {
   controlSteer: "control.steer",
   handback: "handback",
   sourceHit: "source.hit",
+  // [docs/05]
+  cellMessage: "cell.message",
+  stalledCheck: "kernel.stalled_check",
+  runContinue: "kernel.continue",
+  waitTimeout: "kernel.wait_timeout",
 } as const;
 
 /** A human (owner or external sender) said something through a Channel, or typed into 随手记. */
@@ -66,6 +71,13 @@ export interface UserMessagePayload {
   attachments?: DeliverableAttachment[];
   voice?: boolean;                      // text is a voice transcript
   raw?: unknown;                        // adapter-specific original event
+  // [docs/05 §5.3] the standard structured part every channel adapter fills when it can, so watches can route on it
+  /** Who is @-mentioned: adapter-level ids or names (e.g. a bot's open_id, "@all"). */
+  mentions?: string[];
+  /** What kind of event this is, e.g. "message", "mention", "review_requested", "mr.merged", "ci.failed", "doc.updated". */
+  eventKind?: string;
+  /** Free labels the adapter derived (chat name, repo, label names…). */
+  tags?: string[];
 }
 
 /** A deliverAt reminder, a cron tick or an idleSec wakeup. */
@@ -156,6 +168,39 @@ export interface SourceHitPayload {
   data?: unknown;
 }
 
+/** [docs/05] One cell talking to another (RunPorts.sendToCell): a forwarded follow-up, a request for arbitration, a ruling. */
+export interface CellMessagePayload {
+  fromCellId: string;
+  text: string;
+  summary?: string;
+  data?: unknown;
+}
+
+/**
+ * [docs/05 guard 2] Sent once by the kernel when an active project has none of the five anchors left (nothing running
+ * or queued, no watch/timer, no open wait, no card or human action): look at the project and either move it forward,
+ * record what it is waiting for, park it, or finish it.
+ */
+export interface StalledCheckPayload {
+  projectCellId: string;
+  stalledSince: number;
+  detail: string;
+}
+
+/** [docs/05 guard 1] The previous Run stopped at its step limit with work left; continue where it stopped. */
+export interface RunContinuePayload {
+  reason: "step_limit";
+  /** Consecutive continuations so far (1 = first). */
+  count: number;
+}
+
+/** [docs/05 guard 2] A wait registered with a timeout ran out without an answer from `waitingFor`. */
+export interface WaitTimeoutPayload {
+  waitingFor: string;
+  reason: string;
+  since: number;
+}
+
 export interface KernelPayloadMap {
   "user.message": UserMessagePayload;
   "timer.fired": TimerFiredPayload;
@@ -168,6 +213,10 @@ export interface KernelPayloadMap {
   "control.steer": ControlSteerPayload;
   handback: HandbackPayload;
   "source.hit": SourceHitPayload;
+  "cell.message": CellMessagePayload;
+  "kernel.stalled_check": StalledCheckPayload;
+  "kernel.continue": RunContinuePayload;
+  "kernel.wait_timeout": WaitTimeoutPayload;
 }
 
 export type KernelPayloadType = keyof KernelPayloadMap;
@@ -199,6 +248,9 @@ export const kernelPayloadSchemas = {
     attachments: z.array(attachmentSchema).optional(),
     voice: z.boolean().optional(),
     raw: z.unknown().optional(),
+    mentions: z.array(z.string()).optional(),
+    eventKind: z.string().optional(),
+    tags: z.array(z.string()).optional(),
   }),
   "timer.fired": z.looseObject({
     label: z.string(),
@@ -263,6 +315,10 @@ export const kernelPayloadSchemas = {
     uri: z.string().optional(),
     data: z.unknown().optional(),
   }),
+  "cell.message": z.looseObject({ fromCellId: z.string(), text: z.string(), summary: z.string().optional(), data: z.unknown().optional() }),
+  "kernel.stalled_check": z.looseObject({ projectCellId: z.string(), stalledSince: z.number(), detail: z.string() }),
+  "kernel.continue": z.looseObject({ reason: z.literal("step_limit"), count: z.number().int() }),
+  "kernel.wait_timeout": z.looseObject({ waitingFor: z.string(), reason: z.string(), since: z.number() }),
 } as const satisfies Record<KernelPayloadType, z.ZodType>;
 
 for (const [type, schema] of Object.entries(kernelPayloadSchemas)) registerPayloadType(type, schema);

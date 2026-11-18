@@ -7,8 +7,9 @@ import { createKernel, type Kernel, type KernelOptions } from "@ng/cell";
 import { UiChannel } from "@ng/channel";
 import { envSecretStore, type SecretStore } from "@ng/gate";
 import { createBus, createRegistry, DESK_CELL_ID, OWNER_PRINCIPAL, systemClock, type Channel, type CliEngine, type Clock, type ModelClient, type Registry } from "@ng/protocol";
-import { registerPresets } from "@ng/presets";
+import { registerPresets, seedBuiltinSkills } from "@ng/presets";
 import type { Hono } from "hono";
+import { createAgentControlPlane } from "../agent/tools";
 import { createDeskApp } from "./app";
 import { selectBackend, type Env } from "./backend";
 import { channelsFromEnv } from "./channels";
@@ -16,7 +17,8 @@ import { createDemoMode, type DemoMode } from "./demo";
 import { createDesk, type Desk } from "./desk";
 import { createEventHub, type EventHub } from "./events";
 import { DEFAULT_SETTINGS, type DeskSettings } from "./projections/common";
-import { securityPolicyFor, type SecurityPolicy } from "./security";
+import { agentTokensFromEnv, securityPolicyFor, type SecurityPolicy } from "./security";
+import { createModelSwitch } from "./models";
 
 export const DEFAULT_PORT = 8790;
 const APP_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -34,6 +36,8 @@ export interface DeskServerOptions {
   token?: string | null;
   /** Extra Host header names accepted on a loopback bind; default NG_DESK_ALLOWED_HOSTS. */
   allowedHosts?: string[];
+  /** External main agents allowed on `/api/agent/*`: agent id → bearer token. Default NG_AGENT_TOKEN / NG_AGENT_TOKENS. */
+  agentTokens?: Record<string, string>;
   /** Explicit model; wins over the environment (tests, embedding). */
   model?: ModelClient;
   /** Demo seam: the model and seed used when no model is configured (default ./demo.ts createDemoMode()). */
@@ -94,7 +98,7 @@ export async function createDeskServer(opts: DeskServerOptions = {}): Promise<De
   const host = opts.host ?? (env["NG_DESK_HOST"] || "127.0.0.1");
   const port = opts.port ?? portOf(env["NG_DESK_PORT"]);
   const token = opts.token !== undefined ? opts.token : (env["NG_DESK_TOKEN"] ?? null);
-  const security = securityPolicyFor(host, token, opts.allowedHosts ?? csv(env["NG_DESK_ALLOWED_HOSTS"]));
+  const security = securityPolicyFor(host, token, opts.allowedHosts ?? csv(env["NG_DESK_ALLOWED_HOSTS"]), opts.agentTokens ?? agentTokensFromEnv(env));
 
   const timeZone = env["NG_DESK_TZ"] || Intl.DateTimeFormat().resolvedOptions().timeZone;
   const demoMode = opts.demo ?? createDemoMode({ timeZone });
@@ -143,6 +147,8 @@ export async function createDeskServer(opts: DeskServerOptions = {}): Promise<De
     ...(ownerAddresses ? { ownerAddresses } : {}),
     channels: [ui, ...external.channels, ...(choice.demo && demoMode.channels ? demoMode.channels(clock) : []), ...(opts.channels ?? [])],
     onError,
+    // With a CLI agent behind the cells, the owner picks its model in the workbench; the list comes from the CLI.
+    ...(choice.engine !== "api" && choice.engine !== "demo" ? { modelSwitch: true } : {}),
     ...choice.kernelOptions,
     ...opts.kernel,
   });
@@ -151,6 +157,9 @@ export async function createDeskServer(opts: DeskServerOptions = {}): Promise<De
   try {
     const fresh = kernel.getCell(deskCellId) === undefined;
     kernel.ensureRootCell({ id: deskCellId, preset: "inline", title: "主台" });
+    // The playbooks the presets' prompts refer to (an owner-edited SKILL.md of the same name is kept).
+    const seeded = seedBuiltinSkills(kernel.context, deskCellId);
+    if (seeded.length) log(`installed built-in skills: ${seeded.join(", ")}`);
     await kernel.start();
     const settings: DeskSettings = {
       ...DEFAULT_SETTINGS,
@@ -170,8 +179,17 @@ export async function createDeskServer(opts: DeskServerOptions = {}): Promise<De
     }
     events = createEventHub(kernel);
     const webDir = opts.webDir === undefined ? resolve(APP_ROOT, "dist/web") : opts.webDir;
-    const app = createDeskApp({ desk, hub: kernel.hub, events, security, webDir, onError });
-    log(`data ${dataDir} · agents: ${choice.backend}${choice.demo ? " (demo mode)" : ""} — ${choice.reason} · channels: ui${choice.demo ? ", demo" : ""}${external.summary.length ? `, ${external.summary.join(", ")}` : ""}`);
+    const agent = createAgentControlPlane({ kernel, desk, ui, settings });
+    const app = createDeskApp({ desk, hub: kernel.hub, events, security, agent, models: createModelSwitch(kernel), webDir, onError });
+    const agentAccess =
+      security.agentTokens.size > 0
+        ? `token for ${[...security.agentTokens.keys()].map((id) => `agent:${id}`).join(", ")}`
+        : security.loopback && security.token === null
+          ? "open on loopback as agent:local"
+          : "closed (set NG_AGENT_TOKEN)";
+    log(
+      `data ${dataDir} · agents: ${choice.backend}${choice.demo ? " (demo mode)" : ""} — ${choice.reason} · channels: ui${choice.demo ? ", demo" : ""}${external.summary.length ? `, ${external.summary.join(", ")}` : ""} · main-agent API /api/agent/* (MCP: bin/ng-mcp.mjs): ${agentAccess}`,
+    );
 
     let server: ServerType | null = null;
     let closing: Promise<void> | null = null;

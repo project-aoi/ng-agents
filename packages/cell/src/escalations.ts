@@ -18,13 +18,17 @@ import type { KernelCore } from "./core";
 /** `action.args` of a kernel-raised escalation card. */
 export interface KernelEscalationArgs {
   kernel: true;
-  reason: Extract<EscalationReason, "budget_exhausted" | "retry_limit">;
+  reason: Extract<EscalationReason, "budget_exhausted" | "retry_limit" | "blocked">;
   /** The cell that hit the problem (it may differ from the approval's cellId when that one could not hold the card). */
   cellId: string;
   /** retry_limit: the dead messages to requeue on "continue". */
   envelopeIds?: string[];
   /** budget_exhausted: the cell whose ledger stopped the Run (raise this one). */
   limitedBy?: string | null;
+  /** docs/05 guard 1: a retry_limit card raised because a cell kept hitting its step limit; "continue" queues one more continuation. */
+  stepLimit?: boolean;
+  /** docs/05 guard 1: a blocked card raised because the model refused; "continue" wakes the cell to try another way. */
+  refused?: boolean;
 }
 
 export interface Escalations {
@@ -32,6 +36,10 @@ export interface Escalations {
   deadLetter(e: BusTopics["inbox.dead"]): ApprovalRecord | null;
   /** A Run ended budget_stopped → a budget_exhausted card. */
   budgetStopped(cellId: string): ApprovalRecord | null;
+  /** docs/05 guard 1: a cell hit its step limit `times` Runs in a row → a card instead of another silent continuation. */
+  stepLimit(cellId: string, times: number): ApprovalRecord | null;
+  /** docs/05 guard 1: a coordinating cell's model refused → a blocked card (a one-shot cell reports `failed` instead). */
+  refused(cellId: string, said: string | null): ApprovalRecord | null;
 }
 
 const ITEM_TYPES = new Set(["user.message", "source.hit", "handback"]);
@@ -141,6 +149,20 @@ export function createEscalations(core: KernelCore): Escalations {
       return raise(cell, { kernel: true, reason: "retry_limit", cellId: cell.id, envelopeIds: e.envelopeIds }, title, explanation, envs);
     },
 
+    stepLimit(cellId, times) {
+      const cell = cells.get(cellId);
+      if (!cell || cell.status === "closed") return null;
+      const title = `${label(cell)}连续多轮都没做完，需要你看一下`;
+      const explanation = `已经连续 ${times} 轮在单轮步数上限处停下，仍未收尾，后台已暂停自动续跑。可以让它再继续一轮，或标记为线下已解决。`;
+      return raise(cell, { kernel: true, reason: "retry_limit", cellId, stepLimit: true }, title, explanation, []);
+    },
+    refused(cellId, said) {
+      const cell = cells.get(cellId);
+      if (!cell || cell.status === "closed") return null;
+      const title = `${label(cell)}被模型拒绝执行，需要你决定怎么办`;
+      const explanation = `模型拒绝了这一步${said ? `，原话是：${said.slice(0, 600)}` : "，没有给出说明"}。可以调整要求后让它继续，或标记为线下已解决。`;
+      return raise(cell, { kernel: true, reason: "blocked", cellId, refused: true }, title, explanation, []);
+    },
     budgetStopped(cellId) {
       const cell = cells.get(cellId);
       if (!cell || cell.status === "closed") return null;

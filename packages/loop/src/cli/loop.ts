@@ -30,6 +30,7 @@ import { codexAdapter } from "./adapters/codex";
 import { startToolBridge, type BridgeCallResult, type ToolBridge } from "./bridge";
 import { cliEnvironment } from "./env";
 import { spawnCli, type CliProcess } from "./process";
+import { launchChoice, type CliModelChoice } from "./models";
 import { forkNoteIndex, freshPrompt, tailText } from "./render";
 import type { CliAdapter, CliCapabilities, CliDriver, CliEvent, CliModels, CliSessionRecord, DriverIO, LaunchRequest } from "./types";
 
@@ -39,8 +40,12 @@ export const CLI_SESSION_KEY = "cli:session";
 export const CLI_FORK_SESSION_KEY = "cli:session:fork";
 /** MCP server name the kernel tools are published under. */
 export const CLI_MCP_SERVER = "ng";
-/** Workspace tools the CLI's own file/shell tools replace (the kernel-only job tools and code_rpc stay on MCP). */
-export const NATIVE_REPLACED_TOOLS: ReadonlySet<string> = new Set(["read", "write", "edit", "bash"]);
+/**
+ * Workspace tools the CLI's own file/shell tools replace (the kernel-only job tools stay on MCP). `code_rpc` is among
+ * them: it exists for API models without a shell, and a CLI agent that is offered it tends to route every command
+ * through it instead of its own, much better, shell.
+ */
+export const NATIVE_REPLACED_TOOLS: ReadonlySet<string> = new Set(["read", "write", "edit", "bash", "code_rpc"]);
 
 export const RUN_ENDED_NOTICE =
   "[The kernel ended this run with that result. Stop now: make no further tool calls and do no further work; reply with at most one short sentence. You will be woken with the next message.]";
@@ -66,6 +71,11 @@ export interface CliAgentLoopOptions {
   bin?: string;
   /** Tier → model; `""` = the CLI's own default. Merged over the adapter defaults (strong = CLI default). */
   models?: CliModels;
+  /**
+   * Asked at the start of every Run, before `models`: the owner's current choice for the tier (the workbench's model
+   * switch), so a change applies to the next Run without a restart. `undefined` = fall back to `models`.
+   */
+  resolveModel?: (tier: ModelTier) => CliModelChoice | undefined | Promise<CliModelChoice | undefined>;
   /** Tier when processor.modelTier is absent. Default "strong". */
   defaultTier?: ModelTier;
   /** Base environment for the CLI (default process.env), filtered by cliEnvironment. */
@@ -89,6 +99,11 @@ export interface CliAgentLoopOptions {
   extraArgs?: readonly string[];
   /** Node binary for the MCP shim. Default: this process's. */
   nodePath?: string;
+  /**
+   * Where running CLI processes are put on record (`<dataDir>/cli-procs`), so the next kernel can stop the ones a
+   * crashed kernel left behind (reapOrphanedCliProcesses) before it starts another agent in the same directory.
+   */
+  procDir?: string;
   /** Replace the adapter (tests). */
   adapter?: CliAdapter;
   /** Diagnostics: invocations, CLI notices, refused permissions, stderr of failed processes. */
@@ -104,6 +119,8 @@ type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K>
 type EvidenceInput = DistributiveOmit<StepOrExternalEvidence, "runId" | "at">;
 type EndOutcome = NonNullable<ToolResult["endRun"]>;
 type StopReason = "cancelled" | "budget" | "timeout" | "steps";
+/** How a batch of extra input reaches the CLI: a steer may cut the running turn short, a follow-up never does. */
+type DeliverMode = "interrupt" | "turn_end";
 
 interface LegOutcome {
   code: number | null;
@@ -184,7 +201,18 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
     }
     const caps = capabilitiesOf(access, processor, opts.web ?? false);
     const tier = processor.modelTier ?? opts.defaultTier ?? "strong";
-    const model = models[tier] ? models[tier] : undefined;
+    // The owner's switch first; a failure to read it must not stop the Run (the static setting or the CLI's own
+    // default model still works).
+    let chosen: CliModelChoice | undefined;
+    try {
+      chosen = await opts.resolveModel?.(tier);
+    } catch {
+      chosen = undefined;
+    }
+    const launch = chosen ? launchChoice(engine, chosen) : { model: models[tier] ? models[tier] : undefined, effort: undefined };
+    const effort = launch.effort;
+    // One key for "which model answers": a session is only resumed with the model and effort it was created with.
+    const model = launch.model ? (effort ? `${launch.model}@${effort}` : launch.model) : undefined;
     const maxSteps = processor.maxSteps;
 
     // ---------- input ----------
@@ -221,12 +249,17 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
     const systemText = kernelSystem(snapshot.system.text, adapter, caps, tools);
     const systemFile = join(tmpDir, "system.md");
     writeFileSync(systemFile, systemText, { mode: 0o600 });
-    const env = cliEnvironment(opts.env ?? process.env, { ...(opts.keepEnv ? { keep: opts.keepEnv } : {}), ...(opts.dropEnv ? { drop: opts.dropEnv } : {}) });
+    const env = cliEnvironment(opts.env ?? process.env, {
+      ...(opts.keepEnv ? { keep: opts.keepEnv } : {}),
+      ...(opts.dropEnv ? { drop: opts.dropEnv } : {}),
+      ...(adapter.env ? { set: { ...adapter.env } } : {}),
+    });
 
     let sessionId: string | null = plan.session?.mode === "resume" ? plan.session.id : null;
     let sessionModel: string | null = null;
     let sessionCreatedAt = own && plan.session?.mode === "resume" ? own.createdAt : clock.now();
     let endOutcome: EndOutcome | undefined;
+    let refused = false;
     let awaitsWakeup = false;
     let stopReason: StopReason | null = null;
     let steps = 0;
@@ -336,7 +369,8 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
           bin,
           cwd: access.root,
           caps,
-          model,
+          model: launch.model,
+          effort,
           system: systemText,
           systemFile,
           prompt: nextPrompt,
@@ -351,9 +385,11 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
         if (stopReason === "timeout") throw new Error(`${engine} run exceeded ${runTimeoutMs} ms and was stopped`);
         if (endOutcome) return finish(endOutcome);
         if (stopReason === "steps") {
-          await append({ kind: "system_note", text: `[run stopped after ${maxSteps} tool calls (step limit); continue on the next wake-up]` });
-          return finish("completed");
+          // Same outcome as the API loop: work is left, so this is not "completed" (docs/05 guard 1).
+          await append({ kind: "system_note", text: `[run stopped after ${maxSteps} tool calls (step limit); the kernel wakes you to continue]` });
+          return "step_limit";
         }
+        if (refused) return "refused";
         const resumeTrouble =
           req.session !== undefined && (out.resumeFailed !== undefined || (!out.sawSession && !out.turnOk && out.relaunchWith.length === 0));
         if (resumeTrouble && !fellBack) {
@@ -368,9 +404,17 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
           nextPrompt = freshPrompt(snapshot.history, [input, ...out.relaunchWith].join("\n\n"));
           continue;
         }
-        if (out.relaunchWith.length > 0 && sessionId) {
-          nextSession = { id: sessionId, mode: "resume" };
-          nextPrompt = out.relaunchWith.join("\n\n");
+        if (out.relaunchWith.length > 0) {
+          if (sessionId) {
+            nextSession = { id: sessionId, mode: "resume" };
+            nextPrompt = out.relaunchWith.join("\n\n");
+          } else {
+            // No session to continue (the CLI never reported one): the input must still reach a model — a follow-up
+            // that was absorbed into this Run's claim would otherwise be marked done unseen. Start over with the history.
+            fellBack = true;
+            nextSession = undefined;
+            nextPrompt = freshPrompt(snapshot.history, [input, ...out.relaunchWith].join("\n\n"));
+          }
           continue;
         }
         if (out.turnOk && out.turnError === undefined) return finish("completed");
@@ -412,18 +456,36 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
         finishTimer = setTimeout(() => killNow(), Math.max(killGraceMs, 5_000));
       };
 
-      const deliverSteer = (texts: string[]) => {
+      /**
+       * Hand extra input to the CLI. A CLI with live input takes it on stdin. One without (codex exec) needs a new
+       * process on the same session:
+       * - `interrupt` (a steer — the owner or a parent says the work is off course): the running turn is cut short
+       *   and the session resumed with the text;
+       * - `turn_end` (a follow-up absorbed after the turn finished by itself): the process is left to exit on its own
+       *   and the session is then resumed — nothing that is still compiling or testing is ever killed for it.
+       */
+      const deliver = (texts: string[], mode: DeliverMode) => {
         if (texts.length === 0 || finished || stopReason || endOutcome) return;
         const delivered = texts.every((t) => d.steer(t, io));
-        if (!delivered) {
+        if (delivered) return;
+        if (mode === "interrupt" && (!state.sawSession || !sessionId)) {
           // Interrupt + resume needs the session to exist on the CLI's side first.
-          if (!state.sawSession || !sessionId) {
-            pendingSteer.push(...texts);
-            return;
-          }
-          state.relaunchWith.push(...texts);
+          pendingSteer.push(...texts);
+          return;
+        }
+        state.relaunchWith.push(...texts);
+        if (mode === "interrupt") {
           finished = true;
           killNow();
+        } else finishInput();
+      };
+      /** docs/05 §3.3: messages that reached the cell during this turn join the Run (the kernel port decides who absorbs). */
+      const absorbInbound = (): string[] => {
+        try {
+          return (ports.drainInbound?.() ?? []).map((a) => a.text);
+        } catch (err) {
+          debug({ type: "notice", cellId, text: `absorbing follow-ups failed: ${err instanceof Error ? err.message : String(err)}` });
+          return [];
         }
       };
 
@@ -439,7 +501,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
             if (pendingSteer.length) {
               const texts = pendingSteer;
               pendingSteer = [];
-              deliverSteer(texts);
+              deliver(texts, "interrupt");
             }
             break;
           case "text":
@@ -474,13 +536,22 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
           }
           case "turn_end":
             if (e.ok) state.turnOk = true;
+            else if (e.refused) refused = true;
             else if (!e.stopped) state.turnError = e.error ?? "turn failed";
             if (e.more) break;
-            if (!endOutcome && !stopReason && pendingSteer.length && state.sawSession) {
-              const texts = pendingSteer;
-              pendingSteer = [];
-              deliverSteer(texts);
-              if (!finished) break;
+            if (!endOutcome && !stopReason && !refused) {
+              const texts: string[] = [];
+              if (pendingSteer.length && state.sawSession) {
+                texts.push(...pendingSteer);
+                pendingSteer = [];
+              }
+              // The turn ended by itself: only now are follow-ups taken in. They are part of this Run's claim from
+              // here on, so they must reach the model before the Run may end (live input, or a resume of the session).
+              if (e.ok) texts.push(...absorbInbound());
+              if (texts.length) {
+                deliver(texts, "turn_end");
+                if (!finished) break;
+              }
             }
             finishInput();
             break;
@@ -498,6 +569,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
       const p = spawnCli(d.argv, {
         cwd: req.cwd,
         env,
+        ...(opts.procDir ? { registry: { dir: opts.procDir, runId, cellId } } : {}),
         onLine: (line) => {
           let events: CliEvent[];
           try {
@@ -529,7 +601,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
             await append({ kind: "system_note", text });
             texts.push(text);
           }
-          deliverSteer(texts);
+          deliver(texts, "interrupt");
         });
       }, pollMs);
 
@@ -558,7 +630,9 @@ export function capabilitiesOf(access: WorkspaceAccess, processor: LlmProcessorS
   const write = has("write");
   const edit = has("edit");
   const bash = has("bash");
-  return { root: access.root, isolation: access.isolation, write, edit, bash, readOnly: !(write || edit || bash), web };
+  const host = access.isolation === "none";
+  // On the host the agent researches like the owner would (docs/05 scenario 5), so its web tools are on.
+  return { root: access.root, isolation: access.isolation, write, edit, bash, readOnly: !(write || edit || bash), web: web || host, access: host ? "host" : "workspace", cwdMode: access.cwdMode ?? "write" };
 }
 
 async function workspaceAccess(ports: RunPorts): Promise<WorkspaceAccess> {
@@ -575,15 +649,32 @@ async function workspaceAccess(ports: RunPorts): Promise<WorkspaceAccess> {
   return { root: ports.workspace.root, isolation: ports.workspace.isolation, tools: [...ports.self.bounds.tools] };
 }
 
+/**
+ * What a CLI agent must know about being a cell, appended to the cell's frozen system text: a coding CLI arrives with
+ * its own habits (its own sub-agents, its own way of asking the user, a final summary nobody reads here), so this says
+ * which of them do not apply and where the kernel's tools take over.
+ */
 function kernelSystem(frozen: string, adapter: CliAdapter, caps: CliCapabilities, tools: readonly ToolDef[]): string {
   const example = tools[0] ? adapter.mcpToolName(CLI_MCP_SERVER, tools[0].name) : adapter.mcpToolName(CLI_MCP_SERVER, "set_state");
+  // cwdMode "read" is a statement of intent the kernel schedules by (no write slot taken), not a lock: the cell has
+  // its normal tools, and this note says what the intent means.
+  const looking =
+    caps.access === "host" && caps.cwdMode === "read"
+      ? ` You are here to look, not to change: you did not queue for this work tree's write slot, so another cell may be changing it while you run. Read, search and run whatever only looks (git log / diff / show / fetch, a build or test that leaves the tree as it is). Do not edit files, switch branches or commit in this work tree; when the task turns out to need a change, say so in your report or ask your parent for a worker with cwdMode "write" — or make the change in a scratch directory or git worktree you create yourself and name in your report.`
+      : "";
+  const directory = caps.readOnly
+    ? `- Directory: \`${caps.root}\`. This workspace is read-only (its isolation level allows reading and searching only). ${adapter.readOnlyHowTo(caps)}`
+    : caps.access === "host"
+      ? `- Directory: \`${caps.root}\`. You work with this CLI's own file and shell tools, as you normally would, on the owner's real machine with no sandbox — the red lines above are the only guard, so keep to them.${looking || " While you run, no other cell writes in this work tree."}`
+      : `- Directory: \`${caps.root}\`, an isolated workspace of your own. You may change files and run commands inside it.`;
   const lines = [
     frozen.trimEnd(),
     "",
     "## How this cell runs",
-    `- The MCP server "${CLI_MCP_SERVER}" provides this cell's kernel tools (${tools.map((t) => t.name).join(", ") || "none"}); this client names them like ${example}. Use them for state, drafts, messages to people, approvals, reports to your parent, children, reminders and background jobs.`,
-    `- Your working directory is this cell's workspace${caps.readOnly ? " and it is read-only for you: do not try to change files or run commands that modify anything." : "."}`,
-    "- When a kernel tool result says the run has ended, stop at once: no further tool calls and no further work.",
+    `- Kernel tools: the MCP server "${CLI_MCP_SERVER}" provides them (${tools.map((t) => t.name).join(", ") || "none"}); this client names them like ${example}. They are how what you do reaches the rest of the workbench: reports, waits, messages to cells and people, state, artifacts, reminders, background jobs. Tool names in your instructions (report_to_parent, wait, send_message, …) mean these. Reading files, editing and running commands are not their job — that is what this CLI's own tools are for.`,
+    directory,
+    "- Do not use this CLI's own sub-agents, task lists, plan mode or ask-the-user features to coordinate or to ask questions: nobody is at the terminal. Other cells and the owner are reached only through the kernel tools.",
+    "- When a kernel tool result says the run has ended, stop at once: no further tool calls, no further work, no closing summary.",
   ];
   return lines.join("\n");
 }

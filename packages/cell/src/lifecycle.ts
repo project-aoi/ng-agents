@@ -5,6 +5,8 @@ import {
   all,
   cellPrincipal,
   createEnvelope,
+  finalResultEnvelopeId,
+  gtdKeys,
   inboxAddr,
   KERNEL_FROM,
   makeBounds,
@@ -22,8 +24,10 @@ import {
   type CellRecord,
   type CellResultPayload,
   type CellSpec,
+  type ActionRecord,
   type CellTaskPayload,
   type CloseReason,
+  type ProjectRecord,
   type InboxAddr,
   type PolicyBounds,
   type ScheduleRule,
@@ -32,6 +36,7 @@ import {
 import type { KernelCore } from "./core";
 import { jsonSafeBounds, resolveSpec, scheduleEnvelopeId, validateSpec } from "./spec";
 import type { ActorOptions, CellSpecInput, CloseResult, RootCellOptions, SpawnOptions } from "./types";
+import { assertDirectory } from "./workdir";
 
 export interface Lifecycle {
   createRootCell(spec: CellSpecInput, opts?: RootCellOptions): CellRecord;
@@ -39,15 +44,22 @@ export interface Lifecycle {
   spawnCell(parentId: string, spec: CellSpecInput, initialPayload?: unknown, opts?: SpawnOptions): InboxAddr;
   updateCell(cellId: string, patch: Partial<CellSpec>, opts?: ActorOptions): CellRecord;
   /** The transactional cascade; returns the ids it closed (empty if already closed). Cleanup is the caller's. */
-  closeCellSync(cellId: string, reason: CloseReason, opts?: ActorOptions): string[];
+  closeCellSync(cellId: string, reason: CloseReason, opts?: CloseOptions): string[];
   closeCell(cellId: string, reason?: CloseReason, opts?: ActorOptions): Promise<CloseResult>;
-  /** Abort Runs, cancel Jobs and destroy workspaces of cells that were just closed. */
+  /** Abort Runs and stop the runtime (Jobs, an explicit container) of cells that were just closed. Nothing on disk is touched. */
   cleanupClosed(cellIds: readonly string[]): Promise<void>;
   /** Deactivate a cell's watches (all, or one cancelGroup's). */
   deactivateWatches(cellId: string, cancelGroup?: string): number;
 }
 
+/** closeCellSync options. `internal`: the kernel itself settles the cell (drain-then-close, complete_self) — no actor check. */
+export interface CloseOptions extends ActorOptions {
+  internal?: boolean;
+}
+
 const UPDATABLE = new Set(["title", "meta", "processor", "bounds", "watches", "schedules"]);
+/** What a cell may change about itself (docs/05 §5.1.2): how it is woken and how it is labelled — never what it may do. */
+const SELF_UPDATABLE = new Set(["title", "meta", "watches", "schedules"]);
 
 function definedEntries<T extends object>(o: T): Partial<T> {
   const out: Partial<T> = {};
@@ -68,9 +80,10 @@ export function createLifecycle(core: KernelCore): Lifecycle {
 
   // ---------- principals ----------
 
-  function actorKind(principalId: string): { kind: "owner" } | { kind: "cell"; cellId: string } {
+  function actorKind(principalId: string): { kind: "owner" } | { kind: "agent"; agentId: string } | { kind: "cell"; cellId: string } {
     const p = parsePrincipal(principalId, core.ownerPrincipal);
     if (p.kind === "owner") return { kind: "owner" };
+    if (p.kind === "agent") return { kind: "agent", agentId: p.agentId };
     if (p.kind === "cell") return { kind: "cell", cellId: p.cellId };
     throw new NgError("bounds_violation", `principal "${principalId}" may not manage cells`);
   }
@@ -79,11 +92,13 @@ export function createLifecycle(core: KernelCore): Lifecycle {
     return ancestorId !== cellId && cells.ancestors(cellId).some((a) => a.id === ancestorId);
   }
 
-  /** Owner: any cell. `cell:X`: only X's strict descendants. */
-  function assertManages(principalId: string, target: CellRecord, what: string): "owner" | "ancestor" {
+  /** Owner and control-plane agent: any cell. `cell:X`: X's strict descendants, and X itself where `self` is allowed. */
+  function assertManages(principalId: string, target: CellRecord, what: string, self = false): "owner" | "agent" | "ancestor" | "self" {
     const actor = actorKind(principalId);
     if (actor.kind === "owner") return "owner";
+    if (actor.kind === "agent") return "agent";
     if (isStrictAncestor(actor.cellId, target.id)) return "ancestor";
+    if (self && actor.cellId === target.id) return "self";
     throw new NgError("bounds_violation", `${what}: cell "${actor.cellId}" may only manage its own descendants, not "${target.id}"`);
   }
 
@@ -93,12 +108,13 @@ export function createLifecycle(core: KernelCore): Lifecycle {
     const now = clock.now();
     for (const w of watches) {
       const thread = typeof w.threadOrFilter["thread"] === "string" ? (w.threadOrFilter["thread"] as string) : null;
-      run(db, "INSERT INTO cell_watches (cell_id, thread, filter, cancel_group, active, created_at) VALUES (?, ?, ?, ?, 1, ?)", [
+      run(db, "INSERT INTO cell_watches (cell_id, thread, filter, cancel_group, active, created_at, coalesce_ms) VALUES (?, ?, ?, ?, 1, ?, ?)", [
         cellId,
         thread,
         toJson(w.threadOrFilter),
         w.cancelGroup ?? null,
         now,
+        w.coalesceMs !== undefined && w.coalesceMs > 0 ? Math.floor(w.coalesceMs) : null,
       ]);
     }
   }
@@ -215,6 +231,7 @@ export function createLifecycle(core: KernelCore): Lifecycle {
       if (cells.get(id)) throw new NgError("duplicate", `cell "${id}" already exists`);
       const { spec: resolved } = resolveSpec(registry, spec, null);
       validateSpec(registry, resolved);
+      if (resolved.cwd !== undefined) assertDirectory(resolved.cwd, "cwd");
       const bounds = rootBounds(opts.bounds);
       delete resolved.bounds;
       return insertCell({ id, parentId: null, spec: { ...resolved, id }, bounds, principalId });
@@ -255,12 +272,17 @@ export function createLifecycle(core: KernelCore): Lifecycle {
       if (parent.bounds.maxDepth < 1) {
         throw new NgError("bounds_violation", `cell "${parent.id}" may not spawn children (maxDepth 0); do the work itself or report to its parent`);
       }
-      const open = cells.children(parent.id, { status: ["active", "paused"] }).length;
-      if (open >= parent.bounds.maxConcurrentChildren) {
-        throw new NgError(
-          "bounds_violation",
-          `cell "${parent.id}" already has ${open} open children (maxConcurrentChildren ${parent.bounds.maxConcurrentChildren}); wait for one to finish or close one`,
-        );
+      if (resolved.cwd !== undefined && resolved.cwd !== parent.spec.cwd) assertDirectory(resolved.cwd, "cwd");
+      // docs/05 §3.1: the cap is on execution, not on containers. Persistent cells (projects, hubs, sensors) and
+      // anything paused/parked do not take a slot — otherwise sixteen "someday" projects would block the next one.
+      if (resolved.lifetime === "one_shot") {
+        const open = cells.children(parent.id, { status: ["active"] }).filter((c) => c.spec.lifetime === "one_shot").length;
+        if (open >= parent.bounds.maxConcurrentChildren) {
+          throw new NgError(
+            "bounds_violation",
+            `cell "${parent.id}" already has ${open} active one-shot children (maxConcurrentChildren ${parent.bounds.maxConcurrentChildren}); wait for one to report or close one`,
+          );
+        }
       }
       // Never trust requested bounds: Gate clamps them to the parent's effective bounds and remaining budget.
       const bounds = gate.attenuate(parent.bounds, parent.id, boundsRequest);
@@ -309,7 +331,13 @@ export function createLifecycle(core: KernelCore): Lifecycle {
     return withTx(db, () => {
       const cell = cells.require(cellId);
       if (cell.status === "closed") throw new NgError("conflict", `cell "${cellId}" is closed`);
-      const isOwner = assertManages(principalId, cell, "updateCell") === "owner";
+      const by = assertManages(principalId, cell, "updateCell", true);
+      if (by === "self") {
+        const refused = Object.keys(given).filter((k) => !SELF_UPDATABLE.has(k));
+        if (refused.length) throw new NgError("bounds_violation", `a cell may change its own ${[...SELF_UPDATABLE].join(", ")} only, not ${refused.join(", ")}`);
+      }
+      // Only the owner widens bounds; an agent on the control plane narrows like an ancestor would.
+      const isOwner = by === "owner";
       const next: CellSpec = { ...cell.spec };
       let refreshPrefix = false;
       if (given.title !== undefined) next.title = given.title;
@@ -353,25 +381,27 @@ export function createLifecycle(core: KernelCore): Lifecycle {
 
   // ---------- close ----------
 
-  /** Did the child already deliver a final cell.result to the parent (pending or processed)? */
-  function reportedResult(parentId: string, childId: string): boolean {
-    return inbox
-      .listMessagesSync({ cellId: parentId, type: PAYLOAD.cellResult, status: ["pending", "claimed", "done"] })
-      .some((m) => isRecord(m.envelope.payload) && m.envelope.payload["childCellId"] === childId);
+  /**
+   * Has this cell's *final* result — the one the settle transaction delivers when it closes the cell — reached the
+   * parent? Earlier interim results of a persistent cell (a project reporting a phase) do not count: when someone else
+   * closes such a cell later, its parent must still be told.
+   */
+  function finalResultDelivered(parentId: string, child: CellRecord): boolean {
+    return inbox.listMessagesSync({ cellId: parentId, envelopeId: finalResultEnvelopeId(child.id, child.epoch) }).length > 0;
   }
 
-  function closeCellSync(cellId: string, reason: CloseReason, opts: ActorOptions = {}): string[] {
+  function closeCellSync(cellId: string, reason: CloseReason, opts: CloseOptions = {}): string[] {
     const principalId = opts.principalId ?? core.ownerPrincipal;
     if (reason !== "completed" && reason !== "cancelled") throw new NgError("invalid_argument", `invalid close reason "${String(reason)}"`);
     return withTx(db, () => {
       const target = cells.require(cellId);
       if (target.status === "closed") return [];
-      assertManages(principalId, target, "closeCell");
+      if (!opts.internal) assertManages(principalId, target, "closeCell");
       const subtree = [target, ...cells.descendants(target.id, { status: ["active", "paused"] })];
 
       // A parent waiting on this child (a join, the desk's record) must not wait forever when someone else closes it.
       const parent = target.parentId ? cells.get(target.parentId) : undefined;
-      if (parent && parent.status !== "closed" && principalId !== cellPrincipal(parent.id) && !reportedResult(parent.id, target.id)) {
+      if (parent && parent.status !== "closed" && principalId !== cellPrincipal(parent.id) && !finalResultDelivered(parent.id, target)) {
         const payload: CellResultPayload = {
           childCellId: target.id,
           status: reason,
@@ -403,6 +433,8 @@ export function createLifecycle(core: KernelCore): Lifecycle {
         deactivateWatches(c.id);
         closed.push({ id: c.id, epoch });
       }
+      core.waits.dropFor(closed.map((c) => c.id));
+      settleGtdRecords(closed.map((c) => c.id), target.id, reason);
       // Cancels the subtree's pending approvals and unused tokens, permanently.
       gate.revokeSync(target.id);
       afterCommit(db, () => {
@@ -412,19 +444,42 @@ export function createLifecycle(core: KernelCore): Lifecycle {
     });
   }
 
+  /**
+   * The GTD books follow a close, whoever closed the cell (the project itself, the desk, the owner in Radar, an agent
+   * on the control plane, a cascade): a closed cell can no longer keep its own records, and a project shown as
+   * "active" with nothing behind it is exactly the dangling task docs/05 guard 2 rules out. A project record still
+   * marked active/someday becomes completed (the closed target, reason completed) or cancelled; open actions in the
+   * closed cells become done or cancelled the same way. Records that already say how they ended are left alone.
+   */
+  function settleGtdRecords(closedIds: readonly string[], targetId: string, reason: CloseReason): void {
+    const now = clock.now();
+    for (const id of closedIds) {
+      const finished = id === targetId && reason === "completed";
+      const patches: Record<string, unknown> = {};
+      const project = context.readStateSync<ProjectRecord>(id, gtdKeys.project);
+      if (project && typeof project === "object" && (project.lifecycle === "active" || project.lifecycle === "someday")) {
+        const { stalledSince: _s, stalledNotifiedAt: _n, ...rest } = project;
+        patches[gtdKeys.project] = { ...rest, lifecycle: finished ? "completed" : "cancelled", updatedAt: now, ...(finished ? { completedAt: now } : {}) } satisfies ProjectRecord;
+      }
+      for (const e of context.listStateSync(id, gtdKeys.actionPrefix)) {
+        const a = e.value as ActionRecord;
+        if (!a || typeof a !== "object" || a.status !== "open") continue;
+        patches[e.key] = { ...a, status: finished ? "done" : "cancelled", updatedAt: now, ...(finished ? { completedAt: now } : {}) } satisfies ActionRecord;
+      }
+      if (Object.keys(patches).length > 0) context.commitSync(id, { statePatches: patches });
+    }
+  }
+
   async function cleanupClosed(cellIds: readonly string[]): Promise<void> {
     if (cellIds.length === 0) return;
     core.dispatcher.abortCells(cellIds, "close");
     await core.dispatcher.settled(cellIds);
-    for (const id of cellIds) {
-      try {
-        const ws = core.workspace.getWorkspaceSync(id);
-        if (ws && ws.status !== "destroyed") await core.workspace.destroy(id);
-        else await core.workspace.cancelJobsForCell(id);
-      } catch (err) {
-        core.onError(err, `cleanup of closed cell ${id}`);
-      }
-    }
+    // docs/05 guard 4: runtime only. stopRuntime resolves when each Job's process group is confirmed gone — until
+    // then the Jobs still count as running, so the dispatcher keeps the directory's write slot closed.
+    await Promise.all(
+      cellIds.map((id) => core.workspace.stopRuntime(id).catch((err: unknown) => core.onError(err, `stop runtime of closed cell ${id}`))),
+    );
+    core.dispatcher.slotsChanged();
   }
 
   async function closeCell(cellId: string, reason: CloseReason = "completed", opts: ActorOptions = {}): Promise<CloseResult> {

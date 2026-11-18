@@ -12,6 +12,7 @@ import {
   type Address,
   type AuthorizeResult,
   type CancelScope,
+  type CellMessageDraft,
   type CellSpec,
   type ChildSummary,
   type Clock,
@@ -33,12 +34,15 @@ import {
   type ProposedAction,
   type RunPorts,
   type ScheduleRule,
+  type SelfSettleRequest,
   type SendReceipt,
+  type SendToCellResult,
   type StateEntry,
   type StepOrExternalEvidence,
   type ToolKind,
   type Usage,
   type VersionedArtifact,
+  type WorkspaceOccupancy,
   type WorkspacePort,
 } from "@ng/protocol";
 
@@ -73,6 +77,21 @@ export interface FakeRunOptions {
   workspaceRoot?: string;
   /** Tool kinds `workspaceAccess` reports. Default: bounds.tools. */
   workspaceTools?: ToolKind[];
+  /**
+   * Kernel stand-in for `sendToCell` (cell-to-cell messages). Default: `delivered` (envelopeId = the draft's id, else a
+   * generated one; targetStatus active). Every call is recorded in `log.cellMessages` with its result.
+   */
+  sendToCell?: (to: InboxAddr, message: CellMessageDraft) => SendToCellResult | Promise<SendToCellResult>;
+  /**
+   * Messages `drainInbound` hands the running Loop (as if they reached the cell mid-Run). More can be queued with
+   * `ports.pushInbound`. Strings become `user.message` envelopes from `channel:ui:owner`. Unlike the kernel, the fake
+   * absorbs for any cell (the test decides by what it queues).
+   */
+  inbound?: Array<Envelope | string>;
+  /** Kernel stand-in for `settleSelf` (e.g. throw a `conflict` for open children). Default: record the request. */
+  settleSelf?: (request: SelfSettleRequest) => void | Promise<void>;
+  /** What `activeWorkspaces()` reports. Default []. */
+  activeWorkspaces?: WorkspaceOccupancy[];
 }
 
 export interface FakeLog {
@@ -94,6 +113,16 @@ export interface FakeLog {
   execs: Array<{ tool: ToolKind; args: unknown }>;
   jobs: Array<{ jobId: string; command: string; input: string[]; cancelled: boolean }>;
   previews: Array<{ target: string; chunk: string }>;
+  /** sendToCell calls, with what the (fake) kernel answered. */
+  cellMessages: Array<{ to: InboxAddr; message: CellMessageDraft; result: SendToCellResult }>;
+  /** Envelopes drainInbound handed to the Loop (each also appended to `snapshot.batch`). */
+  drained: Envelope[];
+  /** registerWait calls. */
+  waits: Array<{ waitingFor: string; reason: string; timeoutAt?: number }>;
+  /** clearWait calls (the party). */
+  clearedWaits: string[];
+  /** settleSelf requests, in call order (the kernel acts on the last one). */
+  settled: SelfSettleRequest[];
 }
 
 export interface FakeRunPorts extends RunPorts {
@@ -103,6 +132,10 @@ export interface FakeRunPorts extends RunPorts {
   readonly resources: Map<string, string>;
   /** Queue steer messages; the Loop picks them up at its next drainSteer(). */
   pushSteer(...messages: string[]): void;
+  /** Queue messages that "reach the cell mid-Run"; the Loop picks them up at its next drainInbound(). */
+  pushInbound(...messages: Array<Envelope | string>): void;
+  /** Open waits as the fake kernel holds them (registerWait upserts per party, clearWait removes). */
+  readonly openWaits: Map<string, { reason: string; timeoutAt?: number }>;
   /** Simulate the human saving a new version in the Engage editor. */
   humanEdit(artifactId: string, body: string): VersionedArtifact;
   /** Sum of everything metered so far. */
@@ -185,6 +218,11 @@ export function createFakeRun(opts: FakeRunOptions = {}): FakeRun {
     execs: [],
     jobs: [],
     previews: [],
+    cellMessages: [],
+    drained: [],
+    waits: [],
+    clearedWaits: [],
+    settled: [],
   };
   const state = new Map<string, unknown>();
   const artifacts = new Map<string, VersionedArtifact>();
@@ -194,6 +232,11 @@ export function createFakeRun(opts: FakeRunOptions = {}): FakeRun {
   const scheduledIds = new Set<string>();
   let counter = 0;
   const next = (prefix: string) => `${prefix}_${++counter}`;
+  let inboundCounter = 0;
+  const asInbound = (e: Envelope | string): Envelope =>
+    typeof e === "string" ? userMessage(e, { id: `inbound_${++inboundCounter}`, at: clock.now() }) : e;
+  const inboundQueue: Envelope[] = (opts.inbound ?? []).map(asInbound);
+  const openWaits = new Map<string, { reason: string; timeoutAt?: number }>();
 
   const defaultAuthorize = (action: ProposedAction, o?: { artifactVersion?: number }): AuthorizeResult => {
     if (action.type === "channel.send" && !anyCovers(bounds.canSendTo, action.target)) {
@@ -352,7 +395,8 @@ export function createFakeRun(opts: FakeRunOptions = {}): FakeRun {
     },
     async spawnCell(childSpec, initialPayload) {
       const addr = inboxAddr(next("child"));
-      log.spawned.push({ spec: childSpec, initialPayload, addr });
+      // Recorded as written; a spawner may leave the processor to the preset (SpawnSpec).
+      log.spawned.push({ spec: childSpec as CellSpec, initialPayload, addr });
       return addr;
     },
     async updateCell(id, patch) {
@@ -389,6 +433,42 @@ export function createFakeRun(opts: FakeRunOptions = {}): FakeRun {
       log.controls.push({ cellId: id, action: cmd.action, ...(cmd.steerMessage !== undefined ? { steerMessage: cmd.steerMessage } : {}) });
       return { applied: true, epoch: 1 };
     },
+    async sendToCell(to, message) {
+      const result: SendToCellResult = opts.sendToCell
+        ? await opts.sendToCell(to, message)
+        : { status: "delivered", envelopeId: message.id ?? next("msg"), targetStatus: "active" };
+      log.cellMessages.push({ to, message, result });
+      return result;
+    },
+    drainInbound() {
+      const arrived = inboundQueue.splice(0);
+      // Like the kernel: the rows join the claimed batch (the tools see them) and are rendered as hydrate would.
+      for (const envelope of arrived) {
+        snapshot.batch.envelopes.push(envelope);
+        snapshot.batch.seqs.push(snapshot.batch.seqs.length + 1);
+        log.drained.push(envelope);
+      }
+      return arrived.map((envelope) => ({ envelope, text: renderEnvelope(envelope) }));
+    },
+    async registerWait(wait) {
+      log.waits.push({ ...wait });
+      openWaits.set(wait.waitingFor, { reason: wait.reason, ...(wait.timeoutAt !== undefined ? { timeoutAt: wait.timeoutAt } : {}) });
+    },
+    async clearWait(waitingFor) {
+      log.clearedWaits.push(waitingFor);
+      return openWaits.delete(waitingFor);
+    },
+    async settleSelf(request) {
+      if (opts.settleSelf) await opts.settleSelf(request);
+      log.settled.push({ ...request });
+    },
+    activeWorkspaces() {
+      return opts.activeWorkspaces ?? [];
+    },
+    openWaits,
+    pushInbound(...messages) {
+      inboundQueue.push(...messages.map(asInbound));
+    },
     pushSteer(...messages) {
       steerQueue.push(...messages);
     },
@@ -405,7 +485,7 @@ export function createFakeRun(opts: FakeRunOptions = {}): FakeRun {
     ...(opts.workspaceRoot !== undefined
       ? {
           async workspaceAccess() {
-            return { root: opts.workspaceRoot!, isolation: bounds.isolation, tools: opts.workspaceTools ?? [...bounds.tools] };
+            return { root: opts.workspaceRoot!, isolation: bounds.isolation, tools: opts.workspaceTools ?? [...bounds.tools], cwdMode: spec.cwdMode === "write" ? "write" : "read" };
           },
         }
       : {}),

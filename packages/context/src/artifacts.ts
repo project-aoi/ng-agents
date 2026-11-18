@@ -56,8 +56,11 @@ export interface ArtifactsModule {
   listByCell(cellId: string): VersionedArtifact[];
   getVersion(artifactId: string, version: number): ArtifactVersionRecord | null;
   listVersions(artifactId: string): ArtifactVersionRecord[];
-  decide(cellId: string, w: ArtifactWrite): ArtifactDecision;
-  /** Applies a create/update decision; returns the new version. Emits artifact.changed after commit. */
+  decide(w: ArtifactWrite): ArtifactDecision;
+  /**
+   * Applies a create/update decision made by `cellId` (the creator on create; any cell may revise); returns the new
+   * version. Emits artifact.changed (with the artifact's own cellId) after commit.
+   */
   apply(cellId: string, w: ArtifactWrite, d: Exclude<ArtifactDecision, { kind: "conflict" }>): number;
   park(artifactId: string, input: ParkInput): ParkedAddition;
   listParked(artifactId: string, opts?: { includeDismissed?: boolean }): ParkedAddition[];
@@ -68,7 +71,7 @@ export function createArtifacts(deps: Deps): ArtifactsModule {
   const { db, bus, clock } = deps;
   const repo = artifactsRepo(db);
 
-  function decide(cellId: string, w: ArtifactWrite): ArtifactDecision {
+  function decide(w: ArtifactWrite): ArtifactDecision {
     if (!w || typeof w.artifactId !== "string" || !w.artifactId) throw new NgError("invalid_argument", "artifact.artifactId is required");
     if (w.updatedBy !== "agent" && w.updatedBy !== "human") throw new NgError("invalid_argument", "artifact.updatedBy must be agent|human");
     if (w.expectedVersion !== undefined && (!Number.isInteger(w.expectedVersion) || w.expectedVersion < 0)) {
@@ -82,20 +85,16 @@ export function createArtifacts(deps: Deps): ArtifactsModule {
       }
       return { kind: "create" };
     }
-    if (current.cellId !== cellId) {
-      throw new NgError("invalid_argument", `artifact "${w.artifactId}" belongs to cell "${current.cellId}", not "${cellId}"`);
-    }
-    const matches =
-      w.expectedVersion !== undefined
-        ? w.expectedVersion === current.version
-        : w.updatedBy === "agent" && current.updatedBy === "agent";
-    if (matches) return { kind: "update", current };
+    // [docs/05 §3.4 guard 3] Any cell may revise an artifact, but only from the version it read: an update without
+    // expectedVersion is a conflict like a stale one, so concurrent revisers can never silently overwrite each other.
+    if (w.expectedVersion === current.version) return { kind: "update", current };
     return { kind: "conflict", current, park: w.updatedBy === "agent" && current.updatedBy === "human" };
   }
 
   function apply(cellId: string, w: ArtifactWrite, d: Exclude<ArtifactDecision, { kind: "conflict" }>): number {
     const now = clock.now();
     const content = toJson(w.content);
+    const owner = d.kind === "create" ? cellId : d.current.cellId;
     let version: number;
     if (d.kind === "create") {
       version = 1;
@@ -116,13 +115,14 @@ export function createArtifacts(deps: Deps): ArtifactsModule {
       );
       if (r.changes !== 1) throw new NgError("conflict", `artifact "${w.artifactId}" changed concurrently`);
     }
+    // A human edit is committed through some cell (e.g. the UI uses the owner), but that cell did not write it.
     run(
       db,
-      "INSERT INTO artifact_versions (artifact_id, version, content, updated_by, created_at) VALUES (?, ?, ?, ?, ?)",
-      [w.artifactId, version, content, w.updatedBy, now],
+      "INSERT INTO artifact_versions (artifact_id, version, content, updated_by, created_at, cell_id) VALUES (?, ?, ?, ?, ?, ?)",
+      [w.artifactId, version, content, w.updatedBy, now, w.updatedBy === "agent" ? cellId : null],
     );
     afterCommit(db, () =>
-      bus.emit("artifact.changed", { cellId, artifactId: w.artifactId, version, updatedBy: w.updatedBy }),
+      bus.emit("artifact.changed", { cellId: owner, artifactId: w.artifactId, version, updatedBy: w.updatedBy }),
     );
     return version;
   }

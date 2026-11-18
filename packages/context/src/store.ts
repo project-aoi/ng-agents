@@ -9,6 +9,7 @@ import {
   NgError,
   isNgError,
   prefixUpperBound,
+  RESOURCE_URI_PREFIX,
   run,
   toJson,
   withTx,
@@ -21,6 +22,7 @@ import {
   type KnowledgeKind,
   type ParkedAddition,
   type ResourcePage,
+  type SearchScope,
   type StateEntry,
   type StateQuery,
 } from "@ng/protocol";
@@ -61,6 +63,8 @@ function formatStatusLine(value: unknown): string | null {
   return `${line.text} (${p.done}/${p.total}${p.label ? ` ${p.label}` : ""})`;
 }
 
+const SEARCH_SCOPES: readonly SearchScope[] = ["lineage", "subtree", "global"];
+
 const KNOWLEDGE_SCHEMES: ReadonlyArray<[string, KnowledgeKind]> = [
   ["skill://", "skill"],
   ["note://", "note"],
@@ -100,6 +104,7 @@ export function createContextStore(opts: ContextStoreOptions): ContextStore {
     evidence,
     knowledge,
     roster: opts.rosterProvider ?? defaultRoster,
+    tailNotes: opts.tailNotesProvider ?? (() => []),
     resolvePrompt(cell) {
       if (opts.resolvePrompt) return opts.resolvePrompt(cell.spec, cell);
       const p = cell.spec.processor;
@@ -129,7 +134,7 @@ export function createContextStore(opts: ContextStoreOptions): ContextStore {
   function commitSync(cellId: string, tx: CommitTx): CommitResult {
     validateCommit(tx);
     return withTx(db, (): CommitResult => {
-      const decision = tx.artifact ? artifacts.decide(cellId, tx.artifact) : null;
+      const decision = tx.artifact ? artifacts.decide(tx.artifact) : null;
       if (decision?.kind === "conflict") {
         // The whole commit is rejected; the only write that survives is the parked agent content.
         let parked: ParkedAddition | undefined;
@@ -172,7 +177,8 @@ export function createContextStore(opts: ContextStoreOptions): ContextStore {
 
   function readResourceSync(cellId: string, uri: string, page?: ResourcePage): string {
     if (typeof uri !== "string") throw new NgError("invalid_argument", "uri must be a string");
-    if (uri.startsWith("res://")) return evidence.readResource(cellId, uri, page);
+    // [docs/05] res:// and artifact:// are readable by any cell; knowledge keeps its nearest-visible-scope rule.
+    if (uri.startsWith(RESOURCE_URI_PREFIX)) return evidence.readResource(uri, page);
     for (const [scheme, kind] of KNOWLEDGE_SCHEMES) {
       if (!uri.startsWith(scheme)) continue;
       const raw = uri.slice(scheme.length);
@@ -196,7 +202,6 @@ export function createContextStore(opts: ContextStoreOptions): ContextStore {
       if (!m) throw new NgError("invalid_argument", `invalid artifact URI "${uri}"`);
       const artifact = artifacts.get(m[1]!);
       if (!artifact) throw new NgError("not_found", `artifact "${m[1]}" not found`);
-      evidence.assertSameLineage(cellId, artifact.cellId, `artifact "${m[1]}"`);
       if (m[2] === undefined) return pageOf(artifact.content.body, page);
       const v = artifacts.getVersion(artifact.artifactId, Number(m[2]));
       if (!v) throw new NgError("not_found", `artifact "${artifact.artifactId}" has no version ${m[2]}`);
@@ -249,7 +254,9 @@ export function createContextStore(opts: ContextStoreOptions): ContextStore {
     readResourceSync,
     searchHistorySync(cellId, query, o) {
       if (typeof query !== "string") throw new NgError("invalid_argument", "query must be a string");
-      return searchHistory(deps, knowledge.chain(cellId), cellId, query, o?.limit ?? deps.limits.searchLimit);
+      const scope = o?.scope ?? "lineage";
+      if (!SEARCH_SCOPES.includes(scope)) throw new NgError("invalid_argument", `invalid search scope "${String(scope)}"`);
+      return searchHistory(deps, knowledge.chain(cellId), cellId, query, { limit: o?.limit ?? deps.limits.searchLimit, scope });
     },
     upsertSkillOrNoteSync: (cellId, patch) => knowledge.upsert(cellId, patch),
     getArtifactSync: (artifactId) => artifacts.get(artifactId),
@@ -288,8 +295,8 @@ export function createContextStore(opts: ContextStoreOptions): ContextStore {
     async readResource(cellId, uri, page) {
       return readResourceSync(cellId, uri, page);
     },
-    async searchHistory(cellId, query) {
-      return store.searchHistorySync(cellId, query);
+    async searchHistory(cellId, query, o) {
+      return store.searchHistorySync(cellId, query, o);
     },
     async upsertSkillOrNote(cellId, patch) {
       knowledge.upsert(cellId, patch);

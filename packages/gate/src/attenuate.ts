@@ -133,10 +133,14 @@ export function attenuateBounds(
   const tools = reqTools === null ? parentTools : parentTools.filter((t) => reqTools.includes(t));
 
   const parentInbox: Address | null = parentCellId && isAddressPattern(`inbox:${parentCellId}`) ? inboxAddr(parentCellId) : null;
-  const sendable = [...members(parent.canSendTo).filter(isAddressPattern), ...(parentInbox ? [parentInbox] : [])];
+  const parentSendable = members(parent.canSendTo).filter(isAddressPattern);
+  const sendable = [...parentSendable, ...(parentInbox ? [parentInbox] : [])];
   const reqSend = stringList(req.canSendTo);
+  // Internal messaging is free inside the tree: every `inbox:` pattern the parent holds is inherited, requested or not
+  // (so, transitively, every ancestor's inbox, e.g. `inbox:desk` for arbitration). `channel:` only on request.
   const canSendTo = minimizePatterns([
     ...(reqSend === null ? [] : intersectPatterns(reqSend, sendable)),
+    ...parentSendable.filter((p) => p.startsWith("inbox:")),
     ...(parentInbox ? [parentInbox] : []),
   ]);
 

@@ -57,17 +57,18 @@ export function actionShapeFeedback(action: unknown): string | null {
 /**
  * The side effect the Gate attributes to an action regardless of what the caller declared; the effective side effect
  * is the max of the two, so a mislabelled action can only become stricter.
+ * `_bounds` is kept for signature stability: no derived side effect depends on the cell's isolation any more.
  */
-export function derivedSideEffect(action: ProposedAction, bounds: PolicyBounds, ownerAddresses: readonly string[]): SideEffect {
+export function derivedSideEffect(action: ProposedAction, _bounds: PolicyBounds, ownerAddresses: readonly string[]): SideEffect {
   switch (action.type) {
     case "channel.send":
       return anyCovers(ownerAddresses, action.target) ? "notify_owner" : "external";
     case "workspace.exec":
-      if (!MUTATING_TOOLS.has(action.tool)) return "none";
-      // isolation "none" runs in the owner's real directory on the host.
-      return bounds.isolation === "none" ? "external" : "internal";
+      // docs/05: host work in the owner's real directories (isolation "none", the default) is guarded by cwdMode, the
+      // dispatcher's per-directory write queue and the prompts' red lines, not by a card per command.
+      return MUTATING_TOOLS.has(action.tool) ? "internal" : "none";
     case "job.start":
-      return bounds.isolation === "none" ? "external" : "internal";
+      return "internal";
     case "project.start":
       // docs/04 card B: a project only starts after the human confirms the proposal.
       return "external";
@@ -82,6 +83,41 @@ export function derivedSideEffect(action: ProposedAction, bounds: PolicyBounds, 
 
 export function effectiveSideEffect(action: ProposedAction, bounds: PolicyBounds, ownerAddresses: readonly string[]): SideEffect {
   return maxSideEffect(action.sideEffect, derivedSideEffect(action, bounds, ownerAddresses));
+}
+
+// `custom` names of budget-exhausted escalation cards: the Loop's request_approval, and the kernel's own card
+// (packages/cell constants KERNEL_ESCALATION, with `args.reason`).
+const BUDGET_EXHAUSTED = "budget_exhausted";
+const LOOP_BUDGET_ESCALATION = `escalation.${BUDGET_EXHAUSTED}`;
+const KERNEL_ESCALATION = "kernel.escalation";
+
+function isBudgetEscalation(action: ProposedAction): boolean {
+  // Same precedence as the kernel's escalation handling: the card's own escalation reason first, then the action.
+  const data = isObject(action.card) ? action.card["data"] : undefined;
+  if (isObject(data) && data["cardType"] === "escalation" && isObject(data["escalation"]) && data["escalation"]["reason"] === BUDGET_EXHAUSTED) {
+    return true;
+  }
+  if (action.type !== "custom") return false;
+  if (action.name === LOOP_BUDGET_ESCALATION) return true;
+  return action.name === KERNEL_ESCALATION && isObject(action.args) && action.args["reason"] === BUDGET_EXHAUSTED;
+}
+
+/**
+ * Why approving `action` is the owner's decision alone, or null when an external main agent (`agent:*`) may approve it
+ * too (docs/05 guard 3): a send that leaves the owner's own channels, and continuing past an exhausted budget.
+ * Everything else (project proposals, custom actions, blocked / retry_limit / waiting_timeout escalations) an agent may
+ * approve; denying or snoozing is never owner-only. Pass the card too (`{ ...record.action, card: record.card }`):
+ * a budget escalation may be recognisable only by its card.
+ */
+export function ownerOnlyApproval(action: ProposedAction, ownerAddresses: readonly string[]): string | null {
+  if (action.type === "channel.send") {
+    const target: unknown = action.target;
+    if (typeof target !== "string" || !anyCovers(ownerAddresses, target)) {
+      return `it sends to ${String(target)}, outside the owner's own channels`;
+    }
+  }
+  if (isBudgetEscalation(action)) return "it continues past an exhausted budget";
+  return null;
 }
 
 export interface BoundsContext {
@@ -220,7 +256,8 @@ export function ruleInputForClass(
 
 /**
  * Whether a cell with `bounds` (child of `parentCellId`) may deliver to `addr` — for the kernel's inboxOut /
- * emitToParent / notifyChannel checks. The parent's own inbox is always reachable (a child can always report back).
+ * emitToParent / notifyChannel checks. The parent's own inbox is always reachable (a child can always report back);
+ * other inboxes (e.g. `inbox:desk` for arbitration) through the `inbox:` patterns attenuate passes down the tree.
  */
 export function deliveryAllowed(bounds: Pick<PolicyBounds, "canSendTo">, parentCellId: string | null, addr: string): boolean {
   if (typeof addr !== "string" || addr.endsWith("*") || parseAddress(addr) === null) return false;

@@ -20,6 +20,7 @@ import {
   type SourceRecord,
 } from "@ng/protocol";
 import type { Kernel } from "@ng/cell";
+import { registerPresets } from "@ng/presets";
 import { createDeskServer, type DeskServer, type DeskServerOptions } from "../src/server/boot";
 
 export const T0 = Date.UTC(2026, 10, 17, 1, 0, 0);
@@ -156,6 +157,21 @@ export async function bootDesk(opts: Partial<DeskServerOptions> & { clock?: Manu
       return r.json;
     },
   };
+}
+
+/** A desk with the real presets (project, hub, worker, watcher …) and the scripted model; no weekly-review timer. */
+export function bootRealDesk(opts: Partial<DeskServerOptions> & { clock?: ManualClock } = {}): Promise<TestDesk> {
+  return bootDesk({ registerPresets: (registry, o) => registerPresets(registry, { ...o, weeklyReview: false }), ...opts });
+}
+
+/** The cell.message envelopes a cell has received (any status), oldest first. */
+export function cellMessages(kernel: Kernel, cellId: string): Envelope[] {
+  return kernel.inbox.listMessagesSync({ cellId, type: PAYLOAD.cellMessage }).map((m) => m.envelope);
+}
+
+/** Model requests a cell made, as plain text. */
+export function requestsOf(script: RoleScript, cellId: string): string[] {
+  return script.requests.filter((r) => r.cellId === cellId).map((r) => requestText(r.req));
 }
 
 // ==================== writing records and cards directly ====================

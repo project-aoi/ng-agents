@@ -1,8 +1,11 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
   asClarifyCard,
+  CELL_RESULT_CANDIDATE_KEY,
+  finalResultEnvelopeId,
   PAYLOAD,
   steerNoteText,
+  type CellResultCandidate,
   type CellResultPayload,
   type CodeProcessor,
   type ModelRequest,
@@ -70,8 +73,14 @@ describe("dispatcher", () => {
       h.kernel.spawnCell("desk", { id, preset: "worker", meta: { role: id } }, "go");
     }
     await h.kernel.idle();
-    expect(maxOverlap(h)).toBe(2);
-    expect(h.of("run.finished").map((e) => e.outcome)).toEqual(Array(5).fill("completed"));
+    expect(maxOverlap(h)).toBe(2); // the cap counts every cell's Runs, the desk's included
+    expect(h.of("run.finished").filter((e) => ids.includes(e.cellId)).map((e) => e.outcome)).toEqual(Array(5).fill("completed"));
+    // one-shot workers: each delivered exactly one final result and was closed; the desk was woken by them
+    expect(ids.map((id) => h.kernel.getCell(id)!.status)).toEqual(Array(5).fill("closed"));
+    const results = h.kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.cellResult });
+    expect(results.map((m) => m.envelope.id).sort()).toEqual(ids.map((id) => finalResultEnvelopeId(id, 0)));
+    expect(results.map((m) => (m.envelope.payload as CellResultPayload).summary)).toEqual(Array(5).fill("ok"));
+    expect(h.of("run.finished").filter((e) => e.cellId === "desk").length).toBeGreaterThanOrEqual(1);
   });
 
   it("cancel takes effect at once, independent of queue length: the Run is aborted, 300 queued messages are dropped", async () => {
@@ -118,9 +127,14 @@ describe("dispatcher", () => {
 
     h.kernel.control("w", { action: "resume" });
     await h.kernel.idle();
-    expect(h.of("run.finished").map((e) => e.outcome)).toEqual(["cancelled", "completed"]);
+    expect(h.of("run.finished").filter((e) => e.cellId === "w").map((e) => e.outcome)).toEqual(["cancelled", "completed"]);
     expect(h.kernel.inbox.listMessagesSync({ cellId: "w" }).map((m) => m.status)).toEqual(["done", "done"]);
     expect(h.kernel.gate.listPendingSync()).toEqual([]); // no escalation for a pause
+    // the resumed Run took both messages, so the one-shot worker reported once and closed
+    expect(h.kernel.getCell("w")).toMatchObject({ status: "closed", closeReason: "completed" });
+    expect(h.kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.cellResult }).map((m) => (m.envelope.payload as CellResultPayload).summary)).toEqual([
+      "resumed and done",
+    ]);
   });
 
   it("steer reaches the running Loop between steps, without a second Run", async () => {
@@ -228,10 +242,15 @@ describe("escalations", () => {
     expect(await h.kernel.resolveApproval(pending!.actionId, { decision: "continue", raise: { tokens: 5_000 } })).toMatchObject({ status: "continued" });
     expect(h.kernel.gate.usageSync("w")).toMatchObject({ raisedTokens: 5_000, state: "ok" });
     await h.kernel.idle();
-    expect(h.of("run.finished").map((e) => e.outcome)).toEqual(["budget_stopped", "budget_stopped", "completed"]);
+    // a budget stop is never a result: the one-shot worker stayed open until the Run after the raise completed
+    expect(h.of("run.finished").filter((e) => e.cellId === "w").map((e) => e.outcome)).toEqual(["budget_stopped", "budget_stopped", "completed"]);
     const resolved = h.kernel.inbox.listMessagesSync({ cellId: "w", type: PAYLOAD.approvalResolved })[0]!;
     expect(resolved).toMatchObject({ status: "done" });
     expect(resolved.envelope.payload).toMatchObject({ status: "executed", decision: "continue" });
+    expect(h.kernel.getCell("w")).toMatchObject({ status: "closed", closeReason: "completed" });
+    expect(h.kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.cellResult }).map((m) => (m.envelope.payload as CellResultPayload).summary)).toEqual([
+      "continuing",
+    ]);
   });
 
   it("resolve_offline on an escalation closes the affected cell and withdraws the card", async () => {
@@ -252,11 +271,12 @@ describe("escalations", () => {
 
 describe("DND", () => {
   it("focus buffers the owner's notifications but never parent/child traffic", async () => {
+    // A one-shot child stages its result (what report_to_parent does); the kernel delivers it when the Run settles.
     const report: CodeProcessor = {
       name: "test.report",
-      async run({ ports }) {
-        const r: CellResultPayload = { childCellId: ports.self.cellId, status: "completed", summary: "child finished during focus" };
-        await ports.emitToParent(PAYLOAD.cellResult, r);
+      async run({ ports, clock }) {
+        const r: CellResultCandidate = { status: "completed", summary: "child finished during focus", at: clock.now() };
+        await ports.context.commit(ports.self.cellId, { statePatches: { [CELL_RESULT_CANDIDATE_KEY]: r } });
         return "completed";
       },
     };
@@ -272,7 +292,9 @@ describe("DND", () => {
     await h.kernel.idle();
 
     // the child's result woke the desk at once, focus or not
-    expect(h.kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.cellResult }).map((m) => m.status)).toEqual(["done"]);
+    expect(h.kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.cellResult }).map((m) => [m.status, (m.envelope.payload as CellResultPayload).summary])).toEqual([
+      ["done", "child finished during focus"],
+    ]);
     expect(h.of("run.finished").filter((e) => e.cellId === "desk").map((e) => e.outcome)).toEqual(["completed"]);
     // ...while the desk's notice to the owner waits for the end of focus
     expect(h.kernel.hub.listOutboxSync({ channelId: "ui" }).map((o) => o.status)).toEqual(["buffered_dnd"]);
@@ -293,7 +315,8 @@ describe("competing workers", () => {
         return { text: "done" };
       });
     }
-    h.kernel.spawnCell("desk", { id: "p", preset: "worker", claimMode: "competing_workers", maxParallelRuns: 3, meta: { role: "pool" } });
+    // a pool lives on (a one-shot cell must claim serially: drain-then-close needs one claim to decide on)
+    h.kernel.spawnCell("desk", { id: "p", preset: "worker", lifetime: "persistent", claimMode: "competing_workers", maxParallelRuns: 3, meta: { role: "pool" } });
     for (let i = 0; i < 3; i++) {
       h.kernel.inbox.enqueueSync("p", { id: `j${i}`, from: "inbox:desk", principalId: "cell:desk", kind: "event", type: PAYLOAD.userMessage, payload: { text: `job ${i}` }, createdAt: h.clock.now() });
     }
@@ -302,5 +325,39 @@ describe("competing workers", () => {
     await h.kernel.idle();
     expect(maxOverlap(h, ["p"])).toBe(3);
     expect(h.kernel.inbox.listMessagesSync({ cellId: "p" }).every((m) => m.status === "done")).toBe(true);
+    expect(h.kernel.getCell("p")!.status).toBe("active");
+  });
+
+  it("a one-shot cell cannot ask for a pool", async () => {
+    const h = await boot();
+    expect(() => h.kernel.spawnCell("desk", { id: "p", preset: "worker", claimMode: "competing_workers", maxParallelRuns: 3 })).toThrow(
+      "a one_shot cell claims serially (claimMode serial_coalesce)",
+    );
+  });
+});
+
+describe("one-shot results (docs/05 guard 1: the kernel is the single sender)", () => {
+  // RunPorts.emitToParent(cell.result) from a one_shot cell is staged as the candidate, never sent from the port: the
+  // settle transaction stays the only sender, so the parent gets exactly one result with the emitted summary.
+  it("a one-shot code processor that emits cell.result itself still reaches its parent exactly once", async () => {
+    const emit: CodeProcessor = {
+      name: "test.emit_result",
+      async run({ ports }) {
+        await ports.emitToParent(PAYLOAD.cellResult, { childCellId: ports.self.cellId, status: "completed", summary: "emitted directly" } satisfies CellResultPayload);
+        return "completed";
+      },
+    };
+    const h = await boot({
+      setup(registry: Registry) {
+        registerTestPresets(registry);
+        registry.codeProcessors.register(emit);
+      },
+    });
+    h.kernel.spawnCell("desk", { id: "e", preset: "worker", processor: { kind: "code", entry: emit.name } }, "go");
+    await h.kernel.idle();
+    expect(h.kernel.getCell("e")!.status).toBe("closed");
+    expect(h.kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.cellResult }).map((m) => (m.envelope.payload as CellResultPayload).summary)).toEqual([
+      "emitted directly",
+    ]);
   });
 });

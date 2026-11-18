@@ -260,6 +260,15 @@ interface ArtifactRow {
   updated_at: number;
 }
 
+interface VersionRow {
+  artifact_id: string;
+  version: number;
+  content: string;
+  updated_by: string;
+  created_at: number;
+  cell_id: string | null;
+}
+
 function toArtifact(r: ArtifactRow): VersionedArtifact {
   return {
     artifactId: r.artifact_id,
@@ -282,12 +291,13 @@ export interface ArtifactsRepo {
 
 /** Read-only view of `artifacts`/`artifact_versions` for Gate (version checks) and the kernel (sending a bound version). */
 export function artifactsRepo(db: Db): ArtifactsRepo {
-  const toVersion = (r: { artifact_id: string; version: number; content: string; updated_by: string; created_at: number }) => ({
+  const toVersion = (r: VersionRow): ArtifactVersionRecord => ({
     artifactId: r.artifact_id,
     version: r.version,
     content: fromJson<Deliverable>(r.content),
     updatedBy: r.updated_by as VersionedArtifact["updatedBy"],
     createdAt: r.created_at,
+    cellId: r.cell_id ?? null,
   });
   return {
     get(artifactId) {
@@ -298,11 +308,11 @@ export function artifactsRepo(db: Db): ArtifactsRepo {
       return get<{ version: number }>(db, "SELECT version FROM artifacts WHERE artifact_id = ?", [artifactId])?.version;
     },
     getVersion(artifactId, version) {
-      const r = get<ArtifactRow>(db, "SELECT * FROM artifact_versions WHERE artifact_id = ? AND version = ?", [artifactId, version]);
+      const r = get<VersionRow>(db, "SELECT * FROM artifact_versions WHERE artifact_id = ? AND version = ?", [artifactId, version]);
       return r ? toVersion(r) : undefined;
     },
     listVersions(artifactId) {
-      return all<ArtifactRow>(db, "SELECT * FROM artifact_versions WHERE artifact_id = ? ORDER BY version", [artifactId]).map(toVersion);
+      return all<VersionRow>(db, "SELECT * FROM artifact_versions WHERE artifact_id = ? ORDER BY version", [artifactId]).map(toVersion);
     },
     listByCell(cellId) {
       return all<ArtifactRow>(db, "SELECT * FROM artifacts WHERE cell_id = ? ORDER BY updated_at DESC, artifact_id", [cellId]).map(

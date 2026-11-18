@@ -23,6 +23,7 @@ export const ALL_SCHEMAS: readonly SchemaModule[] = [
 export const TABLE_OWNERS: Readonly<Record<string, string>> = {
   cells: "@ng/cell",
   cell_watches: "@ng/cell",
+  cell_waits: "@ng/cell",
   inbox_messages: "@ng/inbox",
   inbox_claims: "@ng/inbox",
   inbox_schedules: "@ng/inbox",
@@ -33,6 +34,9 @@ export const TABLE_OWNERS: Readonly<Record<string, string>> = {
   evidence: "@ng/context",
   evidence_fts: "@ng/context",
   resources: "@ng/context",
+  artifact_fts: "@ng/context",
+  state_fts: "@ng/context",
+  resource_fts: "@ng/context",
   knowledge: "@ng/context",
   knowledge_fts: "@ng/context",
   prompt_prefixes: "@ng/context",

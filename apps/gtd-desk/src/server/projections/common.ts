@@ -1,5 +1,4 @@
 import type { Kernel } from "@ng/cell";
-import { awaitsCard, KEYS, type CoordinatorState } from "@ng/presets";
 import {
   gtdKeys,
   type ActionRecord,
@@ -198,19 +197,24 @@ export function approvalProjectId(kernel: DeskKernel, rec: ApprovalRecord): stri
 }
 
 /**
- * Open actions whose owner part is a Clarify card the item raised (its result or a nudge waits on a card, or for the
- * item's one card slot): the card is where the owner acts, so such an action is no to-do of its own (not in Engage;
- * Radar points at the card). Keyed by `cellId + action id`.
+ * Open actions whose owner part is a Clarify card: the cell carrying the action (`ActionRecord.cellId` — a worker or a
+ * watcher of a project) holds a pending card, e.g. a reply watcher's follow-up or a worker that is blocked on the
+ * owner's decision. The card is where the owner acts, so such an action is no to-do of its own (not in Engage; Radar
+ * points at the card). Keyed by `cellId + action id`.
  */
 export function cardBackedActions(kernel: DeskKernel, actions: ReadonlyArray<Located<ActionRecord>>): Set<string> {
   const out = new Set<string>();
-  const states = new Map<string, CoordinatorState | null>();
+  const carded = new Set(kernel.gate.listPendingSync({ includeSnoozed: true }).map((r) => r.cellId));
   for (const a of actions) {
-    if (a.record.status !== "open") continue;
-    if (!states.has(a.cellId)) states.set(a.cellId, kernel.context.readStateSync<CoordinatorState>(a.cellId, KEYS.coordinator));
-    if (awaitsCard(states.get(a.cellId)!, a.record.id)) out.add(`${a.cellId}\u0000${a.record.id}`);
+    if (a.record.status !== "open" || !a.record.cellId) continue;
+    if (carded.has(a.record.cellId)) out.add(`${a.cellId}\u0000${a.record.id}`);
   }
   return out;
+}
+
+/** Cells that hold a project record (`gtd:project`): one Radar row each. */
+export function projectCellIds(kernel: DeskKernel): Set<string> {
+  return new Set(readProjects(kernel).map((p) => p.cellId));
 }
 
 export const actionKey = (a: Located<ActionRecord>) => `${a.cellId}\u0000${a.record.id}`;

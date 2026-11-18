@@ -9,6 +9,14 @@ export interface ScheduleRule {
   idleSec?: number;                     // fire when this Cell has been idle for N seconds (background housekeeping)
   cancelGroup?: string;                 // linked-cancel group (e.g. clear pending timeout nudges when the other side replies early)
   tz?: string;                          // [ext] IANA timezone for `cron` (default: process local time)
+  /**
+   * [ext] docs/05 §3.3 — fixed (tumbling) batching window, keyed. Exclusive with deliverAt/cron/idleSec. At enqueue:
+   * the cell has an active claim → deliver now (the running Loop absorbs it); otherwise, if a pending wakeup row of the
+   * same cell with `cancel_group = key` is not yet due, reuse *its* deliver_at (the window's fixed right edge: never
+   * extended by later arrivals, never borrowed from another key or an ordinary timer); else deliver_at = now + windowMs.
+   * The row's cancel_group is `key` (convention `coalesce:<watchId>`).
+   */
+  coalesce?: { key: string; windowMs: number };
 }
 
 export interface Inbox {
@@ -66,6 +74,22 @@ export interface Inbox {
    * the active claim). Returns [] when the cell has no active claim, so an idle cell's steer still wakes it normally.
    */
   drainSteerSync(cellId: string): string[];
+  /**
+   * [ext] docs/05 §3.3 — move this cell's due pending messages (wakeup and silent_inject, any type but `control.steer`)
+   * into the active serial claim `claimId`: status → claimed, claim_id set, same expected-epoch drop rule as a claim.
+   * Returns them in seq order with their seqs. [] when the claim is no longer active (nothing is taken) or nothing is
+   * due. Because the rows belong to the claim, `handbackSync` works on them and `releaseSync` gives them back.
+   */
+  drainInboundSync(cellId: string, claimId: string): Array<{ envelope: Envelope; seq: number }>;
+  /**
+   * [ext] docs/05 guard 1 — how many messages would wake this cell: pending `wakeup` rows that are due now, plus
+   * not-yet-due ones that are not the cell's own timers (`timer.fired`) — e.g. a follow-up still inside a coalescing
+   * window. `silent_inject` rows never count, and neither do the kernel's own notices `kernel.stalled_check` and
+   * `kernel.wait_timeout` (they are not work for the cell to finish).
+   */
+  pendingWakeupCountSync(cellId: string): number;
+  /** [ext] Active claims of the cell, optionally excluding one (the settling Run's own). */
+  activeClaimCountSync(cellId: string, exceptClaimId?: string): number;
   /**
    * Advance time-driven state as of `clock.now()`: expire leases, fire due cron/idleSec schedules into messages,
    * and emit `inbox.enqueued {reason:"due"}` for cells whose delayed messages just became due (`"released"` for cells

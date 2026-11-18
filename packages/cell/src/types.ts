@@ -24,11 +24,16 @@ import type {
   InboxAddr,
   ModelClient,
   PresetName,
+  CellMessageDraft,
   ProcessorSpec,
   Progress,
   Registry,
   RunOutcome,
+  SendToCellResult,
+  WorkspaceOccupancy,
 } from "@ng/protocol";
+import type { ModelSettings, ModelSettingsOptions } from "./models";
+import type { WaitRecord } from "./waits";
 import type { WorkspaceManager, WorkspaceManagerOptions } from "@ng/workspace";
 
 /** A spec as callers write it: `processor` may come from the preset's defaults. */
@@ -38,9 +43,11 @@ export type CellSpecInput = Omit<CellSpec, "processor"> & { processor?: Processo
 
 export interface KernelOptions {
   /**
-   * Everything on disk lives here: the database (`ng.db`), skills (`skills/`), workspaces (`workspace/`) and the
-   * scratch base repository (`base-repo/`). Default: a fresh directory under the OS temp dir that `close()` removes —
-   * fine for tests; pass a real directory to persist.
+   * Everything of the kernel's own on disk lives here: the database (`ng.db`), skills (`skills/`), job logs and
+   * explicit isolated workspaces (`workspace/`), the per-cell directories of cells nobody gave a `cwd` (`cells/`) and
+   * the records of running CLI agents (`cli-procs/`). The directories cells work in are the owner's and are never
+   * created or removed here. Default: a fresh directory under the OS temp dir that `close()` removes — fine for
+   * tests; pass a real directory to persist.
    */
   dataDir?: string;
   /** An open database, or a path (":memory:" works). Default `<dataDir>/ng.db`. */
@@ -61,6 +68,12 @@ export interface KernelOptions {
   agentBackend?: AgentBackendSetting;
   /** Per-CLI loop settings (binary, tier models, env pass-through, timeouts, ...). */
   cli?: Partial<Record<CliEngine, Omit<CliAgentLoopOptions, "engine" | "registry" | "clock">>>;
+  /**
+   * The owner's model switch for CLI engines: each Run asks it which model and effort to launch with, the catalogue
+   * comes from the CLI itself, and the default ("auto") is the CLI's own first choice. Off unless given — a bare
+   * kernel launches CLIs with `cli[engine].models` or their own default. `true` = defaults.
+   */
+  modelSwitch?: boolean | Pick<ModelSettingsOptions, "ttlMs" | "firstFetchWaitMs" | "fetch">;
   clock?: Clock;
   bus?: Bus;
   /**
@@ -74,11 +87,7 @@ export interface KernelOptions {
   ownerAddresses?: readonly string[];
   /** Cell that receives unrouted ingress and handbacks. Default "desk". */
   deskCellId?: string;
-  /**
-   * Isolation "none" is the owner's real directory, and the Loop's workspace tools bypass Gate, so the kernel's
-   * workspace port refuses write/edit/bash/code_rpc and job starts for such cells. `true` lifts that (the
-   * single-local-cell CLI shape of docs/02 §四.1). Default false.
-   */
+  /** @deprecated docs/05: host work is the default, governed by each cell's `cwdMode`. Ignored. */
   allowHostWrites?: boolean;
   /** Bounds a root cell gets for every field its own `bounds` leaves out. Default DEFAULT_ROOT_BOUNDS. */
   rootBounds?: BoundsInit;
@@ -87,9 +96,8 @@ export interface KernelOptions {
   /** Secret values for the Gate's proxy. Default: `NG_SECRET_<REF>` environment variables. */
   secrets?: SecretStore;
   /**
-   * The owner's repository: the working directory of `none`/`shared_ro` cells and the base of `git_worktree`
-   * workspaces. When absent, git_worktree/container workspaces branch from a lazily created empty scratch repository
-   * under `<dataDir>/base-repo`, so they always work.
+   * Default working directory of cells that have no `cwd` anywhere up their tree (e.g. the owner's main repository).
+   * Absent: each such cell gets the kernel's own per-cell directory under `<dataDir>/cells/`.
    */
   repoPath?: string;
   workspace?: Omit<WorkspaceManagerOptions, "db" | "bus" | "clock" | "dataDir" | "inbox" | "resources" | "injectSecret" | "defaultRepoPath">;
@@ -106,11 +114,19 @@ export interface KernelOptions {
   /** Retry delay after a failed Run: `retryBackoffMs · 2^attempts`, capped at `maxRetryBackoffMs`. Defaults 5 s / 5 min. */
   retryBackoffMs?: number;
   maxRetryBackoffMs?: number;
+  /** docs/05 guard 1: consecutive step-limit continuations of one cell before the owner gets a card. Default 3. */
+  maxStepContinuations?: number;
+  /** docs/05 guard 2: grace before a project without any anchor gets its single `kernel.stalled_check`. Default 2 s. */
+  stallGraceMs?: number;
   /** Background errors (bus handlers, cleanup, timers). Default: console.error. */
   onError?: (err: unknown, where: string) => void;
 }
 
-/** Who is asking. Default: the owner. Cells act as `cell:<id>` and may only touch their own descendants. */
+/**
+ * Who is asking. Default: the owner. Cells act as `cell:<id>` and may only touch their own descendants (and, for
+ * watches/schedules/title/meta, themselves). An external main agent acts as `agent:<id>`: it may orchestrate any cell
+ * but never widens bounds, raises budgets or approves outward sends (docs/05 §5.3).
+ */
 export interface ActorOptions {
   principalId?: string;
 }
@@ -132,6 +148,8 @@ export interface IngestResult {
   /** "watch": delivered to the cells watching its thread/filter (the desk is bypassed); "desk": nobody watched it. */
   routedBy: "watch" | "desk";
   cellIds: string[];
+  /** docs/05 §3.3: cells that got it through a coalescing watch (it waits for the window's edge unless they are running). */
+  coalesced?: string[];
 }
 
 export interface IdleOptions {
@@ -263,6 +281,11 @@ export interface Kernel {
   readonly loop: AgentLoop;
   /** Engine of llm cells without `processor.engine` (null: none available — such Runs fail with a clear error). */
   readonly agentBackend: AgentEngine | null;
+  /**
+   * The model switch of a CLI engine (default: the backend engine); null when the switch is off (`modelSwitch`) or
+   * the engine is not a CLI.
+   */
+  modelSettings(engine?: CliEngine): ModelSettings | null;
   readonly dataDir: string;
   readonly deskCellId: string;
   readonly ownerPrincipal: string;
@@ -284,8 +307,9 @@ export interface Kernel {
   spawnCell(parentId: string, spec: CellSpecInput, initialPayload?: unknown, opts?: SpawnOptions): InboxAddr;
   updateCell(cellId: string, patch: Partial<CellSpec>, opts?: ActorOptions): CellRecord;
   /**
-   * Cascade over the subtree in one transaction (epochs, status, pending messages, schedules, watches, approvals,
-   * tokens); the returned promise settles after Runs are aborted, Jobs cancelled and workspaces destroyed.
+   * Cascade over the subtree in one transaction (epochs, status, pending messages, schedules, watches, waits,
+   * approvals, tokens, GTD records); the returned promise settles after Runs are aborted and the runtime is stopped
+   * (Jobs cancelled and confirmed gone, an explicit container removed). Nothing on disk is touched.
    */
   closeCell(cellId: string, reason?: CloseReason, opts?: ActorOptions): Promise<CloseResult>;
   /** Inbox.control as the owner (or `opts.principalId`); the kernel aborts Runs / cancels Jobs / closes on cancel. */
@@ -307,6 +331,39 @@ export interface Kernel {
   tree(opts?: { rootId?: string; includeClosed?: boolean }): CellNode[];
   stats(): KernelStats;
   activeRuns(): RunInfo[];
+
+  // ---------- docs/05 ----------
+  /** Who is writing / queued / idle in which work tree, kernel-wide. */
+  activeWorkspaces(): WorkspaceOccupancy[];
+  /** The five anchors of a (project) cell's subtree; `stalled` = none of them holds. */
+  anchorsOf(cellId: string): AnchorReport;
+  /** Open waits of these cells (all cells when omitted). */
+  listWaits(cellIds?: readonly string[]): WaitRecord[];
+  /**
+   * Cell-to-cell message as `principalId` (default: the owner) — the control plane's twin of RunPorts.sendToCell:
+   * `closed` / `not_found` are answers, not errors.
+   */
+  sendToCell(cellId: string, message: CellMessageDraft, opts?: ActorOptions): SendToCellResult;
+  /** Re-evaluate the stall check now (tests, and the app after it changed GTD records itself). */
+  checkStalls(): void;
+}
+
+/** docs/05 guard 2. A stalled_check wake-up and a Run that only it triggered never count as anchors. */
+export interface AnchorReport {
+  cellId: string;
+  /** @Agent: a Run in flight, due or slot-queued work, or a running Job somewhere in the subtree. */
+  agent: boolean;
+  /** @Waiting(external): an active watch, a future timer/cron, or a message waiting in a batching window. */
+  external: boolean;
+  /** @Waiting(internal): an open wait on another cell that is not closed. */
+  internal: boolean;
+  /** @Human: a pending/snoozed card, or an open action whose ball is the owner's. */
+  human: boolean;
+  /** Paused, or the project's lifecycle is not "active". */
+  parked: boolean;
+  stalled: boolean;
+  /** Human-readable account of what holds (or that nothing does), for the stalled_check message and Radar. */
+  detail: string;
 }
 
 /** RunOutcome plus "error" (the Run threw), as reported on `run.finished`. */

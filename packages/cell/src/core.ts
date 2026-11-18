@@ -8,6 +8,8 @@ import type { Dispatcher } from "./dispatcher";
 import type { Escalations } from "./escalations";
 import type { Lifecycle } from "./lifecycle";
 import type { ReadModel } from "./readmodel";
+import type { StallMonitor } from "./stall";
+import type { Waits } from "./waits";
 
 /** Everything the kernel's modules share. Built once by createKernel; modules are attached after construction. */
 export interface KernelCore {
@@ -27,13 +29,14 @@ export interface KernelCore {
   deskCellId: string;
   ownerPrincipal: string;
   ownerAddresses: readonly string[];
-  allowHostWrites: boolean;
   rootBounds: BoundsInit;
   repoPath: string | undefined;
   leaseMs: number;
   maxConcurrentRuns: number;
   retryBackoffMs: number;
   maxRetryBackoffMs: number;
+  maxStepContinuations: number;
+  stallGraceMs: number;
 
   onError(err: unknown, where: string): void;
   /** Background work idle() must wait for (cleanup after a close, approval executions). */
@@ -41,12 +44,11 @@ export interface KernelCore {
   pendingTasks(): number;
   /** Resolves when the currently tracked tasks have settled. */
   tasksSettled(): Promise<void>;
-  /** Base repository for git_worktree/container when none is configured (created lazily). */
-  ensureScratchRepo(): Promise<string>;
-
   lifecycle: Lifecycle;
   dispatcher: Dispatcher;
   escalations: Escalations;
   approvals: Approvals;
   readModel: ReadModel;
+  waits: Waits;
+  stall: StallMonitor;
 }

@@ -1,9 +1,12 @@
+import { BUILTIN_SKILLS } from "@ng/presets";
 import { asClarifyCard, isEnvelopeOfType, type ActionRecord, type Effort, type ReferenceLink } from "@ng/protocol";
 import type { EngageDetailDTO, EngageItemDTO, EngageListDTO, ReferenceDTO } from "../../shared/api";
 import { actionKey, cardBackedActions, linkedApprovalId, projectOfAction, readActions, readProjects, type DeskKernel, type Located, type ProjectionInput } from "./common";
 import { artifactDTO, button, channelLabelOfAddress, effortLabel, enc, post, sourceInfo } from "./format";
 
 const EFFORTS: readonly Effort[] = ["15m", "45m", "low_energy"];
+/** The agents' own playbooks (seeded at boot): not something the owner works with, so not in their context pack. */
+const AGENT_PLAYBOOKS: ReadonlySet<string> = new Set(BUILTIN_SKILLS.map((s) => s.name));
 
 export function isEffort(v: unknown): v is Effort {
   return typeof v === "string" && (EFFORTS as readonly string[]).includes(v);
@@ -137,7 +140,10 @@ export function projectEngageDetail(input: ProjectionInput, cellId: string, acti
     artifact: r.artifactId ? artifactDTO(kernel, r.artifactId, now) : null,
     contextPack: {
       references,
-      skills: kernel.context.listSkillsSync(cellId).map((s) => ({ name: s.name, description: s.description })),
+      skills: kernel.context
+        .listSkillsSync(cellId)
+        .filter((s) => !AGENT_PLAYBOOKS.has(s.name))
+        .map((s) => ({ name: s.name, description: s.description })),
       rawInput: raw && source ? { text: raw, source } : null,
       prepSummary: card?.prep.summary || null,
     },

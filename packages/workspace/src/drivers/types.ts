@@ -12,6 +12,8 @@ export interface DriverDeps {
   slugOf(cellId: string): string;
   /** Host directory holding the cell's job logs and exit files (mounted into containers). */
   jobsDirOf(cellId: string): string;
+  /** The kernel's own per-cell directory under the data dir: the cwd of a host cell that was given none. Never removed. */
+  cellDirOf(cellId: string): string;
 }
 
 export interface Provisioned {
@@ -62,4 +64,9 @@ export interface IsolationDriver {
   /** Signal processes carrying `marker` that live outside the host process group (inside a container). */
   killInside?(ws: WorkspaceRecord, marker: Marker, sig: "TERM" | "KILL"): Promise<void>;
   release(ws: WorkspaceRecord, mode: "destroy" | "hibernate"): Promise<ReleaseResult>;
+  /**
+   * Stop what the kernel itself keeps running for this workspace (a container). Returns warnings. Must not remove or
+   * rewrite anything on disk. Drivers with no runtime of their own leave it out.
+   */
+  stopRuntime?(ws: WorkspaceRecord): Promise<string[]>;
 }

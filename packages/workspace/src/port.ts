@@ -74,19 +74,29 @@ export function createPort(deps: PortDeps, driver: IsolationDriver, initial: Wor
   const killInsideFor = (ws: WorkspaceRecord, marker: Marker) =>
     driver.killInside ? (sig: "TERM" | "KILL") => void driver.killInside!(ws, marker, sig).catch(() => {}) : undefined;
 
-  const bash = async (ws: WorkspaceRecord, args: { command: string; timeoutMs?: number | undefined; cwd?: string | undefined }, signal?: AbortSignal): Promise<ExecResult> => {
-    writable("bash");
-    const cwd = args.cwd ? resolveWorkspacePath(policy, args.cwd).abs : root;
+  const directory = (given: string | undefined): string => {
+    const cwd = given ? resolveWorkspacePath(policy, given).abs : root;
     let isDir = false;
     try {
       isDir = statSync(cwd).isDirectory();
     } catch {
       isDir = false;
     }
-    if (!isDir) throw new NgError("invalid_argument", `cwd is not a directory: ${args.cwd}`);
-    const timeoutMs = Math.min(args.timeoutMs ?? limits.bashTimeoutMs, limits.maxBashTimeoutMs);
+    if (!isDir) throw new NgError("invalid_argument", `not a directory: ${given}`);
+    return cwd;
+  };
+
+  /** One supervised command (argv, no shell of its own) with collected output, a time limit and abort. */
+  const runCommand = async (
+    ws: WorkspaceRecord,
+    what: string,
+    argv: string[],
+    o: { cwd: string; timeoutMs?: number | undefined; env?: Readonly<Record<string, string>> },
+    signal?: AbortSignal,
+  ): Promise<ExecResult> => {
+    const timeoutMs = Math.min(o.timeoutMs ?? limits.bashTimeoutMs, limits.maxBashTimeoutMs);
     const marker = { name: EXEC_MARKER, value: newId("exec", deps.clock) };
-    const plan = driver.plan(ws, { argv: [driver.shell(), "-c", args.command], cwd, env: deps.sandboxEnv(cellId), marker });
+    const plan = driver.plan(ws, { argv, cwd: o.cwd, env: { ...deps.sandboxEnv(cellId), ...o.env }, marker });
     const child = deps.runner.spawn({ ...plan, detached: true, stdio: ["ignore", "pipe", "pipe"] });
     const out = new OutputCollector(limits.maxOutputChars);
     const r = await supervise(child, {
@@ -96,7 +106,7 @@ export function createPort(deps: PortDeps, driver: IsolationDriver, initial: Wor
       onData: (chunk) => out.push(chunk),
       killInside: killInsideFor(ws, marker),
     });
-    if (r.spawnError) throw new NgError("unsupported", `bash could not start: ${r.spawnError.message}`);
+    if (r.spawnError) throw new NgError("unsupported", `${what} could not start: ${r.spawnError.message}`);
     if (r.aborted) throw abortError(signal);
     let exitCode = r.code ?? signalExitCode(r.signal);
     if (r.timedOut) {
@@ -104,6 +114,11 @@ export function createPort(deps: PortDeps, driver: IsolationDriver, initial: Wor
       out.push(`\n[timed out after ${timeoutMs}ms; the command and its process group were killed]\n`);
     }
     return out.truncated ? { output: out.text(), exitCode, truncated: true } : { output: out.text(), exitCode };
+  };
+
+  const bash = (ws: WorkspaceRecord, args: { command: string; timeoutMs?: number | undefined; cwd?: string | undefined }, signal?: AbortSignal): Promise<ExecResult> => {
+    writable("bash");
+    return runCommand(ws, "bash", [driver.shell(), "-c", args.command], { cwd: directory(args.cwd), timeoutMs: args.timeoutMs }, signal);
   };
 
   const exec = async (tool: ToolKind, args: unknown, signal?: AbortSignal): Promise<ExecResult> => {
@@ -167,6 +182,7 @@ export function createPort(deps: PortDeps, driver: IsolationDriver, initial: Wor
     root,
     exec,
     async startJob(spec) {
+      writable("starting a job");
       return deps.jobs.start(current(), driver, spec);
     },
     async observeJob(jobId) {

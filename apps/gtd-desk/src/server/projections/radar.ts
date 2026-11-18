@@ -1,6 +1,6 @@
 import type { CellNode } from "@ng/cell";
 import { asClarifyCard, compareBallOwner, topBallOwner, type ActionRecord, type BallOwner, type ProjectRecord } from "@ng/protocol";
-import { BALL_LABEL, type ButtonDTO, type ProgressDTO, type ProjectActionDTO, type ProjectRowDTO, type RadarDTO, type WaitingDTO } from "../../shared/api";
+import { BALL_LABEL, type ButtonDTO, type ProgressDTO, type ProjectActionDTO, type ProjectRowDTO, type ProjectWorkerDTO, type RadarDTO, type WaitingDTO } from "../../shared/api";
 import { actionKey, approvalProjectId, cardBackedActions, projectOfAction, readActions, readProjects, type Located, type ProjectionInput } from "./common";
 import { button, enc, ownerLabel, post, progressDTO, waitingDeadline, waitingDTO } from "./format";
 import { projectReview } from "./review";
@@ -23,14 +23,22 @@ function flatten(nodes: readonly CellNode[], into = new Map<string, CellNode>())
   return into;
 }
 
+function nodeState(n: CellNode, due: ReadonlySet<string>): ProjectWorkerDTO["state"] {
+  if (n.running || n.runningJobs > 0 || (n.status === "active" && due.has(n.cellId))) return "running";
+  if (n.status === "paused") return "paused";
+  if (n.watching || n.nextTimerAt !== null) return "waiting";
+  return "idle";
+}
+
 function subtreeActivity(node: CellNode | undefined, due: ReadonlySet<string>): Activity {
   const a: Activity = { running: 0, waiting: 0, busyLine: null };
   const walk = (n: CellNode) => {
     if (n.status !== "closed") {
-      if (n.running || n.runningJobs > 0 || (n.status === "active" && due.has(n.cellId))) {
+      const s = nodeState(n, due);
+      if (s === "running") {
         a.running++;
         a.busyLine ??= n.statusLine;
-      } else if (n.watching || n.nextTimerAt !== null) {
+      } else if (s === "waiting") {
         a.waiting++;
       }
     }
@@ -38,6 +46,20 @@ function subtreeActivity(node: CellNode | undefined, due: ReadonlySet<string>): 
   };
   if (node) walk(node);
   return a;
+}
+
+/** The live cells below a project (its workers and watchers, and theirs), excluding cells that are projects of their own. */
+function workersOf(node: CellNode | undefined, due: ReadonlySet<string>, projectCells: ReadonlySet<string>): ProjectWorkerDTO[] {
+  const out: ProjectWorkerDTO[] = [];
+  const walk = (n: CellNode) => {
+    for (const c of n.children) {
+      if (c.status === "closed" || projectCells.has(c.cellId)) continue;
+      out.push({ cellId: c.cellId, title: c.title ?? c.cellId, preset: c.preset, state: nodeState(c, due), statusLine: c.statusLine });
+      walk(c);
+    }
+  };
+  if (node) walk(node);
+  return out;
 }
 
 function actionText(r: ActionRecord, now: number): { text: string; progress: ProgressDTO | null; waiting: WaitingDTO | null } {
@@ -117,11 +139,9 @@ export function radarProjects(input: ProjectionInput): Omit<RadarDTO, "review"> 
   }
   const onCard = cardBackedActions(kernel, [...actionsByProject.values()].flat());
   const visibleCards = new Map<string, { id: string; title: string }>();
-  const anyCards = new Set<string>();
   for (const rec of kernel.gate.listPendingSync({ includeSnoozed: true })) {
     const pid = approvalProjectId(kernel, rec);
     if (!pid) continue;
-    anyCards.add(pid);
     if (rec.snoozedUntil === null || rec.snoozedUntil <= now) {
       const card = asClarifyCard(rec.card.data);
       if (!visibleCards.has(pid)) visibleCards.set(pid, { id: rec.actionId, title: card?.title ?? rec.card.title ?? rec.action.summary });
@@ -134,7 +154,13 @@ export function radarProjects(input: ProjectionInput): Omit<RadarDTO, "review"> 
     if (r.lifecycle !== "active" && r.lifecycle !== "someday") continue;
     const cell = kernel.getCell(p.cellId);
     const paused = cell?.status === "paused";
-    const act = subtreeActivity(nodes.get(p.cellId), due);
+    // docs/05 guard 2: the kernel's five-anchor check (whole subtree, waits, cards, the owner's actions) stamps the
+    // record; the app has no stall rule of its own. A stamp that a pause has not cleared yet does not count. A stalled
+    // project has, by the kernel's account, nothing running and nothing it waits for — the pending stall notice itself
+    // looks like a timer to the cell tree, so its activity is not counted.
+    const stalledSince = r.lifecycle === "active" && !paused && typeof r.stalledSince === "number" ? r.stalledSince : null;
+    const stalled = stalledSince !== null;
+    const act = stalled ? { running: 0, waiting: 0, busyLine: null } : subtreeActivity(nodes.get(p.cellId), due);
     const open = (actionsByProject.get(p.cellId) ?? []).filter((a) => a.record.status === "open");
     open.sort((a, b) => compareBallOwner(a.record.owner, b.record.owner) || (a.record.dueAt ?? Infinity) - (b.record.dueAt ?? Infinity) || a.record.createdAt - b.record.createdAt);
     const openActions: ProjectActionDTO[] = open.map((a) => {
@@ -173,12 +199,12 @@ export function radarProjects(input: ProjectionInput): Omit<RadarDTO, "review"> 
       ball = { owner: "waiting", label: BALL_LABEL.waiting, text: "等待外部回复" };
     }
 
-    const stalled =
-      r.lifecycle === "active" && !paused && act.running === 0 && act.waiting === 0 && !todos.some((a) => a.record.owner === "human") && !anyCards.has(p.cellId);
     rows.push({
       id: p.cellId,
       title: r.title,
       outcome: r.outcome ?? null,
+      summary: typeof r.summary === "string" && r.summary ? r.summary : null,
+      cwd: typeof r.cwd === "string" && r.cwd ? r.cwd : (cell?.spec.cwd ?? null),
       lifecycle: r.lifecycle,
       paused,
       ball,
@@ -188,8 +214,10 @@ export function radarProjects(input: ProjectionInput): Omit<RadarDTO, "review"> 
       pendingCardId: card?.id ?? null,
       stalled,
       stalledText: stalled ? STALLED_TEXT : null,
+      stalledSince,
       running: act.running,
       waitingOn: act.waiting,
+      workers: workersOf(nodes.get(p.cellId), due, projectCells),
       createdAt: r.createdAt,
       updatedAt: r.updatedAt,
       buttons: projectButtons(p.cellId, r, paused, stalled),

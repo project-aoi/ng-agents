@@ -66,7 +66,7 @@ async function eventually<T>(read: () => Promise<T>, ok: (v: T) => boolean, what
   }
 }
 
-describe("demo mode: docs/03 §四 played through the real kernel and presets", () => {
+describe("demo mode: the workbench's scenarios played through the real kernel and presets", () => {
   it("every view has content after the seed, and a restart on the same data directory does not seed again", async () => {
     const dataDir = tempDir("demo");
     const logs: string[] = [];
@@ -82,7 +82,7 @@ describe("demo mode: docs/03 §四 played through the real kernel and presets", 
     expect(status.today.archivedNotifications).toBeGreaterThan(0);
     expect(status.background.running).toBeGreaterThan(0);
 
-    // 📥 Clarify: the three card types of docs/04 §2.2 plus a fan-out result.
+    // 📥 Clarify: a reply waiting for the owner (redrafted after a follow-up) and a proposal raised by a source hit.
     const clarify = await d.get<ClarifyQueueDTO>("/api/clarify");
     const byType = (t: string) => clarify.cards.filter((c) => c.cardType === t);
     const reply = byType("response").find((c) => c.reply?.confirmVerb === "send");
@@ -90,19 +90,13 @@ describe("demo mode: docs/03 §四 played through the real kernel and presets", 
     expect(reply!.draft!.body).toContain("日期区间");
     expect(byType("project_proposal")).toEqual([expect.objectContaining({ title: "报表导出性能优化", sourceBar: expect.objectContaining({ source: expect.objectContaining({ label: "信源 · 客服反复反馈：报表导出卡住" }) }) })]);
     expect(byType("project_proposal")[0]!.proposal!.actions.map((a) => a.owner)).toEqual(["agent", "human", "agent"]);
-    const nudge = byType("escalation")[0]!;
-    expect(nudge).toMatchObject({ escalation: { reason: "waiting_timeout" }, reply: { confirmVerb: "send" } });
-    expect(nudge.escalation!.waiting!.text).toContain("已回 2/3");
-    expect(nudge.buttons.map((b) => b.id).slice(0, 3)).toEqual(["confirm", "extend", "resolve_offline"]);
-    const fanOut = byType("response").find((c) => c.reply?.confirmVerb === "accept");
-    expect(fanOut?.title).toBe("调研 5 家 APM 监控方案：结果已齐 5/5");
-    expect(fanOut!.draft!.body).toContain("**OpenTelemetry + Tempo**");
 
-    // 🎯 Engage: quick check-offs and one deep item with a decision passage and a parked background addition.
+    // 🎯 Engage: a reminder that came due, a project's human action, and one deep item with a decision passage and a
+    // parked background addition.
     const engage = await d.get<EngageListDTO>("/api/engage");
     const quick = engage.items.filter((i) => i.kind === "quick");
-    expect(quick.map((i) => i.title)).toEqual(expect.arrayContaining(["给 HR 回电话，确认后端候选人周五的面试时间", "申请 GitLab、VPN 和堡垒机账号"]));
-    expect(quick.find((i) => i.title.startsWith("给 HR"))).toMatchObject({ overdue: true, source: { label: "定时提醒" } });
+    expect(quick.find((i) => i.title.startsWith("给 HR"))).toMatchObject({ overdue: true, source: { label: "定时提醒" }, project: null });
+    expect(quick.find((i) => i.title === "要 Doubao work 的代码")).toMatchObject({ project: { title: "Harness 对比" } });
     const deep = engage.items.find((i) => i.kind === "deep")!;
     expect(deep).toMatchObject({ title: "回复李总：MySQL 8.0 迁移方案", send: { state: "ready" } });
     const detail = await d.get<EngageDetailDTO>(`/api/engage/${deep.cellId}/${deep.actionId}`);
@@ -113,27 +107,31 @@ describe("demo mode: docs/03 §四 played through the real kernel and presets", 
     expect(detail.contextPack.references.length).toBeGreaterThan(0);
     expect(detail.contextPack.rawInput?.text).toContain("MySQL 5.7 升 8.0");
 
-    // 🧭 Radar: projects in different ball states.
+    // 🧭 Radar: a project running with one worker result in, one waiting on the owner, one waiting on a reply, and a
+    // parked idea with its report.
     const radar = await d.get<RadarDTO>("/api/radar");
     const row = (title: string) => radar.projects.find((p) => p.title === title)!;
-    expect(radar.projects.length).toBeGreaterThanOrEqual(5);
-    expect(row("压测服务器采购比价")).toMatchObject({ ball: { owner: "waiting" }, waiting: { replied: 2, total: 3 }, stalled: false });
-    expect(row("压测服务器采购比价").waiting!.text).toMatch(/已回 2\/3 · 剩 北辰网络/);
-    expect(row("整理 6 家竞品的权限模型")).toMatchObject({ ball: { owner: "agent" }, progress: { done: 3, total: 6 } });
-    expect(row("整理 6 家竞品的权限模型").running).toBeGreaterThan(0);
-    expect(row("排查支付回调偶发 500").ball?.owner).toBe("agent");
-    expect(row("Q4 技术分享会")).toMatchObject({ stalled: true, stalledText: expect.any(String) });
-    expect(row("收齐 Q4 OKR 自评").ball).toMatchObject({ owner: "human", cardId: nudge.id });
-    expect(row("后端新人入职准备").ball).toMatchObject({ owner: "human", engage: expect.any(Object) });
-    expect(radar.counts.stalled).toBe(1);
+    expect(radar.projects.map((p) => p.title).sort()).toEqual(["Harness 对比", "压测服务器采购比价", "排查支付回调偶发 500"].sort());
+    expect(row("排查支付回调偶发 500")).toMatchObject({ ball: { owner: "agent" }, summary: expect.stringContaining("已定位"), stalled: false });
+    expect(row("排查支付回调偶发 500").workers).toEqual([expect.objectContaining({ title: "修复幂等键过期并补并发测试", state: "running" })]);
+    expect(row("Harness 对比")).toMatchObject({ ball: { owner: "human", engage: expect.any(Object) }, summary: expect.stringContaining("trae 部分已分析完"), stalled: false });
+    expect(row("压测服务器采购比价")).toMatchObject({ ball: { owner: "waiting" }, waiting: { replied: 0, total: 1 }, stalled: false });
+    expect(row("压测服务器采购比价").ball!.text).toContain("北辰网络");
+    expect(row("压测服务器采购比价").workers.map((w) => [w.preset, w.state])).toEqual([["watcher", "waiting"]]);
+    expect(radar.someday).toEqual([expect.objectContaining({ title: "极简模式", lifecycle: "someday", paused: true, summary: expect.stringContaining("调研报告") })]);
+    expect(radar.counts).toMatchObject({ active: 3, someday: 1, stalled: 0 });
+    const report = await d.get<{ title: string; body: string }>("/api/artifacts/art_demo_minimal");
+    expect(report).toMatchObject({ title: "极简模式调研报告" });
+    expect(report.body).toContain("Cursor");
 
-    // ⚡ Sources: a silent zero-token check, a model filter that hit once, an observe-mode probe with notes.
+    // ⚡ Sources: a silent zero-token check, a model filter that hit once, an observe-mode probe, a hub.
     const sources = await d.get<SourcesDTO>("/api/sources");
     const sensor = (title: string) => sources.sensors.find((s) => s.title === title)!;
     expect(sensor("核心指标巡检")).toMatchObject({ processor: "code", hitCount: 0, status: "ok" });
     expect(sensor("核心指标巡检").runCount).toBeGreaterThanOrEqual(2);
     expect(sensor("客服群反馈挖掘")).toMatchObject({ mode: "active", hitCount: 1 });
     expect(sensor("研发群支付报错探头")).toMatchObject({ mode: "observe", runCount: 4, hitCount: 2 });
+    expect(sensor("代码评审直通")).toMatchObject({ kind: "channel" });
     expect(sources.channels.map((c) => c.id)).toEqual(expect.arrayContaining(["ui", "demo"]));
 
     // Activity: archived notifications, saved notes, reminders, a withdrawn card, sent replies.
@@ -165,7 +163,7 @@ describe("demo mode: docs/03 §四 played through the real kernel and presets", 
     expect((await d2.get<ActivityListDTO>("/api/activity")).items).toHaveLength(before.activity);
   });
 
-  it("answers live input: a link is saved, a reminder is set, anything else gets an honest demo note, a card can be revised", async () => {
+  it("answers live input: a link is saved, a reminder is set, anything else gets an honest demo note, a card can be revised, a ticked-off action moves its project on", async () => {
     const server = await bootDemo(tempDir("demo-live"));
     cleanupAfter(server);
     const d = api(server);
@@ -192,15 +190,16 @@ describe("demo mode: docs/03 §四 played through the real kernel and presets", 
     );
     expect(redrafted.cards.find((c) => c.id === card.id)!.draft!.body).toMatch(/^您好，/);
 
-    // A background result card is redrafted by the item's own helper (the editor), same card, next version.
-    const result = redrafted.cards.find((c) => c.title.startsWith("调研 5 家 APM"))!;
-    await d.post<ClarifyMutationResponse>(`/api/clarify/${result.id}/revise`, { instruction: "补一句：推荐先试 OpenTelemetry" });
-    const after = await eventually(
-      () => d.get<ClarifyQueueDTO>("/api/clarify"),
-      (q) => q.cards.some((c) => c.id === result.id && c.sourceBar.version === 2),
-      "the result redraft",
+    // The owner got the code: ticking the project's action off wakes it, it sends a worker on, the report grows.
+    const action = (await d.get<EngageListDTO>("/api/engage")).items.find((i) => i.title === "要 Doubao work 的代码")!;
+    await d.post(`/api/engage/${action.cellId}/${action.actionId}/done`, { note: "代码在 ~/code/doubao" });
+    const radar = await eventually(
+      () => d.get<RadarDTO>("/api/radar"),
+      (v) => v.projects.some((p) => p.title === "Harness 对比" && p.summary?.includes("两边都分析完了") === true),
+      "the Harness project moving on",
     );
-    expect(after.cards.find((c) => c.id === result.id)!.draft!.body).toContain("推荐先试 OpenTelemetry");
+    expect(radar.projects.find((p) => p.title === "Harness 对比")).toMatchObject({ ball: { owner: "human", text: expect.stringContaining("对比报告") }, stalled: false });
+    expect(await d.get<{ version: number; body: string }>("/api/artifacts/art_demo_harness")).toMatchObject({ version: 2, body: expect.stringContaining("Doubao work") });
   });
 });
 

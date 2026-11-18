@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { gtdKeys, PAYLOAD, type ProjectProposal } from "@ng/protocol";
-import { defineSensorCheck, OBSERVATION_NOTE, readCoordinator, type SensorHit } from "../src";
-import { boot, cleanupAll, DAY, roots, T0, tool, type Harness } from "./helpers";
+import { defineSensorCheck, OBSERVATION_NOTE, type SensorHit } from "../src";
+import { boot, cleanupAll, DAY, projects, T0, tool, type Harness } from "./helpers";
 
 afterEach(cleanupAll);
 
@@ -54,7 +54,6 @@ describe("docs/03 §四 row 1 — a sensor is a source, not a task", () => {
           { title: "和增长组同步结论", owner: "human", effort: "15m", nextStep: "约增长组开 15 分钟短会" },
         ],
         prep: { summary: "对比了上周与本周的注册漏斗指标" },
-        research: true,
       });
     });
     h.clock.set(MONDAY_9 + 7 * DAY);
@@ -82,30 +81,31 @@ describe("docs/03 §四 row 1 — a sensor is a source, not a task", () => {
     expect(await h.kernel.resolveApproval(card.actionId, { decision: "approve", seenArtifactVersion: 1 })).toMatchObject({ status: "version_mismatch", currentVersion: 2 });
 
     // Approve v2 → the project starts with the edited plan, before (and without) any model call of the desk.
-    h.script.setDefault("worker", () => ({ text: "（调研中）" }));
     const deskCalls = h.script.callsOf("desk").length;
     expect(await h.kernel.resolveApproval(card.actionId, { decision: "approve", seenArtifactVersion: 2 })).toEqual({ status: "approved", actionId: card.actionId });
     await h.kernel.idle();
     expect(h.script.callsOf("desk")).toHaveLength(deskCalls);
 
-    const [root] = roots(h);
-    expect(root).toBeDefined();
-    expect(h.project(root!)).toMatchObject({ title: "排查注册转化率下跌", outcome: "找到下跌原因并给出修复方案", lifecycle: "active", source: { label: "信源 · 注册转化率下跌" } });
-    const acts = h.actions(root);
+    const [project] = projects(h);
+    expect(project).toBeDefined();
+    expect(h.kernel.getCell(project!)).toMatchObject({ preset: "project", status: "active", parentId: "desk" });
+    expect(h.project(project!)).toMatchObject({
+      title: "排查注册转化率下跌",
+      outcome: "找到下跌原因并给出修复方案",
+      lifecycle: "active",
+      source: { label: "信源 · 注册转化率下跌" },
+      proposal: { actions: expect.arrayContaining([expect.objectContaining({ title: "确认埋点没有漏报" })]) },
+    });
+    // The approved plan is on the project's books; the project decides when each step is dispatched.
+    const acts = h.actions(project);
     expect(acts.map((a) => [a.title, a.owner, a.status, a.nextStep ?? null])).toEqual([
       ["拉取近两周注册漏斗数据，定位下跌环节", "agent", "open", null],
       ["和增长组同步结论", "human", "open", "约增长组开 15 分钟短会"],
       ["确认埋点没有漏报", "agent", "open", null],
     ]);
-    expect(acts.every((a) => a.projectCellId === root)).toBe(true);
-    const workers = h.kernel.listCells({ parentId: root! });
-    expect(workers.map((w) => [w.preset, w.status, w.bounds.isolation])).toEqual([
-      ["worker", "active", "none"],
-      ["worker", "active", "none"],
-    ]);
+    expect(acts.every((a) => a.projectCellId === project)).toBe(true);
     expect(h.cards()).toEqual([]);
     expect(h.notices()).toContain("已立项：排查注册转化率下跌，后台开始推进");
-    expect((await readCoordinatorSync(h, root!))?.finished).toBeNull();
   });
 
   it("observe mode: a hit only goes to the observation notes, never to the desk", async () => {
@@ -149,11 +149,6 @@ describe("docs/03 §四 row 1 — a sensor is a source, not a task", () => {
     expect(h.cards()).toEqual([]);
   });
 });
-
-async function readCoordinatorSync(h: Harness, rootId: string) {
-  void readCoordinator;
-  return h.state<{ finished: string | null }>(rootId, "coord:state");
-}
 
 describe("docs/03 §四 row 2 — personal zero-side-effect items: done at once, no card", () => {
   it("a link for the reading list: note + activity + light notice, nothing in Clarify", async () => {

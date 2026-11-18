@@ -66,8 +66,16 @@ export interface ContextStoreOptions {
   registry?: Registry;
   /** Overrides the registry lookup. Return the preset/system prompt text for a cell ("" for none). */
   resolvePrompt?: (spec: CellSpec, cell: CellRecord) => string;
-  /** In-flight children roster for the volatile tail. Default: active/paused children + their `cell:status` state. */
+  /**
+   * In-flight children roster for the volatile tail. Default: active/paused children + their `cell:status` state.
+   * A provider may return a whole subtree in tree order (`depth` > 1 entries are indented under their parent).
+   */
   rosterProvider?: (cellId: string) => ChildSummary[];
+  /**
+   * [docs/05] Extra volatile notes for the tail (active workspaces, open waits): each non-blank note becomes one user
+   * text message, verbatim, after the roster and before the batch, and is listed in `tail.notes`. Never persisted.
+   */
+  tailNotesProvider?: (cellId: string) => string[];
   /**
    * Compaction summariser. Default: a deterministic truncating summary (no model). When one is injected, only the
    * async paths (`hydrate`, `compact`) compact; `hydrateSync` never calls it and leaves an over-budget history as is.

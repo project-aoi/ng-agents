@@ -16,8 +16,10 @@ import type {
   EngageListDTO,
   FocusResponse,
   HttpMethod,
+  ModelsDTO,
   RadarDTO,
   SourcesDTO,
+  SetModelRequest,
   SourcesMutationResponse,
   StatusDTO,
   WeeklyReviewDTO,
@@ -139,6 +141,9 @@ export const api = {
   status: () => request<StatusDTO>("GET", "/api/status"),
   capture: (req: CaptureRequest) => request<CaptureResponse>("POST", "/api/capture", req),
   focus: (on: boolean, keepalive = false) => request<FocusResponse>("POST", "/api/focus", { on }, { keepalive }),
+  /** The CLI agent's models; `refresh` asks the CLI again instead of using the cached list. */
+  models: (refresh = false) => request<ModelsDTO>("GET", refresh ? "/api/models?refresh=1" : "/api/models"),
+  setModel: (req: SetModelRequest) => request<ModelsDTO>("PUT", "/api/models", req),
 
   clarify: () => request<ClarifyQueueDTO>("GET", "/api/clarify"),
 

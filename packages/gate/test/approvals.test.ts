@@ -1,10 +1,32 @@
 import { describe, expect, it } from "vitest";
-import { makeBounds, serializeBounds } from "@ng/protocol";
-import { expectType, meta, putArtifact, send, setup } from "./helpers";
+import { isNgError, makeBounds, serializeBounds, type ProposedAction } from "@ng/protocol";
+import { ownerOnlyApproval } from "../src";
+import { OWNER_UI, expectType, meta, putArtifact, send, setup } from "./helpers";
 
 function deferDraft(f: ReturnType<typeof setup>, subjectKey = "msg:1") {
   putArtifact(f.db, { artifactId: "a1", cellId: "desk", version: 1, body: "v1 by agent" });
   return expectType(f.gate.authorizeSync(send("channel:feishu:oc_1", { artifactId: "a1", subjectKey }), meta("desk")), "defer");
+}
+
+function custom(name: string, over: Record<string, unknown> = {}): ProposedAction {
+  return { type: "custom", name, summary: name, subjectKey: `s:${name}`, sideEffect: "external", ...over } as ProposedAction;
+}
+
+/** An escalation card the way request_approval (kind escalation) or the kernel builds it. */
+function escalationCard(reason: string) {
+  const data = { cardType: "escalation", escalation: { reason, explanation: "x" } };
+  return { format: "card" as const, title: reason, body: reason, data };
+}
+
+/** Runs `fn`, expects NgError("bounds_violation"), returns its message. */
+function refusal(fn: () => unknown): string {
+  try {
+    fn();
+  } catch (e) {
+    expect(isNgError(e, "bounds_violation"), String(e)).toBe(true);
+    return (e as Error).message;
+  }
+  throw new Error("expected a bounds_violation refusal");
 }
 
 describe("approve — version-bound confirmation", () => {
@@ -92,19 +114,120 @@ describe("approve — version-bound confirmation", () => {
     expect(f.gate.approvalStatsSync().find((s) => s.actionClass === "channel.send|channel:feishu:*")).toMatchObject({ approved: 1, denied: 1 });
   });
 
-  it("a cell can never approve, deny or raise budgets", () => {
+  it("a cell (or any principal but the owner and an agent) can never approve, deny or raise budgets", () => {
     const f = setup();
-    const d = expectType(f.gate.authorizeSync(send("channel:feishu:oc_1"), meta("desk")), "defer");
-    expect(() => f.gate.approveSync(d.actionId, "cell:desk")).toThrow(/cell principal/);
-    expect(() => f.gate.denySync(d.actionId, "cell:desk")).toThrow(/cell principal/);
-    expect(() => f.gate.raiseBudgetSync("desk", { tokens: 1 }, "cell:desk")).toThrow(/cell principal/);
+    const d = expectType(f.gate.authorizeSync(custom("merge"), meta("desk")), "defer");
+    for (const who of ["cell:desk", "feishu:ou_colleague", "agent:", "agent:a:b", "someone"]) {
+      expect(refusal(() => f.gate.approveSync(d.actionId, who)), who).toMatch(new RegExp(`needs the owner or an agent on the control plane; ${who} may not`));
+      expect(refusal(() => f.gate.denySync(d.actionId, who)), who).toMatch(/needs the owner or an agent/);
+      expect(refusal(() => f.gate.raiseBudgetSync("desk", { tokens: 1 }, who)), who).toMatch(new RegExp(`raising a budget needs the owner; ${who} may not`));
+    }
+    expect(() => f.gate.approveSync(d.actionId, "")).toThrow(/principal required/);
     expect(f.gate.getApprovalSync(d.actionId)!.status).toBe("pending");
+    expect(f.gate.usageSync("desk").raisedTokens).toBe(0);
   });
 
   it("the async approve delegates", async () => {
     const f = setup();
     const d = expectType(f.gate.authorizeSync(send("channel:feishu:oc_1"), meta("desk")), "defer");
     await expect(f.gate.approve(d.actionId, "owner")).resolves.toBe("approved");
+  });
+});
+
+describe("approve — an external main agent (agent:*) orchestrates but is never the owner (docs/05 guard 3)", () => {
+  const AGENT = "agent:ops";
+
+  it("may approve project proposals, custom actions and blocked / retry_limit / waiting_timeout escalations", () => {
+    const f = setup();
+    const project = expectType(
+      f.gate.authorizeSync(
+        { type: "project.start", summary: "立项", subjectKey: "msg:p", sideEffect: "external", proposal: { title: "竞品调研", outcome: "", actions: [] } },
+        meta("desk"),
+      ),
+      "defer",
+    );
+    const cards = [
+      project.actionId,
+      expectType(f.gate.authorizeSync(custom("merge"), meta("desk")), "defer").actionId,
+      expectType(f.gate.authorizeSync(custom("escalation.blocked", { card: escalationCard("blocked") }), meta("desk")), "defer").actionId,
+      expectType(f.gate.authorizeSync(custom("escalation.waiting_timeout"), meta("desk")), "defer").actionId,
+      expectType(
+        f.gate.authorizeSync(custom("kernel.escalation", { args: { kernel: true, reason: "retry_limit", cellId: "desk" }, card: escalationCard("retry_limit") }), meta("desk")),
+        "defer",
+      ).actionId,
+    ];
+    for (const id of cards) {
+      expect(f.gate.approveSync(id, AGENT)).toBe("approved");
+      expect(f.gate.getApprovalSync(id)).toMatchObject({ status: "approved", approverId: AGENT });
+    }
+    // trust statistics stay the owner's own judgement
+    expect(f.gate.approvalStatsSync()).toEqual([]);
+  });
+
+  it("may not approve a send that leaves the owner's own channels; the card stays pending for the owner", () => {
+    const f = setup();
+    const d = expectType(f.gate.authorizeSync(send("channel:feishu:oc_1"), meta("desk")), "defer");
+    expect(refusal(() => f.gate.approveSync(d.actionId, AGENT))).toMatch(
+      /approving this card needs the owner \(it sends to channel:feishu:oc_1, outside the owner's own channels\); agent:ops may not/,
+    );
+    expect(f.gate.getApprovalSync(d.actionId)).toMatchObject({ status: "pending", approverId: null });
+    expect(f.gate.approveSync(d.actionId, "owner")).toBe("approved");
+    // refused even once decided: the answer does not depend on timing
+    expect(refusal(() => f.gate.approveSync(d.actionId, AGENT))).toMatch(/needs the owner/);
+
+    // a send to the owner's own channel (declared external, so it became a card) is not owner-only
+    const own = expectType(f.gate.authorizeSync(send(OWNER_UI, { subjectKey: "note" }), meta("desk")), "defer");
+    expect(f.gate.approveSync(own.actionId, AGENT)).toBe("approved");
+  });
+
+  it("may not approve a budget_exhausted escalation, however it is recognisable", () => {
+    const f = setup();
+    const kernelArgs = { kernel: true, reason: "budget_exhausted", cellId: "desk", limitedBy: "desk" };
+    const cards = [
+      custom("escalation.budget_exhausted", { card: escalationCard("budget_exhausted") }), // request_approval
+      custom("kernel.escalation", { args: kernelArgs }), // the kernel's own card (args only)
+      custom("kernel.escalation", { args: { ...kernelArgs, reason: "retry_limit" }, card: escalationCard("budget_exhausted"), subjectKey: "s:card" }), // card only
+    ].map((a) => expectType(f.gate.authorizeSync(a, meta("desk")), "defer").actionId);
+    for (const id of cards) {
+      expect(refusal(() => f.gate.approveSync(id, AGENT))).toMatch(/needs the owner \(it continues past an exhausted budget\); agent:ops may not/);
+      expect(f.gate.getApprovalSync(id)!.status).toBe("pending");
+    }
+    expect(f.gate.approveSync(cards[0]!, "owner")).toBe("approved");
+  });
+
+  it("may deny and snooze any card, owner-only ones included", () => {
+    const f = setup();
+    const a = expectType(f.gate.authorizeSync(send("channel:feishu:oc_1", { subjectKey: "a" }), meta("desk")), "defer");
+    const b = expectType(f.gate.authorizeSync(custom("escalation.budget_exhausted"), meta("desk")), "defer");
+    expect(f.gate.denySync(a.actionId, AGENT, "不回了")).toBe("denied");
+    expect(f.gate.getApprovalSync(a.actionId)).toMatchObject({ status: "denied", approverId: AGENT, statusReason: "不回了" });
+    expect(f.gate.snoozeSync(b.actionId, f.clock.now() + 60_000)).toBe("snoozed");
+    expect(f.gate.withdrawSync(b.actionId, "resolved offline")).toBe("cancelled");
+    expect(f.gate.approvalStatsSync()).toEqual([]);
+  });
+});
+
+describe("ownerOnlyApproval (shared with the kernel and the control plane)", () => {
+  const owner = ["channel:ui:*", "channel:cli:*"];
+
+  it("names why a card is the owner's alone, or returns null", () => {
+    expect(ownerOnlyApproval(send("channel:feishu:oc_1"), owner)).toBe("it sends to channel:feishu:oc_1, outside the owner's own channels");
+    expect(ownerOnlyApproval(send("channel:ui:owner"), owner)).toBeNull();
+    expect(ownerOnlyApproval(send("channel:ui:owner"), [])).toMatch(/outside the owner's own channels/);
+    expect(ownerOnlyApproval(send(7 as never), owner)).toMatch(/it sends to 7/);
+    expect(ownerOnlyApproval(custom("escalation.budget_exhausted"), owner)).toBe("it continues past an exhausted budget");
+    expect(ownerOnlyApproval(custom("kernel.escalation", { args: { reason: "budget_exhausted" } }), owner)).toMatch(/exhausted budget/);
+    expect(ownerOnlyApproval(send("channel:ui:owner", { card: escalationCard("budget_exhausted") }), owner)).toMatch(/exhausted budget/);
+    for (const ok of [
+      custom("kernel.escalation", { args: { reason: "retry_limit" } }),
+      custom("kernel.escalation"),
+      custom("escalation.blocked", { card: escalationCard("blocked") }),
+      custom("budget_exhausted"),
+      { type: "project.start", summary: "", subjectKey: "s", sideEffect: "external", proposal: { title: "x", outcome: "", actions: [] } } as ProposedAction,
+      { type: "workspace.exec", summary: "", subjectKey: "s", sideEffect: "external", tool: "bash", args: {} } as ProposedAction,
+    ]) {
+      expect(ownerOnlyApproval(ok, owner), JSON.stringify(ok)).toBeNull();
+    }
   });
 });
 

@@ -1,19 +1,25 @@
 // The demo's "model": a role-routed ScriptedModelClient. During the seed it answers the desk from a queue of turns the
 // seed pushes before each item (so every scenario runs through the real tools and kernel); otherwise it answers by
 // role from what the request contains — the desk with a few live heuristics (a note or link, a reminder, a redraft,
-// anything else → an honest "演示模式" note), workers / sensors / the redraft helper from fixed demo content.
+// anything else → an honest "演示模式" note), projects from a plan per project (what to do on their first task, on
+// each worker result, on each word from the owner — and nothing on any other wake-up), workers and sources from fixed
+// demo content. Every scripted cell acts only on the message that is meant for it: nothing re-dispatches on a stray
+// wake-up (a stall check, a progress note), so nothing loops.
 
 import { ScriptedModelClient, type ScriptTurn } from "@ng/loop";
 import type { Clock, ModelRequest, ToolResultBlock } from "@ng/protocol";
 
-export type DemoRole = "desk" | "worker" | "watcher" | "sensor" | "editor" | "unknown";
+export type DemoRole = "desk" | "project" | "worker" | "checker" | "hub" | "sensor" | "replyWatcher" | "unknown";
 
+/** Openings of the presets' role prompts (presets/src/shared/prompts.ts), most specific first. */
 const ROLE_MARKERS: ReadonlyArray<[DemoRole, string]> = [
   ["desk", "You are the owner's desk"],
-  ["worker", "You are a background worker"],
-  ["watcher", "You wait for one person's reply"],
+  ["project", "You are a project on the owner's GTD workbench"],
+  ["worker", "You are a one-shot worker"],
+  ["checker", "You are a watcher on the owner's GTD workbench"],
+  ["hub", "You are a hub on the owner's GTD workbench"],
   ["sensor", "You are a source on the owner's GTD workbench"],
-  ["editor", "You rewrite one draft"],
+  ["replyWatcher", "You wait for one person's reply"],
 ];
 
 /** From the frozen system prompt, so the role is known even before the seed has run (e.g. right after a restart). */
@@ -26,9 +32,28 @@ export function roleOf(req: ModelRequest): DemoRole {
 export interface WorkerPlan {
   key: string;
   progress?: { text: string; done: number; total: number; label: string };
+  /** A report it saves first (save_artifact with this id; `expectedVersion` when it extends an existing one). */
+  artifact?: { id: string; title: string; body: string; expectedVersion?: number };
   result: string;
   /** Real milliseconds after the task was created before the result comes back (the work "takes" this long). */
   finishAfterMs?: number;
+}
+
+/** A turn, or one computed from the request (e.g. from an earlier tool result). */
+export type PlannedTurn = ScriptTurn | ((req: ModelRequest) => ScriptTurn);
+
+/**
+ * What one project does, matched by a key that appears in its brief. Each list is played as consecutive tool calls in
+ * one Run; a Run woken by anything else (a stall check, a progress note, a wake-up beyond the plan) does nothing.
+ */
+export interface ProjectPlan {
+  key: string;
+  /** On its first task. */
+  first: PlannedTurn[];
+  /** On the n-th child result it receives (in arrival order). */
+  afterResult?: PlannedTurn[][];
+  /** On the n-th message from the owner (or the owner's agent), e.g. "主人已完成：…". */
+  afterOwner?: PlannedTurn[][];
 }
 
 /** A sensor rule: a watched message matching `match` is a hit. */
@@ -55,6 +80,13 @@ function textBlocks(req: ModelRequest, onlyLast: boolean): string[] {
   const users = req.messages.filter((m) => m.role === "user");
   const msgs = onlyLast ? users.slice(-1) : users;
   return msgs.flatMap((m) => m.content.flatMap((b) => (b.type === "text" ? [b.text] : [])));
+}
+
+/** Text of the messages since the model last spoke: on a fresh Run, the batch that woke the cell (and the live notes). */
+function sinceLastAssistant(req: ModelRequest): string[] {
+  let i = req.messages.length - 1;
+  while (i >= 0 && req.messages[i]!.role !== "assistant") i--;
+  return req.messages.slice(i + 1).flatMap((m) => (m.role === "user" ? m.content.flatMap((b) => (b.type === "text" ? [b.text] : [])) : []));
 }
 
 /** Envelopes as the context renders them: `[type · from … · at …]\nbody`. */
@@ -98,6 +130,13 @@ function continuation(req: ModelRequest): { tool: string | null; results: ToolRe
 }
 
 const tool = (name: string, input: unknown = {}): ScriptTurn => ({ toolCalls: [{ name, input }] });
+
+/** The model's own last tool call (name and input), if any. */
+function lastToolCall(req: ModelRequest): { name: string; input: unknown } | null {
+  const prev = [...req.messages].reverse().find((m) => m.role === "assistant");
+  const call = prev?.content.findLast((b) => b.type === "tool_use");
+  return call && call.type === "tool_use" ? { name: call.name, input: call.input } : null;
+}
 
 // ==================== time words ====================
 
@@ -184,7 +223,10 @@ export class DemoBrain {
   readonly #owner: string;
   readonly #deskQueue: ScriptTurn[] = [];
   readonly workers: WorkerPlan[] = [];
+  readonly projects: ProjectPlan[] = [];
   readonly sensorRules: SensorRule[] = [];
+  /** Per project cell: its plan, the turns left of the current Run, and how many results / owner words it has seen. */
+  readonly #projectState = new Map<string, { plan: ProjectPlan | null; queue: PlannedTurn[]; results: number; owner: number }>();
   /** Model calls answered, by role (diagnostics, tests). */
   readonly calls: Array<{ role: DemoRole; tool: string | null }> = [];
   readonly model: ScriptedModelClient;
@@ -213,19 +255,27 @@ export class DemoBrain {
       case "desk":
         turn = this.#deskQueue.shift() ?? this.#desk(req);
         break;
+      case "project":
+        turn = this.#project(req);
+        break;
       case "worker":
         turn = this.#worker(req);
+        break;
+      case "checker":
+        // A one-shot checker: one honest result, then it closes.
+        turn =
+          continuation(req) || !envelopes(sinceLastAssistant(req)).some((b) => b.type === "cell.task")
+            ? {}
+            : tool("report_to_parent", { kind: "result", text: "（演示模式）没有真正检查外部状态。", status: "failed" });
         break;
       case "sensor":
         turn = this.#sensor(req);
         break;
-      case "editor":
-        turn = this.#editor(req);
-        break;
-      case "watcher":
+      case "replyWatcher":
         turn = continuation(req) ? {} : tool("update_watch");
         break;
       default:
+        // The desk's hubs route nothing in the demo: they sit in the sources drawer.
         turn = {};
     }
     this.calls.push({ role, tool: turn.toolCalls?.[0]?.name ?? null });
@@ -293,23 +343,61 @@ export class DemoBrain {
 
   // ---------- background roles: fixed demo content ----------
 
+  // ---------- projects: a plan per project, acted on only for its own triggers ----------
+
+  #project(req: ModelRequest): ScriptTurn {
+    const cellId = req.metadata?.cellId ?? "?";
+    let st = this.#projectState.get(cellId);
+    if (!st) {
+      const all = textBlocks(req, false).join("\n");
+      st = { plan: this.projects.find((p) => all.includes(p.key)) ?? null, queue: [], results: 0, owner: 0 };
+      this.#projectState.set(cellId, st);
+    }
+    const next = () => {
+      const t = st!.queue.shift();
+      return t === undefined ? {} : typeof t === "function" ? t(req) : t;
+    };
+    if (continuation(req)) return next();
+    st.queue = [];
+    const plan = st.plan;
+    if (!plan) return {};
+    for (const b of envelopes(sinceLastAssistant(req))) {
+      if (b.type === "cell.task") st.queue.push(...plan.first);
+      else if (b.type === "cell.result") st.queue.push(...(plan.afterResult?.[st.results++] ?? []));
+      else if (b.type === "cell.message" && /principal (owner|agent:|cell:desk)/.test(b.head)) st.queue.push(...(plan.afterOwner?.[st.owner++] ?? []));
+    }
+    return next();
+  }
+
   #worker(req: ModelRequest): ScriptTurn {
     const all = textBlocks(req, false);
     const task = envelopes(all).find((b) => b.type === "cell.task");
     const taskText = task?.body ?? all.join("\n");
     const plan = this.workers.find((w) => taskText.includes(w.key));
     const cont = continuation(req);
+    // Only its task starts work: a later message (a follow-up, a stray wake-up) never makes it report again.
+    if (!cont && !envelopes(sinceLastAssistant(req)).some((b) => b.type === "cell.task")) return {};
     if (!plan) {
       if (cont) return {};
       return tool("report_to_parent", { kind: "result", text: `（演示模式）这项工作没有真实执行：${clip(primaryText(taskText), 80)}` });
     }
-    if (cont?.tool === "report_to_parent" && cont.results.some((r) => r.content.startsWith("Result"))) return {};
-    if (!cont && plan.progress) {
-      return tool("report_to_parent", { kind: "progress", text: plan.progress.text, progress: { done: plan.progress.done, total: plan.progress.total, label: plan.progress.label } });
+    const last = lastToolCall(req);
+    if (cont && last?.name === "report_to_parent" && (last.input as { kind?: string } | null)?.kind === "result") return {};
+    const art = plan.artifact;
+    const result = (): ScriptTurn => {
+      const createdAt = task ? atOf(task.head) : null;
+      const delayMs = plan.finishAfterMs && createdAt !== null ? Math.max(0, createdAt + plan.finishAfterMs - this.#clock.now()) : 0;
+      return { ...tool("report_to_parent", { kind: "result", text: plan.result, ...(art ? { artifactId: art.id } : {}) }), ...(delayMs > 0 ? { delayMs } : {}) };
+    };
+    const save = (): ScriptTurn =>
+      tool("save_artifact", { artifactId: art!.id, title: art!.title, format: "markdown", body: art!.body, ...(art!.expectedVersion !== undefined ? { expectedVersion: art!.expectedVersion } : {}) });
+    if (!cont) {
+      if (plan.progress) return tool("report_to_parent", { kind: "progress", text: plan.progress.text, progress: { done: plan.progress.done, total: plan.progress.total, label: plan.progress.label } });
+      return art ? save() : result();
     }
-    const createdAt = task ? atOf(task.head) : null;
-    const delayMs = plan.finishAfterMs && createdAt !== null ? Math.max(0, createdAt + plan.finishAfterMs - this.#clock.now()) : 0;
-    return { ...tool("report_to_parent", { kind: "result", text: plan.result }), ...(delayMs > 0 ? { delayMs } : {}) };
+    if (cont.tool === "report_to_parent") return art ? save() : result();
+    if (cont.tool === "save_artifact") return result();
+    return {};
   }
 
   #sensor(req: ModelRequest): ScriptTurn {
@@ -322,13 +410,6 @@ export class DemoBrain {
     return rule ? tool("report_hit", { title: rule.title, summary: rule.summary, rawInput: text }) : tool("no_hit", { note: "无关消息" });
   }
 
-  #editor(req: ModelRequest): ScriptTurn {
-    if (continuation(req)) return {};
-    const task = envelopes(textBlocks(req, false)).find((b) => b.type === "cell.task");
-    const input = (task ? payloadJson(task.body)["input"] : undefined) as { feedback?: string; draft?: string } | undefined;
-    const draft = input?.draft ?? "";
-    return tool("submit_draft", { text: rewrite(draft, input?.feedback ?? ""), note: "演示模式：按固定规则改写" });
-  }
 }
 
 function clip(text: string, max: number): string {

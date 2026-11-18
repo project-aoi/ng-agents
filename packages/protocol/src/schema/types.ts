@@ -11,5 +11,16 @@ export interface SchemaModule {
   owner: string;
   version: number;
   ddl: string;
-  migrations?: ReadonlyArray<{ version: number; up: string }>;
+  migrations?: ReadonlyArray<SchemaMigration>;
+}
+
+/**
+ * `rebuild: true` marks a migration that recreates a table other tables reference (the only way to change a CHECK in
+ * SQLite). Such a table swap cannot commit under enforced foreign keys, so every pending migration of that owner runs
+ * first, in its own transaction with enforcement off, and is verified with `PRAGMA foreign_key_check` before commit.
+ */
+export interface SchemaMigration {
+  version: number;
+  up: string;
+  rebuild?: boolean;
 }

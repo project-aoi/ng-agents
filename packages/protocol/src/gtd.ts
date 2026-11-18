@@ -129,8 +129,16 @@ export interface ProjectRecord {
   createdAt: number;
   updatedAt: number;
   completedAt?: number;
-  /** Set by the stall check when the project has no running cell, no waiting watch and no next step. */
+  /** Set by the stall check when the project has none of the five anchors left (docs/05 guard 2); cleared when one returns. */
   stalledSince?: number;
+  /** When the single `kernel.stalled_check` wake-up for this stall was sent; while set, no second one goes out. */
+  stalledNotifiedAt?: number;
+  /** [docs/05] Where the project's work happens (shown in Radar; children inherit the cell's cwd). */
+  cwd?: string;
+  /** [docs/05] One line on where things stand, kept by the project cell. */
+  summary?: string;
+  /** [docs/05] The approved plan the project was started from (kept so a someday project can be reactivated as is). */
+  proposal?: ProjectProposal;
 }
 
 export interface WaitingParty {
@@ -172,6 +180,10 @@ export interface ActionRecord {
   createdAt: number;
   updatedAt: number;
   completedAt?: number;
+  /** [docs/05] The child cell (worker / watcher) carrying this action while its owner is "agent" or "waiting". */
+  cellId?: string;
+  /** [docs/05] Phase of a staged project this action belongs to (1-based); later phases start after the owner's go-ahead. */
+  phase?: number;
 }
 
 export type ActivityKind =

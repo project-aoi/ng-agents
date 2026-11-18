@@ -77,6 +77,9 @@ export const KERNEL_FROM = {
   router: "kernel:router",         // re-routed / restored ingress
   handback: "kernel:handback",     // handback to the desk
   control: "kernel:control",       // control.steer
+  stall: "kernel:stall",           // kernel.stalled_check [docs/05]
+  dispatcher: "kernel:dispatcher", // kernel.continue [docs/05]
+  wait: "kernel:wait",             // kernel.wait_timeout [docs/05]
 } as const satisfies Record<string, `kernel:${string}`>;
 
 export function timerFrom(scheduleOrLabel: string): `timer:${string}` {
@@ -93,15 +96,27 @@ export function externalPrincipal(channelId: string, externalUserId: string): st
   return `${channelId}:${externalUserId}`;
 }
 
+/**
+ * [docs/05 §5.3] An external main agent on the control plane (MCP / `/api/agent/*`): `agent:<agentId>`. It may
+ * orchestrate like the owner (spawn, update, message, pause/resume/steer/cancel, close) but is never the owner: it
+ * cannot approve a `channel:*` send, raise a budget, or decide a `budget_exhausted` card.
+ */
+export function agentPrincipal(agentId: string): `agent:${string}` {
+  if (!agentId || agentId.includes(":")) throw new NgError("invalid_argument", `agentPrincipal: invalid agent id "${agentId}"`);
+  return `agent:${agentId}`;
+}
+
 export type ParsedPrincipal =
   | { kind: "owner" }
   | { kind: "cell"; cellId: string }
+  | { kind: "agent"; agentId: string }
   | { kind: "external"; channelId: string; userId: string }
   | { kind: "other"; value: string };
 
 export function parsePrincipal(principalId: string, ownerPrincipal: string = OWNER_PRINCIPAL): ParsedPrincipal {
   if (principalId === ownerPrincipal) return { kind: "owner" };
   if (principalId.startsWith("cell:") && principalId.length > 5) return { kind: "cell", cellId: principalId.slice(5) };
+  if (principalId.startsWith("agent:") && principalId.length > 6 && !principalId.slice(6).includes(":")) return { kind: "agent", agentId: principalId.slice(6) };
   const i = principalId.indexOf(":");
   if (i > 0 && i < principalId.length - 1) return { kind: "external", channelId: principalId.slice(0, i), userId: principalId.slice(i + 1) };
   return { kind: "other", value: principalId };

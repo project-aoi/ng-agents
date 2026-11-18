@@ -22,6 +22,24 @@ describe("evidence and Inline & Spill", () => {
     expect(() => h.store.appendEvidenceSync("nope", { kind: "system_note", text: "x", runId: null, at: 1 })).toThrow(/FOREIGN KEY/);
   });
 
+  it("names the exact missing range, and never clips a page the agent explicitly asked to read", () => {
+    const h = setup({ store: { limits: LIMITS } });
+    const big = "x".repeat(5149);
+    const cut = h.store.appendEvidenceSync("desk", { kind: "tool_result", toolUseId: "t1", name: "bash", output: big, runId: "run1", at: 5 });
+    // head 200 + tail 100 are inline; the notice says precisely what is gone and how to read exactly that.
+    expect(cut.modelText).toContain(`4849 of 5149 characters are left out here: the first 200 characters are above and the last 100 below`);
+    expect(cut.modelText).toContain(`read_resource("${cut.spill!.uri}", offset 200, limit 4849)`);
+    // A report read on purpose, and a page of a spilled output, stay whole (otherwise reading the gap leaves a new gap).
+    for (const name of ["read_artifact", "read_resource"]) {
+      const whole = h.store.appendEvidenceSync("desk", { kind: "tool_result", toolUseId: `t-${name}`, name, output: big, runId: "run1", at: 6 });
+      expect(whole.spill).toBeUndefined();
+      expect(whole.modelText ?? big).toBe(big);
+    }
+    // …up to a bound: a huge document is still spilled, with pages to walk.
+    const huge = h.store.appendEvidenceSync("desk", { kind: "tool_result", toolUseId: "t9", name: "read_artifact", output: "y".repeat(40_000), runId: "run1", at: 7 });
+    expect(huge.modelText).toContain("go on page by page");
+  });
+
   it("spills large tool output to a resource, keeps head/tail inline and reads it back in pages", async () => {
     const h = setup({ store: { limits: LIMITS } });
     const lines = Array.from({ length: 300 }, (_, i) => `line ${String(i).padStart(3, "0")} 测试输出`);
@@ -30,7 +48,7 @@ describe("evidence and Inline & Spill", () => {
     expect(r.spill).toMatchObject({ totalChars: big.length, inlineChars: 300 });
     const uri = r.spill!.uri;
     expect(uri).toMatch(/^res:\/\/desk\/res_/);
-    expect(r.modelText).toBe(`${big.slice(0, 200)}${spillNotice(uri, big.length, 300)}\n${big.slice(-100)}`);
+    expect(r.modelText).toBe(`${big.slice(0, 200)}${spillNotice(uri, big.length, 200, 100)}\n${big.slice(-100)}`);
 
     const [stored] = h.store.listEvidenceSync("desk");
     expect(stored!.record).toMatchObject({ kind: "tool_result", output: r.modelText, spillUri: uri });
@@ -73,36 +91,47 @@ describe("evidence and Inline & Spill", () => {
     expect(r.modelText).toBe("ok");
   });
 
-  it("resource access follows the cell tree", () => {
+  it("any cell reads any cell's resources; an unknown one is not_found", () => {
     const h = setup({
-      cells: [{ id: "desk" }, { id: "p", parentId: "desk" }, { id: "w1", parentId: "p" }, { id: "w2", parentId: "p" }],
+      cells: [{ id: "desk" }, { id: "p", parentId: "desk" }, { id: "w1", parentId: "p" }, { id: "w2", parentId: "p" }, { id: "other" }],
     });
     const uri = h.store.writeResourceSync("w1", "job log", { source: "job:1" });
     expect(h.store.readResourceSync("w1", uri)).toBe("job log");
     expect(h.store.readResourceSync("p", uri)).toBe("job log"); // parent reads its child's report
     expect(h.store.readResourceSync("desk", uri)).toBe("job log");
+    expect(h.store.readResourceSync("w2", uri, { offset: 4, limit: 3 })).toBe("log"); // a sibling checks the worker's log
+    expect(h.store.readResourceSync("other", uri)).toBe("job log"); // another tree entirely
     const parentUri = h.store.writeResourceSync("p", "parent notes");
-    expect(h.store.readResourceSync("w1", parentUri)).toBe("parent notes"); // fork_prefix history can reference it
+    expect(h.store.readResourceSync("w1", parentUri)).toBe("parent notes");
+    h.cells.setStatus("w1", "closed");
+    expect(h.store.readResourceSync("p", uri)).toBe("job log"); // a closed worker's output stays readable
     let caught: unknown;
     try {
-      h.store.readResourceSync("w2", uri); // sibling
+      h.store.readResourceSync("w2", "res://w1/missing");
     } catch (e) {
       caught = e;
     }
     expect(isNgError(caught, "not_found")).toBe(true);
-    expect(() => h.store.readResourceSync("w1", "res://w1/missing")).toThrow(/not found/);
     expect(() => h.store.readResourceSync("w1", "ftp://x")).toThrow(/unsupported/);
   });
 
-  it("serves artifact:// with an optional version", () => {
-    const h = setup({ cells: [{ id: "desk" }, { id: "w", parentId: "desk" }, { id: "other" }] });
+  it("serves artifact:// with an optional version to any cell", () => {
+    const h = setup({ cells: [{ id: "desk" }, { id: "w", parentId: "desk" }, { id: "w2", parentId: "desk" }, { id: "other" }] });
     h.store.commitSync("w", { artifact: { artifactId: "a1", content: markdownDeliverable("first"), updatedBy: "agent" } });
     h.store.commitSync("w", { artifact: { artifactId: "a1", content: markdownDeliverable("second"), updatedBy: "agent", expectedVersion: 1 } });
     expect(h.store.readResourceSync("desk", "artifact://a1")).toBe("second");
     expect(h.store.readResourceSync("w", "artifact://a1@1")).toBe("first");
     expect(h.store.readResourceSync("w", "artifact://a1@2", { offset: 1, limit: 3 })).toBe("eco");
+    expect(h.store.readResourceSync("w2", "artifact://a1@1")).toBe("first");
+    expect(h.store.readResourceSync("other", "artifact://a1")).toBe("second");
     expect(() => h.store.readResourceSync("w", "artifact://a1@7")).toThrow(/no version 7/);
-    expect(() => h.store.readResourceSync("other", "artifact://a1")).toThrow(/not found/);
+    let caught: unknown;
+    try {
+      h.store.readResourceSync("other", "artifact://missing");
+    } catch (e) {
+      caught = e;
+    }
+    expect(isNgError(caught, "not_found")).toBe(true);
   });
 
   it("lists evidence by run and after a seq", () => {

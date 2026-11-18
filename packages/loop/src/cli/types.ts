@@ -18,6 +18,21 @@ export interface CliCapabilities {
   readOnly: boolean;
   /** Native web tools (fetch/search) offered to the agent. */
   web: boolean;
+  /**
+   * docs/05 — how far the CLI's own tools reach.
+   * - `"host"` (isolation "none", the default): the owner's real machine as the owner uses it. Reads anywhere the user
+   *   can read, network on, the user's own CLI configuration in effect (login, skills, slash commands, MCP servers).
+   *   A writing cell (`readOnly` false) may also write and run commands anywhere — no OS sandbox, no cwd confinement;
+   *   the irreversible-operation red lines live in the prompts. A read-only cell still gets no write/shell tool.
+   * - `"workspace"` (an explicitly isolated cell: shared_ro / git_worktree): the pre-docs/05 confinement — file tools
+   *   and shell limited to `root`, no network, the user's settings files ignored.
+   */
+  access: "host" | "workspace";
+  /**
+   * [docs/05] The cell's declared intent for its directory. "read" = it did not queue for the work tree's write slot.
+   * It changes what the cell is *told*, never what the CLI is allowed to do. Default "write".
+   */
+  cwdMode?: "read" | "write";
 }
 
 /** Normalized events parsed from a CLI's output stream. MCP calls to the kernel bridge are not reported here (the bridge records them). */
@@ -32,7 +47,7 @@ export type CliEvent =
    * The CLI finished processing its input. `more`: it has further queued input of ours to answer (another turn_end
    * follows). `stopped`: the turn was interrupted on our request.
    */
-  | { type: "turn_end"; ok: boolean; error?: string; more?: boolean; stopped?: boolean }
+  | { type: "turn_end"; ok: boolean; error?: string; more?: boolean; stopped?: boolean; /** docs/05: the model refused (not an error to retry). */ refused?: boolean }
   /** The requested resume/fork could not find the session. */
   | { type: "resume_failed"; message: string }
   /** Diagnostic worth keeping (e.g. a refused permission request). */
@@ -50,6 +65,8 @@ export interface LaunchRequest {
   cwd: string;
   caps: CliCapabilities;
   model: string | undefined;
+  /** Reasoning effort, for CLIs that take it separately from the model (Claude Code, Codex). */
+  effort?: string | undefined;
   /** Text appended to the CLI's own system prompt (fresh sessions). */
   system: string;
   /** The same text on disk (0600), for CLIs that take a file. */
@@ -95,6 +112,14 @@ export interface CliAdapter {
   createDriver(req: LaunchRequest): CliDriver;
   /** Human-readable account of what the flags request and what the CLI's sandbox enforces, for the evidence log. */
   describePermissions(caps: CliCapabilities): string;
+  /**
+   * One sentence for the agent itself on how a *read-only* cell reads with this CLI (which of its tools work and
+   * which are refused). Each CLI differs — Codex reads through a read-only shell, Claude Code has no shell at all —
+   * and an agent told only "you cannot run commands" may conclude it cannot read files.
+   */
+  readOnlyHowTo(caps: CliCapabilities): string;
+  /** Environment variables this CLI needs to behave as a cell (laid over the filtered kernel environment). */
+  readonly env?: Readonly<Record<string, string>>;
 }
 
 /** Persisted per cell (Context state `CLI_SESSION_KEY`) so the next Run resumes the CLI session. */

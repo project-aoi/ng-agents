@@ -58,6 +58,7 @@ type EnqueuedReason = BusTopics["inbox.enqueued"]["reason"];
 type Rule =
   | { kind: "now"; cancelGroup: string | null }
   | { kind: "at"; deliverAt: number; cancelGroup: string | null }
+  | { kind: "coalesce"; key: string; windowMs: number }
   | { kind: "cron"; cron: string; tz: string | null; cancelGroup: string | null }
   | { kind: "idle"; idleSec: number; cancelGroup: string | null };
 
@@ -99,6 +100,12 @@ const SQL_DUE_WAKEUP = `SELECT 1 AS x FROM inbox_messages
 // Serial: every due pending row (wakeup and silent_inject) in one batch. Stale-epoch rows were dropped just before.
 const SQL_TAKE_SERIAL = `UPDATE inbox_messages SET status = 'claimed', claim_id = ?, updated_at = ?
   WHERE cell_id = ? AND status = 'pending' AND deliver_at <= ?
+  RETURNING seq, envelope`;
+// Mid-run absorption (drainInboundSync): like a serial claim, but steer messages keep their own channel (drainSteerSync).
+const SQL_DUE_INBOUND_WAKEUP = `SELECT 1 AS x FROM inbox_messages
+  WHERE cell_id = ? AND status = 'pending' AND delivery = 'wakeup' AND deliver_at <= ? AND type != ? LIMIT 1`;
+const SQL_ABSORB = `UPDATE inbox_messages SET status = 'claimed', claim_id = ?, status_reason = 'absorbed mid-run', updated_at = ?
+  WHERE cell_id = ? AND status = 'pending' AND deliver_at <= ? AND type != ?
   RETURNING seq, envelope`;
 // Something could be claimable: a due wakeup row, or an overdue claim whose rows would return to the queue.
 const SQL_MAYBE_CLAIMABLE = `SELECT 1 AS x WHERE
@@ -520,6 +527,72 @@ export function createInbox(opts: InboxOptions): InboxService {
     });
   }
 
+  function drainInboundSync(cellId: string, claimId: string): Array<{ envelope: Envelope; seq: number }> {
+    return withTx(db, () => {
+      const cell = requireCell(cellId);
+      const c = get<ClaimRow>(db, "SELECT * FROM inbox_claims WHERE claim_id = ?", [claimId]);
+      // Only the cell's live serial Run may absorb: a claim that was released/expired no longer owns anything, and a
+      // Run from before a cancel (epoch moved) is being aborted — what arrives now belongs to whatever runs next.
+      if (!c || c.cell_id !== cellId || c.status !== "active" || c.mode !== "serial_coalesce") return [];
+      if (cell.status !== "active" || c.epoch !== cell.epoch) return [];
+      const now = clock.now();
+      dropStale(cell, now);
+      // Same rule as a claim: silent_inject rows ride along with a wakeup, they never start anything by themselves.
+      if (get(db, SQL_DUE_INBOUND_WAKEUP, [cellId, now, PAYLOAD.controlSteer]) === undefined) return [];
+      const rows = all<{ seq: number; envelope: string }>(db, SQL_ABSORB, [claimId, now, cellId, now, PAYLOAD.controlSteer]);
+      if (rows.length === 0) return [];
+      rows.sort((a, b) => a.seq - b.seq);
+      // An idle-only Run that absorbs real work must count as real work when it ends (see SQL_CLAIM_HAD_REAL_WORK).
+      if (claimHadRealWork(claimId)) suspendIdle(cellId, now);
+      return rows.map((r) => ({ envelope: fromJson<Envelope>(r.envelope), seq: r.seq }));
+    });
+  }
+
+  function pendingWakeupCountSync(cellId: string): number {
+    const cell = requireCell(cellId);
+    const now = clock.now();
+    const row = get<{ n: number }>(
+      db,
+      `SELECT count(*) AS n FROM inbox_messages
+       WHERE cell_id = ? AND status = 'pending' AND delivery = 'wakeup'
+         AND (expected_epoch IS NULL OR expected_epoch = ?)
+         AND type NOT IN (?, ?)
+         AND (deliver_at <= ? OR type != ?)`,
+      // The kernel's own notices are not work: a stalled_check is dropped unseen once the cell has moved on, and a
+      // wait's timeout dies with the wait. Counted, either would keep a finished cell open with nothing left to run.
+      [cellId, cell.epoch, PAYLOAD.stalledCheck, PAYLOAD.waitTimeout, now, PAYLOAD.timerFired],
+    );
+    return Number(row?.n ?? 0);
+  }
+
+  function activeClaimCountSync(cellId: string, exceptClaimId?: string): number {
+    const row =
+      exceptClaimId === undefined
+        ? get<{ n: number }>(db, "SELECT count(*) AS n FROM inbox_claims WHERE cell_id = ? AND status = 'active'", [cellId])
+        : get<{ n: number }>(db, "SELECT count(*) AS n FROM inbox_claims WHERE cell_id = ? AND status = 'active' AND claim_id != ?", [cellId, exceptClaimId]);
+    return Number(row?.n ?? 0);
+  }
+
+  /**
+   * Right edge of the batching window a coalesced message joins (ScheduleRule.coalesce). A fixed (tumbling) bucket per
+   * key: the first message opens it at now + windowMs and everything that follows lands on that same instant, so a
+   * steady stream can neither push the batch out forever nor borrow the time of another key or of an ordinary timer.
+   */
+  function windowEdge(cell: CellRecord, key: string, windowMs: number, now: number): number {
+    // Something is running: hand it over now, the Run absorbs it (or it is simply the next batch).
+    if (get(db, "SELECT 1 AS x FROM inbox_claims WHERE cell_id = ? AND status = 'active' LIMIT 1", [cell.id])) return now;
+    const open = get<{ deliver_at: number }>(
+      db,
+      `SELECT deliver_at FROM inbox_messages
+       WHERE cell_id = ? AND status = 'pending' AND delivery = 'wakeup' AND cancel_group = ?
+       ORDER BY deliver_at DESC LIMIT 1`,
+      [cell.id, key],
+    );
+    if (!open) return now + windowMs;
+    // A window that already came due but was not claimed yet (the cell is queued or paused): join that batch.
+    return open.deliver_at > now ? open.deliver_at : now;
+  }
+
   // ==================== enqueue / cancel ====================
 
   function enqueueSync(cellId: string, env: Envelope, schedule?: ScheduleRule): EnqueueResult {
@@ -530,6 +603,9 @@ export function createInbox(opts: InboxOptions): InboxService {
       const now = clock.now();
       const stored: Envelope = { ...env, to: inboxAddr(cellId) };
       if (rule.kind === "cron" || rule.kind === "idle") return upsertSchedule(cell, stored, rule, now);
+      if (rule.kind === "coalesce") {
+        return insertMessage(cell, stored, { deliverAt: windowEdge(cell, rule.key, rule.windowMs, now), cancelGroup: rule.key, scheduleId: null, announce: "enqueued" }, now).result;
+      }
       const deliverAt = rule.kind === "at" ? rule.deliverAt : now;
       return insertMessage(cell, stored, { deliverAt, cancelGroup: rule.cancelGroup, scheduleId: null, announce: "enqueued" }, now).result;
     });
@@ -1015,6 +1091,9 @@ export function createInbox(opts: InboxOptions): InboxService {
     renewLeaseSync,
     releaseSync,
     drainSteerSync,
+    drainInboundSync,
+    pendingWakeupCountSync,
+    activeClaimCountSync,
     tickSync,
     nextWakeAtSync,
     dueCellIdsSync,
@@ -1101,8 +1180,16 @@ function normalizeRule(s: ScheduleRule | undefined): Rule {
   if (cancelGroup !== null && (typeof cancelGroup !== "string" || cancelGroup.length === 0)) {
     throw new NgError("invalid_argument", "schedule.cancelGroup must be a non-empty string");
   }
-  const given = [s.deliverAt, s.cron, s.idleSec].filter((v) => v !== undefined && v !== null).length;
-  if (given > 1) throw new NgError("invalid_argument", "schedule: at most one of deliverAt, cron, idleSec");
+  const given = [s.deliverAt, s.cron, s.idleSec, s.coalesce].filter((v) => v !== undefined && v !== null).length;
+  if (given > 1) throw new NgError("invalid_argument", "schedule: at most one of deliverAt, cron, idleSec, coalesce");
+  if (s.coalesce !== undefined && s.coalesce !== null) {
+    const { key, windowMs } = s.coalesce;
+    if (typeof key !== "string" || key.length === 0) throw new NgError("invalid_argument", "schedule.coalesce.key must be a non-empty string");
+    if (typeof windowMs !== "number" || !Number.isFinite(windowMs) || windowMs < 0) throw new NgError("invalid_argument", "schedule.coalesce.windowMs must be >= 0");
+    // The key is the row's cancel group: one name for "this window", so a separate cancelGroup would be ambiguous.
+    if (cancelGroup !== null && cancelGroup !== key) throw new NgError("invalid_argument", "schedule.coalesce cannot be combined with a different cancelGroup");
+    return { kind: "coalesce", key, windowMs };
+  }
   if (s.deliverAt !== undefined && s.deliverAt !== null) {
     if (typeof s.deliverAt !== "number" || !Number.isFinite(s.deliverAt)) throw new NgError("invalid_argument", "schedule.deliverAt must be a timestamp");
     return { kind: "at", deliverAt: s.deliverAt, cancelGroup };

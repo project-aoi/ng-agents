@@ -74,12 +74,15 @@ describe("versioned artifacts", () => {
     expect(h.store.commitSync("desk", { artifact: human("my edit of v2", 2) })).toEqual({ ok: true, artifactVersion: 3 });
   });
 
-  it("agent over agent without expectedVersion is accepted; a stale agent version conflicts without parking", () => {
+  it("every update of an existing artifact needs the current expectedVersion, agent over agent included", () => {
     const h = setup();
     h.store.commitSync("desk", { artifact: agent("v1") });
-    expect(h.store.commitSync("desk", { artifact: agent("v2") })).toEqual({ ok: true, artifactVersion: 2 });
+    // Omitting expectedVersion is treated like a stale version: rejected, and not parked over an agent version.
+    expect(h.store.commitSync("desk", { artifact: agent("blind v2") })).toMatchObject({ ok: false, currentArtifact: { version: 1, updatedBy: "agent" } });
+    expect(h.store.commitSync("desk", { artifact: agent("v2", 1) })).toEqual({ ok: true, artifactVersion: 2 });
     expect(h.store.commitSync("desk", { artifact: agent("stale", 1) })).toMatchObject({ ok: false, currentArtifact: { version: 2 } });
     expect(h.store.listParkedSync("draft")).toEqual([]);
+    expect(h.store.getArtifactSync("draft")?.content.body).toBe("v2");
   });
 
   it("expectedVersion on a missing artifact is an error, 0 means create", () => {
@@ -93,6 +96,55 @@ describe("versioned artifacts", () => {
     expect(isNgError(caught, "not_found")).toBe(true);
     expect(h.store.commitSync("desk", { artifact: agent("x", 0) })).toEqual({ ok: true, artifactVersion: 1 });
     expect(h.store.commitSync("desk", { artifact: agent("y", 0) })).toMatchObject({ ok: false });
+  });
+
+  it("any cell may revise a shared artifact from the version it read; the artifact keeps its creating cell", () => {
+    const h = setup({ cells: [{ id: "desk" }, { id: "proj", parentId: "desk" }, { id: "w1", parentId: "proj" }, { id: "w2", parentId: "proj" }] });
+    expect(h.store.commitSync("w1", { artifact: agent("report v1") })).toEqual({ ok: true, artifactVersion: 1 });
+    h.events.length = 0;
+    // A sibling worker continues the report (scenario 1: w2 updates with expectedVersion 1).
+    expect(h.store.commitSync("w2", { artifact: agent("report v2", 1) })).toEqual({ ok: true, artifactVersion: 2 });
+    // A third cell that read v1 loses the race and gets the current version back; nothing is overwritten or parked.
+    const stale = h.store.commitSync("proj", { artifact: agent("report from v1", 1) });
+    expect(stale).toMatchObject({ ok: false, currentArtifact: { version: 2, cellId: "w1", content: { body: "report v2" } } });
+    expect(h.store.commitSync("proj", { artifact: agent("blind write") })).toMatchObject({ ok: false, currentArtifact: { version: 2 } });
+    expect(h.store.listParkedSync("draft")).toEqual([]);
+
+    expect(h.store.getArtifactSync("draft")).toMatchObject({ cellId: "w1", version: 2, updatedBy: "agent" });
+    expect(h.store.listArtifactsSync("w1").map((a) => a.artifactId)).toEqual(["draft"]);
+    expect(h.store.listArtifactsSync("w2")).toEqual([]);
+    // Events name the artifact's own cell, like the parking events do.
+    expect(h.events.filter((e) => e.topic === "artifact.changed").map((e) => e.data)).toEqual([
+      { cellId: "w1", artifactId: "draft", version: 2, updatedBy: "agent" },
+    ]);
+  });
+
+  it("an agent in another cell losing against a human edit is parked, never applied", () => {
+    const h = setup({ cells: [{ id: "desk" }, { id: "w1", parentId: "desk" }, { id: "w2", parentId: "desk" }] });
+    h.store.commitSync("w1", { artifact: agent("agent v1") });
+    expect(h.store.commitSync("desk", { artifact: human("human v2", 1) })).toEqual({ ok: true, artifactVersion: 2 });
+    for (const expectedVersion of [1, undefined]) {
+      const r = h.store.commitSync("w2", { artifact: agent(`w2 refresh from ${expectedVersion}`, expectedVersion) });
+      expect(r).toMatchObject({ ok: false, currentArtifact: { version: 2, updatedBy: "human" }, parked: { basedOnVersion: expectedVersion ?? 0 } });
+    }
+    expect(h.store.listParkedSync("draft").map((p) => p.content.body)).toEqual(["w2 refresh from 1", "w2 refresh from undefined"]);
+    expect(h.store.getArtifactSync("draft")?.content.body).toBe("human v2");
+    // With the current version the other cell may write over the human edit (it has seen it).
+    expect(h.store.commitSync("w2", { artifact: agent("w2 builds on the human edit", 2) })).toEqual({ ok: true, artifactVersion: 3 });
+  });
+
+  it("records the writing cell on each version (null for human edits)", () => {
+    const h = setup({ cells: [{ id: "desk" }, { id: "w1", parentId: "desk" }, { id: "w2", parentId: "desk" }] });
+    h.store.commitSync("w1", { artifact: agent("v1") });
+    h.store.commitSync("w2", { artifact: agent("v2", 1) });
+    h.store.commitSync("w1", { artifact: human("v3", 2) });
+    expect(h.store.listArtifactVersionsSync("draft").map((v) => [v.version, v.updatedBy, v.cellId])).toEqual([
+      [1, "agent", "w1"],
+      [2, "agent", "w2"],
+      [3, "human", null],
+    ]);
+    expect(h.store.getArtifactVersionSync("draft", 2)?.cellId).toBe("w2");
+    expect(artifactsRepo(h.db).getVersion("draft", 1)?.cellId).toBe("w1");
   });
 
   it("explicit parking with a note, listing and dismissing", () => {
