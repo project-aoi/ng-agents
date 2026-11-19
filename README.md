@@ -10,12 +10,13 @@
 
 ```text
 ng-agents/
-├── AGENTS.md / CLAUDE.md          # Agent 开发宪章：强制遵循 01-principles 与 02-workflows，严禁破坏用例不变量
+├── AGENTS.md                      # Agent 开发宪章：强制遵循 01-principles 与 02-workflows，严禁破坏用例不变量
 ├── docs/                          # 分层文档体系（总索引见 docs/README.md）
 │   ├── 01-principles/             # 第一层：产品、原子内核与宿主安全设计原则（Why & Red Lines）
 │   ├── 02-workflows/              # 第二层：产品理想工作方式与 7 组核心用例逐步推导（How & MUST-NOT-BREAK Invariants）
 │   ├── 03-bugs/                   # 第三层：Bug 台账（BUG-001 ~ BUG-013）与端到端实测审计档案（What's Open Now）
-│   └── 04-references/             # 第四层：2026 行业 Agent 调研与早期演进历史归档
+│   ├── 04-references/             # 第四层：2026 行业 Agent 调研与早期演进历史归档
+│   └── 05-proposals/              # 第五层：已拍板的下一代演进提案与四批合流排期（含第 4 视图「分身实况 Agents」）
 ├── packages/                      # 内核层：protocol + 6 个封闭原语 (channel/inbox/context/loop/workspace/gate) + cell 容器
 ├── presets/                       # 编排层：6 套角色预设 (inline/project/worker/watcher/sensor/hub)、Prompt 契约与 SKILL.md
 └── apps/gtd-desk/                 # 应用层：本地常驻服务端、Web 三视图界面、stdio MCP 桥接与外部主 Agent 插件 (main-agent/)
@@ -31,6 +32,8 @@ ng-agents/
    - 汇总当前待修的 `BUG-001` ～ `BUG-013`（分批修复路线图）及 [2026-11-18 端到端实测审计原档](./docs/03-bugs/audits/2026-11-18-traex-live-e2e.md)。
 4. **[第四层：行业调研与历史归档](./docs/04-references/README.md)**
    - [2026 热门 AI Agent 产品调研与十个底层工程共性](./docs/04-references/2026-agent-landscape.md) 及早期设计演进留档。
+5. **[第五层：已拍板的下一代演进提案与合流总排期](./docs/05-proposals/README.md)**
+   - 对话式主台 `desk`、纯叶节点可重唤醒 `Worker` + `inspect_cell` 主动 Pull、AI 目录协同 + `Project` 常驻白板笔记、以及第 4 视图「分身实况 · Agents」完整设计。
 
 ---
 

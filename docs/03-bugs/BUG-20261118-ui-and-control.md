@@ -15,8 +15,8 @@
 - **实测触发证据**：
   - `research_then_park` 跑完后只把完整调研结论存为项目的 `Artifact` 并调 `finish_project({ outcome: "someday" })` 停靠（不弹审批卡、也不建 `@Human` 动作）。
   - 但后端 `ProjectRowDTO` 未投影项目关联的 `artifacts` 列表，前端 `Radar.tsx` 项目行（尤其是 `以后再说` 专区）也没有任何报告阅读抽屉入口——导致后台跑了半小时产出的高质量报告，用户在网页上只能看到两行截断摘要，完全点不开正文，只能回终端让外部主 Agent 调 MCP `read_artifact` 代读！
-- **目标修复方向（对齐 `INV-UC04-03`）**：
-  - 在 `ProjectRowDTO` 与项目详情接口中投影该项目关联的 `artifacts` 摘要列表（`artifactId`、`title`、`version`、`updatedAt`），并在 Web UI `Radar`（含活跃项目、已完结归档与 `以后再说` 停靠行）提供一键点开的 Markdown 报告阅读抽屉。
+- **目标修复方向（对齐 `INV-UC04-03`，与[提案分册四](../05-proposals/04-agents-topology-and-live-chat-tab.md)合并实现）**：
+  - 在 `ProjectRowDTO` 与节点详情接口中投影关联的 `artifacts` 摘要列表（`artifactId`、`title`、`version`、`updatedAt`），在 Web UI 抽出一套通用的 Markdown 报告阅读抽屉组件，同时挂载到 `Radar`（含活跃项目、已完结归档与 `以后再说` 停靠行）以及新增第 4 视图 `Agents`（分身实况）的节点头部与时间线胶囊上。
 
 ---
 

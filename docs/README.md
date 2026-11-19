@@ -7,7 +7,8 @@ docs/
 ├── 01-principles/     # 第一层：产品与架构设计原则（Why & Red Lines —— 最高准则，不可违背）
 ├── 02-workflows/      # 第二层：产品理想工作方式与用例推导（How & Invariants —— 逐步推导，严禁 Break）
 ├── 03-bugs/           # 第三层：Bug 记录与实测审计台账（Point-in-Time Defects —— 独立追踪，修完闭环）
-└── 04-references/     # 第四层：行业背景调研与历史阶段性演进底稿归档（仅供背景溯源）
+├── 04-references/     # 第四层：行业背景调研与历史阶段性演进底稿归档（仅供背景溯源）
+└── 05-proposals/      # 第五层：已拍板的下一代演进提案与合流总排期（按批实施并同步刷新一、二、三层）
 ```
 
 > **Agent 开发强制铁律**（详见仓库根目录 [AGENTS.md](../AGENTS.md)）：  
@@ -57,3 +58,15 @@ docs/
 
 - **[2026-agent-landscape.md](./04-references/2026-agent-landscape.md)** — 2026 热门 AI Agent 产品调研与十个底层工程共性
 - **[archive/](./04-references/archive/)** — 早期阶段性设计稿留档
+
+---
+
+## 五、第五层：已拍板的下一代演进提案与合流总排期（[`05-proposals/`](./05-proposals/)）
+
+存放经讨论定稿的下一阶段架构与交互升级方案，并给出与 `03-bugs/` 去重合流后的零返工执行批次（推进对应批次时同步刷新第一、二层规范与 `INV-*` 单测）：
+
+- **[05-proposals/README.md](./05-proposals/README.md)** — 演进总纲、规范拟修订表与 `03-bugs` $\times$ `05-proposals` 四批合流总排期
+  - [01-conversational-desk-and-dual-entry.md](./05-proposals/01-conversational-desk-and-dual-entry.md) — 常驻 `desk` 升级为双向持久对话主 Agent 与双入口消息归属
+  - [02-direct-worker-chat-and-pull-handoff.md](./05-proposals/02-direct-worker-chat-and-pull-handoff.md) — 纯叶节点可重唤醒 `Worker`（`Dormant`）、直连抄送防滞后与退场通知 + `inspect_cell` 主动 Pull
+  - [03-ai-driven-workspace-and-project-notes.md](./05-proposals/03-ai-driven-workspace-and-project-notes.md) — 取消内核 `cwdMode` 写锁排队改 AI 目录协同 + `Project` 常驻非结构化白板笔记
+  - [04-agents-topology-and-live-chat-tab.md](./05-proposals/04-agents-topology-and-live-chat-tab.md) — 工作台新增第 4 视图「分身实况 · Agents」（三层确定性拓扑画布、工作实况流与智能直连发话框）

@@ -19,6 +19,9 @@
    - 声明只读的协调器、评审、调研与终审分身**零排队全速并行**；
    - CLI 适配层需为 `cwdMode: "read"` 分身挂载底层操作系统级只读保护，**物理阻断修改本地工作树文件与索引**，但同时明确放行合理的只读工程动作：允许读取跨目录源码、允许只读 `git fetch` 更新远端跟踪引用与部分克隆（partial clone）按需拉取对象、允许 SSH 远端只读查询、允许在系统临时目录（`/tmp`）存放计算中间态。
 
+> [!NOTE]
+> **下一代演进目标（已拍板待落地）**：为支持用户随时直连任意 `worker` 顺手修改代码，后续将移除内核 `Dispatcher` 按工作树根的写锁排队与 `cwdMode` 读写门禁（仅保留 `sensor` 只读），改由内核暴露实时活跃目录 `[active workspaces]`、AI 自主协调目录分配、`worker` 动刀前验现场遇冲突主动上报 `wait`，详见 [`05-proposals/03-ai-driven-workspace-and-project-notes.md`](../05-proposals/03-ai-driven-workspace-and-project-notes.md)。
+
 ### `P-SAFE-3`：主人现场神圣不可侵犯与全角色不可逆操作红线
 1. **动刀前必验现场**：任何 `cwdMode: "write"` 分身在修改第一行文件、切分支、rebase 或提交前，必须先执行 `git status --short --branch`：
    - 若撞见交接说明之外的**未提交改动、陌生分支、合并冲突锁或非自身引入的公共 CI 挂死**，**绝对禁止擅自执行 `git reset --hard`、`git clean`、`git checkout -f`、`git restore` 或 `git stash`**；

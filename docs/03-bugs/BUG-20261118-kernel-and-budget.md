@@ -75,6 +75,6 @@
 - **实测触发证据（本机 macOS 跑 `pnpm test` 检出，94 个测试套件中 92 通过、仅此 2 处失败）**：
   1. **`markedAlive` 在 macOS 上完全失去防 PID 复用保护**：`util.ts` 仅检测 Linux 的 `/proc/${pid}/environ`；在 macOS 上 `HAVE_PROC === false`，`markedAlive` 直接回退为裸 `pidAlive(pid)`（`kill(pid, 0)`），导致重启执行 `recover()` 时若原 `Job` 的 PID 已被其他无关进程复用，会被误判为原任务仍在运行并直接收编（`jobs.test.ts:199` 实测复现）。
   2. **`docs05-slots.test.ts` 的 `trap '' TERM; sleep 30` 启动竞态**：`startJob` 刚落库返回 `running` 时 `/bin/sh` 尚未执行完 `trap '' TERM`（或测试 `killGraceMs` 与 `setTimeout(100)` 窗口竞态），此时立即调 `closeCell` 发进程组 `SIGTERM` 会直接杀掉尚未挂好信号屏蔽的 shell，使 100ms 后的中间态断言看到 `running` 数为 `0`。
-- **目标修复方向**：
-  - 在 macOS（`process.platform === "darwin"`）上通过 `ps eww -p <pid>`（或持久化进程启动时间比对）实现非 `/proc` 平台的环境变量标记校验，确保跨重启恢复绝不误收编或误杀复用 PID 的无关进程；
-  - 在 `docs05-slots.test.ts` 中等待子进程写出“已装好 `trap`”就绪标记后再触发 `closeCell`，消除 shell 启动竞态。
+- **目标修复方向（与 [`05-proposals`](../05-proposals/README.md) 合流更新）**：
+  - **必做**：在 macOS（`process.platform === "darwin"`）上通过 `ps eww -p <pid>`（或持久化进程启动时间比对）实现非 `/proc` 平台的环境变量标记校验，确保跨重启恢复绝不误收编或误杀复用 PID 的无关进程；
+  - **已由提案消解（随第 2 批下线）**：[提案分册三](../05-proposals/03-ai-driven-workspace-and-project-notes.md)移除 `Dispatcher` 工作树写锁槽位队列后，`docs05-slots.test.ts` 将整体替换为 AI 目录占用暴露与冲突上报测试，无需单独修补旧写锁测试。

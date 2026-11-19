@@ -40,6 +40,9 @@
    - **`project` `Cell` 持久存活**：只做轻量规划与质检，把目标、动作球权账本、分支/链接等环境事实（`relay:context`）与版本化 `Artifact` 透明保存在项目层；
    - **`worker` `Cell` 一次性执行**：承接明确界定的一棒任务（调研、改码、跑测试、独立终审），完工后经内核**单事务排空检查（`Drain-then-Close`）**确认无未读追单、无未关下级后，投递唯一幂等回执 `${cellId}:${epoch}:cell.result` 并自动关闭。
 
+> [!NOTE]
+> **下一代演进目标（已拍板待落地）**：`worker / watcher` 将物理收口为纯叶节点（`maxDepth: 0`），回合排空后由硬性 `closed` 演进为可被用户或上级消息随时 `--resume` 重唤醒的**静默待命态（`Dormant`）**，并改为「系统确定性退场通知 + 父 `project` 主动 `inspect_cell` Pull 增量足迹」，详见 [`05-proposals/02-direct-worker-chat-and-pull-handoff.md`](../05-proposals/02-direct-worker-chat-and-pull-handoff.md)。
+
 ### `P-KERN-2`：异步事件走队列，UI 简单交互直走同步事务
 - 外部入站消息、定时触发、后台 `Job` 完结与跨 `Cell` 汇报一律走 `Inbox` 异步信封队列；
 - 人类在工作台勾选速办项、保存手改草稿、点击批准/推迟卡片、切换项目暂停/激活状态，直接调用服务端同步事务接口毫秒级落盘返回（需唤醒下游协调器时在事务内顺手投递一条信封），**绝不为了打个勾去空转一轮大模型**。

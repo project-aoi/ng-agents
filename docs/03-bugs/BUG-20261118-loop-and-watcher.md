@@ -48,6 +48,6 @@
   1. **漏采 193 次 Code Mode `custom_tool_call`**：Codex CLI 启用内置 JS REPL（`exec`）做内存计算与拼稿时发出的是 `custom_tool_call` / `custom_tool_call_output` 事件，`codex.ts` 未解析，导致 193 次调用在 `evidence` 表中完全隐身且绕过 `maxSteps` 统计。
   2. **跨轮次异步 `jobs` 原语 100% 闲置**：`kernelSystem` 提示词引导 CLI 优先用原生工具执行一切命令，导致慢任务也在单轮 CLI 进程内硬等，数据库的 `jobs` 表 0 条记录。
   3. **`cwdMode: "read"` 未挂载 CLI 操作系统级只读保护**：`capabilitiesOf` 仅看 `bounds.tools` 而不看 `cwdMode`，导致声明只读的分身仍以 `-s danger-full-access` / `bypassPermissions` 启动，全凭提示词自觉防误写。
-- **目标修复方向（对齐 `P-SAFE-2` 与 `INV-UC05-01`）**：
-  - 在 `codex.ts` 完整采集 `custom_tool_call` 入库 `evidence` 并计入步数；
-  - 评估为 `cwdMode: "read"` 的 CLI 分身挂载合理的本地工作树只读保护（**严禁回归 `docs/05` 之前断网或锁死跨目录读取的旧错误！** 必须确保只读分身仍能正常跑 `git diff / log / fetch`、跨目录读代码、SSH 远端只读查询及写 `/tmp` 临时文件，不破坏 `INV-UC06-04` 与 `uc04`）。
+- **目标修复方向（与 [`05-proposals`](../05-proposals/README.md) 合流更新）**：
+  - **必做（并入提案第 2 批）**：在 `codex.ts` 完整采集 `custom_tool_call` / `custom_tool_call_output` 入库 `evidence` 并计入步数，确保 `inspect_cell` 与第 4 视图「分身实况（`Agents`）」操作流零遗漏；
+  - **已由提案消解（免做）**：[提案分册三](../05-proposals/03-ai-driven-workspace-and-project-notes.md)已决定取消 `worker` 的 `cwdMode: "read" | "write"` 区分与内核排队（仅保留 `sensor` 只读），无需再为 `worker` 额外开发 OS 只读沙箱。

@@ -29,14 +29,18 @@
 - 修复任何 `BUG-xxx` 时，必须确认修复结果向 `02-workflows/` 推导的理想状态机收敛，而非堆叠违背 `01-principles/` 的临时补丁；修完后补齐单测并更新 [docs/03-bugs/README.md](./docs/03-bugs/README.md) 中的状态。
 - *(注：`docs/04-references/archive/` 为历史阶段演进归档，除非追溯旧注释，日常开发请勿将其当作现行规范。)*
 
+### 4. 已拍板的下一代演进蓝图（[`docs/05-proposals/`](./docs/05-proposals/README.md)）—— **按批推进的目标演进态**
+- `docs/05-proposals/`（分册 `01` ～ `04`）记录已拍板定稿的下一代升级：对话式主台 `desk`、纯叶节点可重唤醒 `Worker` + `inspect_cell` 主动 Pull、移除内核 `cwdMode` 排队改 AI 目录协同 + `Project` 常驻白板笔记、以及工作台第 4 视图 **「分身实况 · Agents」**（拓扑画布 + 工作实况流 + 直连发话）。
+- 动手前必读 [docs/05-proposals/README.md](./docs/05-proposals/README.md) 的**去重合流四批排期**：凡注明被新提案消解的旧机制条目切勿重复修补；每完成一批提案编码，必须按拟修订表同步更新 `01-principles/`、`02-workflows/` 与 `03-bugs/` 状态。
+
 ---
 
 ## 二、代码仓库分层结构地图
 
 ```text
 ng-agents/
-├── AGENTS.md / CLAUDE.md       # Agent 开发宪章（本文件）
-├── docs/                       # 分层规范与问题台账 (01-principles / 02-workflows / 03-bugs / 04-references)
+├── AGENTS.md                   # Agent 开发宪章（本文件）
+├── docs/                       # 分层规范、问题台账与演进提案 (01-principles / 02-workflows / 03-bugs / 04-references / 05-proposals)
 ├── packages/                   # 第一层代码：6 个封闭数据面原语 + Cell 控制面容器 (零业务耦合)
 │   ├── protocol/               # Envelope 信封、地址与身份 (owner / agent:*)、SQLite Schema、GTD 基础契约
 │   ├── channel/                # ① 外部通道接入验签、幂等外发与专注期免打扰缓冲
