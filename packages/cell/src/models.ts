@@ -1,14 +1,15 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { NgError, type CliEngine, type Clock, type ModelTier } from "@ng/protocol";
-import { listCliModels, preferredEffort, type CliModelCatalog, type CliModelChoice, type CliModelInfo } from "@ng/loop";
+import { fastRecommendation, listCliModels, preferredEffort, type CliModelCatalog, type CliModelChoice, type CliModelInfo } from "@ng/loop";
 
 /**
  * The owner's model switch for one CLI engine.
  *
  * Which models exist is asked from the CLI (never listed here), and so is which one is "best": the default selection
- * is "auto" — the CLI's own first choice at the preferred effort — and it follows the CLI when a new model becomes
- * its recommendation. A fixed selection stays until the owner changes it. Selections are kept in
+ * is "auto" — for the strong tier the CLI's own first choice at the preferred effort, for the fast tier the lighter
+ * choice derived from the same list (its light model, or the first choice at a lower effort) — and it follows the CLI
+ * when its list or recommendation changes. A fixed selection stays until the owner changes it. Selections are kept in
  * `<dataDir>/models.json`, per engine (model ids mean nothing across engines).
  */
 
@@ -125,8 +126,9 @@ export function createModelSettings(opts: ModelSettingsOptions): ModelSettings {
   const stale = () => catalog === null || clock.now() - catalog.fetchedAt > ttlMs;
   const info = (id: string): CliModelInfo | undefined => catalog?.models.find((m) => m.id === id);
 
-  function choiceOf(sel: ModelSelection): CliModelChoice | null {
-    if (sel.mode === "auto") return catalog?.recommended ?? null;
+  function choiceOf(tier: ModelTier, sel: ModelSelection): CliModelChoice | null {
+    // Auto for fast work must not inherit the flagship at its highest effort: watchers and sources are quick checks.
+    if (sel.mode === "auto") return catalog ? (tier === "fast" ? fastRecommendation(catalog) : catalog.recommended) : null;
     const effort = sel.effort ?? preferredEffort(info(sel.model)?.efforts ?? []);
     return effort ? { model: sel.model, effort } : { model: sel.model };
   }
@@ -150,7 +152,7 @@ export function createModelSettings(opts: ModelSettingsOptions): ModelSettings {
         catalog,
         error,
         selection: { strong: selection.strong, fast: selection.fast },
-        effective: { strong: choiceOf(selection.strong), fast: choiceOf(selection.fast) },
+        effective: { strong: choiceOf("strong", selection.strong), fast: choiceOf("fast", selection.fast) },
       };
     },
     select(tier, sel) {
@@ -176,7 +178,7 @@ export function createModelSettings(opts: ModelSettingsOptions): ModelSettings {
       } else if (stale()) {
         void refresh().catch(() => undefined); // keep using what we have; the next Run sees the new list
       }
-      return choiceOf(sel) ?? undefined;
+      return choiceOf(tier, sel) ?? undefined;
     },
     warm() {
       if (catalog === null) void refresh().catch(() => undefined);

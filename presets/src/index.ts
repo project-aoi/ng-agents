@@ -1,6 +1,6 @@
 // @ng/presets — the workbench's cell templates (docs/05): the desk (triage + arbitration), persistent projects that keep
-// the records and dispatch one-shot workers, light watchers, sources and hubs, with their prompts, toolsets, playbooks
-// and the few zero-token processors. This is where the GTD product behaviour lives; the records they keep (gtd.ts)
+// the records and dispatch workers (they rest between turns and can be woken again), light watchers, sources and hubs,
+// with their prompts, toolsets, playbooks and the few zero-token processors. This is where the GTD product behaviour lives; the records they keep (gtd.ts)
 // are what the workbench UI renders.
 
 import type { Registry } from "@ng/protocol";
@@ -14,6 +14,7 @@ import { projectPreset } from "./project/preset";
 import { projectToolset } from "./project/toolset";
 import { resolveConfig, type RegisterPresetsOptions } from "./shared/config";
 import { legacyProcessors, legacyPrompts, legacyToolsets } from "./shared/legacy";
+import { createCheckProbe } from "./shared/probe";
 import { promptDefs } from "./shared/prompts";
 import { createScriptSensor, sensorToolset } from "./shared/sensor";
 import { createWaitMatch, watcherToolset } from "./shared/watcher";
@@ -40,7 +41,7 @@ export function registerPresets(registry: Registry, opts: RegisterPresetsOptions
   const presets = [deskPreset(books), projectPreset(cfg), workerPreset(), watcherPreset(), sensorPreset(), hubPreset()];
   const prompts = [...promptDefs(cfg), ...legacyPrompts()];
   const toolsets = [deskToolset(cfg, books), projectToolset(cfg), watcherToolset(cfg), sensorToolset(), ...legacyToolsets()];
-  const processors = [createWaitMatch(cfg), createScriptSensor(), ...legacyProcessors()];
+  const processors = [createWaitMatch(cfg), createScriptSensor(), createCheckProbe(cfg), ...legacyProcessors()];
   for (const p of presets) registry.presets.register(p);
   for (const p of prompts) registry.prompts.register(p);
   for (const t of toolsets) registry.toolsets.register(t);
@@ -63,3 +64,4 @@ export { setProjectLifecycleSync, notifyProjectOfOwnerChangeSync } from "./share
 export { startProjectSync, projectLaunch, type ProjectInit, type ProjectLaunch, type ProjectTaskInput, type ProjectSeed, type PlannedAction, type RepoRef, type ProjectMode } from "./project/launch";
 export { startApprovedProjectSync, projectIdForApproval, ACKNOWLEDGE_ACTION, type ReplyItem, type ProposalItem } from "./inline-desk/items";
 export type { WatcherState, ReplyParty, ReplyWatchReport } from "./shared/watcher";
+export type { ProbeArgs, ProbeState, ProbeUntil } from "./shared/probe";

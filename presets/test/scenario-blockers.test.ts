@@ -27,7 +27,7 @@ function projectsDispatchOnce(h: Harness): void {
 }
 
 describe("docs/05 scenario 4 — several workers blocked by the same CI failure: one fixer, everyone woken", () => {
-  it("two workers of two projects ask the desk; with its own note, spawn_cell and send_message the desk starts one fixer, wakes the waiter and learns the other closed meanwhile", async () => {
+  it("two workers of two projects ask the desk; with its own note, spawn_cell and send_message the desk starts one fixer, wakes the waiter and learns the other was stopped meanwhile", async () => {
     const h = await boot();
     projectsDispatchOnce(h);
     const fixers: string[] = [];
@@ -72,7 +72,7 @@ describe("docs/05 scenario 4 — several workers blocked by the same CI failure:
         return tool("spawn_cell", { preset: "worker", title: "修复公共 CI", cwd: repo1, instruction: "在独立 worktree 基于 origin/develop 修复 lint，提 MR 并合入。" });
       },
       (req) => {
-        fixers.push(/cell id (\S+)\. It reports back to your inbox\./.exec(lastToolResult(req))![1]!);
+        fixers.push(/cell id (\S+)\. It starts now; you are woken when its turn is over\./.exec(lastToolResult(req))![1]!);
         openedAt = h.clock.now();
         const note: Record<string, BlockerNote> = { [KEY]: { title: TITLE, fixer: fixers[0]!, waiters: [childrenOf(h, p1)[0]!], openedAt } };
         return tool("set_state", { patches: { [KEYS.arbitration]: note } });
@@ -87,7 +87,7 @@ describe("docs/05 scenario 4 — several workers blocked by the same CI failure:
     const w1 = childrenOf(h, p1)[0]!;
     expect(h.kernel.listWaits([w1])).toEqual([expect.objectContaining({ waitingFor: "inbox:desk" })]);
     expect(fixers).toHaveLength(1);
-    expect(h.kernel.getCell(fixers[0]!)).toMatchObject({ parentId: "desk", preset: "worker", spec: { cwd: repo1, cwdMode: "write" } });
+    expect(h.kernel.getCell(fixers[0]!)).toMatchObject({ parentId: "desk", preset: "worker", spec: { cwd: repo1, lifetime: "wakeable" } });
     expect(h.state<Record<string, BlockerNote>>("desk", KEYS.arbitration)).toEqual({ [KEY]: { title: TITLE, fixer: fixers[0], waiters: [w1], openedAt } });
 
     // 2. The same cause from another project: the desk's note says a fixer is on it, so the reporter only joins the note.
@@ -122,8 +122,8 @@ describe("docs/05 scenario 4 — several workers blocked by the same CI failure:
     expect(h.actions(p2)).toEqual([expect.objectContaining({ status: "open", owner: "agent" })]);
     expect(h.actions(p2)[0]!.cellId).toBeUndefined();
 
-    // 4. The fixer reports: the desk is woken with the result (never swallowed), writes to every waiter in its note and
-    // clears it. The waiter that closed meanwhile comes back as not delivered.
+    // 4. The fixer's turn ends: the desk is told (never swallowed), writes to every waiter in its note and clears it.
+    // The waiter that was stopped meanwhile comes back as not delivered.
     h.script.add(
       "desk",
       (req) => {
@@ -139,7 +139,7 @@ describe("docs/05 scenario 4 — several workers blocked by the same CI failure:
       (req) => {
         const out = lastToolResult(req);
         expect(out).toContain(`Delivered to ${w1}.`);
-        expect(out).toContain(`NOT DELIVERED — ${w2} is closed (it already finished or was cancelled). Nothing was stored.`);
+        expect(out).toContain(`NOT DELIVERED — ${w2} is closed (it was cancelled). Nothing was stored.`);
         return tool("set_state", { patches: { [KEYS.arbitration]: null } });
       },
       tool("wait", { reason: "resolved" }),
@@ -149,10 +149,12 @@ describe("docs/05 scenario 4 — several workers blocked by the same CI failure:
 
     expect(h.script.pending("desk")).toBe(0);
     expect(h.kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.cellResult }).map((m) => (m.envelope.payload as { childCellId: string }).childCellId)).toContain(fixers[0]);
-    expect(h.kernel.getCell(fixers[0]!)).toMatchObject({ status: "closed", closeReason: "completed" });
+    // the fixer rests (dormant): the desk could send it more, nothing keeps it busy
+    expect(h.kernel.getCell(fixers[0]!)).toMatchObject({ status: "active" });
+    expect(h.kernel.activityOf([fixers[0]!]).get(fixers[0]!)!.state).toBe("dormant");
     expect(h.state("desk", KEYS.arbitration)).toBeNull();
-    // the live waiter was woken by the desk's message and finished its own work
-    expect(h.kernel.getCell(w1)).toMatchObject({ status: "closed", closeReason: "completed" });
+    // the live waiter was woken by the desk's message and finished its own work; its project's books close the action
+    expect(h.kernel.activityOf([w1]).get(w1)!.state).toBe("dormant");
     expect(h.kernel.listWaits([w1])).toEqual([]);
     expect(h.actions(p1)).toEqual([expect.objectContaining({ status: "done", owner: "agent" })]);
     // the closed one got nothing; its project still has the open action for a successor

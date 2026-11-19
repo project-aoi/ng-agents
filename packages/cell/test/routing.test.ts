@@ -29,7 +29,8 @@ describe("ingress routing", () => {
 
   it("an off-topic message in a watched thread is handed back to the desk with its original sender", async () => {
     const h = await boot();
-    h.kernel.spawnCell("desk", { id: "w", preset: "watcher", watches: [{ threadOrFilter: { thread: "memory:pr-108" } }] });
+    // a thread watcher lives on its watch (persistent, like the real reply watcher): handing one message back ends nothing
+    h.kernel.spawnCell("desk", { id: "w", preset: "watcher", lifetime: "persistent", watches: [{ threadOrFilter: { thread: "memory:pr-108" } }] });
     h.script.add("watcher", tool("handback", { reason: "a new, unrelated bug report" }));
     h.script.add("desk", { text: "triaged" });
     const env = await h.memory.inject({ from: "dave", text: "顺便说一下，登录页也坏了", threads: ["memory:pr-108"] });
@@ -45,7 +46,7 @@ describe("ingress routing", () => {
 
   it("a 1:1 direct line: the owner grants a worker their channel and a thread; both directions skip the desk", async () => {
     const h = await boot();
-    // a direct line outlives one piece of work: a persistent worker (a one-shot one would be closed after its first Run)
+    // a direct line outlives one piece of work: a persistent worker (a leaf would report every turn to the desk)
     h.kernel.spawnCell("desk", { id: "w", preset: "worker", lifetime: "persistent", processor: { kind: "llm", toolsets: ["kernel.comms"] } });
     expect(h.kernel.getCell("w")!.bounds.canSendTo).toEqual(["inbox:*"]); // cells only, no channel
     // without the grant the worker cannot reach the owner at all

@@ -1,5 +1,6 @@
 import { SCRIPT_PREFIX } from "@ng/loop";
 import {
+  isLeafLifetime,
   AGENT_ENGINES,
   ISOLATION_LEVELS,
   NgError,
@@ -103,12 +104,12 @@ export function validateSpec(registry: Registry, spec: CellSpec): void {
   if (spec.cwdMode !== undefined && spec.cwdMode !== "read" && spec.cwdMode !== "write") {
     throw new NgError("invalid_argument", `invalid cwdMode "${String(spec.cwdMode)}" (read | write)`);
   }
-  if (spec.lifetime !== undefined && spec.lifetime !== "one_shot" && spec.lifetime !== "persistent") {
-    throw new NgError("invalid_argument", `invalid lifetime "${String(spec.lifetime)}" (one_shot | persistent)`);
+  if (spec.lifetime !== undefined && spec.lifetime !== "one_shot" && spec.lifetime !== "wakeable" && spec.lifetime !== "persistent") {
+    throw new NgError("invalid_argument", `invalid lifetime "${String(spec.lifetime)}" (one_shot | wakeable | persistent)`);
   }
-  if (spec.lifetime === "one_shot" && spec.claimMode === "competing_workers") {
-    // Drain-then-close needs "nothing else of this cell is running" to be decidable from one claim.
-    throw new NgError("invalid_argument", "a one_shot cell claims serially (claimMode serial_coalesce)");
+  if (isLeafLifetime(spec.lifetime) && spec.claimMode === "competing_workers") {
+    // Settling a turn needs "nothing else of this cell is running" to be decidable from one claim.
+    throw new NgError("invalid_argument", `a ${spec.lifetime} cell claims serially (claimMode serial_coalesce)`);
   }
   if (spec.absorbInbound !== undefined && typeof spec.absorbInbound !== "boolean") throw new NgError("invalid_argument", "absorbInbound must be a boolean");
   for (const w of spec.watches ?? []) {

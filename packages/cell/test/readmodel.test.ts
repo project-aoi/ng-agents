@@ -21,7 +21,8 @@ function setup(registry: Registry): void {
 describe("read models", () => {
   it("roster, tree and stats describe what is in flight; the roster reaches the parent's snapshot tail", async () => {
     const h = await boot({ setup });
-    h.kernel.spawnCell("desk", { id: "proj", preset: "worker", title: "官网改版", processor: { kind: "code", entry: "test.idle" }, meta: { projectCellId: "proj" } });
+    // a leaf given spawn depth on purpose (a worker has none by default)
+    h.kernel.spawnCell("desk", { id: "proj", preset: "worker", title: "官网改版", processor: { kind: "code", entry: "test.idle" }, meta: { projectCellId: "proj" }, bounds: { maxDepth: 1 } });
     h.kernel.spawnCell("proj", { id: "build", preset: "worker", title: "跑测试", processor: { kind: "code", entry: "test.long_job" } }, "go");
     h.kernel.spawnCell("proj", { id: "wait", preset: "watcher", title: "等报价", processor: { kind: "code", entry: "test.idle" }, watches: [{ threadOrFilter: { thread: "memory:q" } }], schedules: [{ deliverAt: T0 + DAY }] });
     h.kernel.context.commitSync("wait", { statePatches: { [CELL_STATUS_KEY]: { text: "已回", at: T0, progress: { done: 2, total: 3, label: "家" } } } });
@@ -29,7 +30,7 @@ describe("read models", () => {
     await waitFor(() => h.kernel.workspace.listJobsSync({ state: ["running"] }).length === 1, 10_000, "job");
 
     const roster = h.kernel.rosterFor("proj");
-    // a one-shot cell sees its direct children; a persistent one (the desk) its whole live subtree in tree order
+    // a leaf sees its direct children; a persistent one (the desk) its whole live subtree in tree order
     expect(roster.map((r) => [r.cellId, r.depth, r.parentId])).toEqual([
       ["build", 1, "proj"],
       ["wait", 1, "proj"],
@@ -88,10 +89,11 @@ describe("read models", () => {
     expect(h.kernel.getCell("s")!.bounds).toMatchObject({ isolation: "git_worktree", maxTokens: 10_000 });
     expect([...h.kernel.getCell("s")!.bounds.tools].sort()).toEqual(["bash", "read"]);
     expect(h.kernel.getCell("s")!.spec.bounds).toEqual({ isolation: "git_worktree", tools: ["bash", "read"], maxTokens: 10_000 });
-    // a preset that asks for nothing: the caller's field alone; the isolation is the parent's (the desk: the host)
+    // a preset that asks only for maxDepth 0 (the worker): that and the caller's field; the isolation is the parent's
+    // (the desk: the host)
     h.kernel.spawnCell("desk", { id: "w", preset: "worker", processor: { kind: "code", entry: "test.idle" }, bounds: { maxTokens: 10_000 } });
-    expect(h.kernel.getCell("w")!.bounds).toMatchObject({ isolation: "none", maxTokens: 10_000 });
-    expect(h.kernel.getCell("w")!.spec.bounds).toEqual({ maxTokens: 10_000 });
+    expect(h.kernel.getCell("w")!.bounds).toMatchObject({ isolation: "none", maxTokens: 10_000, maxDepth: 0 });
+    expect(h.kernel.getCell("w")!.spec.bounds).toEqual({ maxDepth: 0, maxTokens: 10_000 });
   });
 
   it("setFocus(false) delivers what focus held back", async () => {

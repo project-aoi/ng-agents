@@ -1,7 +1,9 @@
 import {
+  afterCommit,
   all,
   DEFAULT_RESOURCE_PAGE_CHARS,
   get,
+  MAX_RESOURCE_PAGE_CHARS,
   newId,
   NgError,
   RESOURCE_URI_PREFIX,
@@ -116,8 +118,20 @@ export function pageOf(text: string, page: ResourcePage | undefined): string {
   return text.slice(offset, offset + limit);
 }
 
+/** Room left after a read_resource page for its paging line ("…[characters a–b shown; more follows: read_resource(…)]"). */
+const PAGE_NOTE_CHARS = 2_000;
+
 export function createEvidence(deps: Deps): EvidenceModule {
-  const { db, clock, limits } = deps;
+  const { db, bus, clock, limits } = deps;
+
+  /**
+   * How much of an explicit read stays inline. read_resource bounds its own result (one page of at most
+   * MAX_RESOURCE_PAGE_CHARS plus its paging line), so a page the agent asked for is never cut again; other explicit
+   * reads (a whole artifact) stay whole up to EXPLICIT_READ_INLINE_CHARS. Never below the normal inline limit.
+   */
+  function explicitReadInlineChars(tool: string): number {
+    return Math.max(limits.inlineChars, tool === "read_resource" ? MAX_RESOURCE_PAGE_CHARS + PAGE_NOTE_CHARS : EXPLICIT_READ_INLINE_CHARS);
+  }
 
   function writeResource(cellId: string, content: string, meta: { runId?: string; mime?: string; source?: string } = {}): string {
     if (typeof content !== "string") throw new NgError("invalid_argument", "resource content must be a string");
@@ -140,8 +154,7 @@ export function createEvidence(deps: Deps): EvidenceModule {
       let spilledInline: string | null = null;
       if (record.kind === "tool_result" || record.kind === "external") {
         const big = record.kind === "tool_result" ? record.output : record.text;
-        const inlineLimit =
-          record.kind === "tool_result" && EXPLICIT_READ_TOOLS.has(record.name) ? Math.max(limits.inlineChars, EXPLICIT_READ_INLINE_CHARS) : limits.inlineChars;
+        const inlineLimit = record.kind === "tool_result" && EXPLICIT_READ_TOOLS.has(record.name) ? explicitReadInlineChars(record.name) : limits.inlineChars;
         if (big.length > inlineLimit) {
           const uri = writeResource(cellId, big, {
             ...(record.runId ? { runId: record.runId } : {}),
@@ -162,6 +175,9 @@ export function createEvidence(deps: Deps): EvidenceModule {
         `INSERT INTO evidence (cell_id, run_id, kind, content, text, spill_uri, at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
         [cellId, stored.runId ?? null, stored.kind, JSON.stringify(stored), searchableText(stored, spilledInline), stored.spillUri ?? null, stored.at],
       );
+      // After the outermost commit (also when appended inside a caller's transaction), so the row is readable by then.
+      const appended = { cellId, seq, kind: stored.kind, runId: stored.runId ?? null };
+      afterCommit(db, () => bus.emit("evidence.appended", appended));
       const result: EvidenceAppendResult = { seq };
       if (spill) result.spill = spill;
       if (stored.kind === "tool_result") result.modelText = stored.output;

@@ -29,7 +29,7 @@ describe("RunPorts.withdrawApproval", () => {
         registry.codeProcessors.register(proc);
       },
     });
-    // persistent: both are talked to again after their first Run (a one-shot cell is closed once its Run completes)
+    // persistent: both are talked to again after their first Run, and no turn notice wakes the desk each time
     const spec = (id: string) => ({ id, preset: "worker" as const, lifetime: "persistent" as const, processor: { kind: "code" as const, entry: proc.name } });
     h.kernel.spawnCell("desk", spec("a"), "raise");
     h.kernel.spawnCell("desk", spec("b"), "other");

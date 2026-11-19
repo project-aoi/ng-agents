@@ -125,6 +125,12 @@ export interface ControlCommand {
   action: ControlAction;
   principalId: string;
   steerMessage?: string;
+  /**
+   * [ext] steer only: the id the steer message is stored under (default: a new one). A caller that retries with the
+   * same id does not deliver the steer twice, and whoever shows the conversation can match the stored message to
+   * what was typed.
+   */
+  steerEnvelopeId?: string;
 }
 /**
  * Queue-side effects of `control` (the kernel does the rest when it sees the `inbox.control` bus event):

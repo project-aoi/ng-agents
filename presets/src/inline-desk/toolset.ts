@@ -449,7 +449,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
   const startProject = tool({
     name: "start_project",
     description: [
-      "Start a project for anything that takes more than a quick lookup (a task, a todo, a code change, research, an idea). A persistent project cell plans it, keeps its records and its report, and hands every piece of heavy work to one-shot workers; it starts at once and the owner gets a short notice.",
+      "Start a project for anything that takes more than a quick lookup (a task, a todo, a code change, research, an idea). A persistent project cell plans it, keeps its records and its report, and hands every piece of heavy work to workers; it starts at once and the owner gets a short notice.",
       "Put everything it needs into brief: the owner's exact words, constraints, links, what to deliver. cwd is the absolute path of the repository on this machine — ask the owner when you do not know it.",
       'mode "research_then_park" for an idea the owner only wants to keep for later: the project researches what it should be, saves a report and parks itself as someday.',
     ].join(" "),
@@ -576,7 +576,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
   const steerItem = tool({
     name: "steer_item",
     description:
-      "Pass the owner's new instruction or extra requirement to a project (or hub) in flight; it carries it out at its next turn, with a new worker if needed. urgent: it interrupts what the item is doing right now.",
+      "Pass the owner's new instruction or extra requirement to a project (or hub) in flight; it carries it out at its next turn, with the worker that already knows the work or a new one. urgent: it interrupts what the item is doing right now.",
     input: z.object({
       itemId: z.string().min(1),
       message: z.string().min(1).describe("the owner's words and anything the project needs with them"),

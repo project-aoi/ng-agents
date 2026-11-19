@@ -64,7 +64,7 @@ export interface WorkspaceAcquireOptions {
   branch?: string;                      // branch name to create (default derived from cellId)
   /** [ext] docs/05 — the cell's working directory for isolation "none"/"shared_ro" (absolute; must exist). */
   cwd?: string;
-  /** [ext] docs/05 — the cell's declared intent ("read" = it did not queue for the work tree's write slot). Informational: the port enforces nothing by it. Default "write". */
+  /** @deprecated Ignored (see CellSpec.cwdMode). */
   cwdMode?: "read" | "write";
 }
 

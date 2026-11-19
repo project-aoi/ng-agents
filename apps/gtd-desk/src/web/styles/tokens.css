@@ -1,5 +1,5 @@
 /* Design tokens. Color is restrained on purpose: neutrals carry the interface; the three ball owners
-   (🔵 我来处理 · 🟢 Agent 处理中 · 🟡 等待回复) and the stalled red are the only strong signals. */
+   (🔵 我来处理 · 🟢 Agent 处理中 · 🟡 等待外部) and the stalled red are the only strong signals. */
 
 :root {
   color-scheme: light dark;

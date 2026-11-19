@@ -172,7 +172,6 @@ export function defineTool<S extends z.ZodType>(def: {
  */
 export function selectRunTools(tools: readonly ToolDef[], processor: LlmProcessorSpec, bounds: PolicyBounds, spec?: CellSpec): ToolDef[] {
   const allowed = processor.allowedTools ? new Set<ToolKind>(processor.allowedTools) : null;
-  // cwdMode hides nothing: it only says whether the cell queues for its work tree's write slot (the dispatcher).
   // What a cell does with its tools is the prompt's business (docs/05 principle 6), not a filter's.
   return tools.filter(
     (t) =>

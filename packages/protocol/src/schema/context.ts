@@ -28,7 +28,7 @@ INSERT INTO resource_fts(resource_fts) VALUES ('rebuild');
 // Owner: @ng/context. Gate/kernel read artifacts through artifactsRepo(db).
 export const contextSchema: SchemaModule = {
   owner: "@ng/context",
-  version: 3,
+  version: 4,
   migrations: [
     {
       version: 2,
@@ -60,6 +60,13 @@ DROP TABLE cell_state;
 ALTER TABLE cell_state_v3 RENAME TO cell_state;
 ${SEARCH_FTS_TABLES}
 ${SEARCH_FTS_BACKFILL}
+`,
+    },
+    {
+      // BUG-007: a preference may be limited to a directory and/or roles. Existing rows keep NULL = everywhere.
+      version: 4,
+      up: /* sql */ `
+ALTER TABLE knowledge ADD COLUMN applies TEXT;
 `,
     },
   ],
@@ -216,6 +223,7 @@ CREATE TABLE IF NOT EXISTS knowledge (
   tags        TEXT NOT NULL DEFAULT '[]',      -- JSON string[]
   created_at  INTEGER NOT NULL,
   updated_at  INTEGER NOT NULL,
+  applies     TEXT,                            -- v4: JSON KnowledgeApplies (preferences); NULL = every cell
   CHECK ((scope = 'cell') = (cell_id IS NOT NULL))
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ux_knowledge_name ON knowledge(kind, scope, COALESCE(cell_id, ''), name);

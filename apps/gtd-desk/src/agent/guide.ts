@@ -13,31 +13,27 @@ export interface AgentToolDoc {
 
 export const AGENT_SERVER_NAME = "ng-desk";
 
-export const AGENT_INSTRUCTIONS = `This server is the owner's GTD workbench ("ng-agents"): a background system that keeps their tasks moving while they do something else. You are the owner's main agent — the one they talk to. The workbench is where work that outlives this conversation goes; you are how the owner reaches it.
+export const AGENT_INSTRUCTIONS = `This server is the owner's GTD workbench ("ng-agents"): a background system that keeps their work moving while they do something else. You are one of the owner's two ways in — they talk to you here, and they also talk to the workbench's own resident assistant, the desk, in its web view. You act through these tools under your own identity (agent:…), never as the owner; what you pass on is marked as the owner's words passed on by you.
 
-## What is behind these tools
-- **Projects** — one per outcome the owner wants ("改掉 TUI 表格复制", "Harness 对比报告"). A project is a persistent background coordinator: it keeps the goal, the plan, the record of who owes what, and the shared report, and it hands every piece of real work (reading code, changing code, tests, research) to short-lived background **workers** that run on this machine in the directory the project was given. Workers report back and disappear; the project keeps what they found. Projects wait for outside events (an MR merging, a reply) with small **watchers**.
-- **The desk** — the workbench's own triage agent. Anything you \`capture\` goes to it exactly as if the owner had typed it into their inbox: it files notes, sets reminders, drafts replies, and starts projects by its own judgement.
-- **Actions** — the open items of a project, each owned by "agent" (a worker is on it), "human" (the owner must do something — these are the owner's to-do list) or "waiting" (an outside event).
-- **Cards** — decisions waiting for the owner: a message about to go out to someone, a plan to approve, a blocked worker asking what to do, a budget that ran out.
-- **Parked ("someday") projects** — ideas with their research kept, costing nothing until reactivated.
+## Who does what inside (three layers)
+- **The desk** — the workbench's resident main assistant. Triage is its job: before anything new starts it looks for an existing project, parked idea or report on the same subject, decides where a thing belongs (a note, a reminder, a reply for the owner to confirm, more work for an existing project, a new project), asks what is missing, remembers the owner's standing preferences and coordinates across projects. It keeps one continuous conversation with the owner.
+- **A project** answers for one deliverable ("改掉 TUI 表格复制", "Harness 对比报告"): it keeps the goal, the plan, the record of who owes what, its own notes and the shared report, and hands the real work to workers in the directory it was given. It waits for outside events (an MR merging, a reply) with small watchers.
+- **A worker** does one piece of work (reading or changing code, tests, research). When its turn is over it stays dormant on its record: a message wakes it with everything it knew. Its project is told each time a turn ends and reads what the worker did.
+- **Actions** are the open items of a project, owned by "agent" (a worker is on it), "human" (the owner must do something — their to-do list) or "waiting" (an outside event). **Cards** are decisions waiting for the owner (a message about to go out to someone, a plan to approve, a blocked worker, a budget that ran out). **Parked ("someday")** projects keep their research and cost nothing until activated.
 
 ## How to work with it
-1. **Start with \`workbench_overview\`** when the owner asks what is going on, before you create anything, and whenever you are unsure what exists. It is cheap.
-2. **Something new to do:**
-   - First \`search\` (and look at the overview) for an existing project, parked idea or report on the same subject. If there is one, tell the owner and ask whether to continue it — \`message_project\` (running) or \`set_project_state\` with "activate" (parked) — instead of starting a second one.
-   - You are the conversational shell: **get what is missing from the owner before you create the project.** Work on code needs the absolute path of the repository on this machine — ask for it, never guess, never invent one. Ask too if the outcome is unclear.
-   - Then \`create_project\` with a complete brief (the owner's own words, the path, constraints, what done looks like). It starts immediately and runs in the background; you get its id back. For an idea the owner only wants to remember, use mode "research_then_park".
-   - Use \`capture\` instead when the owner is just dropping something for later triage (a note, a reminder, a message to answer, "记一下…") or when you would rather let the desk decide what it is.
-3. **Later instructions for running work** ("继续用 /ship-mr 跟进", "再补个录屏", "先别做那个了") go to the project with \`message_project\` — not to a new project, and not by doing the work yourself in this conversation: the project carries them out with a new worker and keeps everything in one place.
-4. **Work is asynchronous.** Creating or messaging returns at once; results arrive minutes later. Tell the owner it is under way and what will happen; do not poll in a loop. Look again (\`get_project\`) when the owner asks, or when you have a natural reason to check.
-5. **Things only the owner can do** show up as "human" actions and as cards. When you see one, tell the owner plainly what is being asked. If they answer you, relay it: \`complete_action\` when they did the thing ("代码拿到了，在 ~/code/doubao" — put where it is in the note), \`decide_card\` for a card.
-6. **You are not the owner.** You may decide ordinary cards on their explicit say-so, but two kinds are theirs alone and will be refused for you: letting a message go out to another person, and continuing past an exhausted budget. Tell the owner to confirm those in the workbench UI.
-7. **Never do the workbench's work around it.** If a project's worker is changing a repository, do not edit that repository yourself in parallel — \`list_workspaces\` shows which directories are being written to right now. If you must intervene, \`message_project\` or pause it first.
+1. **What is going on?** \`workbench_overview\` first — it is cheap. \`get_project\` for one project, including what its workers did or were told that the project has not taken in yet; \`inspect_cell\` / \`get_cell\` for one cell; \`read_artifact\` and \`read_resource\` page through reports and long outputs. Status questions you answer yourself from these.
+2. **The owner's words for work you can place go straight there.** A project you know → \`message_project\`. A particular worker → \`message_cell\`: a dormant one is woken on its record; one at work takes the message when its current step ends (mode "steer" interrupts it — only when it is going the wrong way). Its project gets a copy automatically.
+3. **Anything new, vague, or that might duplicate existing work → \`chat_with_desk\`** with the owner's words unedited. The desk finds what exists, asks what is missing (for code: the absolute path of the repository on this machine) and puts the work in the right place. It answers in the background: read its replies with \`chat_with_desk\` and \`since\` when the owner asks or you have a reason — never in a loop. Relay its questions to the owner, and send the owner's answer with \`replyToId\` = the id of the question it answers (so it lands on the right matter even when several are open).
+   When the owner has already given you everything (outcome, complete brief, the absolute path) and \`search\` shows nothing on the subject, you may \`create_project\` yourself — never a second project for the same outcome. An idea only to remember: \`create_project\` with mode "research_then_park".
+4. **Work is asynchronous.** Everything returns at once; results arrive minutes later. Tell the owner it is under way and what will happen; do not poll.
+5. **Things only the owner can do** show up as "human" actions and as cards. Tell the owner plainly what is being asked, and relay their answer: \`complete_action\` when they did the thing ("代码拿到了，在 ~/code/doubao" — where it is goes in the note), \`decide_card\` for a card, \`message_cell\` / \`chat_with_desk\` with \`replyToId\` when a cell asked them a question.
+6. **You are not the owner.** You may decide ordinary cards on their explicit say-so, but two kinds are theirs alone and are refused for you: letting a message go out to another person, and continuing past an exhausted budget. Tell the owner to confirm those in the workbench UI.
+7. **Never do the workbench's work around it.** Nothing locks a directory: several cells may work in one repository at once, and \`list_workspaces\` shows which cells are active where right now. Before you change files yourself in such a directory, tell its project (\`message_project\`) or pause it, so nobody's work is overwritten.
 
 ## Answering the owner
 - "What's on my plate?" → the overview's human actions and cards, most urgent first; then one line per active project (who has the ball).
-- "How is X going?" → \`get_project\`: its one-line summary, open actions, what is running, the latest report (\`read_artifact\` for the full text).
+- "How is X going?" → \`get_project\`: its one-line summary, open actions, what its cells are doing, what is new from its workers, the latest report (\`read_artifact\` for the full text).
 - "Did we look into X before?" → \`search\`.
 - "What standing habits have I given you?" → \`list_preferences\`.
 Give ids only when the owner needs them; talk about projects by their titles.
@@ -52,13 +48,24 @@ export const AGENT_TOOLS: readonly AgentToolDoc[] = [
   {
     name: "workbench_overview",
     description:
-      "The whole workbench at a glance: what the owner must do themselves (open human actions), cards waiting for their decision, every project that is active or parked with who has the ball and whether it is stalled, what is running right now, and which directories are being written to. Call this first when the owner asks about their work, and before creating anything.",
+      "The whole workbench at a glance: what the owner must do themselves (open human actions), cards waiting for their decision, every project that is active or parked with who has the ball and whether it is stalled, what is running right now, and which work trees cells are active in. Call this first when the owner asks about their work, and before creating anything.",
     inputSchema: obj({ includeFinished: { type: "boolean", description: "also list recently completed/cancelled projects (default false)" } }),
+  },
+  {
+    name: "chat_with_desk",
+    description:
+      "Talk to the desk — the workbench's resident assistant — in the owner's words: something new to do, a vague request, a question about where something stands, or the owner's answer to a question the desk asked. The desk checks what already exists, asks for what is missing and puts the work in the right place. It answers in the background: the result tells you the cursor to read its replies with later (since), and lists the replies it has already given after `since`. Answering one of its questions: pass that question's id as replyToId.",
+    inputSchema: obj({
+      text: str("the owner's words, unedited (context after them only if needed). Omit to only read the desk's replies since `since`"),
+      since: { type: "number", description: "read the desk's replies after this cursor (the `cursor` an earlier call returned)" },
+      replyToId: str("the id of the desk's question this answers (shown with each reply)"),
+      conversationId: str("a stable id of this conversation with the owner (default: your agent id), so the desk can tell your thread from the web one"),
+    }),
   },
   {
     name: "capture",
     description:
-      "Put something into the desk's inbox in the owner's words, for the desk to triage: a note or link to save, a reminder, a message that needs a reply, a vague todo. The desk decides what it is (and may start a project, ask the owner a question, or raise a card). Returns at once; the outcome shows up in the overview. For a concrete task you have already clarified with the owner, prefer create_project.",
+      "Drop something into the desk's inbox exactly as 随手记 does (a note or link to save, a reminder, a message that needs a reply) for silent triage, without a conversation. Prefer chat_with_desk when the owner expects an answer or the desk may need to ask something.",
     inputSchema: obj({ text: str("the owner's words, unedited; add context after them only if it is needed to understand them") }, ["text"]),
   },
   {
@@ -80,7 +87,7 @@ export const AGENT_TOOLS: readonly AgentToolDoc[] = [
   {
     name: "get_project",
     description:
-      "One project in detail: its state and one-line summary, the directory it works in, every action (who has the ball, next step), the cells working for it right now and what they are doing or waiting for, its reports (artifact ids and titles), pending cards, and whether it is stalled.",
+      "One project in detail: its state and one-line summary, the directory it works in, its token use, every action (who has the ball, next step), all its cells — at work, waiting, dormant (wakeable) or archived — with what they are doing, what its workers did or were told that the project has not taken in yet (read live, including the owner's direct words to them), its reports (artifact ids and titles), pending cards, and whether it is stalled.",
     inputSchema: obj({ id: str("project id from workbench_overview / create_project") }, ["id"]),
   },
   {
@@ -128,8 +135,30 @@ export const AGENT_TOOLS: readonly AgentToolDoc[] = [
   },
   {
     name: "read_artifact",
-    description: "Read a report, draft or plan saved by the workbench (artifact id from get_project or search), with its current version.",
-    inputSchema: obj({ id: str("artifact id") }, ["id"]),
+    description:
+      "Read a report, draft or plan saved by the workbench (artifact id from get_project or search): the current version, or an older one. Long ones come a page at a time — the result says where the next page starts.",
+    inputSchema: obj(
+      {
+        id: str("artifact id"),
+        version: { type: "number", description: "an older version (default: the current one)" },
+        offset: { type: "number", description: "first character to return (default 0)" },
+        limit: { type: "number", description: "characters to return (default 16000, at most 64000)" },
+      },
+      ["id"],
+    ),
+  },
+  {
+    name: "read_resource",
+    description:
+      "Read a long output the workbench stored separately (a res://… link in a cell's record or in get_cell / inspect_cell output), a page at a time.",
+    inputSchema: obj(
+      {
+        uri: str("the res://… link"),
+        offset: { type: "number", description: "first character (default 0)" },
+        limit: { type: "number", description: "characters to return (default 8000, at most 64000)" },
+      },
+      ["uri"],
+    ),
   },
   {
     name: "search",
@@ -140,8 +169,20 @@ export const AGENT_TOOLS: readonly AgentToolDoc[] = [
   {
     name: "save_preference",
     description:
-      'Record how the owner wants a kind of thing done, so every background agent follows it from now on without being told again ("改完代码后直接用 /ship-mr 提 MR", "报告先写结论"). Say when it applies and what to do. Same name replaces the earlier text.',
-    inputSchema: obj({ name: str("short slug, e.g. code-change-followup"), text: str("when it applies and what to do") }, ["name", "text"]),
+      'Record how the owner wants a kind of thing done, so every background agent follows it from now on without being told again ("改完代码后直接用 /ship-mr 提 MR", "报告先写结论"). Say when it applies and what to do. Same name replaces the earlier text. A rule that only makes sense in one repository or for one kind of agent (e.g. a Rust repository\'s commit checks) should name that directory (cwdPrefix) and/or roles; leave both out for how the owner wants things done everywhere.',
+    inputSchema: obj(
+      {
+        name: str("short slug, e.g. code-change-followup"),
+        text: str("when it applies and what to do"),
+        cwdPrefix: str("only agents working in this directory or below it see the rule: its absolute path on this machine. Saving again under the same name without it lifts the limit"),
+        roles: {
+          type: "array",
+          items: { type: "string" },
+          description: 'only agents of these roles see the rule: "worker" (does the hands-on work in a repository), "project" (coordinates a project), "watcher" (waits for an outside event), "desk", "hub", "sensor". Saving again under the same name without it lifts the limit',
+        },
+      },
+      ["name", "text"],
+    ),
   },
   {
     name: "list_preferences",
@@ -152,26 +193,54 @@ export const AGENT_TOOLS: readonly AgentToolDoc[] = [
   {
     name: "list_workspaces",
     description:
-      "Which directories on this machine the workbench's agents are using right now: who is writing (one writer per work tree at a time), who is queued behind them, who is asleep. Check it before you touch a repository yourself.",
+      "Which work trees on this machine the workbench's cells are active in right now, and who is in each (nothing is locked: several cells may work in one repository at once). Check it before you touch a repository yourself.",
     inputSchema: obj({}),
   },
   {
     name: "get_cell",
     description:
-      "Low-level: one background cell (a project, worker, watcher, hub or the desk) — its state, directory, what it waits for, and the tail of what it did. Use it to see why something is stuck when get_project is not enough.",
+      "Low-level: one background cell (a project, worker, watcher, hub or the desk) — its state (at work, waiting, dormant and wakeable, paused, archived), directory, what it waits for, and the tail of what it did. Use it to see why something is stuck when get_project is not enough; inspect_cell reads a longer stretch.",
     inputSchema: obj({ id: str("cell id"), tail: { type: "number", description: "how many recent records to include (default 12)" } }, ["id"]),
+  },
+  {
+    name: "message_cell",
+    description:
+      "Pass the owner's words to one cell directly — a worker of a project, a project, a hub. A dormant worker is woken on its record (no new cell); one at work takes the message when its current step ends, or with mode \"steer\" is interrupted with it now (only when it is going the wrong way). A worker's project is given a copy of what was said (in the background, or woken with notifyParent \"wakeup\"). A worker closed under a project that is still open is brought back; one archived with a finished project, and script probes, take no messages — you are told why.",
+    inputSchema: obj(
+      {
+        id: str("cell id (from get_project, workbench_overview or get_cell)"),
+        text: str("the owner's words, with any context needed to act on them"),
+        mode: { type: "string", enum: ["enqueue", "steer"], description: "enqueue (default): taken when its current step ends, or wakes it. steer: interrupt it now" },
+        notifyParent: { type: "string", enum: ["silent", "wakeup"], description: "silent (default): its project reads the copy at its next wake-up. wakeup: wake the project now too" },
+        replyToId: str("the id of the cell's question this answers"),
+        conversationId: str("a stable id of this conversation with the owner (default: your agent id)"),
+      },
+      ["id", "text"],
+    ),
+  },
+  {
+    name: "inspect_cell",
+    description:
+      "What one cell was told and did, step by step, from a point on: the messages it received (the owner's direct words marked), what it said, the files it changed and the commands it ran, the reports it touched — the same account whichever engine runs it. Reads nothing into anybody's progress: the cell's project still sees the stretch as new.",
+    inputSchema: obj(
+      {
+        id: str("cell id"),
+        afterSeq: { type: "number", description: "start after this record number (default: from the beginning); the result says where it stopped" },
+        detail: { type: "string", enum: ["summary", "full"], description: "summary (default): one line per step. full: tool inputs and outputs as recorded" },
+      },
+      ["id"],
+    ),
   },
   {
     name: "spawn_cell",
     description:
-      'Low-level: start a background cell directly. Prefer create_project — a bare worker has nobody keeping its results. Useful for a one-off look ("read this repository and tell me X") whose result you will fetch yourself with get_cell: preset "worker", cwdMode "read". parentId defaults to the desk. (A hub — a router for a stream of direct messages — needs routing rules: ask the desk for one with capture instead.)',
+      'Low-level: start a background cell directly. Prefer chat_with_desk or create_project — a bare worker has nobody keeping its results. Useful for a one-off look ("read this repository and tell me X") whose result you will fetch yourself: preset "worker" does the job and then stays dormant (inspect_cell / get_cell read what it did; message_cell asks it more). parentId defaults to the desk. (A hub — a router for a stream of direct messages — needs routing rules: ask the desk for one with chat_with_desk instead.)',
     inputSchema: obj(
       {
-        preset: { type: "string", description: 'a registered preset: "worker" (one piece of work, reports once), "watcher" (checks one outside condition), "project" (persistent coordinator), "hub", "sensor"' },
+        preset: { type: "string", description: 'a registered preset: "worker" (one piece of work; stays dormant afterwards, wakes on a message), "watcher" (checks one outside condition), "project" (persistent coordinator), "hub", "sensor"' },
         title: str("short name"),
         instruction: str("the complete task: goal, materials, how to verify, what to report"),
         cwd: str("absolute path of the directory it works in"),
-        cwdMode: { type: "string", enum: ["read", "write"], description: "read: it only looks and runs in parallel with anything; write (worker default): it changes things and queues for the work tree — one writer at a time" },
         parentId: str("cell to attach it to (default: the desk)"),
       },
       ["preset", "title", "instruction"],
@@ -179,7 +248,7 @@ export const AGENT_TOOLS: readonly AgentToolDoc[] = [
   },
   {
     name: "control_cell",
-    description: "Low-level: message, steer (interrupt with a correction), pause, resume or cancel one background cell. A message to a cell that has already closed is reported as not delivered.",
+    description: "Low-level: pause, resume or cancel one background cell (cancel stops it and everything below it; files and branches stay). message / steer are the same as message_cell.",
     inputSchema: obj(
       { id: str("cell id"), action: { type: "string", enum: ["message", "steer", "pause", "resume", "cancel"] }, text: str("for message / steer") },
       ["id", "action"],

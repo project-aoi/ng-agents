@@ -10,21 +10,22 @@
 // - User-facing strings (labels, messages, status text) are Chinese and ready to display.
 // - Errors: non-2xx with `ApiError`. 401 = missing/wrong bearer token, 403 = cross-site or foreign Host,
 //   415 = a write without a JSON body, 404 = unknown id, 409 = the item is no longer in a state that allows this,
-//   400 = malformed input. Exceptions that carry a full result body instead: approve (always 200, the outcome is in
-//   the body), and the two version-protected saves (409 with ArtifactSaveResponse / ClarifyMutationResponse).
+//   400 = malformed input. Exceptions that carry a full result body instead: approve and the Agents view's cell
+//   messages / control / trigger (always 200, the outcome — not_found included — is in the body), and the two
+//   version-protected saves (409 with ArtifactSaveResponse / ClarifyMutationResponse).
 
 // ==================== shared vocabulary ====================
 
-/** 🔵 我来处理 · 🟢 Agent 处理中 · 🟡 等待回复 */
+/** 🔵 我来处理 · 🟢 Agent 处理中 · 🟡 等待外部 (the action's title says what is awaited) */
 export type BallOwner = "human" | "agent" | "waiting";
 export type Effort = "15m" | "45m" | "low_energy";
-export type ViewName = "clarify" | "engage" | "radar" | "review" | "status" | "sources" | "activity";
+export type ViewName = "clarify" | "engage" | "radar" | "agents" | "review" | "status" | "sources" | "activity";
 export type HttpMethod = "GET" | "POST" | "PUT" | "DELETE";
 
 export const BALL_LABEL: Readonly<Record<BallOwner, string>> = {
   human: "🔵 我来处理",
   agent: "🟢 Agent 处理中",
-  waiting: "🟡 等待回复",
+  waiting: "🟡 等待外部",
 };
 
 export const EFFORT_LABELS: Readonly<Record<Effort, string>> = {
@@ -56,6 +57,8 @@ export interface ButtonDTO {
   hint?: string;
   /** Ask for confirmation first (destructive actions). */
   confirm?: string;
+  /** Client-only navigation (no endpoint): a hash route to open, e.g. "#/agents/desk". */
+  href?: string;
 }
 
 export interface SourceInfoDTO {
@@ -160,7 +163,10 @@ export interface ModelChoiceDTO {
   label: string;
   effort?: string;
 }
-/** "auto" follows the CLI's own first choice (it changes when the CLI's recommendation does). */
+/**
+ * "auto" follows the CLI: the strong tier takes its own first choice (`recommended`), the fast tier the lighter choice
+ * picked from its list (`recommendedFast`). Both change when the CLI's list does.
+ */
 export type ModelSelectionDTO = { mode: "auto" } | { mode: "fixed"; model: string; effort?: string };
 export type ModelTierDTO = "strong" | "fast";
 
@@ -172,6 +178,8 @@ export interface ModelsDTO {
   /** As the CLI lists them, its first choice first. Never hard-coded. */
   models: ModelInfoDTO[];
   recommended: ModelChoiceDTO | null;
+  /** What "auto" runs the fast tier on: the list's light model, or the first choice at a lower effort. Absent when there is nothing to switch. */
+  recommendedFast?: ModelChoiceDTO | null;
   fetchedAt: number | null;
   /** Why asking the CLI failed last time (the previous list, if any, is still shown). */
   error: string | null;
@@ -213,9 +221,30 @@ export interface StatusDTO {
     clarify: string;
     engage: string;
     radar: string;
+    /** "2 个分身在跑 · 3 个待命可唤醒" */
+    agents?: string;
   };
   /** Newest first: light notices to the owner (delivered) and the ones held back during focus. */
   notifications: NotificationDTO[];
+  /**
+   * The owner's switch for token/cost limits. `enforced: false` = limits are off: nothing is stopped or held for its
+   * budget (usage is still counted and shown). `label` is ready to display ("额度限制：开" / "额度限制：已关闭").
+   */
+  budgetLimits: { enforced: boolean; label: string };
+}
+
+/** PUT /api/settings/budget-limits — the owner's own switch (never offered to an external agent). */
+export interface SetBudgetLimitsRequest {
+  /** false = switch every budget stop off; true = apply the limits again. */
+  enforced: boolean;
+}
+
+export interface SetBudgetLimitsResponse {
+  ok: boolean;
+  enforced: boolean;
+  /** "已关闭额度限制：2 个因额度暂停的任务已继续" / "已开启额度限制". */
+  message: string;
+  status: StatusDTO;
 }
 
 // ==================== ⚡ 随手记 (POST /api/capture) ====================
@@ -583,6 +612,10 @@ export interface ProjectRowDTO {
   waitingOn: number;
   /** The cells working for it now. */
   workers: ProjectWorkerDTO[];
+  /** Its reports and drafts (research report, plan, review), newest first — each opens in the report drawer. */
+  artifacts: ArtifactRefDTO[];
+  /** Entry to the Agents view: how many cells it has (resting ones included) and how many are at work. */
+  agents: { total: number; running: number; href: string; label: string };
   createdAt: number;
   updatedAt: number;
   buttons: ButtonDTO[];
@@ -615,6 +648,245 @@ export interface AddActionRequest {
   title: string;
   nextStep?: string;
   effort?: Effort;
+}
+
+// ==================== 分身实况 Agents (GET /api/agents/topology, /api/cells/:cellId/timeline, …) ====================
+// The fourth view: who is there, what each one did, and a box to talk to it. Three views are about matters and
+// decisions; this one is about the cells and what is happening. Everything is projected into plain words — a state is
+// "待命可唤醒", never the machinery behind it — while what a cell actually touched (paths, branches, commits, file
+// names, commands, test output) is passed through verbatim for monospace display.
+
+/** A report or draft, as a button that opens the shared report drawer (GET /api/artifacts/:artifactId). */
+export interface ArtifactRefDTO {
+  artifactId: string;
+  title: string;
+  version: number;
+  updatedAt: number;
+}
+
+/**
+ * running: a turn or a background command is in flight (or a message is about to start one) · waiting: a timer, a
+ * watch, an answer from another cell · blocked_human: a card or an action of the owner's · dormant: its turn is over,
+ * nothing runs, a message wakes it with everything it knows · paused · archived: closed (with its project, or done).
+ */
+export type AgentVisualState = "running" | "waiting" | "blocked_human" | "dormant" | "paused" | "archived";
+
+export interface TopologyNodeDTO {
+  cellId: string;
+  parentId: string | null;
+  /** The project it belongs to (itself, for a project node); null for the desk, sources and hubs. */
+  projectId: string | null;
+  preset: "inline" | "worker" | "watcher" | "sensor" | "project" | "hub" | null;
+  /** "总助理" | "项目协调" | "执行分身" | "外部盯梢" | "信源巡检" | "领域中枢" */
+  roleLabel: string;
+  title: string;
+  /** Column of the three-layer canvas: 0 = sources and the desk, 1 = projects and hubs, 2 = workers and watchers. */
+  layer: 0 | 1 | 2;
+  state: AgentVisualState;
+  /** "运行中" | "等待外部" | "等你拍板" | "已待命 · 发消息即唤醒" | "已暂停" | "已归档" */
+  stateLabel: string;
+  /** What exactly it runs or waits for ("正在执行：pnpm test", "每 2 分钟查一次 MR#142", "等「总助理」回信"); null when there is nothing to add. */
+  stateDetail: string | null;
+  processorType: "llm" | "code";
+  /** The box at the bottom of the right pane accepts text for this node (false: script probes, archived cells). */
+  canChat: boolean;
+  /** "claude" | "codex" | "agy" | "api"; null for a script. */
+  engine: string | null;
+  modelTier: "strong" | "fast" | null;
+  cwd: string | null;
+  /** The work tree its directory belongs to (same value on every cell sharing it); null when it has no directory. */
+  gitRoot: string | null;
+  /** Its own one-line status, verbatim. */
+  statusLine: string | null;
+  lastEvidenceSeq: number;
+  /** Records its parent has not looked at yet (shown on the edge as "未汇总 +N"); 0 for non-leaf nodes. */
+  unpulledCount: number;
+  /** The owner has spoken to it directly at some point. */
+  hadDirectUserChat: boolean;
+  /** Tokens charged to it and everything below it, and the limit that applies to it (null: unlimited). */
+  tokensUsed: number;
+  tokensLimit: number | null;
+  /** A card of its waits in Clarify → `#/clarify/:cardId`. */
+  pendingCardId: string | null;
+  /** An action of the owner's belongs to it → `#/engage/:cellId/:actionId`. */
+  engageItem: { cellId: string; actionId: string } | null;
+  /** Closed children folded into this node ("已归档 (N)"); they are listed as nodes only with includeArchived=1. */
+  archivedChildren: number;
+  updatedAt: number | null;
+}
+
+export interface TopologyDTO {
+  generatedAt: number;
+  deskCellId: string;
+  counts: { running: number; waiting: number; dormant: number; archived: number };
+  /** Parents before children; siblings in creation order. */
+  nodes: TopologyNodeDTO[];
+  /** A cell is waiting for another party (dashed amber arrow); `targetCellId` null = a person or something outside. */
+  waits: Array<{ fromCellId: string; targetCellId: string | null; targetLabel: string; description: string; since: number }>;
+  /** Work trees with more than zero active cells right now — the "同目录协作" highlight. */
+  workspaces: Array<{ gitRoot: string; label: string; activeCellIds: string[] }>;
+}
+
+/** One native or workbench tool call inside a folded group. `brief`, `output` verbatim (monospace). */
+export interface ToolStepDTO {
+  seq: number;
+  at: number;
+  /** Tool name as recorded ("Bash", "Edit", "shell", "apply_patch", "save_artifact", …). */
+  name: string;
+  /** The command, path or patch target — what the call was about, one line. */
+  brief: string;
+  /** null while no result is recorded. */
+  ok: boolean | null;
+  /** Head of the output (already clipped by the server); null when none. */
+  output: string | null;
+  /** The full output was stored separately: GET /api/resources?uri=… pages through it. */
+  spillUri: string | null;
+  durationMs: number | null;
+}
+
+interface TimelineItemBase {
+  /** Stable id of the item (also what a reply refers to: SendCellMessageRequest.replyToId). */
+  id: string;
+  /** Evidence position: items are ordered by it and `afterSeq`/`beforeSeq` page by it. */
+  seq: number;
+  at: number;
+}
+
+export type TimelineItemDTO =
+  /** The task it was started with. `fromLabel`: "项目协调「支付重试改造」". */
+  | (TimelineItemBase & { kind: "dispatch_brief"; fromLabel: string; text: string })
+  /**
+   * Something a person said to this cell. `direct`: typed in this view or passed on by the owner's agent (right-hand
+   * bubble); `syncedTo`: the project that was given a copy ("已同步给所属项目「…」"), null when there is none.
+   */
+  | (TimelineItemBase & { kind: "user_chat"; text: string; senderLabel: string; direct: boolean; mode: "enqueue" | "steer"; syncedTo: string | null; replyToId: string | null })
+  /** What another cell or the system told it (a project's follow-up, the desk's ruling, a job's result), one block. */
+  | (TimelineItemBase & { kind: "peer_message"; fromLabel: string; text: string })
+  /** What the cell said (Markdown). `toOwner`: it was sent to the owner as a message, not only said in the turn. `question`: it ends in a question the owner can answer here. */
+  | (TimelineItemBase & { kind: "assistant_reply"; text: string; toOwner: boolean; question: boolean })
+  /** Consecutive tool calls folded into one line: "执行了 6 步操作：读取 3 个文件 · 修改 src/retry.ts · 运行 pnpm test（通过）". */
+  | (TimelineItemBase & { kind: "tool_group"; toSeq: number; summary: string; failed: number; steps: ToolStepDTO[] })
+  | (TimelineItemBase & { kind: "artifact_event"; verb: "created" | "revised"; artifact: ArtifactRefDTO })
+  /** A turn ended and the project was told; a project was started / finished; a card was raised. */
+  | (TimelineItemBase & { kind: "milestone"; text: string; tone: "ok" | "warn" | "info" })
+  /** Everything else worth a grey line ("系统巡检唤醒", "额度用完，已暂停推进"). */
+  | (TimelineItemBase & { kind: "system_event"; text: string });
+
+/** What the box under the timeline does for the selected node (proposal part 4 §3.3). */
+export interface ComposerDTO {
+  /** false: read-only, show `hint` and `quick` only. */
+  enabled: boolean;
+  /**
+   * desk: the main conversation · wake: dormant, a message wakes it on its record · running: "顺手补充" by default,
+   * "立即打断" as a second button · coordinator: an instruction to a project or hub · script: a deterministic probe,
+   * no conversation · archived: closed with a finished project · paused.
+   */
+  mode: "desk" | "wake" | "running" | "coordinator" | "script" | "archived" | "paused";
+  /** The line above the box ("该分身正在运行 — 默认顺手补充，本轮收尾时处理"). */
+  hint: string;
+  placeholder: string;
+  /** Show the secondary "立即打断" button (send with mode "steer"). */
+  canSteer: boolean;
+  /** The project that gets a copy of what is typed here ("自动同步给所属项目「…」", with the "立即唤醒项目" checkbox). */
+  syncTo: { cellId: string; title: string } | null;
+  /** Buttons that replace or accompany the box ("立即触发一次检查", "重新启动所属项目", "去总助理另起新事项"). */
+  quick: ButtonDTO[];
+}
+
+export interface CellJobDTO {
+  jobId: string;
+  command: string;
+  startedAt: number;
+  /** Last lines of its output so far (verbatim); null when it is not previewed. */
+  tail: string | null;
+}
+
+/** GET /api/cells/:cellId/timeline?afterSeq=&beforeSeq=&limit= */
+export interface CellTimelineDTO {
+  generatedAt: number;
+  node: TopologyNodeDTO;
+  /** "总助理 › 支付重试改造 › 分身：核心退避编码" — every entry is clickable. */
+  breadcrumb: Array<{ cellId: string; label: string }>;
+  /** Current branch of `node.cwd` when it is a git repository. */
+  branch: string | null;
+  /** Reports and drafts of the node and of its project. */
+  artifacts: ArtifactRefDTO[];
+  /** A project's own notes (its whiteboard), verbatim Markdown; null for other nodes or when it has none. */
+  notes: string | null;
+  /** A project: what its workers did that it has not looked at yet. */
+  unpulled: Array<{ cellId: string; title: string; count: number; preview: string | null; hadDirectUserChat: boolean }>;
+  /** Background commands of the node that are running now. */
+  jobs: CellJobDTO[];
+  /** The node's latest unanswered question to the owner: a reply typed now is sent with `replyToId = id`. */
+  pendingQuestion: { id: string; text: string } | null;
+  /** pause / resume / cancel as the server would accept them now (POST /api/cells/:cellId/control). */
+  controls: ButtonDTO[];
+  composer: ComposerDTO;
+  /** Oldest first. With `afterSeq`: only items after it (may be empty). */
+  items: TimelineItemDTO[];
+  /** Range of evidence covered by `items` (0/0 when empty), and whether older records exist before `firstSeq`. */
+  firstSeq: number;
+  lastSeq: number;
+  hasEarlier: boolean;
+}
+
+/** GET /api/resources?uri=res://…&offset=0&limit=16000 */
+export interface ResourcePageDTO {
+  uri: string;
+  content: string;
+  offset: number;
+  limit: number;
+  totalChars: number;
+  hasMore: boolean;
+}
+
+/** POST /api/cells/:cellId/messages */
+export interface SendCellMessageRequest {
+  text: string;
+  /** Idempotent message id (/^[\w.:-]{1,80}$/): a retry after a dropped connection never sends twice. */
+  clientId: string;
+  /** Default "enqueue" (顺手补充); "steer" = 立即打断插话. */
+  mode?: "enqueue" | "steer";
+  /** Default "silent": the project gets a copy without being woken; "wakeup" = 同时立即唤醒项目协调器. */
+  notifyParent?: "silent" | "wakeup";
+  /** The timeline item this answers (CellTimelineDTO.pendingQuestion.id). */
+  replyToId?: string;
+}
+
+export type SendCellMessageOutcome = "delivered" | "duplicate" | "reopened" | "refused_script" | "refused_archived" | "not_found";
+
+export interface SendCellMessageResponse {
+  ok: boolean;
+  outcome: SendCellMessageOutcome;
+  /** Ready to show: "已发送，分身已被唤醒", "已顺手补充，本轮收尾时处理", "这是确定性脚本探针，不接受自然语言对话". */
+  message: string;
+  /** Id of the message as stored (equals clientId). */
+  id: string | null;
+  /** The cell's timeline tail after the send (items after the caller's last seq are enough to append). */
+  timeline: CellTimelineDTO | null;
+  status: StatusDTO;
+}
+
+/** POST /api/cells/:cellId/control */
+export interface CellControlRequest {
+  action: "pause" | "resume" | "cancel";
+}
+
+export interface CellControlResponse {
+  ok: boolean;
+  outcome: "paused" | "resumed" | "cancelled" | "not_applied" | "not_found";
+  message: string;
+  node: TopologyNodeDTO | null;
+  status: StatusDTO;
+}
+
+/** POST /api/cells/:cellId/trigger — "立即触发一次检查" on a script probe (ComposerDTO.quick of a script node). */
+export interface CellTriggerResponse {
+  ok: boolean;
+  outcome: "triggered" | "not_applied" | "not_found";
+  message: string;
+  node: TopologyNodeDTO | null;
+  status: StatusDTO;
 }
 
 // ==================== weekly review (GET /api/review; also inside RadarDTO) ====================
@@ -760,6 +1032,10 @@ export type DeskEvent =
   | { event: "refresh"; data: { views: ViewName[] } }
   | { event: "artifact"; data: { artifactId: string; version: number; updatedBy: "agent" | "human"; parked: boolean } }
   | { event: "notification"; data: NotificationDTO }
+  /** New records on one cell's timeline (debounced per cell): fetch `timeline?afterSeq=<what you have>` if it is the open one. */
+  | { event: "cell_tail"; data: { cellId: string; lastSeq: number } }
+  /** Live output of a background command of a cell (only for jobs started with a preview). */
+  | { event: "job_chunk"; data: { cellId: string; jobId: string; chunk: string } }
   | { event: "ping"; data: Record<string, never> };
 
 export type DeskEventName = DeskEvent["event"];

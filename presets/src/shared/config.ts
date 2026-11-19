@@ -29,6 +29,8 @@ export const PROCESSORS = {
   waitMatch: "gtd.wait_match",
   /** Sensor that runs a script through its workspace (args.script). */
   sensorScript: "gtd.sensor_script",
+  /** A watcher dispatched with a check command (probe.ts): runs it on a timer, zero tokens until it reports. */
+  checkProbe: "gtd.check_probe",
 } as const;
 
 /**
@@ -62,6 +64,8 @@ export const STD = STANDARD_TOOLSETS;
 export const KEYS = {
   /** In a reply watcher (await_reply): WatcherState. */
   watcher: "watch:state",
+  /** In a watcher with a check command: ProbeState. */
+  probe: "probe:state",
   /** In the desk: its own notes on the shared blockers it is arbitrating (kept by the model with set_state; no code reads it). */
   arbitration: "desk:arbitration",
   reply: (subjectKey: string) => `desk:reply:${subjectKey}`,

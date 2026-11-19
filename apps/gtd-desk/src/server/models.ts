@@ -1,4 +1,5 @@
 import type { Kernel, ModelSelection, ModelSettings } from "@ng/cell";
+import { fastRecommendation } from "@ng/loop";
 import { NgError, type ModelTier } from "@ng/protocol";
 import type { ModelChoiceDTO, ModelsDTO, SetModelRequest } from "../shared/api";
 
@@ -25,6 +26,7 @@ function dto(settings: ModelSettings): ModelsDTO {
     engine: v.engine,
     models: v.catalog?.models ?? [],
     recommended: choice(v.catalog?.recommended ?? null),
+    recommendedFast: choice(v.catalog ? fastRecommendation(v.catalog) : null),
     fetchedAt: v.catalog?.fetchedAt ?? null,
     error: v.error,
     selection: v.selection,

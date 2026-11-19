@@ -67,7 +67,15 @@ export function createWaits(core: Pick<KernelCore, "db" | "clock" | "inbox" | "b
 
   function answers(wait: WaitRecord, env: Envelope): boolean {
     if (env.type === PAYLOAD.waitTimeout) return (env.payload as WaitTimeoutPayload).waitingFor === wait.waitingFor;
-    if (env.type === PAYLOAD.stalledCheck || env.type === PAYLOAD.runContinue || env.type === PAYLOAD.controlSteer) return false;
+    if (env.type === PAYLOAD.stalledCheck || env.type === PAYLOAD.runContinue) return false;
+    // The owner (or their agent) writing to the cell directly — as a message or as an interruption — outranks whoever
+    // it was waiting for: a worker that asked its project what to do about a dirty directory and is told by the owner
+    // has its answer. A steer from another cell is a correction, not an answer.
+    if ((env.type === PAYLOAD.cellMessage || env.type === PAYLOAD.userMessage || env.type === PAYLOAD.controlSteer) && env.from === KERNEL_FROM.control) {
+      const p = parsePrincipal(env.principalId, core.ownerPrincipal);
+      if (p.kind === "owner" || p.kind === "agent") return true;
+    }
+    if (env.type === PAYLOAD.controlSteer) return false;
     if (wait.waitingFor === WAIT_HUMAN) {
       // The owner spoke, decided a card, or an agent acting for them on the control plane did.
       const p = parsePrincipal(env.principalId, core.ownerPrincipal);

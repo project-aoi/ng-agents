@@ -7,7 +7,7 @@ import { agyAdapter, agyArgs, agyPermissionAllowed } from "../src/cli/adapters/a
 import { CLAUDE_SANDBOX_SETTINGS, claudeAdapter, claudeArgs, claudeBuiltinTools } from "../src/cli/adapters/claude";
 import { codexAdapter, codexArgs, codexSandboxMode } from "../src/cli/adapters/codex";
 import { HOST_UNSANDBOXED } from "../src/cli/adapters/util";
-import type { CliCapabilities, LaunchRequest } from "../src/cli/types";
+import type { CliCapabilities, CliDriver, CliEvent, LaunchRequest } from "../src/cli/types";
 
 // Argument builders and permission answers per access mode (docs/05). No CLI is launched: the claude driver only
 // writes its MCP config (and, for a sandboxed workspace writer, its settings file) into the request's tmpDir.
@@ -322,5 +322,198 @@ describe("reasoning effort (the owner's model switch)", () => {
       expect(codexConfig(plain).some((c) => c.startsWith("model_reasoning_effort"))).toBe(false);
       expect(plain.join(" ")).not.toContain("reasoning_effort");
     }
+  });
+});
+
+// ---------- stream parsing: what each driver reports, line by line ----------
+
+/** An io that records what the driver writes to the CLI. */
+function recordingIo(): { written: Array<Record<string, unknown>>; write(line: string): void; end(): void } {
+  const written: Array<Record<string, unknown>> = [];
+  return { written, write: (line) => void written.push(JSON.parse(line) as Record<string, unknown>), end: () => undefined };
+}
+
+function feeder(driver: CliDriver, io = recordingIo()) {
+  return (...msgs: unknown[]): CliEvent[] => msgs.flatMap((m) => driver.onLine(JSON.stringify(m), io));
+}
+
+describe("codex driver: items and usage", () => {
+  const codex = () => feeder(codexAdapter().createDriver(launch("codex", capsOf("host-write"))));
+  const completed = (item: Record<string, unknown>) => ({ type: "item.completed", item });
+  const started = (item: Record<string, unknown>) => ({ type: "item.started", item });
+
+  it("mirrors a code-mode custom_tool_call with its output inline as one tool call (keyed by call_id)", () => {
+    const feed = codex();
+    expect(feed(completed({ id: "item_3", type: "custom_tool_call", call_id: "call_a", name: "exec", input: "const n = 1 + 1; n", output: "2", status: "completed" }))).toEqual([
+      { type: "tool_start", id: "call_a", name: "exec", input: { input: "const n = 1 + 1; n" } },
+      { type: "tool_end", id: "call_a", name: "exec", output: "2" },
+    ]);
+  });
+
+  it("keeps a custom_tool_call open until its separate custom_tool_call_output arrives, matched by call_id", () => {
+    const feed = codex();
+    const call = { id: "item_1", type: "custom_tool_call", call_id: "call_b", name: "exec", input: "await tools.shell('ls')" };
+    expect(feed(started({ ...call, status: "in_progress" }))).toEqual([{ type: "tool_start", id: "call_b", name: "exec", input: { input: "await tools.shell('ls')" } }]);
+    // completed without an output: nothing yet (and no second tool_start)
+    expect(feed(completed({ ...call, status: "completed" }))).toEqual([]);
+    expect(feed(completed({ id: "item_2", type: "custom_tool_call_output", call_id: "call_b", output: "README.md\nsrc" }))).toEqual([
+      { type: "tool_end", id: "call_b", name: "exec", output: "README.md\nsrc" },
+    ]);
+
+    // the same without an item.started; a structured output is rendered as its text
+    const again = codex();
+    expect(again(completed({ ...call, call_id: "call_c" }))).toEqual([{ type: "tool_start", id: "call_c", name: "exec", input: { input: "await tools.shell('ls')" } }]);
+    expect(again(completed({ id: "item_4", type: "custom_tool_call_output", call_id: "call_c", output: { content: [{ type: "text", text: "ok" }] } }))).toEqual([
+      { type: "tool_end", id: "call_c", name: "exec", output: "ok" },
+    ]);
+  });
+
+  it("reports a failed custom_tool_call as an error result", () => {
+    const feed = codex();
+    expect(feed(completed({ id: "item_5", type: "custom_tool_call", call_id: "call_d", name: "exec", input: "JSON.parse('{')", output: "SyntaxError: Unexpected end of JSON input", status: "failed" }))).toEqual([
+      { type: "tool_start", id: "call_d", name: "exec", input: { input: "JSON.parse('{')" } },
+      { type: "tool_end", id: "call_d", name: "exec", output: "SyntaxError: Unexpected end of JSON input", isError: true },
+    ]);
+    // failed without any output: the status is the output, and the call is not left open
+    expect(feed(completed({ id: "item_6", type: "custom_tool_call", call_id: "call_e", name: "exec", input: "x", status: "failed" }))).toEqual([
+      { type: "tool_start", id: "call_e", name: "exec", input: { input: "x" } },
+      { type: "tool_end", id: "call_e", name: "exec", output: "failed", isError: true },
+    ]);
+  });
+
+  it("mirrors an item type it has never seen as a tool call named after its type", () => {
+    const feed = codex();
+    expect(feed(completed({ id: "item_7", type: "image_generation_call", status: "completed", prompt: "a lighthouse", result: "saved /tmp/lighthouse.png" }))).toEqual([
+      { type: "tool_start", id: "item_7", name: "image_generation_call", input: { prompt: "a lighthouse" } },
+      { type: "tool_end", id: "item_7", name: "image_generation_call", output: "saved /tmp/lighthouse.png" },
+    ]);
+    // a generic call with arguments (function_call) shows them as its input, its output item closes it
+    expect(feed(completed({ id: "item_8", type: "function_call", call_id: "fc_1", name: "view_image", arguments: { path: "/tmp/lighthouse.png" } }))).toEqual([
+      { type: "tool_start", id: "fc_1", name: "view_image", input: { path: "/tmp/lighthouse.png" } },
+    ]);
+    expect(feed(completed({ id: "item_9", type: "function_call_output", call_id: "fc_1", output: "[image]" }))).toEqual([{ type: "tool_end", id: "fc_1", name: "view_image", output: "[image]" }]);
+  });
+
+  it("does not mirror conversation and bookkeeping items, nor its own kernel MCP calls", () => {
+    const feed = codex();
+    for (const item of [
+      { id: "i1", type: "reasoning", text: "**Planning the fix**" },
+      { id: "i2", type: "todo_list", items: [{ text: "run tests", completed: false }] },
+      { id: "i3", type: "user_message", text: "hello" },
+      { id: "i4", type: "agent_message", text: "   " },
+      { id: "i5", type: "mcp_tool_call", server: SERVER, tool: "set_state", arguments: {}, status: "completed" },
+    ]) {
+      expect(feed(started(item))).toEqual([]);
+      expect(feed(completed(item))).toEqual([]);
+    }
+    expect(feed(completed({ id: "i6", type: "agent_message", text: "Done." }))).toEqual([{ type: "text", text: "Done." }]);
+    expect(feed(completed({ id: "i7", type: "error", message: "stream disconnected" }))).toEqual([{ type: "notice", text: "codex: stream disconnected" }]);
+    // another MCP server's call is the agent's own tool: mirrored
+    expect(feed(completed({ id: "i8", type: "mcp_tool_call", server: "github", tool: "get_pr", arguments: { n: 1 }, result: { content: [{ type: "text", text: "PR #1" }] }, status: "completed" }))).toEqual([
+      { type: "tool_start", id: "i8", name: "github.get_pr", input: { n: 1 } },
+      { type: "tool_end", id: "i8", name: "github.get_pr", output: "PR #1" },
+    ]);
+  });
+
+  it("reports turn.completed usage as the session's running total, with the cached input among the tokens", () => {
+    const feed = codex();
+    expect(feed({ type: "turn.completed", usage: { input_tokens: 120_000, cached_input_tokens: 96_000, output_tokens: 3_000 } })).toEqual([
+      { type: "usage", tokens: 123_000, cents: 0, cached: 96_000, sessionTotal: true },
+      { type: "turn_end", ok: true },
+    ]);
+    expect(feed({ type: "turn.completed", usage: { input_tokens: 500, output_tokens: 20 } })).toEqual([
+      { type: "usage", tokens: 520, cents: 0, cached: 0, sessionTotal: true },
+      { type: "turn_end", ok: true },
+    ]);
+    // nothing reported, nothing metered
+    expect(feed({ type: "turn.completed", usage: {} })).toEqual([{ type: "turn_end", ok: true }]);
+  });
+});
+
+describe("claude driver: cache reads on usage", () => {
+  const assistant = (id: string, usage: Record<string, number>, parent: string | null = null) => ({
+    type: "assistant",
+    message: { id, role: "assistant", content: [], usage },
+    parent_tool_use_id: parent,
+  });
+
+  it("passes cache reads on partial and result usage events without counting them twice", () => {
+    const feed = feeder(claudeAdapter().createDriver(launch("claude", capsOf("host-write"))));
+    expect(feed(assistant("m1", { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 1_000, cache_creation_input_tokens: 0 }))).toEqual([
+      { type: "usage", tokens: 1_015, cents: 0, cached: 1_000 },
+    ]);
+    // the same message streamed again with more output: only the increment, the cache reads were already reported
+    expect(feed(assistant("m1", { input_tokens: 10, output_tokens: 50, cache_read_input_tokens: 1_000, cache_creation_input_tokens: 0 }))).toEqual([
+      { type: "usage", tokens: 45, cents: 0 },
+    ]);
+    expect(feed(assistant("m2", { input_tokens: 20, output_tokens: 10, cache_read_input_tokens: 2_000, cache_creation_input_tokens: 0 }))).toEqual([
+      { type: "usage", tokens: 2_030, cents: 0, cached: 2_000 },
+    ]);
+    // a sub-agent's messages reach the result totals only
+    expect(feed(assistant("m3", { input_tokens: 99, output_tokens: 1, cache_read_input_tokens: 400 }, "toolu_task"))).toEqual([]);
+    // the result reconciles: what the partials did not cover (cache writes, the sub-agent) is reported once, with its cost
+    const result = (cacheRead: number, extra: number, costUSD: number) => ({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      num_turns: 1,
+      result: "done",
+      model_usage_since_last_result: { "claude-x": { inputTokens: 30 + 99, outputTokens: 60 + 1, cacheReadInputTokens: cacheRead, cacheCreationInputTokens: extra, costUSD } },
+    });
+    expect(feed(result(3_400, 500, 0.25))).toEqual([
+      { type: "usage", tokens: 1_000, cents: 25, cached: 400 },
+      { type: "turn_end", ok: true },
+    ]);
+  });
+
+  it("reports cache reads that only the result carries, and none when there are none", () => {
+    const feed = feeder(claudeAdapter().createDriver(launch("claude", capsOf("host-read"))));
+    const result = (usage: Record<string, number>) => ({ type: "result", subtype: "success", is_error: false, num_turns: 1, result: "ok", usage, total_cost_usd: 0 });
+    expect(feed(result({ input_tokens: 100, output_tokens: 20, cache_read_input_tokens: 880, cache_creation_input_tokens: 0 }))).toEqual([
+      { type: "usage", tokens: 1_000, cents: 0, cached: 880 },
+      { type: "turn_end", ok: true },
+    ]);
+    expect(feed(result({ input_tokens: 100, output_tokens: 20 }))).toEqual([
+      { type: "usage", tokens: 120, cents: 0 },
+      { type: "turn_end", ok: true },
+    ]);
+  });
+});
+
+describe("agy driver: cache reads on usage", () => {
+  /** Drive the ACP handshake up to the first session/prompt; returns the feeder and that request's id. */
+  function prompting() {
+    const io = recordingIo();
+    const driver = agyAdapter().createDriver(launch("agy", capsOf("host-write")));
+    const feed = feeder(driver, io);
+    driver.start(io);
+    const reply = (method: string, result: unknown) => feed({ jsonrpc: "2.0", id: io.written.find((w) => w["method"] === method)!["id"], result });
+    reply("initialize", { protocolVersion: 1 });
+    expect(reply("session/new", { sessionId: "s1" })).toEqual([{ type: "session", sessionId: "s1" }]);
+    const promptId = io.written.find((w) => w["method"] === "session/prompt")!["id"];
+    return { feed, promptId };
+  }
+
+  it("passes cachedReadTokens on as cached, among the turn's total", () => {
+    const { feed, promptId } = prompting();
+    expect(
+      feed({ jsonrpc: "2.0", id: promptId, result: { stopReason: "end_turn", usage: { inputTokens: 100, outputTokens: 50, cachedReadTokens: 4_000, cachedWriteTokens: 0, thoughtTokens: 10, totalTokens: 4_160 } } }),
+    ).toEqual([
+      { type: "usage", tokens: 4_160, cents: 0, cached: 4_000 },
+      { type: "turn_end", ok: true },
+    ]);
+  });
+
+  it("sums the parts when there is no total, and reports no cached figure without cache reads", () => {
+    const a = prompting();
+    expect(a.feed({ jsonrpc: "2.0", id: a.promptId, result: { stopReason: "end_turn", usage: { inputTokens: 100, outputTokens: 50, cachedReadTokens: 300, thoughtTokens: 10 } } })).toEqual([
+      { type: "usage", tokens: 460, cents: 0, cached: 300 },
+      { type: "turn_end", ok: true },
+    ]);
+    const b = prompting();
+    expect(b.feed({ jsonrpc: "2.0", id: b.promptId, result: { stopReason: "end_turn", usage: { inputTokens: 70, outputTokens: 30, totalTokens: 100 } } })).toEqual([
+      { type: "usage", tokens: 100, cents: 0 },
+      { type: "turn_end", ok: true },
+    ]);
   });
 });

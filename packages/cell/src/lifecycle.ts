@@ -8,6 +8,8 @@ import {
   finalResultEnvelopeId,
   gtdKeys,
   inboxAddr,
+  isLeafLifetime,
+  CELL_TURN_KEY,
   KERNEL_FROM,
   makeBounds,
   newId,
@@ -50,6 +52,13 @@ export interface Lifecycle {
   cleanupClosed(cellIds: readonly string[]): Promise<void>;
   /** Deactivate a cell's watches (all, or one cancelGroup's). */
   deactivateWatches(cellId: string, cancelGroup?: string): number;
+  /**
+   * Bring a closed leaf back so a message can reach it: `active` again at its current epoch, authority reinstated,
+   * its CLI session still on record — the next Run resumes it. Only below a parent that is itself still open; a cell
+   * archived with a finished project stays archived (false). Watches and timers are not restored: the message that
+   * prompted this is what wakes it. Call inside the transaction that enqueues that message.
+   */
+  reopenLeafSync(cellId: string): boolean;
 }
 
 /** closeCellSync options. `internal`: the kernel itself settles the cell (drain-then-close, complete_self) — no actor check. */
@@ -195,7 +204,6 @@ export function createLifecycle(core: KernelCore): Lifecycle {
       return assertBudget(makeBounds(merged as BoundsInit), "a root cell");
     }
     const parent = cells.require(cell.parentId);
-    // No ledger cap here (unlike spawn): re-capping by "remaining" would drop the limit below what the cell already used.
     const next = attenuateBounds(parent.bounds, parent.id, merged);
     return isOwner ? next : meetBounds(next, cell.bounds);
   }
@@ -273,20 +281,23 @@ export function createLifecycle(core: KernelCore): Lifecycle {
         throw new NgError("bounds_violation", `cell "${parent.id}" may not spawn children (maxDepth 0); do the work itself or report to its parent`);
       }
       if (resolved.cwd !== undefined && resolved.cwd !== parent.spec.cwd) assertDirectory(resolved.cwd, "cwd");
-      // docs/05 §3.1: the cap is on execution, not on containers. Persistent cells (projects, hubs, sensors) and
-      // anything paused/parked do not take a slot — otherwise sixteen "someday" projects would block the next one.
-      if (resolved.lifetime === "one_shot") {
-        const open = cells.children(parent.id, { status: ["active"] }).filter((c) => c.spec.lifetime === "one_shot").length;
-        if (open >= parent.bounds.maxConcurrentChildren) {
+      // docs/05 §3.1: the cap is on execution, not on containers. Persistent cells (projects, hubs, sensors), anything
+      // paused/parked, and workers that have finished their turn and lie dormant do not take a slot — otherwise sixteen
+      // "someday" projects, or sixteen workers that are merely still addressable, would block the next one.
+      if (isLeafLifetime(resolved.lifetime)) {
+        const busy = core.readModel.busyLeafChildren(parent.id).length;
+        if (busy >= parent.bounds.maxConcurrentChildren) {
           throw new NgError(
             "bounds_violation",
-            `cell "${parent.id}" already has ${open} active one-shot children (maxConcurrentChildren ${parent.bounds.maxConcurrentChildren}); wait for one to report or close one`,
+            `cell "${parent.id}" already has ${busy} children at work (maxConcurrentChildren ${parent.bounds.maxConcurrentChildren}); wait for one to finish its turn or close one`,
           );
         }
       }
-      // Never trust requested bounds: Gate clamps them to the parent's effective bounds and remaining budget.
+      // Never trust requested bounds: Gate clamps them to the parent's effective bounds.
       const bounds = gate.attenuate(parent.bounds, parent.id, boundsRequest);
-      if (bounds.maxTokens <= 0 || bounds.maxCents <= 0) {
+      // The child spends from its ancestors' live ledgers (nothing is carved out for it), so a chain that is already
+      // stopped would start it dead.
+      if (bounds.maxTokens <= 0 || bounds.maxCents <= 0 || gate.usageSync(parent.id).state === "hard_stop") {
         throw new NgError("bounds_violation", `the budget of "${parent.id}" (or an ancestor) is used up; a child would be denied everything. Ask the owner to raise it.`);
       }
 
@@ -402,11 +413,14 @@ export function createLifecycle(core: KernelCore): Lifecycle {
       // A parent waiting on this child (a join, the desk's record) must not wait forever when someone else closes it.
       const parent = target.parentId ? cells.get(target.parentId) : undefined;
       if (parent && parent.status !== "closed" && principalId !== cellPrincipal(parent.id) && !finalResultDelivered(parent.id, target)) {
+        // A wakeable worker has told its parent about every settled turn already; what is new is only that it is gone.
+        const reported = context.readStateSync(target.id, CELL_TURN_KEY) !== null;
         const payload: CellResultPayload = {
           childCellId: target.id,
           status: reason,
-          summary: `Closed (${reason}) by ${principalId} before it reported a result.`,
+          summary: reported ? `Closed (${reason}) by ${principalId}; its turns were already reported.` : `Closed (${reason}) by ${principalId} before it reported a result.`,
           data: { closedBy: principalId, synthetic: true },
+          childState: "closed",
         };
         inbox.enqueueSync(
           parent.id,
@@ -426,9 +440,13 @@ export function createLifecycle(core: KernelCore): Lifecycle {
       }
 
       const closed: Array<{ id: string; epoch: number }> = [];
+      const working = new Set(core.dispatcher.activeRuns().map((r) => r.cellId));
       for (const c of subtree) {
         const epoch = cells.bumpEpoch(c.id);
-        cells.setStatus(c.id, "closed", c.id === target.id ? reason : "cancelled");
+        // A worker that had finished its turns and was merely still addressable is archived with its project, not
+        // cancelled: nothing of its work was cut short.
+        const archived = reason === "completed" && isLeafLifetime(c.spec.lifetime) && !working.has(c.id) && context.readStateSync(c.id, CELL_TURN_KEY) !== null;
+        cells.setStatus(c.id, "closed", c.id === target.id || archived ? reason : "cancelled");
         inbox.cancelScheduledSync({ cellId: c.id });
         deactivateWatches(c.id);
         closed.push({ id: c.id, epoch });
@@ -475,11 +493,10 @@ export function createLifecycle(core: KernelCore): Lifecycle {
     core.dispatcher.abortCells(cellIds, "close");
     await core.dispatcher.settled(cellIds);
     // docs/05 guard 4: runtime only. stopRuntime resolves when each Job's process group is confirmed gone — until
-    // then the Jobs still count as running, so the dispatcher keeps the directory's write slot closed.
+    // then the Jobs still count as running, and the occupancy view keeps showing them in their directory.
     await Promise.all(
       cellIds.map((id) => core.workspace.stopRuntime(id).catch((err: unknown) => core.onError(err, `stop runtime of closed cell ${id}`))),
     );
-    core.dispatcher.slotsChanged();
   }
 
   async function closeCell(cellId: string, reason: CloseReason = "completed", opts: ActorOptions = {}): Promise<CloseResult> {
@@ -488,7 +505,20 @@ export function createLifecycle(core: KernelCore): Lifecycle {
     return { closed };
   }
 
-  return { createRootCell, ensureRootCell, spawnCell, updateCell, closeCellSync, closeCell, cleanupClosed, deactivateWatches };
+  function reopenLeafSync(cellId: string): boolean {
+    return withTx(db, () => {
+      const cell = cells.get(cellId);
+      if (!cell || cell.status !== "closed" || !cell.parentId || !isLeafLifetime(cell.spec.lifetime)) return false;
+      // Every ancestor must still be open: a worker of a finished or cancelled project is history.
+      if (cells.ancestors(cellId).some((a) => a.status === "closed")) return false;
+      cells.setStatus(cellId, "active");
+      gate.reinstateSync(cellId);
+      afterCommit(db, () => bus.emit("cell.changed", { cellId, change: "status", status: "active", epoch: cell.epoch }));
+      return true;
+    });
+  }
+
+  return { createRootCell, ensureRootCell, spawnCell, updateCell, closeCellSync, closeCell, cleanupClosed, deactivateWatches, reopenLeafSync };
 }
 
 /** Active watches as rows (for routing and read models). */

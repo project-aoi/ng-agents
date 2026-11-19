@@ -5,7 +5,6 @@ import {
   CELL_RESULT_CANDIDATE_KEY,
   PAYLOAD,
   asClarifyCard,
-  finalResultEnvelopeId,
   gtdKeys,
   subjectKeys,
   type ActivityRecord,
@@ -90,7 +89,7 @@ describe("docs/03 §四 — five granularities through the real primitives", () 
       (req) => {
         const text = JSON.stringify(req.messages);
         expect(text).toContain("built-ok");
-        // a one-shot worker: this ends the Run; the kernel delivers the result and closes it
+        // this ends the Run; the kernel tells the desk the worker's turn settled, with this as its result
         return tool("report_to_parent", { kind: "result", text: "测试全部通过 (built-ok)" });
       },
     );
@@ -102,9 +101,11 @@ describe("docs/03 §四 — five granularities through the real primitives", () 
     await h.kernel.idle();
 
     const worker = h.kernel.getCell(workerId())!;
-    expect(worker).toMatchObject({ status: "closed", closeReason: "completed", preset: "worker" });
+    // the worker rests: active, nothing in flight, ready to be woken with everything it knows
+    expect(worker).toMatchObject({ status: "active", preset: "worker" });
+    expect(h.kernel.activityOf([worker.id]).get(worker.id)!.state).toBe("dormant");
     // docs/05: on the host, in the kernel's own directory for it (nobody gave it one) — no scratch repository, no
-    // worktree; the directory and the workspace record outlive the close
+    // worktree; the directory and the workspace record stay with it
     expect(worker.bounds.isolation).toBe("none");
     expect(existsSync(join(h.dataDir, "base-repo"))).toBe(false);
     const ws = h.kernel.workspace.getWorkspaceSync(worker.id)!;
@@ -113,11 +114,12 @@ describe("docs/03 §四 — five granularities through the real primitives", () 
 
     const jobs = h.kernel.workspace.listJobsSync({ cellId: worker.id });
     expect(jobs.map((j) => j.state)).toEqual(["succeeded"]);
+    const runs = h.of("run.started").filter((e) => e.cellId === worker.id).map((e) => e.runId);
     const results = h.kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.cellResult });
-    expect(results.map((m) => [m.envelope.id, (m.envelope.payload as CellResultPayload).summary, m.status])).toEqual([
-      [finalResultEnvelopeId(worker.id, 0), "测试全部通过 (built-ok)", "done"],
+    expect(results.map((m) => [m.envelope.id, (m.envelope.payload as CellResultPayload).summary, (m.envelope.payload as CellResultPayload).childState, m.status])).toEqual([
+      [`${worker.id}:${runs[1]}:settled`, "测试全部通过 (built-ok)", "dormant", "done"],
     ]);
-    // worker: task Run (yielded: a job will wake it) + job.result Run (completed; the kernel closed it, not the desk)
+    // worker: task Run (yielded: a job will wake it — no notice) + job.result Run (completed: its turn settled)
     expect(h.of("run.finished").filter((e) => e.cellId === worker.id).map((e) => e.outcome)).toEqual(["yielded_waiting", "completed"]);
     expect(h.script.queues.get("worker")).toEqual([]); // report_to_parent ended the Run: no further model call
     // desk: spawn + "已派出" (yielded: the child will wake it), then "收到" on the result
@@ -162,11 +164,11 @@ describe("docs/03 §四 — five granularities through the real primitives", () 
         const task = snapshot.batch.envelopes.find((e) => e.type === PAYLOAD.cellTask);
         if (!task) return "completed";
         const i = (task.payload as { input: { i: number } }).input.i;
-        // A one-shot child stages its result; the kernel delivers it once when the Run settles (docs/05 guard 1).
+        // A child stages its result; the kernel delivers it once when its turn settles (docs/05 guard 1).
         const candidate: CellResultCandidate = { status: "completed", summary: `item ${i}`, at: clock.now() };
         await ports.context.commit(ports.self.cellId, { statePatches: { [CELL_RESULT_CANDIDATE_KEY]: candidate } });
         if (i === 0) {
-          // a second report through the raw port: for a one-shot cell it only refreshes the staged candidate
+          // a second report through the raw port: for a leaf it only refreshes the staged candidate
           const dup: CellResultPayload = { childCellId: ports.self.cellId, status: "completed", summary: `item ${i}` };
           await ports.emitToParent(PAYLOAD.cellResult, dup);
         }
@@ -195,9 +197,12 @@ describe("docs/03 §四 — five granularities through the real primitives", () 
     expect(children).toHaveLength(N);
     expect(children.every((c) => c.status === "closed" && c.spec.meta?.["projectCellId"] === "proj1")).toBe(true);
     expect(h.kernel.context.listStateSync("proj1", "result:").map((e) => e.value).sort()).toEqual(["item 0", "item 1", "item 2"]);
-    // exactly one result per child, each under its fixed id — the double report of child 0 produced no second message
+    // exactly one result per child, under the id of its one settled turn — the double report of child 0 produced no
+    // second message
+    const runsOf = (cellId: string) => h.of("run.started").filter((e) => e.cellId === cellId).map((e) => e.runId);
+    expect(children.map((c) => runsOf(c.id).length)).toEqual(Array(N).fill(1));
     const got = h.kernel.inbox.listMessagesSync({ cellId: "proj1", type: PAYLOAD.cellResult }).map((m) => m.envelope.id);
-    expect(got.sort()).toEqual(children.map((c) => finalResultEnvelopeId(c.id, 0)).sort());
+    expect(got.sort()).toEqual(children.map((c) => `${c.id}:${runsOf(c.id)[0]}:settled`).sort());
 
     // A late duplicate after the card: still exactly one card.
     h.kernel.inbox.enqueueSync("proj1", {

@@ -38,6 +38,11 @@ export interface DeskServerOptions {
   allowedHosts?: string[];
   /** External main agents allowed on `/api/agent/*`: agent id → bearer token. Default NG_AGENT_TOKEN / NG_AGENT_TOKENS. */
   agentTokens?: Record<string, string>;
+  /**
+   * The owner's budget-limits switch at start: false = no cell is stopped for its budget. Default NG_BUDGET_LIMITS
+   * (`off` / `0` / `false`, `on` / `1` / `true`); unset = the choice last made in the workbench applies (default on).
+   */
+  budgetLimits?: boolean;
   /** Explicit model; wins over the environment (tests, embedding). */
   model?: ModelClient;
   /** Demo seam: the model and seed used when no model is configured (default ./demo.ts createDemoMode()). */
@@ -80,6 +85,15 @@ function csv(v: string | undefined): string[] {
   return (v ?? "").split(",").map((s) => s.trim()).filter(Boolean);
 }
 
+/** NG_BUDGET_LIMITS: `off`/`0`/`false` → false, `on`/`1`/`true` → true, unset/empty → undefined (the stored choice). */
+export function budgetLimitsFromEnv(v: string | undefined): boolean | undefined {
+  const s = v?.trim().toLowerCase();
+  if (!s) return undefined;
+  if (s === "off" || s === "0" || s === "false") return false;
+  if (s === "on" || s === "1" || s === "true") return true;
+  throw new Error(`NG_BUDGET_LIMITS must be on or off, got "${v}"`);
+}
+
 function portOf(v: string | undefined): number {
   if (v === undefined || v === "") return DEFAULT_PORT;
   const n = Number(v);
@@ -100,6 +114,7 @@ export async function createDeskServer(opts: DeskServerOptions = {}): Promise<De
   const token = opts.token !== undefined ? opts.token : (env["NG_DESK_TOKEN"] ?? null);
   const security = securityPolicyFor(host, token, opts.allowedHosts ?? csv(env["NG_DESK_ALLOWED_HOSTS"]), opts.agentTokens ?? agentTokensFromEnv(env));
 
+  const budgetLimits = opts.budgetLimits ?? budgetLimitsFromEnv(env["NG_BUDGET_LIMITS"]);
   const timeZone = env["NG_DESK_TZ"] || Intl.DateTimeFormat().resolvedOptions().timeZone;
   const demoMode = opts.demo ?? createDemoMode({ timeZone });
   const choice = selectBackend(env, {
@@ -149,6 +164,7 @@ export async function createDeskServer(opts: DeskServerOptions = {}): Promise<De
     onError,
     // With a CLI agent behind the cells, the owner picks its model in the workbench; the list comes from the CLI.
     ...(choice.engine !== "api" && choice.engine !== "demo" ? { modelSwitch: true } : {}),
+    ...(budgetLimits !== undefined ? { budgetLimits } : {}),
     ...choice.kernelOptions,
     ...opts.kernel,
   });

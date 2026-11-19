@@ -48,6 +48,15 @@ const NG_STATUS: Partial<Record<NgError["code"], 400 | 404 | 409>> = {
   unsupported: 400,
 };
 
+/** An optional non-negative integer query parameter; anything else is a 400. */
+function intQuery(c: Context, name: string): number | undefined {
+  const v = c.req.query(name);
+  if (v === undefined || v === "") return undefined;
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 0) throw new DeskError(400, "invalid_argument", `${name} 必须是非负整数`);
+  return n;
+}
+
 /** JSON body or `{}` for an empty one; malformed JSON is a 400. */
 async function body<T>(c: Context): Promise<T> {
   const text = await c.req.text();
@@ -135,6 +144,8 @@ export function createDeskApp(deps: DeskAppDeps): Hono {
     return c.json(await deps.models.set(await body<SetModelRequest>(c)));
   });
   app.post("/api/capture", async (c) => c.json(await desk.capture(await body(c))));
+  // The owner's budget-limits switch: an owner route (the agent's credential never opens it, and no tool reaches it).
+  app.put("/api/settings/budget-limits", async (c) => c.json(desk.setBudgetLimits(await body(c))));
   app.post("/api/focus", async (c) => c.json(await desk.focus(await body(c))));
 
   // ---------- 📥 Clarify ----------
@@ -184,6 +195,24 @@ export function createDeskApp(deps: DeskAppDeps): Hono {
     app.post(`/api/projects/:projectId/${op}`, async (c) => c.json(await desk.projectOp(c.req.param("projectId"), op)));
   }
   app.post("/api/projects/:projectId/actions", async (c) => c.json(await desk.addProjectAction(c.req.param("projectId"), await body(c))));
+
+  // ---------- 分身实况 Agents ----------
+  app.get("/api/agents/topology", (c) => {
+    const archived = c.req.query("includeArchived");
+    if (archived !== undefined && archived !== "0" && archived !== "1") throw new DeskError(400, "invalid_argument", "includeArchived 只能是 0 或 1");
+    return c.json(desk.topology({ includeArchived: archived === "1", projectId: c.req.query("projectId") || null }));
+  });
+  app.get("/api/cells/:cellId/timeline", (c) => {
+    const afterSeq = intQuery(c, "afterSeq");
+    const beforeSeq = intQuery(c, "beforeSeq");
+    const limit = intQuery(c, "limit");
+    if (limit === 0) throw new DeskError(400, "invalid_argument", "limit 必须是正整数");
+    return c.json(desk.timeline(c.req.param("cellId"), { ...(afterSeq !== undefined ? { afterSeq } : {}), ...(beforeSeq !== undefined ? { beforeSeq } : {}), ...(limit !== undefined ? { limit } : {}) }));
+  });
+  app.get("/api/resources", (c) => c.json(desk.resource(c.req.query("uri") ?? "", intQuery(c, "offset") ?? 0, intQuery(c, "limit") ?? undefined)));
+  app.post("/api/cells/:cellId/messages", async (c) => c.json(desk.sendCellMessage(c.req.param("cellId"), await body(c))));
+  app.post("/api/cells/:cellId/control", async (c) => c.json(await desk.cellControl(c.req.param("cellId"), await body(c))));
+  app.post("/api/cells/:cellId/trigger", (c) => c.json(desk.cellTrigger(c.req.param("cellId"))));
 
   // ---------- weekly review ----------
   app.get("/api/review", (c) => c.json(desk.review()));

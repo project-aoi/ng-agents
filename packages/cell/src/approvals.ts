@@ -302,12 +302,10 @@ export function createApprovals(core: KernelCore): Approvals {
         const reason = kernelArgs?.reason ?? escalationReason(rec);
         if (reason === "budget_exhausted") {
           const affected = kernelArgs?.cellId ?? rec.cellId;
-          const limitedBy = cells.get(affected) ? (gate.usageSync(affected).limitedBy ?? kernelArgs?.limitedBy ?? affected) : null;
-          if (limitedBy && cells.get(limitedBy)) {
-            const lim = gate.usageSync(limitedBy);
-            const add = d.raise ?? { tokens: Math.max(1, Math.ceil(lim.limitTokens / 2)), cents: Math.max(1, Math.ceil(lim.limitCents / 2)) };
-            gate.raiseBudgetSync(limitedBy, add, approverId);
-          }
+          // One click lifts every ledger on the way up that is stopped right now — the project's and its exhausted
+          // ancestor's together, so the owner is not handed a second card 58 ms later. Ledgers that are not stopped
+          // (an ancestor a sibling's card already raised) are left alone.
+          if (cells.get(affected)) gate.raiseChainSync(affected, approverId, d.raise);
         }
         if (rec.action.type !== "custom") {
           // e.g. "再等 1 天" on a watcher's nudge card: the proposed send does not happen; the cell keeps waiting.

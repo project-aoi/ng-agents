@@ -139,13 +139,14 @@ describe("waits (the internal anchor)", () => {
     await h.kernel.idle();
     expect(h.kernel.listWaits(["proj"])).toMatchObject([{ waitingFor: "inbox:desk", timeoutAt: T0 + 30 * 60_000 }]);
 
-    // The owner drops in a remark: the project wakes, but it is still waiting for the desk.
+    // A colleague drops in a remark (an outside sender, not the party it named): the project wakes, but it is still
+    // waiting for the desk. (The owner writing to it directly would have answered any wait.)
     let sawOpenWait = false;
     h.script.add("proj", (req) => {
       sawOpenWait = requestText(req).includes("waiting for inbox:desk");
       return tool("wait", { reason: "还在等" });
     });
-    h.kernel.sendToCell("proj", { text: "顺便说一句，周五前要" });
+    h.kernel.inbox.enqueueSync("proj", { id: "remark", from: "channel:memory:carol", principalId: "memory:carol", kind: "event", type: PAYLOAD.userMessage, payload: { text: "顺便说一句，周五前要" }, createdAt: h.clock.now() });
     await h.kernel.idle();
     expect(sawOpenWait).toBe(true);
     expect(h.kernel.listWaits(["proj"])).toHaveLength(1);

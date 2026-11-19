@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute, relative, sep } from "node:path";
@@ -80,26 +81,57 @@ function probe(target: number): boolean {
 export const pidAlive = (pid: number) => probe(pid);
 export const groupAlive = (pgid: number) => probe(-pgid);
 
-const HAVE_PROC = existsSync("/proc/self/environ");
+/**
+ * A live process's command line followed by its environment, via `ps` (macOS has no /proc). `-E` adds the
+ * environment there; the BSD-style `eww` is avoided because on macOS `-e` is `-A` (every process), so `-p` would no
+ * longer narrow the output to one process. The variables come out space-separated and unquoted. Null when `ps`
+ * fails, times out or prints nothing.
+ */
+export function psEnvironment(pid: number): string | null {
+  try {
+    const out = execFileSync("ps", ["-E", "-ww", "-o", "command=", "-p", String(pid)], {
+      encoding: "latin1",
+      timeout: 2_000,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return out.trim() ? out : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * How a process's environment is read. With /proc (Linux) it is `/proc/<pid>/environ`; otherwise `readEnvironment`,
+ * which is `ps` on macOS and nothing elsewhere. Mutable so tests can drive the non-/proc path on Linux.
+ */
+export const processInspection: { useProc: boolean; readEnvironment: (pid: number) => string | null } = {
+  useProc: existsSync("/proc/self/environ"),
+  readEnvironment: process.platform === "darwin" ? psEnvironment : () => null,
+};
 
 /**
  * Whether `pid` is a live process carrying `name=value` in its environment. Every process the workspace starts gets
  * such a marker, which is what makes a pid stored before a restart safe to signal: a recycled pid will not carry it.
- * Returns null when /proc is unavailable (non-Linux), so callers fall back to a bare liveness probe.
+ * Null when the process is alive but its environment could not be read (no /proc, and `ps` failed or is unavailable).
  */
 export function processHasMarker(pid: number, name: string, value: string): boolean | null {
-  if (!HAVE_PROC) return null;
-  try {
-    const env = readFileSync(`/proc/${pid}/environ`, "latin1");
-    return env.split("\0").includes(`${name}=${value}`);
-  } catch {
-    return false;
+  if (processInspection.useProc) {
+    try {
+      const env = readFileSync(`/proc/${pid}/environ`, "latin1");
+      return env.split("\0").includes(`${name}=${value}`);
+    } catch {
+      return false;
+    }
   }
+  if (!pidAlive(pid)) return false;
+  const env = processInspection.readEnvironment(pid);
+  if (env === null) return null;
+  return env.split(/\s+/).includes(`${name}=${value}`);
 }
 
+/** Only a process positively identified by its marker counts: one we cannot identify is never adopted or signalled. */
 export function markedAlive(pid: number, name: string, value: string): boolean {
-  const m = processHasMarker(pid, name, value);
-  return m === null ? pidAlive(pid) : m;
+  return processHasMarker(pid, name, value) === true;
 }
 
 export function assertNever(x: never, what: string): never {

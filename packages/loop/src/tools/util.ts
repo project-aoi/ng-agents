@@ -1,4 +1,5 @@
 import {
+  KERNEL_FROM,
   isEnvelopeOfType,
   parseAddress,
   projectCellIdOf,
@@ -57,6 +58,8 @@ export function itemSource(snapshot: PromptSnapshot): ItemSource {
   if (from?.kind === "channel") return { ...base, label: CHANNEL_LABELS[from.channelId] ?? from.channelId, channelId: from.channelId };
   if (from?.kind === "inbox") return { ...base, label: "后台分身" };
   if (env.from.startsWith("timer:")) return { ...base, label: "定时提醒" };
+  // What a person typed into a cell's conversation (the workbench's chat, or their agent passing it on).
+  if (env.from === KERNEL_FROM.control && isEnvelopeOfType(env, "user.message")) return { ...base, label: env.principalId.startsWith("agent:") ? "外部助手" : "对话" };
   return { ...base, label: "系统" };
 }
 

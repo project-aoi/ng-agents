@@ -93,7 +93,6 @@ export function replyWatcherSpec(party: ReplyParty, o: Omit<ReplyWatchMeta, "par
     processor: interpret ? REPLY_WATCHER_LLM_PROCESSOR : WAIT_MATCH_PROCESSOR,
     // It lives until the reply comes (or the owner settles it); it never touches a directory.
     lifetime: "persistent",
-    cwdMode: "read",
     bounds: { tools: toolKinds(), canSendTo: party.to ? [party.to] : [] },
     meta: { role: ROLES.watcher, gtd: { party, ...meta } satisfies ReplyWatchMeta },
   };

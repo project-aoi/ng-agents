@@ -33,7 +33,7 @@ describe("docs/05 scenario 1 — part of the work waits for the owner; the repor
       "project",
       (req) => {
         expect(requestText(req)).toContain(`doubao-work：${doubao}`);
-        return tool("dispatch", { title: "分析 trae 的 Harness", instruction: `只读分析 ${trae} 的 Harness 设计，新建对比报告 artifact，报告它的 id。`, cwd: trae, cwdMode: "read" });
+        return tool("dispatch", { title: "分析 trae 的 Harness", instruction: `只读分析 ${trae} 的 Harness 设计，新建对比报告 artifact，报告它的 id。`, cwd: trae });
       },
       tool("track_action", { title: "要到 Doubao work 的代码", owner: "human", nextStep: `向张三要 Doubao work 的代码，放到 ${doubao} 后在这里勾掉` }),
       tool("send_message", { to: "channel:ui:owner", text: `Doubao work 的代码需要你向张三要一下，放到 ${doubao}。`, summary: "需要主人要代码" }),
@@ -75,7 +75,6 @@ describe("docs/05 scenario 1 — part of the work waits for the owner; the repor
         title: "补充 Doubao work 的分析",
         instruction: `只读分析 ${doubao} 的 Harness，把结论补进报告 ${report}（当前 v1）：先 read_artifact，再带 expectedVersion 保存，不要另起一份。`,
         cwd: doubao,
-        cwdMode: "read",
       }),
       {},
     );

@@ -25,6 +25,8 @@ import type {
   ModelClient,
   PresetName,
   CellMessageDraft,
+  CellInspection,
+  InspectCellOptions,
   ProcessorSpec,
   Progress,
   Registry,
@@ -87,7 +89,7 @@ export interface KernelOptions {
   ownerAddresses?: readonly string[];
   /** Cell that receives unrouted ingress and handbacks. Default "desk". */
   deskCellId?: string;
-  /** @deprecated docs/05: host work is the default, governed by each cell's `cwdMode`. Ignored. */
+  /** @deprecated host work is the default. Ignored. */
   allowHostWrites?: boolean;
   /** Bounds a root cell gets for every field its own `bounds` leaves out. Default DEFAULT_ROOT_BOUNDS. */
   rootBounds?: BoundsInit;
@@ -103,8 +105,14 @@ export interface KernelOptions {
   workspace?: Omit<WorkspaceManagerOptions, "db" | "bus" | "clock" | "dataDir" | "inbox" | "resources" | "injectSecret" | "defaultRepoPath">;
   context?: Pick<ContextStoreOptions, "summarize" | "limits" | "rescanSkillsOnCreate">;
   loopOptions?: Omit<AgentLoopOptions, "model" | "registry" | "clock">;
-  gate?: Pick<GateOptions, "tokenTtlMs" | "warnRatio" | "trustStreak">;
+  gate?: Pick<GateOptions, "tokenTtlMs" | "warnRatio" | "trustStreak" | "cacheReadWeight" | "wrapUp">;
   hubOptions?: Pick<ChannelHubOptions, "sendTimeoutMs" | "requireToken">;
+  /**
+   * The owner's switch for budget limits. `false`: no cell is ever stopped, held or refused for its token or cost
+   * budget (usage is still counted and shown). Given, it applies to this process and is remembered; absent, the
+   * choice last made (also through `setBudgetLimits`) applies; default on. See Kernel.setBudgetLimits.
+   */
+  budgetLimits?: boolean;
   /** Runs in flight across all cells. Default 8. */
   maxConcurrentRuns?: number;
   /** Claim lease; renewed while the Run is alive. Default 10 minutes. */
@@ -333,25 +341,50 @@ export interface Kernel {
   activeRuns(): RunInfo[];
 
   // ---------- docs/05 ----------
-  /** Who is writing / queued / idle in which work tree, kernel-wide. */
+  /** Which cells are active in which work tree right now, kernel-wide. */
   activeWorkspaces(): WorkspaceOccupancy[];
+  /** What each cell is doing right now (working, waiting, dormant, …). */
+  activityOf(cellIds: readonly string[]): Map<string, CellActivity>;
+  /**
+   * A person speaks to one cell directly (the workbench's chat box, an agent passing the owner's words on). One
+   * transaction: a closed leaf whose parent is still open is brought back; the message is delivered (queued, or as a
+   * steer); and when the target is a leaf below a coordinator, that coordinator gets a `cell.direct_chat` copy in the
+   * owner's words — background by default — so it is never behind on what its worker was told. Script cells and cells
+   * archived with a finished project are refused.
+   */
+  directMessage(cellId: string, message: DirectMessage, opts?: ActorOptions): DirectMessageResult;
+  /** RunPorts.inspectCell for the control plane: nobody's cursor moves. */
+  inspectCell(cellId: string, opts?: InspectCellOptions): CellInspection;
   /** The five anchors of a (project) cell's subtree; `stalled` = none of them holds. */
   anchorsOf(cellId: string): AnchorReport;
   /** Open waits of these cells (all cells when omitted). */
   listWaits(cellIds?: readonly string[]): WaitRecord[];
   /**
    * Cell-to-cell message as `principalId` (default: the owner) — the control plane's twin of RunPorts.sendToCell:
-   * `closed` / `not_found` are answers, not errors.
+   * `closed` / `not_found` are answers, not errors. From the owner or an agent to a leaf below a coordinator, the
+   * coordinator gets the same carbon copy as with directMessage (which is what a chat surface should call).
    */
   sendToCell(cellId: string, message: CellMessageDraft, opts?: ActorOptions): SendToCellResult;
   /** Re-evaluate the stall check now (tests, and the app after it changed GTD records itself). */
   checkStalls(): void;
+
+  // ---------- budget limits ----------
+  /** Whether budget limits are enforced right now. */
+  budgetLimits(): { enforced: boolean };
+  /**
+   * Switch budget limits on or off — the owner only (an agent or a cell is refused with `bounds_violation`): off
+   * removes every stop a budget would cause, which is a wider grant than raising any single budget. Switching off
+   * starts the cells that were held at their budget stop and answers the budget cards that were waiting with
+   * "continue" (nothing is left to decide on them; the cells they were about go on); switching on applies the limits again from the next decision (a ledger
+   * that is over its limit stops its cells at their next step or wake-up). Remembered across restarts.
+   */
+  setBudgetLimits(enforced: boolean, opts?: ActorOptions): { enforced: boolean; changed: boolean; releasedCells: string[]; continuedCards: string[] };
 }
 
 /** docs/05 guard 2. A stalled_check wake-up and a Run that only it triggered never count as anchors. */
 export interface AnchorReport {
   cellId: string;
-  /** @Agent: a Run in flight, due or slot-queued work, or a running Job somewhere in the subtree. */
+  /** @Agent: a Run in flight, due work, or a running Job somewhere in the subtree. */
   agent: boolean;
   /** @Waiting(external): an active watch, a future timer/cron, or a message waiting in a batching window. */
   external: boolean;
@@ -365,6 +398,47 @@ export interface AnchorReport {
   /** Human-readable account of what holds (or that nothing does), for the stalled_check message and Radar. */
   detail: string;
 }
+
+/** What a cell is doing right now (ReadModel.activityOf). `idle` is a coordinator with nothing in flight; `dormant` a leaf. */
+export interface CellActivity {
+  state: "working" | "waiting" | "dormant" | "idle" | "paused" | "closed";
+  /** One plain clause saying why (for refusals and status lines). */
+  why: string;
+}
+
+/** A message from a person (the owner, or their agent on the control plane) straight to one cell. */
+export interface DirectMessage {
+  text: string;
+  /** Idempotency id of this message: a retried send with the same id is not delivered twice. */
+  clientId?: string;
+  /** `enqueue` (default): it takes the message when its current step ends, or is woken by it. `steer`: interrupt it now. */
+  mode?: "enqueue" | "steer";
+  /** How the parent of a leaf learns of it: `silent` (default) = at its next wake-up; `wakeup` = it is woken now. */
+  notifyParent?: "silent" | "wakeup";
+  /**
+   * The message this one answers (a question the cell asked) — its id and, so the cell can tell which question that
+   * was without looking anything up, the text it asked — and the conversation this message belongs to.
+   */
+  replyToId?: string;
+  replyToText?: string;
+  conversationId?: string;
+}
+
+export type DirectMessageResult =
+  | {
+      status: "delivered";
+      envelopeId: string;
+      /** The retried send of a message that was already delivered: nothing was sent again. */
+      duplicate: boolean;
+      /** The cell had been closed and was brought back for this message. */
+      reopened: boolean;
+      targetStatus: "active" | "paused";
+      /** The parent that got the carbon copy, when there is one. */
+      ccTo: string | null;
+    }
+  | { status: "not_found" }
+  /** `code`: a deterministic script cell takes no conversation; `archived`: closed with a closed or finished parent. */
+  | { status: "refused"; reason: "code" | "archived" | "not_allowed"; detail: string };
 
 /** RunOutcome plus "error" (the Run threw), as reported on `run.finished`. */
 export type RunResult = RunOutcome | "error";

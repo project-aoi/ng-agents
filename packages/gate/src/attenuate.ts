@@ -18,14 +18,6 @@ import {
 const MAX_LIMIT = Number.MAX_SAFE_INTEGER;
 const STRONGEST_ISOLATION: IsolationLevel = "cow_microvm";
 
-export interface AttenuateOptions {
-  /**
-   * What the parent cell and every ancestor above it still have left in the ledger (effective limit − subtree usage,
-   * minimum over the chain). Caps the child's maxTokens / maxCents.
-   */
-  remaining?: { tokens: number; cents: number };
-}
-
 /** Same rule as the protocol's serialized-bounds schema: `inbox:`/`channel:` prefix wildcard, or a parseable address. */
 export function isAddressPattern(value: unknown): value is Address {
   if (typeof value !== "string") return false;
@@ -120,7 +112,6 @@ export function attenuateBounds(
   parent: PolicyBounds,
   parentCellId: string,
   requested?: Partial<PolicyBounds> | null,
-  opts: AttenuateOptions = {},
 ): PolicyBounds {
   const parentDepth = typeof parent.maxDepth === "number" && Number.isFinite(parent.maxDepth) ? Math.floor(parent.maxDepth) : 0;
   if (parentDepth < 1) {
@@ -154,8 +145,6 @@ export function attenuateBounds(
 
   const clampInt = (value: unknown, cap: number) => (value === undefined ? cap : Math.min(nonNegInt(value), cap));
   const clampNum = (value: unknown, cap: number) => (value === undefined ? cap : Math.min(nonNegNum(value), cap));
-  const remTokens = opts.remaining ? nonNegInt(opts.remaining.tokens) : MAX_LIMIT;
-  const remCents = opts.remaining ? nonNegNum(opts.remaining.cents) : MAX_LIMIT;
 
   const result: PolicyBounds = {
     tools: new Set(tools),
@@ -163,8 +152,9 @@ export function attenuateBounds(
     secretRefs: new Set(secretRefs),
     isolation,
     maxConcurrentChildren: clampInt(req.maxConcurrentChildren, nonNegInt(parent.maxConcurrentChildren)),
-    maxTokens: clampInt(req.maxTokens, Math.min(nonNegInt(parent.maxTokens), remTokens)),
-    maxCents: clampNum(req.maxCents, Math.min(nonNegNum(parent.maxCents), remCents)),
+    // Static caps only; the live ledgers of the whole chain govern spending (Gate.meter), see the Gate contract.
+    maxTokens: clampInt(req.maxTokens, nonNegInt(parent.maxTokens)),
+    maxCents: clampNum(req.maxCents, nonNegNum(parent.maxCents)),
     maxDepth: clampInt(req.maxDepth, parentDepth - 1),
   };
 

@@ -61,7 +61,10 @@ export function projectCellIdOf(spec: Pick<CellSpec, "meta">): string | undefine
 
 // ==================== ball owner (docs/03 principle 3, docs/04 §4) ====================
 
-/** human = 🔵 我来处理 (@Human) · agent = 🟢 Agent 处理中 (@Agent) · waiting = 🟡 等待回复 (@Waiting) */
+/**
+ * human = 🔵 我来处理 (@Human) · agent = 🟢 Agent 处理中 (@Agent) · waiting = 🟡 等待外部 (@Waiting: a CI gate, a merge, a
+ * colleague's reply, a lock to be released — the action's own title says what exactly is awaited).
+ */
 export type BallOwner = "human" | "agent" | "waiting";
 
 /** Display priority when aggregating a project's open actions: 🔵 > 🟢 > 🟡. */
@@ -70,7 +73,7 @@ export const BALL_OWNER_PRIORITY: readonly BallOwner[] = ["human", "agent", "wai
 export const BALL_OWNER_LABEL: Readonly<Record<BallOwner, string>> = {
   human: "🔵 我来处理",
   agent: "🟢 Agent 处理中",
-  waiting: "🟡 等待回复",
+  waiting: "🟡 等待外部",
 };
 
 export function compareBallOwner(a: BallOwner, b: BallOwner): number {

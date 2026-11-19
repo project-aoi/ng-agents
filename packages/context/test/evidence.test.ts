@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isNgError, markdownDeliverable, run, spillNotice } from "@ng/protocol";
+import { createBus, isNgError, markdownDeliverable, MAX_RESOURCE_PAGE_CHARS, run, spillNotice, withTx, type BusTopics } from "@ng/protocol";
 import { batchOf, setup, userEnvelope } from "./helpers";
 
 const LIMITS = { inlineChars: 400, spillHeadChars: 200, spillTailChars: 100 };
@@ -38,6 +38,65 @@ describe("evidence and Inline & Spill", () => {
     // …up to a bound: a huge document is still spilled, with pages to walk.
     const huge = h.store.appendEvidenceSync("desk", { kind: "tool_result", toolUseId: "t9", name: "read_artifact", output: "y".repeat(40_000), runId: "run1", at: 7 });
     expect(huge.modelText).toContain("go on page by page");
+  });
+
+  it("keeps the largest read_resource page whole (with its paging line), but not more", () => {
+    const h = setup({ store: { limits: LIMITS } });
+    const note = `\n…[characters 0–${MAX_RESOURCE_PAGE_CHARS} shown; more follows: read_resource("artifact://art_report", offset ${MAX_RESOURCE_PAGE_CHARS}, limit ${MAX_RESOURCE_PAGE_CHARS})]`;
+    const page = "p".repeat(MAX_RESOURCE_PAGE_CHARS) + note;
+    const whole = h.store.appendEvidenceSync("desk", { kind: "tool_result", toolUseId: "t1", name: "read_resource", output: page, runId: "run1", at: 1 });
+    expect(whole.spill).toBeUndefined();
+    expect(whole.modelText).toBe(page);
+    // The same size from another tool is cut as usual; read_resource output beyond a page is cut too.
+    for (const name of ["read_artifact", "bash"]) {
+      expect(h.store.appendEvidenceSync("desk", { kind: "tool_result", toolUseId: `t-${name}`, name, output: page, runId: "run1", at: 2 }).spill).toBeDefined();
+    }
+    const over = h.store.appendEvidenceSync("desk", { kind: "tool_result", toolUseId: "t3", name: "read_resource", output: "q".repeat(MAX_RESOURCE_PAGE_CHARS * 2), runId: "run1", at: 3 });
+    expect(over.spill).toBeDefined();
+  });
+
+  it("announces each appended record after commit with its stored seq", () => {
+    const h = setup({ cells: [{ id: "desk" }, { id: "w1", parentId: "desk" }] });
+    const bus = createBus();
+    const store = h.makeStore({ bus, rescanSkillsOnCreate: false });
+    const heard: Array<BusTopics["evidence.appended"]> = [];
+    // A subscriber can read the row the moment it hears about it.
+    const readable: boolean[] = [];
+    bus.on("evidence.appended", (e) => {
+      heard.push(e);
+      readable.push(store.listEvidenceSync(e.cellId, { afterSeq: e.seq - 1, limit: 1 })[0]?.seq === e.seq);
+    });
+
+    const a = store.appendEvidenceSync("desk", { kind: "run_boundary", phase: "start", epoch: 0, runId: "run1", at: 1 });
+    const b = store.appendEvidenceSync("w1", { kind: "tool_result", toolUseId: "t1", name: "bash", output: "z".repeat(5000), runId: "run2", at: 2 });
+    const c = store.appendEvidenceSync("desk", { kind: "system_note", text: "a note from the UI", runId: null, at: 3 });
+    expect(heard).toEqual([
+      { cellId: "desk", seq: a.seq, kind: "run_boundary", runId: "run1" },
+      { cellId: "w1", seq: b.seq, kind: "tool_result", runId: "run2" },
+      { cellId: "desk", seq: c.seq, kind: "system_note", runId: null },
+    ]);
+    expect(readable).toEqual([true, true, true]);
+
+    // Inside a caller's transaction: nothing until the outer commit, then one event per record, in order.
+    heard.length = 0;
+    const seqs = withTx(h.db, () => {
+      const first = store.appendEvidenceSync("desk", { kind: "assistant_text", text: "one", runId: "run3", at: 4 }).seq;
+      const second = store.appendEvidenceSync("desk", { kind: "assistant_text", text: "two", runId: "run3", at: 5 }).seq;
+      expect(heard).toEqual([]);
+      return [first, second];
+    });
+    expect(heard).toEqual(seqs.map((seq) => ({ cellId: "desk", seq, kind: "assistant_text", runId: "run3" })));
+
+    // A rolled back append announces nothing.
+    heard.length = 0;
+    expect(() =>
+      withTx(h.db, () => {
+        store.appendEvidenceSync("desk", { kind: "system_note", text: "lost", runId: null, at: 6 });
+        throw new Error("caller failed");
+      }),
+    ).toThrow("caller failed");
+    expect(heard).toEqual([]);
+    expect(readable.every(Boolean)).toBe(true);
   });
 
   it("spills large tool output to a resource, keeps head/tail inline and reads it back in pages", async () => {

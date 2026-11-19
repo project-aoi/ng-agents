@@ -209,7 +209,8 @@ describe("searchHistory scopes", () => {
     h.store.commitSync("proj", { artifact: { artifactId: "report", content: markdownDeliverable("改用 metrics_v4 看板"), updatedBy: "agent", expectedVersion: 1 } });
     expect(sub("metrics_v3")).toEqual([]);
     expect(sub("metrics_v4")).toEqual([expect.objectContaining({ source: "artifact", cellId: "w2", seq: 2 })]);
-    expect(sub("metrics_v4")[0]!.title).toBeUndefined();
+    // v2 was saved without a title: the artifact keeps (and stays findable by) its title (BUG-006).
+    expect(sub("metrics_v4")[0]!.title).toBe("周报草稿");
 
     h.store.commitSync("g", { statePatches: { "notes:datasource": "now clickhouse_events" } });
     expect(sub("kafka-topic-clicks")).toEqual([]);

@@ -1,5 +1,6 @@
 import { z } from "zod";
 import {
+  isLeafLifetime,
   anyCovers,
   CELL_RESULT_CANDIDATE_KEY,
   CELL_STATUS_KEY,
@@ -138,9 +139,9 @@ function normalizeReport(raw: unknown): unknown {
 }
 
 const hasParent = ({ spec }: { spec?: CellSpec }) => spec === undefined || Boolean(spec.parentId);
-const isOneShot = (spec: CellSpec | undefined) => spec?.lifetime === "one_shot";
-/** complete_self / pause_self: for cells that live until they say so (a one-shot cell just reports its result). */
-const settlesItself = ({ spec }: { spec?: CellSpec }) => spec !== undefined && Boolean(spec.parentId) && !isOneShot(spec);
+const isLeaf = (spec: CellSpec | undefined) => isLeafLifetime(spec?.lifetime);
+/** complete_self / pause_self: for cells that live until they say so (a leaf's turns are settled by the kernel). */
+const settlesItself = ({ spec }: { spec?: CellSpec }) => spec !== undefined && Boolean(spec.parentId) && !isLeaf(spec);
 const canReachChannels = (bounds: PolicyBounds) => bounds.canSendTo.some((a) => a.startsWith("channel:"));
 
 /** `inbox:<cellId>` → what to tell the model about a cell-to-cell delivery (docs/05 guard 1: a closed target is said out loud). */
@@ -156,12 +157,12 @@ async function sendToInbox(ctx: ToolContext, to: `inbox:${string}`, args: { text
         output:
           r.targetStatus === "paused"
             ? `Delivered to ${target}, which is paused: it reads the message when it is resumed.`
-            : `Delivered to ${target}. It handles the message in its current run or is woken with it; if you need its answer, end your turn with wait (waitingFor "${to}").`,
+            : `Delivered to ${target}. It handles the message in its current run, or is woken with it (a dormant worker continues with everything it knows); if you need its answer, end your turn with wait (waitingFor "${to}").`,
         data: r,
       };
     case "closed":
       return {
-        output: `NOT DELIVERED — ${target} is closed (it already finished${r.closeReason === "cancelled" ? " or was cancelled" : " and reported"}). Nothing was stored. If the work still needs doing, start a new worker with spawn_cell and give it the context it needs (what the previous one did, the branch or artifact it left).`,
+        output: `NOT DELIVERED — ${target} is closed (${r.closeReason === "cancelled" ? "it was cancelled" : "it was closed, or its project ended"}). Nothing was stored. If the work still needs doing, start a new worker with spawn_cell and give it the context it needs (what the previous one did, the branch or artifact it left).`,
         isError: true,
         data: r,
       };
@@ -187,7 +188,7 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
     description: [
       "Send a message to a person or to another cell.",
       "To a person — channel:<channelId>:<target>: messages to the owner go out directly; messages to anyone else are saved as a versioned draft and normally wait on an approval card for the owner (the run then ends and you are woken with the outcome). To revise a draft you already saved, pass its artifactId instead of text.",
-      "To a cell — inbox:<cellId>: delivered at once, no approval (forward a follow-up to a child that is working, ask inbox:desk to arbitrate, answer a cell that asked you). The result tells you if the cell has already closed — then nothing was delivered and you start a new worker instead.",
+      "To a cell — inbox:<cellId>: delivered at once, no approval (a follow-up to a worker of yours — working or dormant, it wakes with everything it knows —, a question to inbox:desk or to your parent, an answer to a cell that asked you). The result tells you if the cell is closed — then nothing was delivered and you start a new worker instead.",
     ].join(" "),
     input: z.object({
       to: z.string().describe("channel:<channelId>:<target> for a person, inbox:<cellId> for a cell (inbox:desk = the desk)"),
@@ -392,7 +393,7 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
     description: [
       "Report to the cell that started you.",
       "kind progress: a short status line your parent reads at its next wake-up without being woken.",
-      "kind result: your final outcome, once, when you are done or cannot finish. If you are a one-shot worker this ends your run: the kernel hands the result to your parent and closes you — unless a follow-up message reached you in the meantime, in which case you are woken with it first and report again when that is done too.",
+      "kind result: the outcome of your work, when you are done or cannot finish. For a worker this is optional — your parent is told when your turn ends either way and can read what you did — but it is how you hand over a structured result: the artifact id, a clear \"failed\" with the reason, the branch and what was verified. It ends your run. If a follow-up message reached you in the meantime, you are woken with it first.",
     ].join(" "),
     // Lenient on purpose: three different CLI agents call this, sometimes from the name alone. The obvious near-misses
     // (summary/result for text, success/done/error for status, a missing kind) are understood rather than bounced.
@@ -421,9 +422,9 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
         await ctx.ports.context.commit(childCellId, { statePatches: { [CELL_STATUS_KEY]: status } });
         return "Progress noted.";
       }
-      if (isOneShot(ctx.ports.self.spec)) {
-        // docs/05 guard 1: nothing is sent from here. The candidate is stored; the kernel delivers it exactly once when
-        // the run has settled and the inbox is drained, in the same transaction that closes this cell.
+      if (isLeaf(ctx.ports.self.spec)) {
+        // docs/05 guard 1: nothing is sent from here. The candidate is stored; the kernel delivers it when the run has
+        // settled and the inbox is drained (and closes a one-shot cell in that same transaction).
         const candidate: CellResultCandidate = {
           status: args.status ?? "completed",
           summary: args.text,
@@ -433,7 +434,7 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
         };
         await ctx.ports.context.commit(childCellId, { statePatches: { [CELL_RESULT_CANDIDATE_KEY]: candidate, [CELL_STATUS_KEY]: status } });
         return {
-          output: "Result recorded. Your run ends now; the kernel delivers it to your parent and closes you. If a follow-up message reached you first, you are woken with it instead — handle it, then report the updated result.",
+          output: "Result recorded. Your run ends now and your parent is told. If a follow-up message reached you first, you are woken with it instead — handle it, then report the updated result.",
           endRun: "completed",
           data: { staged: true },
         };
@@ -517,7 +518,7 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
     name: "wait",
     kind: "kernel",
     description: [
-      "End this run and sleep until the next message wakes you. Sleeping costs nothing and releases your directory's write slot.",
+      "End this run and sleep until the next message wakes you. Sleeping costs nothing.",
       "Say who you are waiting for with waitingFor, so the wait is on record until exactly that party answers (other wake-ups do not clear it): an address such as \"inbox:desk\" (you asked the desk to arbitrate) or a child's \"inbox:<cellId>\"; \"human\" (the owner must do or decide something — only after you raised a card or recorded an action for them); \"external\" (an outside event — only with a watch or a timer set).",
       "timeoutMinutes wakes you if nothing came by then. Without waitingFor it simply ends the run (a job, a reminder or a reply you already arranged will wake you).",
     ].join(" "),
@@ -548,7 +549,7 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
     availableFor: settlesItself,
     description: [
       "Close this cell because its whole job is finished (or, with cancelled, abandoned). Your parent gets one final result with your summary.",
-      "Closing takes every child cell that is still open with it. So when some are open you are told which, and nothing is closed: wait for their results — or call again with closeChildren: true when stopping them is what you mean.",
+      "Closing takes every child cell with it. Workers that have finished their turn and are dormant are simply archived; but when a child is still at work (running, waiting, watching) you are told which, and nothing is closed: wait for it — or call again with closeChildren: true when stopping it is what you mean.",
       "The run ends now and the kernel closes you once your inbox is drained — a message that arrived meanwhile wakes you first, and you call this again when that is handled.",
     ].join(" "),
     input: z.object({

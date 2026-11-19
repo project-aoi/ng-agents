@@ -29,15 +29,15 @@ sequenceDiagram
     participant Ctx as "Context (VersionedArtifact & Actions)"
 
     Note over Proj,Ctx: 1. 拆解并行先行项与人工卡点
-    Proj->>W: "dispatch(worker 1, cwdMode=read): 先分析本地已有 trae 源码 -> save_artifact(v1)"
+    Proj->>W: "dispatch(worker 1, 只做查阅): 先分析本地已有 trae 源码 -> save_artifact(v1)"
     Proj->>Ctx: "track_action(owner='human', title='获取 Doubao 代码', nextStep='放到 ~/code/doubao 后勾掉')"
-    Proj->>Proj: "wait(waitingFor='human') (worker 1 在后台照常运行并回报 v1)"
+    Proj->>Proj: "wait(waitingFor='human') (worker 1 在后台照常运行，本轮结束时内核通知项目 v1 已就绪)"
 
     Note over Human,Proj: 2. 人类完成物理动作 -> 同步事务毫秒级销账并唤醒项目
     Human->>Sync: "在 Engage 点击 [✓ 已办完] 或经主 Agent complete_action(note='代码已在 ~/code/doubao')"
     Sync->>Ctx: "同步事务将 action 标为 done，同时向 inbox:proj 入队唤醒信封"
     Ctx->>Proj: "唤醒协调器 (携带完成备注与既有 Artifact v1 ID)"
-    Proj->>W: "dispatch(worker 2, cwdMode=read): 读取 Artifact v1，增补 Doubao 对比 -> 传 expectedVersion=1 升 v2"
+    Proj->>W: "dispatch(worker 2, 只做查阅): 读取 Artifact v1，增补 Doubao 对比 -> 传 expectedVersion=1 升 v2"
 
     Note over Human,Ctx: 3. 专注区人工手改防覆盖与免打扰
     Human->>Sync: "在 Engage 左栏编辑保存草稿 -> Context.commit(updatedBy='human') 升为 v3"
@@ -82,5 +82,4 @@ sequenceDiagram
   - [presets/test/scenario-human-step.test.ts](../../presets/test/scenario-human-step.test.ts)（部分先行 + `@Human` 等待 + 勾完续跑升版报告 + 补充要求迭代）
   - [presets/test/scenario-someday.test.ts](../../presets/test/scenario-someday.test.ts)（分阶段门控与中途改计划同步账本）
   - [packages/context/test/artifacts.test.ts](../../packages/context/test/artifacts.test.ts)
-- **当前待修实现偏差（详见 [03-bugs](../03-bugs/README.md)）**：
-  - `BUG-006`（`save_artifact` 升版省略 `title` 时误抹成 `NULL`；尚缺局部锚点修订工具 `patch_artifact` 导致超长报告分页读写风暴）。
+- **当前待修实现偏差（详见 [03-bugs](../03-bugs/README.md)）**：无本用例专属条目（原列条目已于 2026-11-19 修复）。

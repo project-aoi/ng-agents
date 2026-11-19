@@ -122,7 +122,7 @@ export function renderBrief(init: ProjectInit): string {
       '报告完成后：用 update_project 写一句结论，然后 finish_project（outcome "someday"）停靠到“以后再说”。主人以后重新提起时会唤醒你。',
     );
   } else {
-    section("推进方式", "现在开始推进：你负责计划、记录和汇总，读代码、改代码、跑测试、调研这些重活交给一次性 worker（dispatch）。");
+    section("推进方式", "现在开始推进：你负责计划、记录和汇总，读代码、改代码、跑测试、调研这些重活交给 worker（dispatch）。worker 一轮做完会待命，同一件事的后续直接发消息给它（send_message）。");
   }
   if (init.phases?.length) {
     section(

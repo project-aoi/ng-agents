@@ -187,7 +187,7 @@ describe("Radar projection", () => {
       waiting: { description: "等待供应商报价回信", join: "all", parties: [{ id: "a", label: "A", replied: true }, { id: "b", label: "B", replied: true }, { id: "c", label: "C", replied: false, dueAt: clock.now() + DAY }] },
     });
     let row = projectRadar(view(kernel)).projects[0]!;
-    expect(row.ball).toMatchObject({ owner: "waiting", label: "🟡 等待回复", text: "等待供应商报价回信 (已回 2/3 · 剩 C 明天到期)" });
+    expect(row.ball).toMatchObject({ owner: "waiting", label: "🟡 等待外部", text: "等待供应商报价回信 (已回 2/3 · 剩 C 明天到期)" });
     expect(row.waiting).toMatchObject({ replied: 2, total: 3 });
 
     writeAction(kernel, p, { title: "整理竞品", owner: "agent", progress: { done: 11, total: 15, label: "正在并发整理竞品资料" } });

@@ -1,8 +1,11 @@
-import { existsSync, fstatSync, readFileSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { once } from "node:events";
+import { existsSync, fstatSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { isNgError, run, validatePayload, type JobResultPayload } from "@ng/protocol";
-import { defaultCommandRunner, type CommandRunner } from "../src";
+import { defaultCommandRunner, JOB_MARKER, type CommandRunner } from "../src";
+import { markedAlive, processHasMarker, processInspection, psEnvironment } from "../src/util";
 import { cleanupAll, harness, pidGone, waitFor } from "./helpers";
 
 afterEach(cleanupAll);
@@ -327,5 +330,156 @@ describe("jobs", () => {
     await next.recover();
     expect(next.getJobSync(jobId)).toMatchObject({ state: "cancelled", error: "stopped by the owner" });
     expect((h.inbox.list("w1")[0]!.payload as JobResultPayload).state).toBe("cancelled");
+  });
+});
+
+/** Linux's procps prints the same shape as macOS's `ps -E` (command line, then the environment) with BSD-style `eww`. */
+function procpsEnvironment(pid: number): string | null {
+  try {
+    const out = execFileSync("ps", ["eww", "-o", "command=", "-p", String(pid)], { encoding: "latin1", stdio: ["ignore", "pipe", "ignore"] });
+    return out.trim() ? out : null;
+  } catch {
+    return null;
+  }
+}
+
+const realPs = process.platform === "darwin" ? psEnvironment : process.platform === "linux" ? procpsEnvironment : null;
+
+describe("process identity without /proc (macOS)", () => {
+  const saved = { ...processInspection };
+  afterEach(() => {
+    Object.assign(processInspection, saved);
+  });
+
+  /** Takes the non-/proc path, with `read` standing in for `ps`; returns the pids it was asked about. */
+  function withoutProc(read: (pid: number) => string | null): number[] {
+    const calls: number[] = [];
+    processInspection.useProc = false;
+    processInspection.readEnvironment = (pid) => {
+      calls.push(pid);
+      return read(pid);
+    };
+    return calls;
+  }
+
+  it("finds the marker among the environment `ps` appends to the command line, only as a whole NAME=value word", () => {
+    // What `ps -E -ww -o command= -p <pid>` prints on macOS: the command line, then the environment, unquoted.
+    const line = (env: string) => `/bin/sh -c exitf="$1"; shift; "$@" ng-job /tmp/j/exit /bin/sh -c make test PATH=/usr/bin:/bin HOME=/Users/me ${env} LANG=en_US.UTF-8\n`;
+    withoutProc(() => line(`${JOB_MARKER}=job_abc`));
+    expect(processHasMarker(process.pid, JOB_MARKER, "job_abc")).toBe(true);
+    expect(markedAlive(process.pid, JOB_MARKER, "job_abc")).toBe(true);
+    expect(markedAlive(process.pid, JOB_MARKER, "job_ab")).toBe(false);
+    withoutProc(() => line(`X${JOB_MARKER}=job_abc`));
+    expect(markedAlive(process.pid, JOB_MARKER, "job_abc")).toBe(false);
+  });
+
+  it("a recycled pid (alive, but without the marker) is not ours", () => {
+    withoutProc(() => "node /usr/local/lib/node_modules/some-tool/cli.js PATH=/usr/bin:/bin HOME=/Users/someone\n");
+    expect(processHasMarker(process.pid, JOB_MARKER, "job_abc")).toBe(false);
+    expect(markedAlive(process.pid, JOB_MARKER, "job_abc")).toBe(false);
+  });
+
+  it("a live process whose environment cannot be read is not ours; a dead pid is not even looked up", async () => {
+    const calls = withoutProc(() => null);
+    expect(processHasMarker(process.pid, JOB_MARKER, "job_abc")).toBeNull();
+    expect(markedAlive(process.pid, JOB_MARKER, "job_abc")).toBe(false);
+    const gone = spawn("true", { stdio: "ignore" });
+    await once(gone, "exit");
+    calls.length = 0;
+    expect(processHasMarker(gone.pid!, JOB_MARKER, "job_abc")).toBe(false);
+    expect(calls).toEqual([]);
+  });
+
+  it("recover() adopts and signals nothing it cannot identify: a recycled pid and an unreadable one are finished as failed", async () => {
+    const h = harness();
+    await h.mgr.acquire("w1", "none");
+    const stranger = spawn("sleep", ["30"], { stdio: "ignore" });
+    await once(stranger, "spawn");
+    try {
+      withoutProc((pid) => (pid === process.pid ? "node vitest PATH=/usr/bin:/bin HOME=/Users/me\n" : null));
+      run(
+        h.db,
+        `INSERT INTO jobs (job_id, cell_id, epoch, command, cwd, state, pid, log_path, stream_preview, started_at, updated_at)
+         VALUES ('job_recycled', 'w1', 0, 'make', NULL, 'running', ?, NULL, 0, 1, 1),
+                ('job_unreadable', 'w1', 0, 'make', NULL, 'running', ?, NULL, 0, 1, 1)`,
+        [process.pid, stranger.pid!],
+      );
+      await h.mgr.recover();
+      expect(h.mgr.getJobSync("job_recycled")).toMatchObject({ state: "failed" });
+      expect(h.mgr.getJobSync("job_unreadable")).toMatchObject({ state: "failed" });
+      expect(pidGone(stranger.pid!)).toBe(false);
+      expect(stranger.exitCode).toBeNull();
+    } finally {
+      stranger.kill("SIGKILL");
+    }
+  });
+
+  it.runIf(realPs !== null)("with the real `ps`: recover() re-attaches a live job by its marker and reports it when it ends", async () => {
+    withoutProc(realPs!);
+    const h = harness();
+    const port = await h.mgr.acquire("w1", "none");
+    const { jobId } = await port.startJob({ command: "while [ ! -f go ]; do sleep 0.05; done; echo late" });
+    const pid = h.mgr.getJobSync(jobId)!.pid!;
+    expect(markedAlive(pid, JOB_MARKER, jobId)).toBe(true);
+    expect(markedAlive(pid, JOB_MARKER, "job_other")).toBe(false);
+    expect(markedAlive(process.pid, JOB_MARKER, jobId)).toBe(false);
+    h.mgr.close();
+    const next = h.restart();
+    await next.recover();
+    expect(next.getJobSync(jobId)!.state).toBe("running");
+    writeFileSync(join(port.root, "go"), "");
+    const job = await finished({ mgr: next }, jobId);
+    expect(job.state).toBe("succeeded");
+    expect((h.inbox.list("w1")[0]!.payload as JobResultPayload).tail).toContain("late");
+  });
+
+  it("a re-attached job outlives a passing `ps` failure; one that never recovers ends the watch without a signal", async () => {
+    const h = harness();
+    const port = await h.mgr.acquire("w1", "none");
+    const { jobId } = await port.startJob({ command: "while [ ! -f go ]; do sleep 0.05; done" });
+    const pid = h.mgr.getJobSync(jobId)!.pid!;
+    let failures = 0;
+    const calls = withoutProc(() => {
+      if (failures > 0) {
+        failures--;
+        return null;
+      }
+      return `/bin/sh -c ng-job ${JOB_MARKER}=${jobId} PATH=/usr/bin:/bin`;
+    });
+    try {
+      h.mgr.close();
+      const next = h.restart();
+      await next.recover();
+      expect(next.getJobSync(jobId)!.state).toBe("running");
+
+      failures = 2;
+      const n = calls.length;
+      await waitFor(() => calls.length >= n + 5);
+      expect(failures).toBe(0);
+      expect(next.getJobSync(jobId)!.state).toBe("running");
+
+      failures = Number.POSITIVE_INFINITY;
+      const job = await finished({ mgr: next }, jobId);
+      expect(job).toMatchObject({ state: "failed" });
+      expect(pidGone(pid)).toBe(false); // left alone: it could not be identified any more
+    } finally {
+      writeFileSync(join(port.root, "go"), "");
+      await waitFor(() => pidGone(pid));
+    }
+  });
+
+  it.runIf(process.platform === "darwin")("macOS: `ps -E` shows a real process's environment", async () => {
+    const child = spawn("sleep", ["30"], { env: { ...process.env, NG_TEST_MARK: "mark-123" }, stdio: "ignore" });
+    await once(child, "spawn");
+    try {
+      expect(psEnvironment(child.pid!)).toContain("NG_TEST_MARK=mark-123");
+      expect(markedAlive(child.pid!, "NG_TEST_MARK", "mark-123")).toBe(true);
+      expect(markedAlive(child.pid!, "NG_TEST_MARK", "other")).toBe(false);
+      expect(markedAlive(process.pid, "NG_TEST_MARK", "mark-123")).toBe(false);
+    } finally {
+      child.kill("SIGKILL");
+    }
+    await once(child, "exit");
+    expect(psEnvironment(child.pid!)).toBeNull();
   });
 });

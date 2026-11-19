@@ -113,12 +113,18 @@ describe("demo mode: the workbench's scenarios played through the real kernel an
     const row = (title: string) => radar.projects.find((p) => p.title === title)!;
     expect(radar.projects.map((p) => p.title).sort()).toEqual(["Harness 对比", "压测服务器采购比价", "排查支付回调偶发 500"].sort());
     expect(row("排查支付回调偶发 500")).toMatchObject({ ball: { owner: "agent" }, summary: expect.stringContaining("已定位"), stalled: false });
-    expect(row("排查支付回调偶发 500").workers).toEqual([expect.objectContaining({ title: "修复幂等键过期并补并发测试", state: "running" })]);
+    // The worker that reported rests (dormant, wakeable); the next one is still at it.
+    expect(row("排查支付回调偶发 500").workers).toEqual([
+      expect.objectContaining({ title: "复现并定位支付回调 500", state: "idle" }),
+      expect.objectContaining({ title: "修复幂等键过期并补并发测试", state: "running" }),
+    ]);
     expect(row("Harness 对比")).toMatchObject({ ball: { owner: "human", engage: expect.any(Object) }, summary: expect.stringContaining("trae 部分已分析完"), stalled: false });
     expect(row("压测服务器采购比价")).toMatchObject({ ball: { owner: "waiting" }, waiting: { replied: 0, total: 1 }, stalled: false });
     expect(row("压测服务器采购比价").ball!.text).toContain("北辰网络");
     expect(row("压测服务器采购比价").workers.map((w) => [w.preset, w.state])).toEqual([["watcher", "waiting"]]);
-    expect(radar.someday).toEqual([expect.objectContaining({ title: "极简模式", lifecycle: "someday", paused: true, summary: expect.stringContaining("调研报告") })]);
+    // Parked is its own state, not also "paused" (BUG-011.3); its report opens from the row (BUG-010).
+    expect(radar.someday).toEqual([expect.objectContaining({ title: "极简模式", lifecycle: "someday", paused: false, summary: expect.stringContaining("调研报告") })]);
+    expect(radar.someday[0]!.artifacts).toEqual([expect.objectContaining({ artifactId: "art_demo_minimal", title: "极简模式调研报告" })]);
     expect(radar.counts).toMatchObject({ active: 3, someday: 1, stalled: 0 });
     const report = await d.get<{ title: string; body: string }>("/api/artifacts/art_demo_minimal");
     expect(report).toMatchObject({ title: "极简模式调研报告" });

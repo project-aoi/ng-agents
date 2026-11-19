@@ -117,8 +117,9 @@ describe("conventions the workbench app relies on", () => {
   it("stopping a project the owner had paused closes it and everything below it; the records say cancelled", async () => {
     const h = await boot();
     h.script.add("desk", tool("start_project", { title: "整理客户名单", outcome: "一份去重后的客户名单", brief: "整理一下客户名单" }), tool("wait", { reason: "ok" }));
-    h.script.add("project", tool("dispatch", { title: "整理名单", instruction: "整理客户名单", cwdMode: "read" }), {});
-    h.script.add("worker", tool("wait", { reason: "thinking" }));
+    h.script.add("project", tool("dispatch", { title: "整理名单", instruction: "整理客户名单" }), {});
+    // Still at work: it waits for an answer (a bare wait would end its turn).
+    h.script.add("worker", tool("wait", { reason: "thinking", waitingFor: "inbox:desk" }));
     await h.ui.capture({ text: "整理一下客户名单" });
     await h.kernel.idle();
     const [project] = projects(h);
@@ -138,10 +139,12 @@ describe("conventions the workbench app relies on", () => {
 // ==================== prompts vs tools ====================
 
 /**
- * Snake_case or `ticked` words that appear in the prompts but are argument values or shell commands, not tools
- * (the worker's look-only note names git subcommands: `git log` / `diff` / `show`).
+ * Snake_case or `ticked` words that appear in the prompts but are not tools: argument values and shell commands (the
+ * worker's look-only note names git subcommands: `git log` / `diff` / `show`; dispatch's `check`), a message type
+ * (`cell.direct_chat`), the sample cell names of the project's board note, and the subject-matter terms COMMON gives
+ * as examples of words that are never translated (`code_cell.rs`, `token`, `queue`, `epoch`).
  */
-const NOT_TOOLS = new Set(["research_then_park", "diff", "show"]);
+const NOT_TOOLS = new Set(["research_then_park", "diff", "show", "check", "direct_chat", "worker_a1", "worker_b2", "code_cell", "token", "queue", "epoch"]);
 
 /**
  * Names a prompt mentions that its role does not have, reported to the prompts' owner (see the presets report). The
@@ -185,9 +188,15 @@ describe("conventions: every prompt names only tools its role has", () => {
       if (gaps.length) missing[c.source] = [...(missing[c.source] ?? []), ...gaps];
     }
     expect(missing).toEqual(KNOWN_PROMPT_GAPS);
-    // A one-shot worker and the watcher preset's checker get the general primitives too, spawning included: whether
-    // they delegate is their prompt's business, not a filter's.
-    for (const prompt of [PROMPTS.worker, PROMPTS.checker]) expect(toolsOf(prompt)).toEqual(expect.arrayContaining(["spawn_cell", "control_cell", "close_cell", "bash", "write"]));
+    // A worker and the watcher preset's checker are leaves (maxDepth 0): the tools that start, steer or close cells are
+    // not offered to them, so no prompt or playbook of theirs may rely on them. They keep the shell and the files, and
+    // update_cell for their own watches.
+    for (const prompt of [PROMPTS.worker, PROMPTS.checker]) {
+      expect(toolsOf(prompt)).toEqual(expect.arrayContaining(["bash", "write", "update_cell"]));
+      for (const name of ["spawn_cell", "control_cell", "close_cell"]) expect(toolsOf(prompt)).not.toContain(name);
+    }
+    // The coordinators read what their cells did.
+    for (const prompt of [PROMPTS.desk, PROMPTS.project, PROMPTS.hub]) expect(toolsOf(prompt)).toContain("inspect_cell");
     // Every registered role prompt was checked (the legacy stand-in names no tools).
     expect(new Set(checks.map((c) => c.prompt))).toEqual(new Set(Object.values(PROMPTS)));
   });

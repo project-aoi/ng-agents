@@ -131,6 +131,12 @@ export type ContextMode = "isolated" | "fork_prefix";
 export type ResourcePage = { offset: number; limit: number };
 export const RESOURCE_URI_PREFIX = "res://";
 export const DEFAULT_RESOURCE_PAGE_CHARS = 8000;
+/**
+ * [ext] BUG-006 — the largest page the `read_resource` tool hands the model when it asks for one with an explicit
+ * `limit` (a large document in few calls); the default page stays DEFAULT_RESOURCE_PAGE_CHARS. Context keeps such a
+ * page inline whole (it is never spilled again), whatever its normal inline limit.
+ */
+export const MAX_RESOURCE_PAGE_CHARS = 64_000;
 
 /**
  * hydrate inputs (all read from the shared DB): the cell row via cellsRepo (spec, bounds, epoch); the system prompt
@@ -333,8 +339,23 @@ export type KnowledgeKind = "skill" | "note" | "preference";
 export type KnowledgeScope = "global" | "cell";
 
 /**
- * - upsert: create or replace description/body/tags (description + body required).
- * - append: append `body` to the existing body (creates it if missing).
+ * [ext] BUG-007 — which cells a preference is shown to (in their frozen system prefix). Both filters must hold when
+ * both are set; with neither, the preference applies to every cell (the default, and every row written before this).
+ * - `cwdPrefix`: an absolute directory (`~/…` expands to the owner's home); matches cells whose `spec.cwd` is that
+ *   directory or below it, compared on path-segment boundaries (`/a/b` covers `/a/b/c`, not `/a/bc`). A cell without
+ *   `spec.cwd` never matches. Stored normalized (expanded, resolved, no trailing slash).
+ * - `roles`: matches a cell whose `spec.meta.role` or preset name is one of them (e.g. "worker", "project", "watcher",
+ *   "desk", "hub", "sensor", "checker", "inline"); stored trimmed and lowercased, an empty list is no limit.
+ */
+export interface KnowledgeApplies {
+  cwdPrefix?: string;
+  roles?: string[];
+}
+
+/**
+ * - upsert: create or replace description/body/tags (description + body required). For a preference, `applies` is
+ *   replaced too: absent means it applies everywhere again.
+ * - append: append `body` to the existing body (creates it if missing); `applies` is kept unless given.
  * - delete: remove (only kind/name/scope matter).
  * `scope: "cell"` means the cellId passed to upsertSkillOrNote.
  */
@@ -346,6 +367,7 @@ export interface KnowledgePatch {
   scope: KnowledgeScope;
   tags?: string[];
   mode: "upsert" | "append" | "delete";
+  applies?: KnowledgeApplies;           // [ext] preferences only (invalid_argument for other kinds)
 }
 
 export interface KnowledgeRecord {
@@ -359,6 +381,7 @@ export interface KnowledgeRecord {
   tags: string[];
   createdAt: number;
   updatedAt: number;
+  applies?: KnowledgeApplies;           // [ext] present only on a preference limited to some cells
 }
 
 export interface SkillIndexEntry {
@@ -406,7 +429,16 @@ export interface ChildSummary {
   depth?: number;
   parentId?: string | null;
   cwd?: string;
+  /** @deprecated never set any more (see CellSpec.cwdMode). */
   cwdMode?: "read" | "write";
+  /**
+   * What the cell is doing right now: `working` (a Run or Job in flight, or a message waiting to start it), `waiting`
+   * (a watch, a timer, an open wait or a card), `dormant` (a wakeable worker with nothing in flight and nothing that
+   * would wake it — a message does), `paused`.
+   */
+  activity?: "working" | "waiting" | "dormant" | "paused";
+  /** Direct leaf children only: evidence the viewing cell has not looked at with inspect_cell yet (`from`..`to`). */
+  unread?: { from: number; to: number };
 }
 
 /** Conventional state key a cell writes to describe itself in its parent's roster. Value: CellStatusLine. */
@@ -420,8 +452,9 @@ export interface CellStatusLine {
 /**
  * Everything a Loop needs for one bounded Run, laid out for prompt-cache prefix stability:
  *
- *   system  — frozen per cell (preset prompt + skills index + inlined `processor.skills` + bounds summary +
- *             long-term preferences); stored in `prompt_prefixes` on first hydrate and reused verbatim until
+ *   system  — frozen per cell (preset prompt + skills index (minus the skills inlined here) + inlined
+ *             `processor.skills` + bounds summary + the long-term preferences whose `applies` matches the cell);
+ *             stored in `prompt_prefixes` on first hydrate and reused verbatim until
  *             compaction or refreshPrefixSync. A fork_prefix child freezes a copy of its parent's system instead (so
  *             the provider cache can hit); its own prompt and bounds go into the fork note below.
  *   history — provider-neutral messages rebuilt from evidence; append-only across Runs (between compactions,

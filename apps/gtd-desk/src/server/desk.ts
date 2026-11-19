@@ -49,6 +49,8 @@ import type {
   ArtifactSaveResponse,
   CaptureRequest,
   CaptureResponse,
+  SetBudgetLimitsRequest,
+  SetBudgetLimitsResponse,
   ClarifyMutationResponse,
   ClarifyOutcome,
   ClarifyQueueDTO,
@@ -104,6 +106,7 @@ import { projectStatus } from "./projections/status";
 import { projectSources } from "./projections/sources";
 import { projectActivity } from "./projections/activity";
 import { afternoonSlot, whenText } from "./projections/time";
+import { createAgentsApi } from "./agents";
 
 const DAY = 24 * 3_600_000;
 
@@ -290,6 +293,25 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
       ...(req.clientId ? { clientId: req.clientId } : {}),
     });
     return { ok: true, id: env.id, acceptedAt: env.createdAt, message: "已收进信箱", status: status() };
+  }
+
+  /**
+   * The owner's switch for token/cost limits (PUT /api/settings/budget-limits). The owner's alone: the kernel refuses
+   * anyone else, and no control-plane tool reaches it. Off: nothing is stopped for its budget — the cells held at their
+   * stop go on and the budget cards waiting for the owner are answered.
+   */
+  function setBudgetLimits(req: SetBudgetLimitsRequest): SetBudgetLimitsResponse {
+    if (typeof req?.enforced !== "boolean") throw bad("enforced 必须是 true 或 false");
+    const r = kernel.setBudgetLimits(req.enforced, { principalId: owner });
+    let message: string;
+    if (!r.changed) message = r.enforced ? "额度限制本来就是开着的" : "额度限制本来就是关着的";
+    else if (r.enforced) message = "已开启额度限制";
+    else {
+      // A held cell and the card about it are one stopped task.
+      const went = Math.max(r.releasedCells.length, r.continuedCards.length);
+      message = went > 0 ? `已关闭额度限制：${went} 个因额度暂停的任务已继续` : "已关闭额度限制";
+    }
+    return { ok: true, enforced: r.enforced, message, status: status() };
   }
 
   async function focus(req: FocusRequest): Promise<FocusResponse> {
@@ -1029,7 +1051,6 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     const cell = kernel.getCell(sensorId);
     if (!src || !cell || cell.status === "closed") throw missing("找不到这个信源");
     const entry = checkEntry(req?.entry);
-    // cwdMode cannot change after spawn; the sensor preset gives every source write mode in its own directory.
     kernel.updateCell(sensorId, { processor: { kind: "code", entry } });
     commitState(sensorId, { [gtdKeys.source]: { ...src, processor: "code", updatedAt: now() } });
     commitState(desk, { [`${SENSOR_SUGGESTION_PREFIX}${sensorId}`]: null });
@@ -1140,10 +1161,9 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
           preset: "sensor",
           title,
           schedules: [schedule],
+          // A script check runs its commands in the source's own directory (sources never inherit a cwd, so never the
+          // owner's repository).
           ...(processor ? { processor } : {}),
-          // A script check runs commands: write mode, in the source's own directory (sources never inherit a cwd, so
-          // never the owner's repository) — no worktree, no sandbox (docs/05).
-          ...(processor?.entry.startsWith(SCRIPT_PREFIX) ? { cwdMode: "write" as const } : {}),
           meta: { gtd: { source: init } },
         },
         { instruction, title },
@@ -1188,8 +1208,24 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     return sourcesResult("deleted", true, `已删除信源「${src.title}」`, sensorId);
   }
 
+  const agents = createAgentsApi({
+    kernel,
+    settings,
+    status,
+    projectOp: (projectId, op, as) => projectOp(projectId, op, as),
+    errors: { bad, missing },
+  });
+
   return {
     status,
+    setBudgetLimits,
+    topology: agents.topology,
+    timeline: agents.timeline,
+    resource: agents.resource,
+    sendCellMessage: agents.sendMessage,
+    deliverCellMessage: agents.deliver,
+    cellControl: agents.control,
+    cellTrigger: agents.trigger,
     clarify,
     clarifyCard: (cardId: string) => clarifyCardById(input(), cardId),
     radar,

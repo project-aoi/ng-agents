@@ -3,7 +3,7 @@ import type { SchemaModule } from "./types";
 // Owner: @ng/gate.
 export const gateSchema: SchemaModule = {
   owner: "@ng/gate",
-  version: 2,
+  version: 3,
   migrations: [
     {
       version: 2,
@@ -12,6 +12,13 @@ ALTER TABLE approvals ADD COLUMN proposed_version INTEGER;
 ALTER TABLE action_tokens ADD COLUMN secret_ref TEXT;
 ALTER TABLE ledger ADD COLUMN revoked_at INTEGER;
 ALTER TABLE ledger ADD COLUMN revoke_reason TEXT;
+`,
+    },
+    {
+      version: 3,
+      up: /* sql */ `
+ALTER TABLE usage_log ADD COLUMN raw_tokens INTEGER;
+ALTER TABLE usage_log ADD COLUMN cached_tokens INTEGER NOT NULL DEFAULT 0;
 `,
     },
   ],
@@ -67,9 +74,11 @@ CREATE TABLE IF NOT EXISTS ledger (
 CREATE TABLE IF NOT EXISTS usage_log (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   cell_id    TEXT NOT NULL REFERENCES cells(id),
-  tokens     INTEGER NOT NULL,
+  tokens     INTEGER NOT NULL,             -- charged against the limits (cache reads weighted)
   cents      REAL NOT NULL,
-  at         INTEGER NOT NULL
+  at         INTEGER NOT NULL,
+  raw_tokens    INTEGER,                   -- v3: tokens as the model reported them (NULL on rows from before v3: same as tokens)
+  cached_tokens INTEGER NOT NULL DEFAULT 0 -- v3: how many of raw_tokens were prompt-cache reads
 );
 CREATE INDEX IF NOT EXISTS idx_usage_cell ON usage_log(cell_id, at);
 

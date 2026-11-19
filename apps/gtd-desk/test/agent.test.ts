@@ -202,20 +202,24 @@ describe("tools", () => {
     expect((await refused(d, "set_project_state", { id: projectId, state: "complete" })).text).toContain("已经取消");
   });
 
-  it("get_project lists the reports of the workers that already finished; a message to the finished project names them", async () => {
+  it("get_project lists the reports of its workers, the dormant ones and the archived ones; a message to the finished project names them", async () => {
     const d = await bootRealDesk({ agentTokens: { main: AGENT_TOKEN } });
-    d.script.add("project", tool("dispatch", { title: "调研竞品", instruction: "调研 3 家竞品", cwdMode: "read" }));
+    d.script.add("project", tool("dispatch", { title: "调研竞品", instruction: "调研 3 家竞品" }));
     d.script.add("worker", tool("save_artifact", { artifactId: "art_w", title: "竞品调研", body: "A、B、C 三家" }), tool("report_to_parent", { kind: "result", text: "报告 art_w", artifactId: "art_w" }));
     const { projectId } = (await ok(d, "create_project", { title: "竞品调研", outcome: "报告", brief: "调研" })).data as { projectId: string };
     await d.kernel.idle();
+    // A worker is not closed for finishing its turn: it rests, wakeable, and get_project says so.
     const worker = d.kernel.listCells({ parentId: projectId })[0]!;
-    expect(worker.status).toBe("closed");
+    expect(worker.status).toBe("active");
     const got = await ok(d, "get_project", { id: projectId });
     expect(got.text).toContain("art_w v1「竞品调研」");
+    expect(got.text).toContain(`${worker.id}「调研竞品」（worker，待命可唤醒`);
     expect((got.data as { artifacts: Array<{ id: string; cellId: string }> }).artifacts).toEqual([expect.objectContaining({ id: "art_w", cellId: worker.id })]);
-    expect((got.data as { actions: Array<{ status: string }> }).actions).toEqual([expect.objectContaining({ status: "done" })]);
+    expect((got.data as { cells: Array<{ id: string; state: string }> }).cells).toEqual([expect.objectContaining({ id: worker.id, state: "待命可唤醒" })]);
     await ok(d, "set_project_state", { id: projectId, state: "complete" });
     await d.kernel.idle();
+    // Archived with its project: still listed, as history.
+    expect((await ok(d, "get_project", { id: projectId })).text).toContain(`${worker.id}「调研竞品」（worker，已归档`);
     expect((await refused(d, "message_project", { id: projectId, text: "再加一家" })).text).toContain("art_w");
   });
 
@@ -315,8 +319,12 @@ describe("tools", () => {
     expect(data.parked.map((p) => p.id)).toEqual([parked]);
     expect(data.running.length).toBeGreaterThan(0);
     expect(data.workspaces.length).toBeGreaterThan(0);
+    // Who is active where — a fact, nobody queued or locked out.
     const ws = await ok(d, "list_workspaces");
-    expect(ws.text).toContain("写入中");
+    expect(ws.text).toContain(repo);
+    expect(ws.text).toContain("「改 a.ts」（项目「改 a」）：正在工作");
+    expect(ws.text).toContain("Nothing is locked");
+    expect(ws.text).not.toMatch(/写入中|排队|cwdMode/);
     await d.kernel.stop();
   });
 
@@ -332,24 +340,46 @@ describe("tools", () => {
     expect(pref.text).toContain('Saved the global preference "code-change-followup"');
     expect(d.kernel.context.getKnowledgeSync({ kind: "preference", name: "code-change-followup", scope: "global" })).toMatchObject({ body: "改完代码后直接用 /ship-mr 提 MR" });
     expect((await ok(d, "save_preference", { name: "code-change-followup", text: "改完代码后用 /ship-mr 提 MR，再补录屏" })).text).toContain("Replaced");
+    // A rule for one repository and one kind of agent keeps its limits.
+    const gate = await ok(d, "save_preference", { name: "trae-x-commit-gate", text: "改 Rust 代码后先跑 cargo clippy 再提交", cwdPrefix: "/work/trae-x/", roles: ["worker"] });
+    expect(gate.text).toBe('Saved the preference "trae-x-commit-gate": only background agents working in /work/trae-x or below and whose role is worker see it, from their next turn on.');
+    expect(gate.data).toMatchObject({ replaced: false, applies: { cwdPrefix: "/work/trae-x", roles: ["worker"] } });
+    const gateRecord = () => d.kernel.context.getKnowledgeSync({ kind: "preference", name: "trae-x-commit-gate", scope: "global" });
+    expect(gateRecord()?.applies).toEqual({ cwdPrefix: "/work/trae-x", roles: ["worker"] });
+    expect((await ok(d, "list_preferences")).text).toContain("trae-x-commit-gate（");
+    expect((await ok(d, "list_preferences")).text).toContain("；仅限目录 /work/trae-x，仅限角色 worker）");
+    expect((await refused(d, "save_preference", { name: "x-gate", text: "t", cwdPrefix: "work/trae-x" })).text).toContain("cwdPrefix must be an absolute directory path");
+    expect((await refused(d, "save_preference", { name: "x-gate", text: "t", roles: "worker" })).text).toContain('"roles" must be an array of strings');
+    // Saved again without limits: it applies everywhere.
+    expect((await ok(d, "save_preference", { name: "trae-x-commit-gate", text: "改 Rust 代码后先跑 cargo clippy" })).text).toContain('Replaced the global preference "trae-x-commit-gate"');
+    expect(gateRecord()).not.toHaveProperty("applies");
     const found = await ok(d, "search", { query: "双写灰度" });
     expect(found.text).toMatch(/hit\(s\) for "双写灰度"/);
     expect((found.data as { hits: Array<{ source: string }> }).hits.some((h) => h.source === "artifact")).toBe(true);
     expect((await ok(d, "search", { query: "ship-mr" })).text).toContain("ship-mr");
 
     d.script.add("worker", tool("report_to_parent", { kind: "result", text: "仓库里有 3 个 harness 入口" }));
+    // An agent that still sends the retired cwdMode is not refused for it; nothing about it is stored.
     const spawned = await ok(d, "spawn_cell", { preset: "worker", title: "看一眼仓库", instruction: "数一数 harness 入口", cwdMode: "read" });
+    expect(spawned.text).toContain("stays dormant");
     const cellId = (spawned.data as { cellId: string }).cellId;
     expect(d.kernel.getCell(cellId)).toMatchObject({ preset: "worker", parentId: "desk", principalId: "agent:main" });
+    expect(d.kernel.getCell(cellId)!.spec.cwdMode).toBeUndefined();
     await d.kernel.idle();
     const cell = await ok(d, "get_cell", { id: cellId, tail: 5 });
-    expect(cell.text).toContain(`cell ${cellId}「看一眼仓库」`);
-    expect(cell.text).toContain("closed");
+    expect(cell.text).toContain(`cell ${cellId}「看一眼仓库」 — worker，待命可唤醒`);
+    expect(cell.text).not.toContain("cwdMode");
     expect(cell.text).toContain("report_to_parent");
+    expect(cell.data).toMatchObject({ state: "dormant" });
+    expect(cell.data).not.toHaveProperty("cwdMode");
     expect((cell.data as { tail: unknown[] }).tail.length).toBeLessThanOrEqual(5);
-    const closed = await refused(d, "control_cell", { id: cellId, action: "message", text: "再看一下" });
-    expect(closed.text).toContain("has already closed");
-    expect((await refused(d, "control_cell", { id: "cell_nope", action: "message", text: "x" })).text).toContain("there is no cell");
+    // The finished worker is woken by a message on its record.
+    d.script.add("worker", { text: "又看了一遍，还是 3 个" });
+    const woken = await ok(d, "control_cell", { id: cellId, action: "message", text: "再看一下" });
+    expect(woken.text).toContain("was dormant and is woken by it");
+    await d.kernel.idle();
+    expect(d.kernel.listCells({ parentId: "desk" }).filter((c) => c.title === "看一眼仓库")).toHaveLength(1);
+    expect((await refused(d, "control_cell", { id: "cell_nope", action: "message", text: "x" })).text).toContain('there is no cell "cell_nope"');
     expect((await refused(d, "control_cell", { id: "desk", action: "steer" })).text).toContain("needs text");
 
     const { projectId } = (await ok(d, "create_project", { title: "季度总结", outcome: "发出", brief: "写" })).data as { projectId: string };

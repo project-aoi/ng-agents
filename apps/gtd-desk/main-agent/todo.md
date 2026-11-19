@@ -1,5 +1,5 @@
 ---
-description: 把一件事交给 ng-agents 工作台（先查重、缺信息先问、再立项或随手记）
+description: 把一件事交给 ng-agents 工作台（能确定归属就直达，不确定就交给总助理分拣）
 argument-hint: <要做的事，原话即可>
 ---
 
@@ -7,11 +7,12 @@ argument-hint: <要做的事，原话即可>
 
 $ARGUMENTS
 
-用 `ng-desk` 这个 MCP 服务器的工具处理，按它的说明（server instructions）行事，要点：
+用 `ng-desk` 这个 MCP 服务器的工具处理，按它的说明（server instructions）行事。工作台里分三层：总助理（desk）查重、决定事情归谁；项目（project）对一个交付目标负责；执行分身（worker）干具体的一块活。要点：
 
-1. 先看有没有同一件事：`search` 关键词，必要时 `workbench_overview`。已有进行中的项目、停靠的想法或报告，就告诉我它的状态并问是否继续（`message_project` / `set_project_state` activate），不要重复立项。
-2. 判断它是什么：
-   - 只是想先记一下、不确定做不做 → `create_project`，`mode: "research_then_park"`（先调研出报告再停靠），或者只是备忘/提醒 → `capture`。
-   - 现在就要做 → 先把缺的信息问我要齐。涉及代码必须有本机仓库的绝对路径：没有就问，不要猜。
-3. 信息齐了再 `create_project`：`brief` 里带上我的原话、路径、约束和“怎样算做完”。
-4. 立项后用一两句话告诉我：建了什么、接下来会发生什么。不要在这个对话里自己动手做这件事，也不要循环轮询进度。
+1. 先看现状：`workbench_overview`，必要时 `search` 关键词。
+2. 判断归属：
+   - 明确是某个进行中项目的追加要求 → `message_project`；明确是对某个分身说的话 → `message_cell`（它在待命会被唤醒，所属项目自动收到抄送）。
+   - 新的事、说不清归谁、可能和已有工作重复 → `chat_with_desk`，原话转给总助理，由它查重、追问缺的信息（代码类必须有本机仓库的绝对路径）并放到对的地方。
+   - 信息已经问齐、`search` 确认没有同题项目时，也可以自己 `create_project`（`brief` 带上原话、路径、约束和“怎样算做完”）；只想先记着的点子用 `mode: "research_then_park"`。
+3. 总助理在后台回复：我问起时用 `chat_with_desk` 带 `since` 读它的回复并转述；回答它的追问时带上那条追问的 `replyToId`。
+4. 用一两句话告诉我交给了谁、接下来会发生什么。不要在这个对话里自己动手做这件事，也不要循环轮询进度。

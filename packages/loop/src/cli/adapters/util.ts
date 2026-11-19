@@ -1,5 +1,5 @@
 /** describePermissions wording for a writing cell on the host: nothing in the CLI or the OS confines it (docs/05). */
-export const HOST_UNSANDBOXED = "unsandboxed host access; guarded by the cell's prompt contract and the kernel's write queue";
+export const HOST_UNSANDBOXED = "unsandboxed host access; guarded by the cell's prompt contract (the red lines and the look-before-you-change rule)";
 
 export function asRecord(v: unknown): Record<string, unknown> {
   return v !== null && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : {};

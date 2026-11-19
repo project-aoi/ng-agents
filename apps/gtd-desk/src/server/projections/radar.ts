@@ -1,10 +1,20 @@
 import type { CellNode } from "@ng/cell";
-import { asClarifyCard, compareBallOwner, topBallOwner, type ActionRecord, type BallOwner, type ProjectRecord } from "@ng/protocol";
-import { BALL_LABEL, type ButtonDTO, type ProgressDTO, type ProjectActionDTO, type ProjectRowDTO, type ProjectWorkerDTO, type RadarDTO, type WaitingDTO } from "../../shared/api";
-import { actionKey, approvalProjectId, cardBackedActions, projectOfAction, readActions, readProjects, type Located, type ProjectionInput } from "./common";
+import { asClarifyCard, compareBallOwner, topBallOwner, type ActionRecord, type BallOwner, type CellRecord, type ProjectRecord } from "@ng/protocol";
+import {
+  BALL_LABEL,
+  type ArtifactRefDTO,
+  type ButtonDTO,
+  type ProgressDTO,
+  type ProjectActionDTO,
+  type ProjectRowDTO,
+  type ProjectWorkerDTO,
+  type RadarDTO,
+  type WaitingDTO,
+} from "../../shared/api";
+import { actionKey, approvalProjectId, cardBackedActions, projectOfAction, readActions, readProjects, type DeskKernel, type Located, type ProjectionInput } from "./common";
 import { button, enc, ownerLabel, post, progressDTO, waitingDeadline, waitingDTO } from "./format";
 import { projectReview } from "./review";
-import { weekStart } from "./time";
+import { weekStart, whenText } from "./time";
 
 export const STALLED_TEXT = "没有在推进的任务、没有在等的回复，也没有下一步 — 补上下一步，或移进以后再说";
 
@@ -13,7 +23,11 @@ interface Activity {
   waiting: number;
   /** First status line of a busy cell (what the agent is doing right now). */
   busyLine: string | null;
+  /** What the first waiting cell waits for ("「等 CI」下次检查 今天 14:32"). */
+  waitLine: string | null;
 }
+
+type KernelActivity = ReturnType<DeskKernel["activityOf"]>;
 
 function flatten(nodes: readonly CellNode[], into = new Map<string, CellNode>()): Map<string, CellNode> {
   for (const n of nodes) {
@@ -23,23 +37,38 @@ function flatten(nodes: readonly CellNode[], into = new Map<string, CellNode>())
   return into;
 }
 
-function nodeState(n: CellNode, due: ReadonlySet<string>): ProjectWorkerDTO["state"] {
-  if (n.running || n.runningJobs > 0 || (n.status === "active" && due.has(n.cellId))) return "running";
-  if (n.status === "paused") return "paused";
-  if (n.watching || n.nextTimerAt !== null) return "waiting";
-  return "idle";
+/** The kernel's account of what a cell is doing, in the row's four words (a dormant worker is resting: "idle"). */
+function nodeState(n: CellNode, activity: KernelActivity): ProjectWorkerDTO["state"] {
+  switch (activity.get(n.cellId)?.state) {
+    case "working":
+      return "running";
+    case "paused":
+      return "paused";
+    case "waiting":
+      return "waiting";
+    case undefined:
+      return n.status === "paused" ? "paused" : n.running || n.runningJobs > 0 ? "running" : n.watching || n.nextTimerAt !== null ? "waiting" : "idle";
+    default:
+      return "idle";
+  }
 }
 
-function subtreeActivity(node: CellNode | undefined, due: ReadonlySet<string>): Activity {
-  const a: Activity = { running: 0, waiting: 0, busyLine: null };
+function waitLineOf(n: CellNode, now: number): string {
+  const what = n.nextTimerAt !== null ? `下次检查 ${whenText(n.nextTimerAt, now)}` : n.watching ? (n.threads.length ? `盯着 ${n.threads.join("、")}` : "盯着外部事件") : "在等回音";
+  return n.title ? `「${n.title}」${what}` : what;
+}
+
+function subtreeActivity(node: CellNode | undefined, activity: KernelActivity, now: number): Activity {
+  const a: Activity = { running: 0, waiting: 0, busyLine: null, waitLine: null };
   const walk = (n: CellNode) => {
     if (n.status !== "closed") {
-      const s = nodeState(n, due);
+      const s = nodeState(n, activity);
       if (s === "running") {
         a.running++;
         a.busyLine ??= n.statusLine;
       } else if (s === "waiting") {
         a.waiting++;
+        a.waitLine ??= waitLineOf(n, now);
       }
     }
     n.children.forEach(walk);
@@ -49,17 +78,42 @@ function subtreeActivity(node: CellNode | undefined, due: ReadonlySet<string>): 
 }
 
 /** The live cells below a project (its workers and watchers, and theirs), excluding cells that are projects of their own. */
-function workersOf(node: CellNode | undefined, due: ReadonlySet<string>, projectCells: ReadonlySet<string>): ProjectWorkerDTO[] {
+function workersOf(node: CellNode | undefined, activity: KernelActivity, projectCells: ReadonlySet<string>): ProjectWorkerDTO[] {
   const out: ProjectWorkerDTO[] = [];
   const walk = (n: CellNode) => {
     for (const c of n.children) {
       if (c.status === "closed" || projectCells.has(c.cellId)) continue;
-      out.push({ cellId: c.cellId, title: c.title ?? c.cellId, preset: c.preset, state: nodeState(c, due), statusLine: c.statusLine });
+      out.push({ cellId: c.cellId, title: c.title ?? c.cellId, preset: c.preset, state: nodeState(c, activity), statusLine: c.statusLine });
       walk(c);
     }
   };
   if (node) walk(node);
   return out;
+}
+
+/** Every cell of a project's subtree, closed ones included (finished workers' reports stay with the project). */
+function subtreeIds(rootId: string, byParent: ReadonlyMap<string, CellRecord[]>): string[] {
+  const out = [rootId];
+  for (let i = 0; i < out.length; i++) for (const c of byParent.get(out[i]!) ?? []) out.push(c.id);
+  return out;
+}
+
+/** BUG-010: the project's reports and drafts (its own and its cells'), newest first — each opens in the drawer. */
+function projectArtifacts(kernel: DeskKernel, ids: readonly string[]): ArtifactRefDTO[] {
+  return ids
+    .flatMap((id) => kernel.context.listArtifactsSync(id))
+    .filter((a) => a.content.format !== "card")
+    .sort((a, b) => b.updatedAt - a.updatedAt)
+    .map((a) => ({ artifactId: a.artifactId, title: a.content.title ?? "未命名文档", version: a.version, updatedAt: a.updatedAt }));
+}
+
+/** The entry to the Agents view: "3 个分身（1 个在跑） →". */
+function agentsEntry(projectId: string, ids: readonly string[], cells: ReadonlyMap<string, CellRecord>, activity: KernelActivity): ProjectRowDTO["agents"] {
+  const below = ids.filter((id) => id !== projectId && cells.get(id)?.status !== "closed");
+  const running = below.filter((id) => activity.get(id)?.state === "working").length;
+  const total = below.length;
+  const label = total === 0 ? "查看分身实况 →" : running > 0 ? `${total} 个分身（${running} 个在跑） →` : `${total} 个分身 →`;
+  return { total, running, href: `#/agents?project=${enc(projectId)}`, label };
 }
 
 function actionText(r: ActionRecord, now: number): { text: string; progress: ProgressDTO | null; waiting: WaitingDTO | null } {
@@ -127,7 +181,11 @@ export function radarProjects(input: ProjectionInput): Omit<RadarDTO, "review"> 
   const projects = readProjects(kernel);
   const projectCells = new Set(projects.map((p) => p.cellId));
   const nodes = flatten(kernel.tree());
-  const due = new Set(kernel.inbox.dueCellIdsSync());
+  const cellList = kernel.listCells();
+  const cells = new Map(cellList.map((c) => [c.id, c]));
+  const byParent = new Map<string, CellRecord[]>();
+  for (const c of cellList) if (c.parentId !== null) byParent.set(c.parentId, [...(byParent.get(c.parentId) ?? []), c]);
+  const activity = kernel.activityOf(cellList.filter((c) => c.status !== "closed").map((c) => c.id));
 
   const actionsByProject = new Map<string, Array<Located<ActionRecord>>>();
   for (const a of readActions(kernel)) {
@@ -152,15 +210,17 @@ export function radarProjects(input: ProjectionInput): Omit<RadarDTO, "review"> 
   for (const p of projects) {
     const r = p.record;
     if (r.lifecycle !== "active" && r.lifecycle !== "someday") continue;
-    const cell = kernel.getCell(p.cellId);
-    const paused = cell?.status === "paused";
+    const cell = cells.get(p.cellId);
+    // BUG-011.3: a parked project is paused underneath, but "以后再说" is its state — not also "已暂停".
+    const paused = cell?.status === "paused" && r.lifecycle !== "someday";
     // docs/05 guard 2: the kernel's five-anchor check (whole subtree, waits, cards, the owner's actions) stamps the
     // record; the app has no stall rule of its own. A stamp that a pause has not cleared yet does not count. A stalled
     // project has, by the kernel's account, nothing running and nothing it waits for — the pending stall notice itself
     // looks like a timer to the cell tree, so its activity is not counted.
     const stalledSince = r.lifecycle === "active" && !paused && typeof r.stalledSince === "number" ? r.stalledSince : null;
     const stalled = stalledSince !== null;
-    const act = stalled ? { running: 0, waiting: 0, busyLine: null } : subtreeActivity(nodes.get(p.cellId), due);
+    const act = stalled ? { running: 0, waiting: 0, busyLine: null, waitLine: null } : subtreeActivity(nodes.get(p.cellId), activity, now);
+    const subtree = subtreeIds(p.cellId, byParent);
     const open = (actionsByProject.get(p.cellId) ?? []).filter((a) => a.record.status === "open");
     open.sort((a, b) => compareBallOwner(a.record.owner, b.record.owner) || (a.record.dueAt ?? Infinity) - (b.record.dueAt ?? Infinity) || a.record.createdAt - b.record.createdAt);
     const openActions: ProjectActionDTO[] = open.map((a) => {
@@ -196,7 +256,7 @@ export function radarProjects(input: ProjectionInput): Omit<RadarDTO, "review"> 
     } else if (top === "waiting") {
       ball = { owner: "waiting", label: BALL_LABEL.waiting, text: first("waiting")!.text };
     } else if (act.waiting > 0) {
-      ball = { owner: "waiting", label: BALL_LABEL.waiting, text: "等待外部回复" };
+      ball = { owner: "waiting", label: BALL_LABEL.waiting, text: act.waitLine ?? "后台在等外部条件" };
     }
 
     rows.push({
@@ -217,7 +277,9 @@ export function radarProjects(input: ProjectionInput): Omit<RadarDTO, "review"> 
       stalledSince,
       running: act.running,
       waitingOn: act.waiting,
-      workers: workersOf(nodes.get(p.cellId), due, projectCells),
+      workers: workersOf(nodes.get(p.cellId), activity, projectCells),
+      artifacts: projectArtifacts(kernel, subtree),
+      agents: agentsEntry(p.cellId, subtree, cells, activity),
       createdAt: r.createdAt,
       updatedAt: r.updatedAt,
       buttons: projectButtons(p.cellId, r, paused, stalled),

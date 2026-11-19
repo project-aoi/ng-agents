@@ -86,8 +86,9 @@ describe("root cells", () => {
     expect(desk.bounds.maxCents).toBeGreaterThan(0);
     expect(desk.bounds.maxDepth).toBe(4); // DEFAULT_ROOT_BOUNDS
     expect(desk.bounds.isolation).toBe("none"); // the owner's machine
-    // the preset's defaults (test "inline" desk: every toolset, read-only, persistent)
-    expect(desk.spec).toMatchObject({ processor: { kind: "llm", toolsets: [TOOLSETS.context, TOOLSETS.comms, TOOLSETS.schedule, TOOLSETS.cells, TOOLSETS.workspace] }, cwdMode: "read", lifetime: "persistent" });
+    // the preset's defaults (test "inline" desk: every toolset, persistent)
+    expect(desk.spec).toMatchObject({ processor: { kind: "llm", toolsets: [TOOLSETS.context, TOOLSETS.comms, TOOLSETS.schedule, TOOLSETS.cells, TOOLSETS.workspace] }, lifetime: "persistent" });
+    expect(desk.spec).not.toHaveProperty("cwdMode");
     expect(desk.spec.processor).not.toHaveProperty("allowedTools");
     expect(desk.spec).not.toHaveProperty("cwd"); // nobody gave it a directory
     expect(h.kernel.ensureRootCell({ id: "desk", preset: "inline" }).createdAt).toBe(desk.createdAt);
@@ -109,6 +110,8 @@ describe("spawnCell", () => {
       {
         id: "child",
         preset: "worker",
+        // one-shot: the kernel closes it once it is done, which waits for its child (the maxDepth it asks for: it gets 1)
+        lifetime: "one_shot",
         processor: { kind: "code", entry: "test.greedy" },
         bounds: { tools: new Set(["read", "write", "bash"]), canSendTo: ["channel:*"] as unknown as Address[], secretRefs: new Set(["github"]), isolation: "none", maxDepth: 7, maxTokens: 1e9, maxCents: 1e6, maxConcurrentChildren: 99 },
       },
@@ -141,31 +144,34 @@ describe("spawnCell", () => {
       isolation: "git_worktree",
       maxDepth: 0,
     });
-    // the one-shot child closed only after its grandchild had reported (closing cascades; it waits for open children)
+    // the one-shot child closed only after its grandchild's turn was over (closing cascades; it waits for children at
+    // work); the grandchild, a dormant worker by then, was archived with it — completed, not cancelled
     expect(grand).toMatchObject({ status: "closed", closeReason: "completed" });
     expect(h.kernel.getCell("child")).toMatchObject({ status: "closed", closeReason: "completed" });
     expect(h.of("run.started").filter((e) => e.cellId === "child")).toHaveLength(2);
   });
 
-  it("enforces maxConcurrentChildren on active one-shot children only and frees the slot on close", async () => {
+  it("enforces maxConcurrentChildren on leaf children at work only and frees the slot on close", async () => {
     const h = await boot({ setup: setupWith(idle), desk: false });
     h.kernel.createRootCell({ id: "desk", preset: "inline" }, { bounds: { maxConcurrentChildren: 2 } });
-    const spec = { preset: "worker" as const, processor: { kind: "code" as const, entry: "test.idle" } };
+    // a timer of its own keeps each worker "waiting" (not dormant), so it holds a slot
+    const spec = { preset: "worker" as const, processor: { kind: "code" as const, entry: "test.idle" }, schedules: [{ deliverAt: T0 + DAY }] };
     const a = h.kernel.spawnCell("desk", spec);
     const b = h.kernel.spawnCell("desk", spec);
-    expectNgError(() => h.kernel.spawnCell("desk", spec), "bounds_violation", /already has 2 active one-shot children \(maxConcurrentChildren 2\)/);
-    // docs/05 §3.1: the cap is on execution — persistent children (projects, hubs, watchers) never take a slot ...
+    expect([a, b].map((x) => h.kernel.activityOf([x.slice(6)]).get(x.slice(6))!.state)).toEqual(["waiting", "waiting"]);
+    expectNgError(() => h.kernel.spawnCell("desk", spec), "bounds_violation", /already has 2 children at work \(maxConcurrentChildren 2\)/);
+    // docs/05 §3.1: the cap is on execution — persistent children (projects, hubs) never take a slot ...
     const proj = h.kernel.spawnCell("desk", { preset: "project", processor: { kind: "code", entry: "test.idle" } });
-    h.kernel.spawnCell("desk", { preset: "watcher", processor: { kind: "code", entry: "test.idle" } });
+    h.kernel.spawnCell("desk", { preset: "hub", processor: { kind: "code", entry: "test.idle" } });
     expect(h.kernel.getCell(proj.slice(6))!.spec.lifetime).toBe("persistent");
-    expectNgError(() => h.kernel.spawnCell("desk", spec), "bounds_violation", /already has 2 active one-shot children/);
-    // ... and neither does a paused one-shot child
+    expectNgError(() => h.kernel.spawnCell("desk", spec), "bounds_violation", /already has 2 children at work/);
+    // ... and neither does a paused leaf
     h.kernel.control(a.slice(6), { action: "pause" });
     const c = h.kernel.spawnCell("desk", spec);
-    expectNgError(() => h.kernel.spawnCell("desk", spec), "bounds_violation", /already has 2 active one-shot children/);
+    expectNgError(() => h.kernel.spawnCell("desk", spec), "bounds_violation", /already has 2 children at work/);
     await h.kernel.closeCell(b.slice(6), "completed");
     expect(() => h.kernel.spawnCell("desk", spec)).not.toThrow();
-    expect(h.kernel.listCells({ parentId: "desk", status: ["active"] }).filter((x) => x.spec.lifetime === "one_shot").map((x) => x.id)).toHaveLength(2);
+    expect(h.kernel.listCells({ parentId: "desk", status: ["active"] }).filter((x) => x.spec.lifetime === "wakeable").map((x) => x.id)).toHaveLength(2);
     expect(h.kernel.getCell(c.slice(6))!.status).toBe("active");
   });
 
@@ -187,7 +193,7 @@ describe("spawnCell", () => {
     await h.kernel.idle();
     const upto = h.kernel.context.lastEvidenceSeqSync("desk");
     expect(upto).toBeGreaterThan(0);
-    h.kernel.spawnCell("desk", { id: "proj", preset: "worker", processor: { kind: "code", entry: "test.idle" }, meta: { projectCellId: "proj" } });
+    h.kernel.spawnCell("desk", { id: "proj", preset: "project", processor: { kind: "code", entry: "test.idle" }, meta: { projectCellId: "proj" } });
     h.kernel.spawnCell("proj", { id: "fix", preset: "worker", contextMode: "fork_prefix", processor: { kind: "code", entry: "test.idle" } });
     expect(h.kernel.getCell("fix")!.spec).toMatchObject({ fork: { fromCellId: "proj", uptoSeq: 0 }, meta: { projectCellId: "proj" }, parentId: "proj" });
     h.kernel.spawnCell("desk", { id: "fork2", preset: "worker", contextMode: "fork_prefix", processor: { kind: "code", entry: "test.idle" } });
@@ -198,7 +204,8 @@ describe("spawnCell", () => {
 describe("updateCell", () => {
   it("owner may widen within the parent (授权 1 对 1 直连); a cell may only narrow; narrowing cascades down", async () => {
     const h = await boot({ setup: setupWith(idle) });
-    h.kernel.spawnCell("desk", { id: "w", preset: "worker", processor: { kind: "code", entry: "test.idle" } });
+    // given spawn depth (a worker has none by default) so the narrowing can be seen to cascade
+    h.kernel.spawnCell("desk", { id: "w", preset: "worker", processor: { kind: "code", entry: "test.idle" }, bounds: { maxDepth: 1 } });
     h.kernel.spawnCell("w", { id: "ww", preset: "worker", processor: { kind: "code", entry: "test.idle" }, bounds: { tools: new Set(["read", "bash"]) } });
     // the desk holds `inbox:*` (DEFAULT_ROOT_BOUNDS): internal messaging inside the tree is inherited; no channel unasked
     expect(h.kernel.getCell("w")!.bounds.canSendTo).toEqual(["inbox:*"]);
@@ -262,7 +269,7 @@ describe("updateCell", () => {
 describe("closeCell", () => {
   it("cascade leaves nothing running: no pending rows, schedules, watches, approvals or jobs; the directory is left as it was; late results are dropped", async () => {
     const h = await boot({ setup: setupWith(startJob, idle) });
-    h.kernel.spawnCell("desk", { id: "proj", preset: "worker", processor: { kind: "code", entry: "test.idle" }, meta: { projectCellId: "proj" } });
+    h.kernel.spawnCell("desk", { id: "proj", preset: "project", processor: { kind: "code", entry: "test.idle" }, meta: { projectCellId: "proj" } });
     h.kernel.spawnCell("proj", {
       id: "watch",
       preset: "watcher",
@@ -347,14 +354,28 @@ describe("closeCell", () => {
   it("a child's reported result reaches the parent even when it is closed right after; only someone else's close is announced", async () => {
     const h = await boot({ setup: setupWith(idle) });
     const results = () => h.kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.cellResult }).map((m) => (m.envelope.payload as CellResultPayload).summary);
-    // a one-shot worker: the kernel delivers its single final result and closes it in the same transaction
-    h.script.add("worker", tool("report_to_parent", { kind: "result", text: "做完了" }));
-    h.kernel.spawnCell("desk", { id: "a", preset: "worker" }, "work");
+    // a one-shot probe: the kernel delivers its single final result and closes it in the same transaction
+    h.script.add("watcher", tool("report_to_parent", { kind: "result", text: "做完了" }));
+    h.kernel.spawnCell("desk", { id: "a", preset: "watcher" }, "work");
     await h.kernel.idle();
     expect(h.kernel.getCell("a")).toMatchObject({ status: "closed", closeReason: "completed" });
     expect(h.kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.cellResult }).map((m) => m.envelope.id)).toEqual([finalResultEnvelopeId("a", 0)]);
     expect(await h.kernel.closeCell("a", "completed")).toEqual({ closed: [] });
     expect(results()).toEqual(["做完了"]);
+
+    // a wakeable worker reports its turn and stays; when the owner closes it later the parent is told it is gone, and
+    // that its turns were already reported (no result is outstanding)
+    h.script.add("worker", tool("report_to_parent", { kind: "result", text: "第一轮完成" }));
+    h.kernel.spawnCell("desk", { id: "w", preset: "worker" }, "work");
+    await h.kernel.idle();
+    expect(h.kernel.getCell("w")!.status).toBe("active");
+    await h.kernel.closeCell("w", "completed");
+    expect(results()).toEqual(["做完了", "第一轮完成", "Closed (completed) by owner; its turns were already reported."]);
+    expect(h.kernel.inbox.listMessagesSync({ cellId: "desk", envelopeId: "w:closed" })[0]!.envelope.payload).toMatchObject({
+      status: "completed",
+      childState: "closed",
+      data: { closedBy: "owner", synthetic: true },
+    });
 
     // a persistent child reports an interim result at once and stays open; when the owner closes it later the parent is
     // told — an earlier phase report is not the cell's final word
@@ -363,17 +384,17 @@ describe("closeCell", () => {
     await h.kernel.idle();
     expect(h.kernel.getCell("p")!.status).toBe("active");
     await h.kernel.closeCell("p", "completed");
-    expect(results()).toEqual(["做完了", "阶段一完成", "Closed (completed) by owner before it reported a result."]);
+    expect(results().slice(3)).toEqual(["阶段一完成", "Closed (completed) by owner before it reported a result."]);
     expect(h.kernel.inbox.listMessagesSync({ cellId: "desk", envelopeId: "p:closed" })).toHaveLength(1);
 
     // the parent closing its own child: no synthetic report
     h.kernel.spawnCell("desk", { id: "b", preset: "worker", processor: { kind: "code", entry: "test.idle" } });
     await h.kernel.closeCell("b", "completed", { principalId: "cell:desk" });
-    expect(results()).toHaveLength(3);
+    expect(results()).toHaveLength(5);
     // the owner closing it: the parent is told
     h.kernel.spawnCell("desk", { id: "c", preset: "worker", processor: { kind: "code", entry: "test.idle" } });
     await h.kernel.closeCell("c", "completed");
-    expect(results()).toHaveLength(4);
+    expect(results()).toHaveLength(6);
     expect(h.kernel.inbox.listMessagesSync({ cellId: "desk", envelopeId: "c:closed" })[0]!.envelope.payload).toMatchObject({ status: "completed", data: { synthetic: true } });
 
     // closing twice is a no-op; a non-ancestor cell may not close

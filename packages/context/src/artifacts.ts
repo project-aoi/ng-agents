@@ -45,6 +45,19 @@ export function assertDeliverable(content: unknown, what: string): asserts conte
   if (!r.success) throw new NgError("invalid_argument", `${what}: invalid Deliverable (${r.error.issues[0]?.message ?? "invalid"})`);
 }
 
+function hasTitle(title: string | undefined): title is string {
+  return typeof title === "string" && title.trim() !== "";
+}
+
+/**
+ * [BUG-006] A title changes only when a non-empty new one is given: a version saved without a title (an agent revising
+ * the body, any upsert that leaves it out) keeps the artifact's current title, in the row and in the version history.
+ */
+function withKeptTitle(next: Deliverable, current: Deliverable): Deliverable {
+  if (hasTitle(next.title) || !hasTitle(current.title)) return next;
+  return { ...next, title: current.title };
+}
+
 /** Outcome of checking an artifact write against the current row, before anything is written. */
 export type ArtifactDecision =
   | { kind: "create" }
@@ -93,7 +106,8 @@ export function createArtifacts(deps: Deps): ArtifactsModule {
 
   function apply(cellId: string, w: ArtifactWrite, d: Exclude<ArtifactDecision, { kind: "conflict" }>): number {
     const now = clock.now();
-    const content = toJson(w.content);
+    const stored = d.kind === "create" ? w.content : withKeptTitle(w.content, d.current.content);
+    const content = toJson(stored);
     const owner = d.kind === "create" ? cellId : d.current.cellId;
     let version: number;
     if (d.kind === "create") {
@@ -107,11 +121,12 @@ export function createArtifacts(deps: Deps): ArtifactsModule {
     } else {
       version = d.current.version + 1;
       // Conditional on the version we checked, so a concurrent writer on another connection cannot be overwritten.
+      // The title column follows the same rule as the content: only a non-empty new title replaces it.
       const r = run(
         db,
-        `UPDATE artifacts SET version = ?, title = ?, format = ?, content = ?, updated_by = ?, updated_at = ?
+        `UPDATE artifacts SET version = ?, title = COALESCE(?, title), format = ?, content = ?, updated_by = ?, updated_at = ?
          WHERE artifact_id = ? AND version = ?`,
-        [version, w.content.title ?? null, w.content.format, content, w.updatedBy, now, w.artifactId, d.current.version],
+        [version, hasTitle(stored.title) ? stored.title : null, stored.format, content, w.updatedBy, now, w.artifactId, d.current.version],
       );
       if (r.changes !== 1) throw new NgError("conflict", `artifact "${w.artifactId}" changed concurrently`);
     }

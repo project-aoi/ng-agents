@@ -20,7 +20,7 @@ import {
 } from "@ng/protocol";
 import type { Deps, SummaryInput } from "./deps";
 import type { EvidenceModule } from "./evidence";
-import type { KnowledgeModule } from "./knowledge";
+import { appliesTo, type KnowledgeModule } from "./knowledge";
 import {
   HISTORY_START_TEXT,
   messagesSize,
@@ -81,18 +81,26 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
 
   const readRow = (cellId: string) => get<PrefixRow>(db, "SELECT * FROM prompt_prefixes WHERE cell_id = ?", [cellId]);
 
-  function inlinedSkills(cell: CellRecord): string[] {
+  /** The cell's `processor.skills` with their bodies; `inlined` names those whose body was found and is in `sections`. */
+  function inlinedSkills(cell: CellRecord): { sections: string[]; inlined: Set<string> } {
     const names = cell.spec.processor.kind === "llm" ? (cell.spec.processor.skills ?? []) : [];
-    if (names.length === 0) return [];
-    return names.map((name) => {
+    const inlined = new Set<string>();
+    const sections = names.map((name) => {
       let body: string;
       try {
         body = knowledge.readBody(cell.id, "skill", name).trimEnd();
+        inlined.add(name);
       } catch {
         body = "(this skill is not installed)";
       }
       return `# Skill: ${name}\n${body}`;
     });
+    return { sections, inlined };
+  }
+
+  /** The long-term preferences this cell sees whose `applies` (directory, roles) matches it. */
+  function preferencesFor(cell: CellRecord): KnowledgeRecord[] {
+    return knowledge.visible(cell.id, "preference").filter((p) => appliesTo(p.applies, cell));
   }
 
   function skillsSection(skills: readonly SkillIndexEntry[]): { text: string; shown: SkillIndexEntry[] } | null {
@@ -123,28 +131,40 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
     const sections: string[] = [];
     const prompt = deps.resolvePrompt(cell).trimEnd();
     if (prompt) sections.push(prompt);
-    const skills = skillsSection(knowledge.listSkills(cell.id));
+    const own = inlinedSkills(cell);
+    // A skill whose full text is inlined below is not listed again as one to read on demand.
+    const skills = skillsSection(knowledge.listSkills(cell.id).filter((s) => !own.inlined.has(s.name)));
     if (skills) sections.push(skills.text);
-    sections.push(...inlinedSkills(cell));
+    sections.push(...own.sections);
     sections.push(`# Your bounds\n${describeBounds(cell.bounds)}`);
-    const prefs = preferencesSection(knowledge.visible(cell.id, "preference"));
+    const prefs = preferencesSection(preferencesFor(cell));
     if (prefs) sections.push(prefs);
     return { text: sections.join("\n\n"), skills: skills?.shown ?? [] };
   }
 
   /** What a fork_prefix child knows about itself; it stands after the inherited history (the system is the parent's). */
-  function buildForkNote(cell: CellRecord, parentId: string): string {
+  function buildForkNote(cell: CellRecord, parent: CellRecord): string {
     const who = [`cell "${cell.id}"`];
     if (cell.title) who.push(`("${cell.title}")`);
     const kind = cell.preset ? `, a ${cell.preset} cell` : "";
     const parts = [
-      `[fork] Everything above is the context of cell "${parentId}" up to the moment it created this cell. ` +
+      `[fork] Everything above is the context of cell "${parent.id}" up to the moment it created this cell. ` +
         `You are now ${who.join(" ")}${kind} with your own task, bounds and history; continue from here on your own.`,
     ];
     const prompt = deps.resolvePrompt(cell).trimEnd();
     if (prompt) parts.push(`## Your instructions\n${prompt}`);
-    for (const s of inlinedSkills(cell)) parts.push(`#${s}`);
+    for (const s of inlinedSkills(cell).sections) parts.push(`#${s}`);
     parts.push(`## Your bounds\n${describeBounds(cell.bounds)}`);
+    // The inherited system lists the preferences that apply to the parent; when this cell's differ (another
+    // directory or role), its own list stands here.
+    const mine = preferencesSection(preferencesFor(cell));
+    if (mine !== preferencesSection(preferencesFor(parent))) {
+      parts.push(
+        mine
+          ? `#${mine}\nThese replace the long-term preferences in the system prompt above, which were cell "${parent.id}"'s.`
+          : `## Long-term preferences\nThe long-term preferences in the system prompt above were cell "${parent.id}"'s; none of them apply to you.`,
+      );
+    }
     return parts.join("\n\n");
   }
 
@@ -168,7 +188,7 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
         hash: parentRow.hash,
         skills: parentRow.skills,
         inherited: JSON.stringify(inherited),
-        fork_note: buildForkNote(cell, parent.id),
+        fork_note: buildForkNote(cell, parent),
       };
     } else {
       const sys = buildSystem(cell);
@@ -293,7 +313,7 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
           parentRow.text,
           parentRow.hash,
           parentRow.skills,
-          buildForkNote(cell, parent.id),
+          buildForkNote(cell, parent),
           cell.epoch,
           clock.now(),
           cellId,

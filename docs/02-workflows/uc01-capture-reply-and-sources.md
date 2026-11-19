@@ -46,7 +46,7 @@ sequenceDiagram
         Gate->>Gate: "同步事务校验 principal=owner 且 currentVersion === 1"
         Gate->>Src: "Channel.send(idempotencyKey) -> 收到 sent 回执才标完结"
     else 用例 1C：信源静默巡检与周报习惯挖掘
-        Desk->>Ctx: "search_history(scope='global') 穿透已关 Worker 与 resources 溢出表"
+        Desk->>Ctx: "search_history(scope='global') 穿透已关或待命的 Worker 与 resources 溢出表"
         Desk->>UI: "识别 ≥3 次同节奏周报配方 -> suggest_skill + 提议开启定时信源"
         UI->>Desk: "主人确认开启 -> add_source(cron)"
         loop 每次定时唤醒 sensor Cell
@@ -70,7 +70,7 @@ sequenceDiagram
    - **版本防盲发**：前端渲染卡片时记录当前看到的 `version`；点击确认调用同步事务 `Gate.approve(actionId, "owner", seenVersion)`——若数据库里版本已变成 `v2` 而用户刚看到的是 `v1`，事务立即返回 `version_mismatch` 拒绝外发并刷新界面。
    - **身份硬隔离与诚实回执**：目标为外部 `channel:*` 的卡片标记 `ownerOnly: true`，外部主 Agent 调 `decide_card` 会被硬拒；`Channel.send` 若遇到网络超时返回 `unknown`，卡片如实保留并提示核实，绝不伪造“发送成功”也不盲目重发造成群聊刷屏。
 3. **为什么用例 1C 能从历史会话里捞出周报配方，且平时不污染待办？**
-   - **全域含溢出表检索**：早期会话查询飞书/Git 的长输出往往超过内联阈值溢存至 `resources` 表，且执行拉数的 `worker` 早已关闭。`Context.searchHistory(scope: "global")` 同时建立对所有已关子孙 `evidence`、`artifacts`、`cell_state` 与 `resources` 正文的 `FTS5` 索引，再用 `read_resource` 还原完整命令与数据结构。
+   - **全域含溢出表检索**：早期会话查询飞书/Git 的长输出往往超过内联阈值溢存至 `resources` 表，且执行拉数的 `worker` 早已结束（待命或随项目归档）。`Context.searchHistory(scope: "global")` 同时建立对所有子孙（含已关闭的）`evidence`、`artifacts`、`cell_state` 与 `resources` 正文的 `FTS5` 索引，再用 `read_resource` 还原完整命令与数据结构。
    - **先请示后挂信源**：按 `habit-and-routine-discovery` 技能规范，未满 3 次只记笔记观察；满 3 次先拟好技能并弹卡请示主人，绝不私自开启定时推送。
    - **信源隔离**：`sensor` 只有 `no_hit` 与 `report_hit` 出口，没有创建项目或外发消息权限，从架构上根除了“定时巡检变成勾不完的僵尸待办”。
 
@@ -81,7 +81,7 @@ sequenceDiagram
 - **`INV-UC01-01`（个人微事零卡片）**：主人本人的零外部副作用操作（存笔记/链接、设个人提醒、静默归档纯通知）严禁产生待确认审批卡。
 - **`INV-UC01-02`（信源静默不建待办）**：`sensor` 信源未命中目标时（`no_hit`）不得往 `desk` 投递消息，更不得在 `Radar` 项目列表或 `Engage` 待办列表中留下任何条目。
 - **`INV-UC01-03`（外发版本一致与人类专属放行）**：任何发往非主人外部地址的消息必须经 `Gate` 审批、由 `owner` 身份放行，且 `seenArtifactVersion` 不匹配时必须拦截返回 `version_mismatch`。
-- **`INV-UC01-04`（全域检索穿透已关分身与长输出）**：`search_history(scope: "global")` 必须能命中已关闭 `worker` 的轨迹及溢存至 `resources` 表中的超长工具输出中间段落。
+- **`INV-UC01-04`（全域检索穿透已关分身与长输出）**：`search_history(scope: "global")` 必须能命中已关闭或待命 `worker` 的轨迹及溢存至 `resources` 表中的超长工具输出中间段落。
 
 ---
 

@@ -48,6 +48,8 @@ export {
   parseCodexModels,
   parseAgyModels,
   preferredEffort,
+  recommendFast,
+  fastRecommendation,
   sortEfforts,
   launchChoice,
   type CliModelInfo,

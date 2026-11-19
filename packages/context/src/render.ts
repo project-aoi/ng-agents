@@ -24,6 +24,7 @@ const PRIMARY_FIELD: Readonly<Record<string, string>> = {
   handback: "reason",
   "cell.task": "instruction",
   "cell.message": "text",
+  "cell.direct_chat": "text",
   "kernel.stalled_check": "detail",
   "kernel.wait_timeout": "reason",
 };
@@ -32,6 +33,8 @@ const PRIMARY_FIELD: Readonly<Record<string, string>> = {
  * (docs/05 guards 1 and 2), then the payload follows as usual.
  */
 const LEAD: Readonly<Record<string, string>> = {
+  "cell.direct_chat":
+    "The owner said this directly to one of your cells (named below), not to you. It is already with that cell — do not forward it. Take it into your own picture of the work: the plan, your notes, what you tell the next cell.",
   "kernel.stalled_check":
     "Nothing is moving this project forward any more. Look at where it stands and do exactly one of these now: start the next step; record what it waits for (a card or an action for the owner, a watcher for an outside event, a wait on a cell that will answer); park it (pause_self); or finish it (complete_self). You get this notice once per stall — if you end this run without doing one of them, the project just stays stalled.",
   "kernel.continue":
@@ -84,6 +87,9 @@ export function renderEnvelope(env: Envelope): string {
   head.push(`at ${isoTime(env.createdAt)}`);
   // A message from outside can be handed back or answered one by one, also when several arrive in one batch.
   if (env.type === "user.message" && env.from.startsWith("channel:")) head.push(`id ${env.id}`);
+  // What a person said straight to this cell (or to one of its children) carries its own id too: both entry points —
+  // the workbench and the owner's agent — refer to messages by it.
+  else if (env.from === "kernel:control" && (env.type === "user.message" || env.type === "cell.message")) head.push(`id ${env.id}`);
   const payload = renderPayload(env);
   const lead = LEAD[env.type];
   const body = lead ? (payload ? `${lead}\n${payload}` : lead) : payload;

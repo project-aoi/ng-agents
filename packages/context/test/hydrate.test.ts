@@ -1,3 +1,5 @@
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   CELL_STATUS_KEY,
@@ -7,6 +9,7 @@ import {
   steerNoteText,
   type ChildSummary,
   type Envelope,
+  type KnowledgeApplies,
   type ModelMessage,
   type PromptSnapshot,
   type StepOrExternalEvidence,
@@ -76,14 +79,14 @@ describe("hydrate: frozen system prefix", () => {
     expect(snap.system.text).toBe(
       [
         "You are the desk. Triage every inbound item.",
-        '# Skills\nPlaybooks you can load on demand. Before doing one of these kinds of task, read its full instructions with read_resource("skill://<name>").\n- triage: 分拣规则\n- weekly-review: 周回顾',
+        '# Skills\nPlaybooks you can load on demand. Before doing one of these kinds of task, read its full instructions with read_resource("skill://<name>").\n- weekly-review: 周回顾',
         "# Skill: triage\n先判断是否零副作用",
         "# Your bounds\nTools: read.\nMay send to: inbox:*.\nSecrets (injected by proxy, never visible): none.\nIsolation: none.\nChildren: up to 3 concurrent, 2 more level(s) of spawning.\nBudget (shared with subtree): 1000000 tokens, 500 cents.",
         "# Long-term preferences\n- language: Always answer in Chinese.",
       ].join("\n\n"),
     );
     expect(snap.system.text).not.toMatch(/20\d\d-\d\d-\d\d/);
-    expect(snap.skills.map((s) => s.name)).toEqual(["triage", "weekly-review"]);
+    expect(snap.skills.map((s) => s.name)).toEqual(["weekly-review"]);
     expect(snap).toMatchObject({ cellId: "desk", epoch: 0, runId: snap.batch.claimId, mode: "isolated", historyUptoSeq: 0, history: [] });
     expect(snap.spec.processor).toMatchObject({ prompt: "desk" });
     expect(snap.bounds.maxDepth).toBe(2);
@@ -97,6 +100,29 @@ describe("hydrate: frozen system prefix", () => {
     const snap = h.store.hydrateSync("desk", batchOf("desk", []), "isolated");
     expect(snap.system.text).toContain("- skill-a: a\n- skill-b: b\n- … 3 more skills");
     expect(snap.skills.length).toBe(2);
+  });
+
+  it("does not list an inlined skill again as one to read on demand; with nothing else left there is no index", () => {
+    const h = deskHarness();
+    h.cells.insert({ id: "p", parentId: "desk", preset: "project", spec: { preset: "project", processor: { kind: "llm", prompt: "worker", skills: ["project-relay", "ghost"] } } });
+    h.store.upsertSkillOrNoteSync("desk", { kind: "skill", scope: "global", name: "project-relay", description: "接力", body: "1. 派 worker", mode: "upsert" });
+    const p = h.store.hydrateSync("p", batchOf("p", []), "isolated");
+    expect(p.system.text).not.toContain("# Skills");
+    expect(p.system.text).not.toContain("skill://");
+    expect(p.system.text).toContain("# Skill: project-relay\n1. 派 worker");
+    expect(p.system.text).toContain("# Skill: ghost\n(this skill is not installed)");
+    expect(p.skills).toEqual([]);
+
+    // Another skill installed later shows up in the index on refresh; the inlined one still does not.
+    h.store.upsertSkillOrNoteSync("desk", { kind: "skill", scope: "global", name: "weekly-review", description: "周回顾", body: "...", mode: "upsert" });
+    h.store.refreshPrefixSync("p");
+    const p2 = h.store.hydrateSync("p", batchOf("p", []), "isolated");
+    expect(p2.system.text).toContain("# Skills\n");
+    expect(p2.skills.map((s) => s.name)).toEqual(["weekly-review"]);
+    expect(p2.system.text.match(/project-relay/g)).toHaveLength(1);
+    // The desk inlines only triage: project-relay stays in its index.
+    const desk = h.store.hydrateSync("desk", batchOf("desk", []), "isolated");
+    expect(desk.skills.map((s) => s.name)).toEqual(["project-relay", "weekly-review"]);
   });
 
   it("stays byte-identical while skills, preferences and the spec change, until refreshPrefix", () => {
@@ -134,6 +160,108 @@ describe("hydrate: frozen system prefix", () => {
   it("rejects a batch for another cell", () => {
     const h = deskHarness();
     expect(() => h.store.hydrateSync("desk", batchOf("other", []), "isolated")).toThrow(/batch belongs/);
+  });
+});
+
+describe("hydrate: preferences limited to a directory or a role", () => {
+  const code = { kind: "code", entry: "noop" } as const;
+
+  function scoped(): Harness & { pref(name: string, applies?: KnowledgeApplies): void; prefsOf(id: string): string[] } {
+    const h = setup({
+      cells: [
+        { id: "desk", preset: "inline", spec: { preset: "inline", processor: code, meta: { role: "desk" } } },
+        { id: "p", parentId: "desk", preset: "project", spec: { preset: "project", cwd: "/work/trae-x", processor: code, meta: { role: "project" } } },
+        { id: "w", parentId: "p", preset: "worker", spec: { preset: "worker", cwd: "/work/trae-x/crates/core", processor: code, meta: { role: "worker" } } },
+        { id: "w-old", parentId: "desk", preset: "worker", spec: { preset: "worker", cwd: "/work/trae-x-old", processor: code, meta: { role: "worker" } } },
+        { id: "chk", parentId: "p", preset: "watcher", spec: { preset: "watcher", cwd: "/work/trae-x", processor: code, meta: { role: "checker" } } },
+        { id: "reply", parentId: "desk", preset: "watcher", spec: { preset: "watcher", processor: code, meta: { role: "watcher" } } },
+      ],
+    });
+    return {
+      ...h,
+      pref(name, applies) {
+        h.store.upsertSkillOrNoteSync("desk", { kind: "preference", scope: "global", name, description: name, body: `rule ${name}`, mode: "upsert", ...(applies ? { applies } : {}) });
+      },
+      prefsOf(id) {
+        h.store.refreshPrefixSync(id);
+        const text = h.store.hydrateSync(id, batchOf(id, []), "isolated").system.text;
+        return [...text.matchAll(/^- ([\w-]+): rule /gm)].map((m) => m[1]!);
+      },
+    };
+  }
+
+  it("shows a preference only to the cells inside its directory and of its roles; unlimited ones to every cell", () => {
+    const h = scoped();
+    h.pref("language");
+    h.pref("rust-commit-gate", { cwdPrefix: "/work/trae-x", roles: ["worker"] });
+    h.pref("repo-notes", { cwdPrefix: "/work/trae-x/" });
+    h.pref("report-format", { roles: ["project"] });
+    h.pref("quiet-watch", { roles: ["watcher"] });
+    expect(h.prefsOf("desk")).toEqual(["language"]);
+    expect(h.prefsOf("p")).toEqual(["language", "repo-notes", "report-format"]);
+    expect(h.prefsOf("w")).toEqual(["language", "repo-notes", "rust-commit-gate"]);
+    // a sibling directory that only shares the name's beginning is outside
+    expect(h.prefsOf("w-old")).toEqual(["language"]);
+    // "watcher" names the preset as well as the reply watcher's role
+    expect(h.prefsOf("chk")).toEqual(["language", "quiet-watch", "repo-notes"]);
+    expect(h.prefsOf("reply")).toEqual(["language", "quiet-watch"]);
+    // the role "checker" alone reaches only the checker; preset "inline" reaches the desk
+    h.pref("quiet-watch", { roles: ["checker", "inline"] });
+    expect(h.prefsOf("chk")).toEqual(["language", "quiet-watch", "repo-notes"]);
+    expect(h.prefsOf("reply")).toEqual(["language"]);
+    expect(h.prefsOf("desk")).toEqual(["language", "quiet-watch"]);
+    // a filtered-out preference leaves no trace in that cell's prompt
+    const deskText = h.store.hydrateSync("desk", batchOf("desk", []), "isolated").system.text;
+    expect(deskText).not.toContain("rust-commit-gate");
+    expect(deskText).not.toContain("trae-x");
+  });
+
+  it("stores the directory expanded and normalized, and changing a preference's reach takes effect on refresh", () => {
+    const h = scoped();
+    h.pref("home-code", { cwdPrefix: "~/code/", roles: [" Worker ", "worker"] });
+    expect(h.store.getKnowledgeSync({ kind: "preference", scope: "global", name: "home-code" })?.applies).toEqual({ cwdPrefix: join(homedir(), "code"), roles: ["worker"] });
+    h.cells.update("w", { spec: { preset: "worker", cwd: join(homedir(), "code", "app"), processor: code, meta: { role: "worker" } } });
+    expect(h.prefsOf("w")).toEqual(["home-code"]);
+
+    h.pref("gate", { cwdPrefix: "/work/trae-x", roles: ["worker"] });
+    expect([h.prefsOf("p"), h.prefsOf("w-old")]).toEqual([[], []]);
+    h.pref("gate", { roles: ["project"] });
+    expect([h.prefsOf("p"), h.prefsOf("w-old")]).toEqual([["gate"], []]);
+    // append keeps the reach unless given
+    h.store.upsertSkillOrNoteSync("desk", { kind: "preference", scope: "global", name: "gate", body: "rule more", mode: "append" });
+    expect(h.store.getKnowledgeSync({ kind: "preference", scope: "global", name: "gate" })).toMatchObject({ body: "rule gate\nrule more", applies: { roles: ["project"] } });
+    h.store.upsertSkillOrNoteSync("desk", { kind: "preference", scope: "global", name: "gate", body: "rule last", mode: "append", applies: { roles: ["worker"] } });
+    expect([h.prefsOf("p"), h.prefsOf("w-old")]).toEqual([[], ["gate"]]);
+    // saved again without a reach: every cell
+    h.pref("gate");
+    expect(h.store.getKnowledgeSync({ kind: "preference", scope: "global", name: "gate" })).not.toHaveProperty("applies");
+    expect([h.prefsOf("p"), h.prefsOf("w-old"), h.prefsOf("desk")]).toEqual([["gate"], ["gate"], ["gate"]]);
+  });
+
+  it("a fork_prefix child whose preferences differ from its parent's gets its own list in the fork note", () => {
+    const h = scoped();
+    h.pref("language");
+    h.cells.insert({
+      id: "fp",
+      parentId: "desk",
+      preset: "project",
+      spec: { preset: "project", cwd: "/work/trae-x", contextMode: "fork_prefix", fork: { fromCellId: "desk", uptoSeq: 0 }, processor: code, meta: { role: "project" } },
+    });
+    const noteOf = (id: string) => {
+      h.store.refreshPrefixSync(id);
+      const s = h.store.hydrateSync(id, batchOf(id, []), "fork_prefix");
+      return (s.history.at(-1)!.content[0] as { text: string }).text;
+    };
+    // same preferences as the desk: nothing repeated
+    expect(noteOf("fp")).not.toContain("preferences");
+    h.pref("repo-notes", { cwdPrefix: "/work/trae-x" });
+    const note = noteOf("fp");
+    expect(note).toContain('## Long-term preferences\n- language: rule language\n- repo-notes: rule repo-notes\nThese replace the long-term preferences in the system prompt above, which were cell "desk"\'s.');
+    expect(h.store.hydrateSync("fp", batchOf("fp", []), "fork_prefix").system.text).not.toContain("repo-notes");
+    // the other way round: the desk's only preference does not apply to the child
+    h.pref("language", { roles: ["desk"] });
+    h.pref("repo-notes", { cwdPrefix: "/elsewhere" });
+    expect(noteOf("fp")).toContain('## Long-term preferences\nThe long-term preferences in the system prompt above were cell "desk"\'s; none of them apply to you.');
   });
 });
 

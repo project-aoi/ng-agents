@@ -1,5 +1,5 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import type { StatusDTO, ViewName } from "../shared/api";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
+import type { ArtifactRefDTO, StatusDTO, ViewName } from "../shared/api";
 import { ApiFailure } from "./api";
 
 // ==================== top-bar status ====================
@@ -25,7 +25,7 @@ export function useStatus(): StatusApi {
 
 type Ticks = Readonly<Record<ViewName, number>>;
 
-const ZERO: Ticks = { clarify: 0, engage: 0, radar: 0, review: 0, status: 0, sources: 0, activity: 0 };
+const ZERO: Ticks = { clarify: 0, engage: 0, radar: 0, agents: 0, review: 0, status: 0, sources: 0, activity: 0 };
 
 interface RefreshApi {
   ticks: Ticks;
@@ -58,6 +58,22 @@ export function useRefreshTick(views: readonly ViewName[]): number {
   let n = 0;
   for (const v of views) n += ticks[v] ?? 0;
   return n;
+}
+
+/**
+ * Calls `onTick` once things behind `views` stopped changing for `delayMs`: a busy cell fires many refreshes in a row
+ * and one refetch at the end is enough. Never on mount (the first load is the caller's).
+ */
+export function useDebouncedRefresh(views: readonly ViewName[], delayMs: number, onTick: () => void): void {
+  const tick = useRefreshTick(views);
+  const first = useRef(tick);
+  const cb = useRef(onTick);
+  cb.current = onTick;
+  useEffect(() => {
+    if (tick === first.current) return;
+    const t = setTimeout(() => cb.current(), delayMs);
+    return () => clearTimeout(t);
+  }, [tick, delayMs]);
 }
 
 export function toFailure(err: unknown): ApiFailure {
@@ -211,6 +227,100 @@ export function useArtifactEvents(artifactId: string | null | undefined, onChang
   }, [artifactId]);
 }
 
+// ==================== live cell records (SSE `cell_tail`, `job_chunk`) ====================
+// Only the open Agents pane listens; everyone else ignores them, so they go straight to listeners (no refresh tick).
+
+export interface CellTailEvent {
+  cellId: string;
+  lastSeq: number;
+}
+
+export interface JobChunkEvent {
+  cellId: string;
+  jobId: string;
+  chunk: string;
+}
+
+const tailListeners = new Set<(e: CellTailEvent) => void>();
+const chunkListeners = new Set<(e: JobChunkEvent) => void>();
+
+export function emitCellTail(e: CellTailEvent): void {
+  for (const l of [...tailListeners]) l(e);
+}
+
+export function emitJobChunk(e: JobChunkEvent): void {
+  for (const l of [...chunkListeners]) l(e);
+}
+
+/** Calls the handlers for events about this one cell. */
+export function useCellLive(cellId: string | null, handlers: { tail(e: CellTailEvent): void; chunk(e: JobChunkEvent): void }): void {
+  const ref = useRef(handlers);
+  ref.current = handlers;
+  useEffect(() => {
+    if (!cellId) return;
+    const onTail = (e: CellTailEvent) => {
+      if (e.cellId === cellId) ref.current.tail(e);
+    };
+    const onChunk = (e: JobChunkEvent) => {
+      if (e.cellId === cellId) ref.current.chunk(e);
+    };
+    tailListeners.add(onTail);
+    chunkListeners.add(onChunk);
+    return () => {
+      tailListeners.delete(onTail);
+      chunkListeners.delete(onChunk);
+    };
+  }, [cellId]);
+}
+
+// ==================== the desk's id ====================
+// Learned from the topology the first time the Agents view loads; links elsewhere fall back to "desk", which the
+// Agents view resolves to the real id.
+
+const DESK_KEY = "ng-desk-desk-id";
+let knownDeskId: string | null = (() => {
+  try {
+    return typeof sessionStorage === "undefined" ? null : sessionStorage.getItem(DESK_KEY);
+  } catch {
+    return null;
+  }
+})();
+const deskListeners = new Set<() => void>();
+
+export function rememberDeskId(id: string): void {
+  if (!id || id === knownDeskId) return;
+  knownDeskId = id;
+  try {
+    sessionStorage.setItem(DESK_KEY, id);
+  } catch {
+    // per-tab convenience only
+  }
+  for (const l of [...deskListeners]) l();
+}
+
+export function useDeskId(): string {
+  const read = () => knownDeskId ?? "desk";
+  return useSyncExternalStore(
+    (l) => {
+      deskListeners.add(l);
+      return () => deskListeners.delete(l);
+    },
+    read,
+    read,
+  );
+}
+
+// ==================== the shared report drawer ====================
+
+const ReportContext = createContext<(ref: ArtifactRefDTO) => void>(() => undefined);
+
+export const ReportProvider = ReportContext.Provider;
+
+/** Opens a report or draft read-only in the side drawer (Radar rows, the Agents header and timeline). */
+export function useOpenReport(): (ref: ArtifactRefDTO) => void {
+  return useContext(ReportContext);
+}
+
 // ==================== keyboard ====================
 
 export type KeyHandler = (e: KeyboardEvent) => boolean;
@@ -257,7 +367,7 @@ export function isActivatableTarget(t: EventTarget | null): boolean {
 
 // ==================== routing ====================
 
-export type ViewKey = "clarify" | "engage" | "radar";
+export type ViewKey = "clarify" | "engage" | "radar" | "agents";
 
 export interface Route {
   view: ViewKey;
@@ -265,19 +375,37 @@ export interface Route {
   cardId?: string;
   /** Engage: the open 8/4 workspace. */
   item?: { cellId: string; actionId: string };
+  /** Agents: the selected node ("desk" stands for the desk whatever its id). */
+  cellId?: string;
+  /** Agents: show only this project's part of the tree. */
+  projectId?: string;
 }
 
+function decode(p: string): string {
+  try {
+    return decodeURIComponent(p);
+  } catch {
+    return p;
+  }
+}
+
+/**
+ * `#/clarify[/:cardId]` · `#/engage[/:cellId/:actionId]` · `#/radar` ·
+ * `#/agents[/:cellId][?project=<projectId>]`. Anything else is Clarify.
+ */
 export function parseRoute(hash: string): Route {
-  const parts = hash.replace(/^#\/?/, "").split("/").filter(Boolean).map((p) => {
-    try {
-      return decodeURIComponent(p);
-    } catch {
-      return p;
-    }
-  });
+  const raw = hash.replace(/^#\/?/, "");
+  const q = raw.indexOf("?");
+  const path = q >= 0 ? raw.slice(0, q) : raw;
+  const query = new URLSearchParams(q >= 0 ? raw.slice(q + 1) : "");
+  const parts = path.split("/").filter(Boolean).map(decode);
   const [view, a, b] = parts;
   if (view === "engage") return a && b ? { view: "engage", item: { cellId: a, actionId: b } } : { view: "engage" };
   if (view === "radar") return { view: "radar" };
+  if (view === "agents") {
+    const project = query.get("project");
+    return { view: "agents", ...(a ? { cellId: a } : {}), ...(project ? { projectId: project } : {}) };
+  }
   return a ? { view: "clarify", cardId: a } : { view: "clarify" };
 }
 
@@ -285,6 +413,7 @@ export function routeHash(r: Route): string {
   const e = encodeURIComponent;
   if (r.view === "engage" && r.item) return `#/engage/${e(r.item.cellId)}/${e(r.item.actionId)}`;
   if (r.view === "clarify" && r.cardId) return `#/clarify/${e(r.cardId)}`;
+  if (r.view === "agents") return `#/agents${r.cellId ? `/${e(r.cellId)}` : ""}${r.projectId ? `?project=${e(r.projectId)}` : ""}`;
   return `#/${r.view}`;
 }
 

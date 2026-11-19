@@ -8,13 +8,16 @@ import {
   makeBounds,
   NgError,
   PAYLOAD,
+  selectRunTools,
+  type CellInspection,
   type ChannelSendAction,
   type Envelope,
   type ProposedAction,
+  type SendToCellResult,
   type ToolContext,
   type ToolDef,
 } from "@ng/protocol";
-import { createFakeRun, type FakeRun, type FakeRunOptions } from "../src/testing";
+import { createFakeRun, fakeInspection, type FakeRun, type FakeRunOptions } from "../src/testing";
 import { clock, makeRegistry } from "./helpers";
 
 const registry = makeRegistry();
@@ -140,15 +143,18 @@ describe("kernel.comms send_message", () => {
   it("delivers to another cell's inbox without an approval, and says so out loud when the target is closed", async () => {
     const run = fakeRun({
       batch: ["转给 worker"],
-      sendToCell: (to) =>
-        to === "inbox:w_done"
-          ? { status: "closed", closeReason: "completed" }
-          : to === "inbox:ghost"
-            ? { status: "not_found" }
-            : { status: "delivered", envelopeId: `msg_to_${to.slice(6)}`, targetStatus: to === "inbox:parked" ? "paused" : "active" },
+      sendToCell: (to): SendToCellResult => {
+        if (to === "inbox:w_done") return { status: "closed", closeReason: "completed" };
+        if (to === "inbox:w_cancelled") return { status: "closed", closeReason: "cancelled" };
+        if (to === "inbox:ghost") return { status: "not_found" };
+        return { status: "delivered", envelopeId: `msg_to_${to.slice(6)}`, targetStatus: to === "inbox:parked" ? "paused" : "active" };
+      },
     });
     const ok = await invoke(run, "send_message", { to: "inbox:w1", text: "顺便把单测也补上", summary: "追加要求" });
-    expect(ok).toMatchObject({ output: 'Delivered to w1. It handles the message in its current run or is woken with it; if you need its answer, end your turn with wait (waitingFor "inbox:w1").' });
+    expect(ok).toMatchObject({
+      output:
+        'Delivered to w1. It handles the message in its current run, or is woken with it (a dormant worker continues with everything it knows); if you need its answer, end your turn with wait (waitingFor "inbox:w1").',
+    });
     expect(ok.isError).toBeUndefined();
     expect(run.ports.log.cellMessages[0]).toEqual({
       to: "inbox:w1",
@@ -158,7 +164,10 @@ describe("kernel.comms send_message", () => {
     expect((await invoke(run, "send_message", { to: "inbox:parked", text: "x", summary: "s" })).output).toBe("Delivered to parked, which is paused: it reads the message when it is resumed.");
     const closed = await invoke(run, "send_message", { to: "inbox:w_done", text: "还有一件事", summary: "追加" });
     expect(closed.isError).toBe(true);
-    expect(closed.output).toMatch(/^NOT DELIVERED — w_done is closed \(it already finished and reported\)\. Nothing was stored\. .*spawn_cell/);
+    // a worker is not closed for finishing a turn: a closed one was closed on purpose, or went with its project
+    expect(closed.output).toMatch(/^NOT DELIVERED — w_done is closed \(it was closed, or its project ended\)\. Nothing was stored\. .*spawn_cell/);
+    const cancelled = await invoke(run, "send_message", { to: "inbox:w_cancelled", text: "x", summary: "s" });
+    expect(cancelled).toMatchObject({ isError: true, output: expect.stringMatching(/^NOT DELIVERED — w_cancelled is closed \(it was cancelled\)\. Nothing was stored\./) });
     const ghost = await invoke(run, "send_message", { to: "inbox:ghost", text: "x", summary: "s" });
     expect(ghost).toMatchObject({ isError: true, output: expect.stringMatching(/^NOT DELIVERED — there is no cell "ghost"/) });
     // cell-to-cell messages never go through the Gate or a channel
@@ -231,7 +240,7 @@ describe("kernel.comms request_approval / report_to_parent / handback / wait", (
     await invoke(run, "report_to_parent", { kind: "progress", text: "跑完一半" });
     const r = await invoke(run, "report_to_parent", { kind: "result", text: "测试全过，分支 fix/ci", artifactId: "art_rep", data: { branch: "fix/ci" } });
     expect(r).toMatchObject({ endRun: "completed", data: { staged: true } });
-    expect(r.output).toMatch(/^Result recorded\. Your run ends now; the kernel delivers it to your parent and closes you\./);
+    expect(r.output).toMatch(/^Result recorded\. Your run ends now and your parent is told\. If a follow-up message reached you first, you are woken with it instead/);
     // progress still goes out at once (silent); the result does not
     expect(run.ports.log.emitted.map((e) => e.type)).toEqual([PAYLOAD.cellProgress]);
     expect(run.ports.state.get(CELL_RESULT_CANDIDATE_KEY)).toEqual({
@@ -245,6 +254,26 @@ describe("kernel.comms request_approval / report_to_parent / handback / wait", (
     // complete_self / pause_self are for cells that live until they say so
     expect(tool("complete_self").availableFor!({ bounds: run.ports.self.bounds, spec: run.ports.self.spec })).toBe(false);
     expect(tool("complete_self").availableFor!({ bounds: run.ports.self.bounds, spec: { processor: { kind: "llm" }, parentId: "desk" } })).toBe(true);
+  });
+
+  it("a wakeable worker's result is staged like a one-shot's: nothing is sent, the run ends; it settles nothing itself", async () => {
+    const run = fakeRun({ cellId: "w2", spec: { lifetime: "wakeable" } });
+    const r = await invoke(run, "report_to_parent", { kind: "result", text: "失败：上游接口 502", status: "failed", artifactId: "art_log" });
+    expect(r).toEqual({
+      output: "Result recorded. Your run ends now and your parent is told. If a follow-up message reached you first, you are woken with it instead — handle it, then report the updated result.",
+      endRun: "completed",
+      data: { staged: true },
+    });
+    expect(run.ports.log.emitted).toEqual([]);
+    expect(run.ports.state.get(CELL_RESULT_CANDIDATE_KEY)).toEqual({ status: "failed", summary: "失败：上游接口 502", artifactId: "art_log", at: c.now() });
+    expect(run.ports.state.get(CELL_STATUS_KEY)).toMatchObject({ text: "失败：上游接口 502" });
+    // a leaf's turns are settled by the kernel: complete_self / pause_self are not offered to it
+    for (const name of ["complete_self", "pause_self"]) {
+      expect(tool(name).availableFor!({ bounds: run.ports.self.bounds, spec: run.ports.self.spec })).toBe(false);
+      expect(tool(name).availableFor!({ bounds: run.ports.self.bounds, spec: { processor: { kind: "llm" }, parentId: "desk", lifetime: "persistent" } })).toBe(true);
+    }
+    // report_to_parent itself stays offered to every cell with a parent
+    expect(tool("report_to_parent").availableFor!({ bounds: run.ports.self.bounds, spec: run.ports.self.spec })).toBe(true);
   });
 
   it("complete_self / pause_self hand the kernel a settle request and end the run", async () => {
@@ -442,16 +471,190 @@ describe("kernel.context", () => {
     expect((await invoke(run, "save_skill", { name: "Bad Name", description: "d", body: "b" })).isError).toBe(true);
     run.ports.resources.set("res://cell1/r1", "abcdefghij");
     // A page says whether more follows and where; the last page and a whole short text come back bare.
+    // An explicit page size is carried into the next call.
     expect((await invoke(run, "read_resource", { uri: "res://cell1/r1", offset: 2, limit: 3 })).output).toBe(
-      'cde\n…[characters 2–5 shown; more follows: read_resource("res://cell1/r1", offset 5)]',
+      'cde\n…[characters 2–5 shown; more follows: read_resource("res://cell1/r1", offset 5, limit 3)]',
     );
     expect((await invoke(run, "read_resource", { uri: "res://cell1/r1", offset: 5 })).output).toBe("fghij");
     expect((await invoke(run, "read_resource", { uri: "res://cell1/r1" })).output).toBe("abcdefghij");
     expect((await invoke(run, "read_resource", { uri: "res://cell1/r1", offset: 50 })).output).toContain("nothing at offset 50");
-    // One page is never larger than what stays inline, whatever limit is asked for.
-    run.ports.resources.set("res://cell1/big", "z".repeat(20_000));
-    const page = (await invoke(run, "read_resource", { uri: "res://cell1/big", limit: 50_000 })).output;
-    expect(page.startsWith("z".repeat(8000) + "\n…[characters 0–8000 shown; more follows")).toBe(true);
+    // The default page is 8000 characters; an explicit limit reads up to 64000 per call, never more.
+    run.ports.resources.set("res://cell1/big", "z".repeat(150_000));
+    const first = (await invoke(run, "read_resource", { uri: "res://cell1/big" })).output;
+    expect(first).toBe(`${"z".repeat(8000)}\n…[characters 0–8000 shown; more follows: read_resource("res://cell1/big", offset 8000)]`);
+    const large = (await invoke(run, "read_resource", { uri: "res://cell1/big", offset: 8000, limit: 64_000 })).output;
+    expect(large).toBe(`${"z".repeat(64_000)}\n…[characters 8000–72000 shown; more follows: read_resource("res://cell1/big", offset 72000, limit 64000)]`);
+    const capped = (await invoke(run, "read_resource", { uri: "res://cell1/big", limit: 1_000_000 })).output;
+    expect(capped.startsWith(`${"z".repeat(64_000)}\n…[characters 0–64000 shown; more follows`)).toBe(true);
+    expect((await invoke(run, "read_resource", { uri: "res://cell1/big", offset: 100_000, limit: 64_000 })).output).toBe("z".repeat(50_000));
+  });
+
+  describe("patch_artifact", () => {
+    const REPORT = [
+      "# Harness 对比",
+      "",
+      "## 结论",
+      "",
+      "trae 基于事件循环。",
+      "",
+      "## 遥测",
+      "",
+      "侧车上报 OTLP。",
+      "",
+      "```bash",
+      "## not a heading inside a code block",
+      "```",
+      "",
+      "### 细节",
+      "",
+      "采样率 10%。",
+      "",
+      "## 附录",
+      "",
+      "- 待补",
+      "",
+    ].join("\n");
+
+    async function withReport(o: { title?: string; body?: string } = {}) {
+      const run = fakeRun();
+      const created = await invoke(run, "save_artifact", { title: o.title ?? "Harness 对比报告", body: o.body ?? REPORT });
+      return { run, id: (created.data as { artifactId: string }).artifactId };
+    }
+    const bodyOf = (run: FakeRun, id: string) => run.ports.artifacts.get(id)!.content.body;
+
+    it("replaces one passage, keeps the title and reports the new version and size", async () => {
+      const { run, id } = await withReport();
+      const r = await invoke(run, "patch_artifact", { artifactId: id, expectedVersion: 1, edits: [{ op: "replace", find: "OTLP", replace: "OTLP/gRPC" }] });
+      const body = REPORT.replace("OTLP", "OTLP/gRPC");
+      expect(r).toMatchObject({ output: `Saved ${id} v2 (${body.length} chars, 1 edit applied).`, data: { artifactId: id, version: 2, chars: body.length, edits: 1 } });
+      expect(run.ports.artifacts.get(id)!.content).toEqual({ format: "markdown", title: "Harness 对比报告", body });
+      expect(run.ports.log.commits.at(-1)!.artifact).toMatchObject({ artifactId: id, updatedBy: "agent", expectedVersion: 1 });
+    });
+
+    it("applies several edits in order, renames when asked, and groups thousands in the size", async () => {
+      const { run, id } = await withReport({ body: `${"x".repeat(1500)}\nEND` });
+      const r = await invoke(run, "patch_artifact", {
+        artifactId: id,
+        expectedVersion: 1,
+        title: "终稿",
+        edits: [
+          { op: "replace", find: "END", replace: "MID" },
+          { op: "append", text: "END" },
+          { op: "prepend", text: "# 标题" },
+          { op: "replace", find: "x", replace: "y", all: true },
+        ],
+      });
+      const body = `# 标题\n${"y".repeat(1500)}\nMID\nEND`;
+      expect(body.length).toBe(1513);
+      expect(r.output).toBe(`Saved ${id} v2 (1,513 chars, 4 edits applied; title now "终稿").`);
+      expect(run.ports.artifacts.get(id)!.content).toMatchObject({ title: "终稿", body });
+    });
+
+    it("rejects an ambiguous or missing find and writes nothing", async () => {
+      const { run, id } = await withReport();
+      const commits = run.ports.log.commits.length;
+      const twice = await invoke(run, "patch_artifact", {
+        artifactId: id,
+        expectedVersion: 1,
+        edits: [
+          { op: "append", text: "- 新增一条" },
+          { op: "replace", find: "## ", replace: "### " },
+        ],
+      });
+      expect(twice.isError).toBe(true);
+      expect(twice.output).toContain("edit 2 (replace): the find text occurs 5 times (lines 3, 7, 12, 15, 19)");
+      expect(twice.output).toContain(`Nothing was saved; ${id} stays at v1.`);
+      const missing = await invoke(run, "patch_artifact", { artifactId: id, expectedVersion: 1, edits: [{ op: "replace", find: "OTLP over HTTP", replace: "x" }] });
+      expect(missing.isError).toBe(true);
+      expect(missing.output).toContain("edit 1 (replace): the find text does not occur in the body");
+      const incomplete = await invoke(run, "patch_artifact", { artifactId: id, expectedVersion: 1, edits: [{ op: "replace", find: "OTLP" }] });
+      expect(incomplete).toMatchObject({ isError: true, output: expect.stringContaining("edit 1 (replace) needs replace") });
+      expect(run.ports.log.commits.length).toBe(commits);
+      expect(run.ports.artifacts.get(id)!.version).toBe(1);
+      expect(bodyOf(run, id)).toBe(REPORT);
+    });
+
+    it("replaces a Markdown section up to the next heading of the same or higher level", async () => {
+      const { run, id } = await withReport();
+      const r = await invoke(run, "patch_artifact", { artifactId: id, expectedVersion: 1, edits: [{ op: "replace_section", heading: "## 遥测", text: "侧车经 OTLP/gRPC 上报，采样率 5%。" }] });
+      expect(r.output).toBe(`Saved ${id} v2 (${bodyOf(run, id).length} chars, 1 edit applied).`);
+      // The subsection and the fenced block went with it; the blank lines around the section stay as they were.
+      expect(bodyOf(run, id)).toBe(["# Harness 对比", "", "## 结论", "", "trae 基于事件循环。", "", "## 遥测", "", "侧车经 OTLP/gRPC 上报，采样率 5%。", "", "## 附录", "", "- 待补", ""].join("\n"));
+      // Just the heading text works when it is unique; the last section runs to the end of the body.
+      await invoke(run, "patch_artifact", { artifactId: id, expectedVersion: 2, edits: [{ op: "replace_section", heading: "附录", text: "- 无\n" }] });
+      expect(bodyOf(run, id).endsWith("## 附录\n\n- 无\n")).toBe(true);
+    });
+
+    it("rejects an unknown or duplicate heading, listing the headings", async () => {
+      const { run, id } = await withReport({ body: "## A\none\n## B\ntwo\n# Top\n## A\nthree\n" });
+      const unknown = await invoke(run, "patch_artifact", { artifactId: id, expectedVersion: 1, edits: [{ op: "replace_section", heading: "## C", text: "x" }] });
+      expect(unknown.isError).toBe(true);
+      expect(unknown.output).toContain('edit 1 (replace_section): no heading "## C" in the body. Headings in the body: line 1: ## A; line 3: ## B; line 5: # Top; line 6: ## A.');
+      const dup = await invoke(run, "patch_artifact", { artifactId: id, expectedVersion: 1, edits: [{ op: "replace_section", heading: "A", text: "x" }] });
+      expect(dup.output).toContain('the heading "A" occurs 2 times (line 1: ## A; line 6: ## A)');
+      expect(run.ports.artifacts.get(id)!.version).toBe(1);
+    });
+
+    it("appends on its own line", async () => {
+      const { run, id } = await withReport({ body: "第一段" });
+      await invoke(run, "patch_artifact", { artifactId: id, expectedVersion: 1, edits: [{ op: "append", text: "第二段" }] });
+      expect(bodyOf(run, id)).toBe("第一段\n第二段");
+      await invoke(run, "patch_artifact", { artifactId: id, expectedVersion: 2, edits: [{ op: "append", text: "\n\n第三段\n" }] });
+      expect(bodyOf(run, id)).toBe("第一段\n第二段\n\n第三段\n");
+      expect(run.ports.artifacts.get(id)!.content.title).toBe("Harness 对比报告");
+    });
+
+    it("a stale expectedVersion overwrites nothing and is reported like save_artifact's conflict", async () => {
+      const { run, id } = await withReport();
+      await invoke(run, "save_artifact", { artifactId: id, expectedVersion: 1, body: `${REPORT}\n另一个分身补的一段` });
+      const stale = await invoke(run, "patch_artifact", { artifactId: id, expectedVersion: 1, edits: [{ op: "replace", find: "OTLP", replace: "OTLP/gRPC" }] });
+      expect(stale.isError).toBe(true);
+      expect(stale.output).toContain(`Version conflict: ${id} is at v2 (last edited by agent).`);
+      expect(stale.output).toContain("patch with expectedVersion 2");
+      expect(stale.output).toContain("另一个分身补的一段");
+      expect(stale.data).toEqual({ artifactId: id, currentVersion: 2, updatedBy: "agent" });
+      expect(run.ports.artifacts.get(id)!.version).toBe(2);
+      expect(run.ports.log.parked).toEqual([]);
+
+      // Over a human's newer version the edited text is kept beside it, as with save_artifact.
+      run.ports.humanEdit(id, "人工 v3");
+      const human = await invoke(run, "patch_artifact", { artifactId: id, expectedVersion: 2, edits: [{ op: "append", text: "补充" }] });
+      expect(human.output).toContain("at v3 (last edited by human). Your text was kept beside it as a suggestion");
+      expect(run.ports.log.parked).toHaveLength(1);
+      expect(bodyOf(run, id)).toBe("人工 v3");
+    });
+
+    it("refuses a missing artifact and non-text formats", async () => {
+      const run = fakeRun();
+      expect((await invoke(run, "patch_artifact", { artifactId: "art_nope", expectedVersion: 1, edits: [{ op: "append", text: "x" }] })).output).toContain("No artifact art_nope");
+      const json = await invoke(run, "save_artifact", { format: "json", body: '{"a":1}' });
+      const jid = (json.data as { artifactId: string }).artifactId;
+      const r = await invoke(run, "patch_artifact", { artifactId: jid, expectedVersion: 1, edits: [{ op: "replace", find: "1", replace: "2" }] });
+      expect(r).toMatchObject({ isError: true, output: expect.stringContaining("is a json artifact; patch_artifact only edits text and Markdown bodies") });
+      expect((await invoke(run, "patch_artifact", { artifactId: jid, expectedVersion: 1, edits: [] })).isError).toBe(true);
+    });
+  });
+
+  it("save_note limits a preference to a directory and roles; refuses the limits on a note", async () => {
+    const run = fakeRun();
+    const gate = await invoke(run, "save_note", { name: "commit-gate", body: "提交前跑 cargo clippy", kind: "preference", cwdPrefix: "/work/trae-x", roles: ["worker"] });
+    expect(gate.output).toBe('Saved preference "commit-gate" (global; only for cells in /work/trae-x and roles worker).');
+    await invoke(run, "save_note", { name: "report-style", body: "报告先写结论", kind: "preference", roles: ["project", "worker"] });
+    await invoke(run, "save_note", { name: "tone", body: "回复同事用简短中文", kind: "preference", roles: [] });
+    expect(run.ports.log.knowledge).toEqual([
+      { kind: "preference", name: "commit-gate", body: "提交前跑 cargo clippy", description: "提交前跑 cargo clippy", scope: "global", mode: "upsert", applies: { cwdPrefix: "/work/trae-x", roles: ["worker"] } },
+      { kind: "preference", name: "report-style", body: "报告先写结论", description: "报告先写结论", scope: "global", mode: "upsert", applies: { roles: ["project", "worker"] } },
+      { kind: "preference", name: "tone", body: "回复同事用简短中文", description: "回复同事用简短中文", scope: "global", mode: "upsert" },
+    ]);
+    for (const input of [
+      { name: "n", body: "b", cwdPrefix: "/work/trae-x" },
+      { name: "n", body: "b", kind: "note", roles: ["worker"] },
+    ]) {
+      const r = await invoke(run, "save_note", input);
+      expect(r).toMatchObject({ isError: true, output: expect.stringContaining('only limit a preference; a note cannot take them') });
+    }
+    expect(run.ports.log.knowledge).toHaveLength(3);
+    expect(tool("save_note").description).toContain("leave both out for a rule about how the owner wants things done everywhere");
   });
 });
 
@@ -468,13 +671,11 @@ describe("kernel.cells", () => {
       watches: [{ thread: "github:org/repo#108", cancelGroup: "pr108" }, { filter: { "payload.text": { $contains: "CI" } }, coalesceMinutes: 2 }],
       schedules: [{ at: "2026-11-18T09:00:00+08:00" }],
       cwd: "/repos/app",
-      cwdMode: "write",
     });
     expect(r).toEqual({
-      output:
-        'Spawned "修复 PR #108 CI" (worker) as inbox:child_1 — cell id child_1. It reports back to your inbox. If another cell is writing in the same work tree it starts when that one is done — nothing for you to manage.',
+      output: 'Spawned "修复 PR #108 CI" (worker) as inbox:child_1 — cell id child_1. It starts now; you are woken when its turn is over.',
       data: { addr: "inbox:child_1" },
-      // the child will wake this cell with its result: a run that ends after spawning is waiting, not finished
+      // the child will wake this cell when its turn is over: a run that ends after spawning is waiting, not finished
       awaitsWakeup: true,
     });
     const { spec, initialPayload } = run.ports.log.spawned[0]!;
@@ -484,7 +685,6 @@ describe("kernel.cells", () => {
       title: "修复 PR #108 CI",
       contextMode: "fork_prefix",
       cwd: "/repos/app",
-      cwdMode: "write",
       processor: { kind: "llm", modelTier: "fast", toolsets: ["workspace", "kernel.comms"], maxSteps: 40 },
       watches: [
         { threadOrFilter: { thread: "github:org/repo#108" }, cancelGroup: "pr108" },
@@ -496,9 +696,11 @@ describe("kernel.cells", () => {
     expect(spec.meta).toBeUndefined();
     expect([...spec.bounds!.tools!]).toEqual(["read", "edit", "bash"]);
 
+    // docs/05-proposals/03: no write queue — the spec carries no cwdMode
+    expect(spec).not.toHaveProperty("cwdMode");
+
     const r2 = await invoke(run, "spawn_cell", { preset: "sensor", title: "指标巡检", instruction: "每天 9 点查", input: { metric: "pay_success" } });
-    // no cwdMode anywhere (neither asked for nor a preset default): read, so no write-queue note
-    expect(r2.output).toBe('Spawned "指标巡检" (sensor) as inbox:child_2 — cell id child_2. It reports back to your inbox.');
+    expect(r2.output).toBe('Spawned "指标巡检" (sensor) as inbox:child_2 — cell id child_2. It starts now; you are woken when its turn is over.');
     expect(run.ports.log.spawned[1]).toMatchObject({
       spec: { processor: { kind: "code", entry: "script:checks/metrics.sh" } },
       initialPayload: { instruction: "每天 9 点查", input: { metric: "pay_success" } },
@@ -532,13 +734,103 @@ describe("kernel.cells", () => {
     ]);
   });
 
-  it("spawn, control and close are unavailable without spawn depth; update_cell (own watches/schedules) always is", () => {
-    for (const name of ["spawn_cell", "control_cell", "close_cell"]) {
+  it("spawn, inspect, control and close are unavailable without spawn depth; update_cell (own watches/schedules) always is", () => {
+    for (const name of ["spawn_cell", "inspect_cell", "control_cell", "close_cell"]) {
       const t = tool(name);
       expect(t.availableFor!({ bounds: makeBounds({ maxDepth: 0 }) })).toBe(false);
       expect(t.availableFor!({ bounds: makeBounds({ maxDepth: 1 }) })).toBe(true);
     }
     expect(tool("update_cell").availableFor).toBeUndefined();
+  });
+
+  it("kernel.cells gives a leaf (maxDepth 0) only update_cell, and a coordinator all five tools", () => {
+    const offered = (maxDepth: number) =>
+      selectRunTools(registry.resolveTools(["kernel.cells"]), { kind: "llm", toolsets: ["kernel.cells"] }, makeBounds({ maxDepth }), { processor: { kind: "llm" }, parentId: "desk" }).map(
+        (t) => t.name,
+      );
+    expect(offered(0)).toEqual(["update_cell"]);
+    expect(offered(1)).toEqual(["spawn_cell", "inspect_cell", "update_cell", "control_cell", "close_cell"]);
+  });
+
+  it("spawn_cell takes no cwdMode (docs/05-proposals/03): it is not in the schema, and a stray one never reaches the spec", async () => {
+    const schema = tool("spawn_cell").inputSchema as { properties: Record<string, unknown> };
+    expect(Object.keys(schema.properties)).toContain("cwd");
+    expect(Object.keys(schema.properties)).not.toContain("cwdMode");
+    // the description says a child starts at once and nobody locks a directory
+    expect(tool("spawn_cell").description).toContain("It starts at once: nothing queues or locks a directory.");
+    expect(tool("spawn_cell").description).toContain('"active workspaces"');
+    expect(tool("spawn_cell").description).not.toMatch(/write queue|cwdMode/);
+
+    const run = fakeRun();
+    const r = await invoke(run, "spawn_cell", { preset: "worker", title: "t", instruction: "i", cwd: "/repos/app", cwdMode: "write" });
+    expect(r.isError).toBeUndefined();
+    expect(run.ports.log.spawned[0]!.spec).toMatchObject({ cwd: "/repos/app" });
+    expect(run.ports.log.spawned[0]!.spec).not.toHaveProperty("cwdMode");
+  });
+});
+
+describe("kernel.cells inspect_cell", () => {
+  it("describes its arguments: cellId, afterSeq (a cursor) and detail summary | full", () => {
+    const schema = tool("inspect_cell").inputSchema as { properties: Record<string, { enum?: unknown[] }>; required?: string[] };
+    expect(Object.keys(schema.properties).sort()).toEqual(["afterSeq", "cellId", "detail"]);
+    expect(schema.required).toEqual(["cellId"]);
+    expect(schema.properties["detail"]!.enum).toEqual(["summary", "full"]);
+    expect(tool("inspect_cell").kind).toBe("kernel");
+  });
+
+  it("asks the kernel with only the arguments given and returns its text, with the covered range and facts as data", async () => {
+    const run = fakeRun();
+    const r = await invoke(run, "inspect_cell", { cellId: "w1" });
+    const canned = fakeInspection("w1");
+    expect(r).toEqual({
+      output: canned.text,
+      data: { fromSeq: 1, toSeq: 3, more: false, state: "dormant", directChats: 0, artifactIds: [] },
+    });
+    expect(r.isError).toBeUndefined();
+    expect(r.endRun).toBeUndefined();
+    // no afterSeq: the kernel's own cursor applies; no detail: the kernel's default
+    expect(run.ports.log.inspections).toEqual([{ cellId: "w1", opts: {}, result: canned }]);
+
+    await invoke(run, "inspect_cell", { cellId: "w1", afterSeq: 0, detail: "full" });
+    await invoke(run, "inspect_cell", { cellId: "w2", afterSeq: 17 });
+    expect(run.ports.log.inspections.slice(1).map(({ cellId, opts }) => ({ cellId, opts }))).toEqual([
+      { cellId: "w1", opts: { afterSeq: 0, detail: "full" } },
+      { cellId: "w2", opts: { afterSeq: 17 } },
+    ]);
+  });
+
+  it("hands on what the kernel found: more records left, direct chats with the owner, artifacts touched", async () => {
+    const found: CellInspection = {
+      cellId: "w3",
+      title: "修复 PR #108 CI",
+      state: "working",
+      fromSeq: 41,
+      toSeq: 90,
+      more: true,
+      directChats: 2,
+      artifactIds: ["art_report"],
+      text: "#41 inbound (the owner, directly): 先别动 main 分支\n#42 bash: git switch -c fix/ci → exit 0\n…",
+    };
+    const run = fakeRun({ inspectCell: (cellId, opts) => ({ ...found, cellId, fromSeq: (opts?.afterSeq ?? 0) + 1 }) });
+    const r = await invoke(run, "inspect_cell", { cellId: "w3", afterSeq: 40, detail: "summary" });
+    expect(r).toEqual({
+      output: found.text,
+      data: { fromSeq: 41, toSeq: 90, more: true, state: "working", directChats: 2, artifactIds: ["art_report"] },
+    });
+    expect(run.ports.log.inspections[0]).toMatchObject({ cellId: "w3", opts: { afterSeq: 40, detail: "summary" } });
+  });
+
+  it("refuses bad arguments, and says so when the kernel offers no inspect port", async () => {
+    const run = fakeRun();
+    for (const input of [{}, { cellId: "" }, { cellId: "w1", afterSeq: -1 }, { cellId: "w1", afterSeq: 1.5 }, { cellId: "w1", detail: "everything" }]) {
+      const r = await invoke(run, "inspect_cell", input);
+      expect(r).toMatchObject({ isError: true, output: expect.stringMatching(/^Invalid input for inspect_cell/) });
+    }
+    expect(run.ports.log.inspections).toEqual([]);
+
+    const bare = fakeRun();
+    delete (bare.ports as { inspectCell?: unknown }).inspectCell;
+    expect(await invoke(bare, "inspect_cell", { cellId: "w1" })).toEqual({ output: "inspect_cell is not available in this environment.", isError: true });
   });
 });
 

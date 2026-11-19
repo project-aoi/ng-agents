@@ -19,7 +19,12 @@ import { asRecord, contentText, HOST_UNSANDBOXED, num, str, tomlInlineTable, tom
  *   command outside the sandbox (a read-only cell must not get a write path that way).
  * - Host access: the hosted `web_search` tool in "live" mode when the cell has web (it needs no sandbox network).
  * - Steer: no live input in exec mode — the loop interrupts the process and resumes the session with the steer text.
- * - Usage: `turn.completed.usage` (input incl. cached + output); no cost is reported (cents 0).
+ * - Usage: `turn.completed.usage` (input incl. cached + output); no cost is reported (cents 0). The figures are the
+ *   session's running totals — after `exec resume` they include every earlier turn — so they are passed on as
+ *   `sessionTotal` and the loop meters the difference.
+ * - Besides commands, patches, MCP calls and web searches, Codex has tools that only show up as generic items (its
+ *   code-mode JS `exec` arrives as `custom_tool_call` / `custom_tool_call_output`). Every item that is not plain
+ *   conversation is mirrored as a tool call, so nothing the agent did is missing from the record or the step count.
  */
 export function codexAdapter(): CliAdapter {
   return {
@@ -135,7 +140,7 @@ class CodexDriver implements CliDriver {
       case "turn.completed": {
         const u = asRecord(msg["usage"]);
         const tokens = num(u["input_tokens"]) + num(u["output_tokens"]);
-        if (tokens > 0) out.push({ type: "usage", tokens, cents: 0 });
+        if (tokens > 0) out.push({ type: "usage", tokens, cents: 0, cached: Math.min(num(u["cached_input_tokens"]), tokens), sessionTotal: true });
         out.push({ type: "turn_end", ok: true });
         break;
       }
@@ -158,8 +163,9 @@ class CodexDriver implements CliDriver {
     if (!id || this.#isOurs(item)) return;
     const start = toolStart(item);
     if (!start) return;
-    this.#started.set(id, start.name);
-    out.push({ type: "tool_start", id, name: start.name, input: start.input });
+    const callId = isGenericCall(item) ? (str(item["call_id"]) ?? id) : id;
+    this.#started.set(callId, start.name);
+    out.push({ type: "tool_start", id: callId, name: start.name, input: start.input });
   }
 
   #itemCompleted(item: Record<string, unknown>, out: CliEvent[]): void {
@@ -174,13 +180,46 @@ class CodexDriver implements CliDriver {
       out.push({ type: "notice", text: `codex: ${str(item["message"]) ?? "error"}` });
       return;
     }
+    if (item["type"] === "custom_tool_call_output" || item["type"] === "function_call_output") {
+      // The result of a call that was reported as an item of its own, matched by call id.
+      const callId = str(item["call_id"]) ?? id;
+      const name = this.#started.get(callId) ?? "tool";
+      this.#started.delete(callId);
+      out.push({ type: "tool_end", id: callId, name, output: outputText(item["output"]) || "(no output)" });
+      return;
+    }
     const start = toolStart(item);
     if (!start) return;
-    if (!this.#started.has(id)) out.push({ type: "tool_start", id, name: start.name, input: start.input });
-    this.#started.delete(id);
+    const callId = isGenericCall(item) ? (str(item["call_id"]) ?? id) : id;
+    if (!this.#started.has(callId)) out.push({ type: "tool_start", id: callId, name: start.name, input: start.input });
+    // The two call shapes whose output comes as a separate item stay open until that item arrives. Any other
+    // unknown item is complete as it stands: left open, it would never get a result.
+    if (TWO_PART_CALLS.has(String(item["type"])) && item["output"] === undefined && item["result"] === undefined && item["status"] !== "failed") {
+      this.#started.set(callId, start.name);
+      return;
+    }
+    this.#started.delete(callId);
     const failed = item["status"] === "failed" || item["status"] === "declined" || (typeof item["exit_code"] === "number" && item["exit_code"] !== 0);
-    out.push({ type: "tool_end", id, name: start.name, output: toolOutput(item), ...(failed ? { isError: true } : {}) });
+    out.push({ type: "tool_end", id: callId, name: start.name, output: toolOutput(item), ...(failed ? { isError: true } : {}) });
   }
+}
+
+const TWO_PART_CALLS = new Set(["custom_tool_call", "function_call"]);
+
+/** Items that are conversation or bookkeeping, not something the agent did to the machine. */
+const NOT_A_TOOL = new Set(["agent_message", "reasoning", "todo_list", "error", "user_message", "custom_tool_call_output", "function_call_output"]);
+
+/** An item Codex has no dedicated shape for: its code-mode `exec` and whatever tool a later release adds. */
+function isGenericCall(item: Record<string, unknown>): boolean {
+  const type = str(item["type"]);
+  return type !== undefined && !NOT_A_TOOL.has(type) && !["command_execution", "file_change", "mcp_tool_call", "web_search"].includes(type);
+}
+
+function outputText(v: unknown): string {
+  if (typeof v === "string") return v;
+  if (v === undefined || v === null) return "";
+  const viaContent = contentText(asRecord(v)["content"] ?? v);
+  return viaContent || JSON.stringify(v);
 }
 
 function toolStart(item: Record<string, unknown>): { name: string; input: unknown } | null {
@@ -193,8 +232,13 @@ function toolStart(item: Record<string, unknown>): { name: string; input: unknow
       return { name: `${str(item["server"]) ?? "mcp"}.${str(item["tool"]) ?? "tool"}`, input: item["arguments"] ?? {} };
     case "web_search":
       return { name: "web_search", input: { query: item["query"] } };
-    default:
-      return null;
+    default: {
+      if (!isGenericCall(item)) return null;
+      // custom_tool_call carries `name` + `input` (a JS source string for exec); other generic items carry what they carry.
+      const { id: _id, type, status: _status, output: _output, result: _result, call_id: _callId, name, ...rest } = item;
+      const input = item["input"] !== undefined ? { input: item["input"] } : item["arguments"] !== undefined ? item["arguments"] : rest;
+      return { name: str(name) ?? String(type), input };
+    }
   }
 }
 
@@ -217,6 +261,6 @@ function toolOutput(item: Record<string, unknown>): string {
     case "web_search":
       return `searched: ${str(item["query"]) ?? ""}`;
     default:
-      return "";
+      return outputText(item["output"] ?? item["result"]) || String(item["status"] ?? "");
   }
 }

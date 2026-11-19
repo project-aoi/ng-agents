@@ -86,7 +86,7 @@ describe("app × real presets", () => {
 
   it("a project's worker blocked on the owner: its card is decided in Clarify, the action it carries is no to-do in Engage, Radar points at the card", async () => {
     const d = await bootRealDesk();
-    d.script.add("project", tool("dispatch", { title: "整理上线检查清单", instruction: "整理上线检查清单，用 markdown", cwdMode: "read" }));
+    d.script.add("project", tool("dispatch", { title: "整理上线检查清单", instruction: "整理上线检查清单，用 markdown" }));
     d.script.add("worker", tool("request_approval", { kind: "escalation", title: "清单要不要包含回滚演练？", summary: "需要主人决定范围", escalation: { reason: "blocked", explanation: "回滚演练要停服 10 分钟，要不要写进清单？" } }));
     const projectId = await deskProject(d, "整理上线检查清单");
     await d.kernel.idle();

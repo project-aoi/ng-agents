@@ -13,8 +13,15 @@ const V3_FTS = ["artifact_fts", "state_fts", "resource_fts"];
 const columns = (db: Db, table: string) => all<{ name: string }>(db, `PRAGMA table_info(${table})`).map((c) => c.name);
 const tables = (db: Db) => all<{ name: string }>(db, "SELECT name FROM sqlite_master WHERE type = 'table'").map((r) => r.name);
 
+/** Turn a freshly created database back into the v3 shape: knowledge rows have no `applies`. */
+function downgradeToV3(db: Db): void {
+  db.exec("ALTER TABLE knowledge DROP COLUMN applies");
+  run(db, "UPDATE schema_versions SET version = 3 WHERE owner = '@ng/context'");
+}
+
 /** Turn a freshly created database back into the v2 shape: no search indexes, no artifact_versions.cell_id, cell_state WITHOUT ROWID. */
 function downgradeToV2(db: Db): void {
+  downgradeToV3(db);
   for (const t of V3_FTS) for (const op of ["ai", "au", "ad"]) db.exec(`DROP TRIGGER ${t}_${op}`);
   for (const t of V3_FTS) db.exec(`DROP TABLE ${t}`);
   db.exec(`
@@ -79,7 +86,7 @@ describe("context schema migrations", () => {
     old.close();
 
     const db = openDatabase(path);
-    expect(schemaVersions(db)["@ng/context"]).toBe(3);
+    expect(schemaVersions(db)["@ng/context"]).toBe(contextSchema.version);
     expect(columns(db, "artifact_versions")).toContain("cell_id");
     expect(columns(db, "cell_state")[0]).toBe("seq");
     expect(all(db, "SELECT cell_id, key FROM cell_state ORDER BY seq")).toEqual([
@@ -113,5 +120,26 @@ describe("context schema migrations", () => {
     expect(storeOn(again).searchHistorySync("desk", "zq_middle_token", { scope: "global" })).toHaveLength(1);
     expect(all(again, "SELECT count(*) AS n FROM state_fts")).toEqual([{ n: 3 }]);
     again.close();
+  });
+
+  it("v3 → v4 adds knowledge.applies; preferences saved before it stay unlimited", () => {
+    const path = join(tempDir(), "ng.db");
+    const old = openDatabase(path);
+    downgradeToV3(old);
+    expect(columns(old, "knowledge")).not.toContain("applies");
+    cellsRepo(old).insert({ id: "desk" });
+    run(old, "INSERT INTO knowledge (id, kind, scope, cell_id, name, description, body, tags, created_at, updated_at) VALUES ('kn1','preference','global',NULL,'tone','语气','简洁','[]',1,1)");
+    old.close();
+
+    const db = openDatabase(path);
+    expect(schemaVersions(db)["@ng/context"]).toBe(4);
+    expect(columns(db, "knowledge")).toContain("applies");
+    const store = storeOn(db);
+    const tone = store.getKnowledgeSync({ kind: "preference", scope: "global", name: "tone" });
+    expect(tone).toMatchObject({ body: "简洁" });
+    expect(tone).not.toHaveProperty("applies");
+    store.upsertSkillOrNoteSync("desk", { kind: "preference", scope: "global", name: "tone", description: "语气", body: "简洁", mode: "upsert", applies: { roles: ["worker"] } });
+    expect(store.getKnowledgeSync({ kind: "preference", scope: "global", name: "tone" })?.applies).toEqual({ roles: ["worker"] });
+    db.close();
   });
 });

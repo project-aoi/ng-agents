@@ -1,6 +1,6 @@
 import type { CellStatus } from "./contract/cell";
 import type { OutboxStatus } from "./contract/channel";
-import type { ArtifactAuthor, KnowledgeKind, KnowledgeScope } from "./contract/context";
+import type { ArtifactAuthor, EvidenceKind, KnowledgeKind, KnowledgeScope } from "./contract/context";
 import type { ApprovalStatus, MeterResult } from "./contract/gate";
 import type { ControlAction } from "./contract/inbox";
 import type { RunOutcome } from "./contract/loop";
@@ -26,9 +26,16 @@ export interface BusTopics {
   "job.output": { jobId: string; cellId: string; chunk: string };
   "run.started": { cellId: string; runId: string; epoch: number };
   "run.finished": { cellId: string; runId: string; epoch: number; outcome: RunOutcome | "error"; error?: string };
+  /**
+   * An evidence record was appended to the cell's transcript (emitted after commit, so the row with this `seq` is
+   * readable when a subscriber hears of it). `runId` is the record's Run, null for records written outside a Run.
+   */
+  "evidence.appended": { cellId: string; seq: number; kind: EvidenceKind; runId: string | null };
   "state.changed": { cellId: string; keys: string[] };
   "knowledge.changed": { kind: KnowledgeKind; name: string; scope: KnowledgeScope; cellId: string | null };
   "ledger.alert": { cellId: string; level: Exclude<MeterResult, "ok"> };
+  /** The owner raised this cell's budget: cells below it that were held back by the budget stop can be dispatched again. */
+  "ledger.raised": { cellId: string };
 }
 
 export type BusTopic = keyof BusTopics;

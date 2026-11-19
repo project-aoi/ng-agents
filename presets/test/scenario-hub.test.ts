@@ -7,7 +7,7 @@ afterEach(cleanupAll);
 const at = (h: Harness, from: string, text: string) => h.memory.inject({ from, replyTarget: "chat-review", text, threads: ["memory:chat-review"] });
 
 describe("docs/05 scenario 6 — a hub for direct review requests: batched, routed, follow-ups forwarded", () => {
-  it("add_hub with an operator watch and a window; one batch; workers per topic; a follow-up delivered, another refused as closed and re-dispatched; noise handed back", async () => {
+  it("add_hub with an operator watch and a window; one batch; workers per topic; follow-ups reach the worker still at it and wake the one that has finished — no successor; noise handed back", async () => {
     const h = await boot();
     const repo = gitRepo("gateway");
     h.script.add(
@@ -34,8 +34,8 @@ describe("docs/05 scenario 6 — a hub for direct review requests: batched, rout
         expect(text).toContain("看下 MR !38");
         return {
           toolCalls: [
-            { name: "spawn_cell", input: { preset: "worker", title: "评审 MR !41", cwd: repo, cwdMode: "read", instruction: "评审 MR !41，张三特别提到：重点看并发。交付阻塞项/建议项。" } },
-            { name: "spawn_cell", input: { preset: "worker", title: "评审 MR !38", cwd: repo, cwdMode: "read", instruction: "评审 MR !38（王五）。" } },
+            { name: "spawn_cell", input: { preset: "worker", title: "评审 MR !41", cwd: repo, instruction: "评审 MR !41，张三特别提到：重点看并发。只做查阅，不要改文件、不要切分支。交付阻塞项/建议项。" } },
+            { name: "spawn_cell", input: { preset: "worker", title: "评审 MR !38", cwd: repo, instruction: "评审 MR !38（王五）。只做查阅，不要改文件、不要切分支。" } },
             { name: "handback", input: { envelopeId: noiseId, reason: "不是代码评审的事" } },
             { name: "set_state", input: { patches: { "hub:topics": { "mr-41": { state: "reviewing" }, "mr-38": { state: "reviewing" } } } } },
           ],
@@ -50,10 +50,11 @@ describe("docs/05 scenario 6 — a hub for direct review requests: batched, rout
           ],
         };
       }
-      if (lastToolResult(req).includes("NOT DELIVERED") && !done.has("successor")) {
-        done.add("successor");
-        expect(lastToolResult(req)).toContain("Delivered to");
-        return tool("spawn_cell", { preset: "worker", title: "复核 MR !38", cwd: repo, cwdMode: "read", instruction: "继续评审 MR !38：上一轮结论见 ledger；作者称已修改，请复核阻塞项。" });
+      if (done.has("batch2") && !done.has("delivered") && continuesRun(req) && lastToolResult(req).includes("Delivered to")) {
+        done.add("delivered");
+        // Both delivered: the one still reviewing takes it in its turn; the one that has finished is woken by it.
+        expect(lastToolResult(req).match(/Delivered to /g)).toHaveLength(2);
+        expect(lastToolResult(req)).not.toContain("NOT DELIVERED");
       }
       return {};
     });
@@ -61,8 +62,13 @@ describe("docs/05 scenario 6 — a hub for direct review requests: batched, rout
       if (continuesRun(req)) return {};
       const title = titleOf(req.metadata!.cellId!);
       if (title === "评审 MR !41") return ctx.lastUserText.includes("再看下锁") ? tool("report_to_parent", { kind: "result", text: "!41：并发与锁粒度均已评审，1 个建议项" }) : tool("wait", { reason: "评审中" });
-      if (title === "评审 MR !38") return tool("report_to_parent", { kind: "result", text: "!38 评审完成：2 个阻塞项" });
-      return tool("report_to_parent", { kind: "result", text: "!38 阻塞项已解决" });
+      if (title === "评审 MR !38") {
+        // Woken again for the author's follow-up: it continues on its own record (its first review is in front of it).
+        if (!ctx.lastUserText.includes("改好了")) return tool("report_to_parent", { kind: "result", text: "!38 评审完成：2 个阻塞项" });
+        expect(requestText(req)).toContain("!38 评审完成：2 个阻塞项");
+        return tool("report_to_parent", { kind: "result", text: "!38 阻塞项已解决" });
+      }
+      throw new Error(`unexpected worker ${title}`);
     });
     await h.ui.capture({ text: "把群里 @bot 的评审请求直接转给评审助手处理" });
     await h.kernel.idle();
@@ -70,7 +76,7 @@ describe("docs/05 scenario 6 — a hub for direct review requests: batched, rout
     expect(h.kernel.getCell(hub())).toMatchObject({
       preset: "hub",
       status: "active",
-      spec: { lifetime: "persistent", absorbInbound: true, cwdMode: "read", watches: [{ threadOrFilter: { "payload.text": { $contains: "@bot" } }, coalesceMs: 2 * MIN }] },
+      spec: { lifetime: "persistent", absorbInbound: true, watches: [{ threadOrFilter: { "payload.text": { $contains: "@bot" } }, coalesceMs: 2 * MIN }] },
     });
     expect(h.source(hub())).toMatchObject({ title: "代码评审直通", kind: "channel", processor: "llm", runCount: 0 } satisfies Partial<SourceRecord>);
     expect(h.notices()).toContain("已添加直通入口：代码评审直通");
@@ -100,19 +106,26 @@ describe("docs/05 scenario 6 — a hub for direct review requests: batched, rout
     expect(h.source(hub())).toMatchObject({ runCount: 1 });
     const review41 = hubChild("评审 MR !41");
     const review38 = hubChild("评审 MR !38");
-    expect(h.kernel.getCell(review41)).toMatchObject({ status: "active", spec: { cwd: repo, cwdMode: "read" } });
-    expect(h.kernel.getCell(review38)?.status).toBe("closed");
+    expect(h.kernel.getCell(review41)).toMatchObject({ status: "active", spec: { cwd: repo, lifetime: "wakeable" } });
+    // !38's review turn is over: it rests, not closed.
+    expect(h.kernel.getCell(review38)?.status).toBe("active");
+    expect(h.kernel.activityOf([review38]).get(review38)!.state).toBe("dormant");
 
-    // Follow-ups in the next window: one reaches the running worker, the other finds it closed and gets a successor.
+    // Follow-ups in the next window: one reaches the worker still reviewing, the other wakes the one that finished.
     await at(h, "zhangsan", "@bot !41 再看下锁");
     await at(h, "wangwu", "@bot !38 改好了再看一眼");
     h.clock.advance(2 * MIN);
     await h.kernel.idle();
 
-    expect(done).toEqual(new Set(["batch1", "batch2", "successor"]));
-    expect(h.kernel.getCell(review41)).toMatchObject({ status: "closed", closeReason: "completed" });
-    const results = h.kernel.inbox.listMessagesSync({ cellId: hub(), type: PAYLOAD.cellResult }).map((m) => (m.envelope.payload as { summary: string }).summary);
-    expect(results).toEqual(expect.arrayContaining(["!38 评审完成：2 个阻塞项", "!41：并发与锁粒度均已评审，1 个建议项", "!38 阻塞项已解决"]));
+    expect(done).toEqual(new Set(["batch1", "batch2", "delivered"]));
+    // Still two workers: no successor was needed.
+    expect(childrenOf(h, hub())).toEqual([review41, review38]);
+    expect(h.kernel.activityOf([review41, review38]).get(review41)!.state).toBe("dormant");
+    expect(h.kernel.activityOf([review41, review38]).get(review38)!.state).toBe("dormant");
+    expect(h.of("run.started").filter((e) => e.cellId === review38)).toHaveLength(2);
+    const results = h.kernel.inbox.listMessagesSync({ cellId: hub(), type: PAYLOAD.cellResult }).map((m) => m.envelope.payload as { childCellId: string; summary: string });
+    expect(results.map((r) => r.summary)).toEqual(expect.arrayContaining(["!38 评审完成：2 个阻塞项", "!41：并发与锁粒度均已评审，1 个建议项", "!38 阻塞项已解决"]));
+    expect(results.filter((r) => r.childCellId === review38)).toHaveLength(2);
     expect(h.kernel.context.readStateSync(hub(), gtdKeys.project)).toBeNull(); // a hub is a source, never a project row
   });
 });

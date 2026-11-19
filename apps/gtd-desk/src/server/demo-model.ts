@@ -15,6 +15,8 @@ export type DemoRole = "desk" | "project" | "worker" | "checker" | "hub" | "sens
 const ROLE_MARKERS: ReadonlyArray<[DemoRole, string]> = [
   ["desk", "You are the owner's desk"],
   ["project", "You are a project on the owner's GTD workbench"],
+  ["worker", "You are a worker on the owner's GTD workbench"],
+  // The opening before workers became wakeable (a demo data directory keeps frozen prompts across restarts).
   ["worker", "You are a one-shot worker"],
   ["checker", "You are a watcher on the owner's GTD workbench"],
   ["hub", "You are a hub on the owner's GTD workbench"],

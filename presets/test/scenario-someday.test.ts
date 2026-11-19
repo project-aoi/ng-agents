@@ -19,7 +19,7 @@ describe("docs/05 scenario 5 — an idea for later: research, park, bring it bac
       (req) => {
         expect(requestText(req)).toContain("先调研，再停靠");
         expect(requestText(req)).toContain('finish_project（outcome "someday"）');
-        return tool("dispatch", { title: "调研其他产品的极简模式", instruction: "调研其他产品如何做极简/省 Token 模式，存成调研报告 artifact，报告它的 id。", cwdMode: "read" });
+        return tool("dispatch", { title: "调研其他产品的极简模式", instruction: "调研其他产品如何做极简/省 Token 模式，存成调研报告 artifact，报告它的 id。" });
       },
       {},
     );
@@ -106,7 +106,7 @@ describe("docs/05 scenario 5 — an idea for later: research, park, bring it bac
       },
       {},
     );
-    h.script.setDefault("worker", () => tool("wait", { reason: "working" }));
+    h.script.setDefault("worker", () => tool("wait", { reason: "working", waitingFor: "inbox:desk" }));
     expect(await h.kernel.resolveApproval(card!.actionId, { decision: "approve" })).toMatchObject({ status: "approved" });
     await h.kernel.idle();
     expect(childrenOf(h, project!, "worker")).toHaveLength(3);

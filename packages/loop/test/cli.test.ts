@@ -2,7 +2,7 @@ import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { createRegistry, makeBounds, TOOL_KINDS, type Address, type CliEngine, type PolicyBounds, type Registry, type RunOutcome } from "@ng/protocol";
+import { createRegistry, makeBounds, TOOL_KINDS, type Address, type CliEngine, type PolicyBounds, type Registry, type RunOutcome, type Usage } from "@ng/protocol";
 import {
   CLI_FORK_SESSION_KEY,
   CLI_SESSION_KEY,
@@ -14,7 +14,7 @@ import {
   type CliDebugEvent,
   type CliSessionRecord,
 } from "../src";
-import { createFakeRun, installFakeCli, type FakeCli, type FakeCliTurn, type FakeRunOptions } from "../src/testing";
+import { createFakeRun, installFakeCli, type FakeCli, type FakeCliTurn, type FakeRun, type FakeRunOptions } from "../src/testing";
 import { FORK_NOTE_PREFIX, HISTORY_HEADER } from "../src/cli/render";
 
 const dirs: string[] = [];
@@ -88,6 +88,36 @@ async function waitFor(cond: () => boolean, what: string, ms = 10_000): Promise<
 
 function writerBounds(): PolicyBounds {
   return makeBounds({ tools: TOOL_KINDS, canSendTo: ["channel:*", "inbox:*"] as Address[], isolation: "git_worktree", maxConcurrentChildren: 4, maxDepth: 2, maxTokens: 10_000_000, maxCents: 100_000 });
+}
+
+/** A writing cell on the owner's machine (isolation none, docs/05 default). */
+function hostBounds(): PolicyBounds {
+  return makeBounds({ ...writerBounds(), tools: [...writerBounds().tools], isolation: "none" });
+}
+
+/**
+ * The system text the CLI was handed, in launch order: claude's --append-system-prompt-file on every launch (logged by
+ * the fake; the file itself is removed after the run), codex's developer_instructions and agy's session/new
+ * systemPrompt on fresh sessions only.
+ */
+function systemTexts(s: Setup): string[] {
+  const log = s.fake.log();
+  const texts =
+    s.fake.engine === "claude"
+      ? log.filter((e) => e.type === "claude_system").map((e) => e["text"])
+      : s.fake.engine === "codex"
+        ? log.filter((e) => e.type === "codex_config").map((e) => e["developerInstructions"])
+        : log.filter((e) => e.type === "acp_session").map((e) => e["systemPrompt"]);
+  return texts.filter((t): t is string => typeof t === "string");
+}
+
+/** What a Run handed the kernel's meter, without the zero-usage budget probe it starts with. */
+function meteredOf(r: FakeRun): Usage[] {
+  return r.ports.log.metered.filter((u) => u.tokens > 0 || u.billedCents > 0);
+}
+
+function sessionOf(r: FakeRun): CliSessionRecord {
+  return r.ports.state.get(CLI_SESSION_KEY) as CliSessionRecord;
 }
 
 const ENGINES: CliEngine[] = ["claude", "codex", "agy"];
@@ -172,7 +202,7 @@ describe.each(ENGINES)("CLI loop with a fake %s", (engine) => {
       },
     ]);
     // an explicitly isolated (git_worktree) writer: the pre-docs/05 confinement ("workspace" access)
-    const r = s.run({ bounds: writerBounds(), spec: { processor: { kind: "llm", toolsets: TOOLSETS }, cwdMode: "write" } });
+    const r = s.run({ bounds: writerBounds(), spec: { processor: { kind: "llm", toolsets: TOOLSETS } } });
     // job_start arranged a wake-up, so a run that would complete yields instead (same as the API loop)
     expect(await runOf(s, r)).toBe("yielded_waiting");
     expect(r.ports.log.jobs.map((j) => j.command)).toEqual(["sleep 1"]);
@@ -212,14 +242,13 @@ describe.each(ENGINES)("CLI loop with a fake %s", (engine) => {
         ],
       },
     ]);
-    const bounds = makeBounds({ ...writerBounds(), tools: [...writerBounds().tools], isolation: "none" });
-    const r = s.run({ bounds, spec: { processor: { kind: "llm", toolsets: TOOLSETS }, cwdMode: "write" } });
+    const r = s.run({ bounds: hostBounds(), spec: { processor: { kind: "llm", toolsets: TOOLSETS } } });
     expect(await runOf(s, r)).toBe("yielded_waiting");
     expect(r.ports.log.jobs.map((j) => j.command)).toEqual(["sleep 1"]);
     const launch = launches(s)[0]!;
     expect(launch.cwd).toBe(s.root);
     // capabilitiesOf: host access, and web on for every host cell even though the loop's web option is off
-    expect(launch.caps).toEqual({ root: s.root, isolation: "none", write: true, edit: true, bash: true, readOnly: false, web: true, access: "host", cwdMode: "write" });
+    expect(launch.caps).toEqual({ root: s.root, isolation: "none", write: true, edit: true, bash: true, readOnly: false, web: true, access: "host" });
     const argv = launch.argv;
     if (engine === "claude") {
       expect(argv[argv.indexOf("--permission-mode") + 1]).toBe("bypassPermissions");
@@ -239,62 +268,70 @@ describe.each(ENGINES)("CLI loop with a fake %s", (engine) => {
     expect(tools).not.toContain("code_rpc");
   });
 
-  it("runs a read cell (cwdMode read) on the host exactly like a writing one; only the directory note says it is here to look", async () => {
+  it("tells the CLI how it runs as a cell: kernel tools over MCP, no ask-the-user or plan approval, its own sub-agents allowed, a shared directory", async () => {
+    const s = setup(engine, [{ actions: [{ text: "ok" }] }]);
+    const r = s.run({ bounds: hostBounds(), spec: { processor: { kind: "llm", toolsets: TOOLSETS } } });
+    expect(await runOf(s, r)).toBe("completed");
+    const [system] = systemTexts(s);
+    expect(system).toBeDefined();
+    // the cell's frozen system text first, then the kernel's note
+    expect(system!.startsWith("You are a test cell.\n\n## How this cell runs\n")).toBe(true);
+    expect(system).toContain('- Kernel tools: the MCP server "ng" provides them (');
+    expect(system).toContain(`this client names them like ${engine === "agy" ? "mcp_ng_" : "mcp__ng__"}`);
+    // nobody is at the terminal: the CLI's ask-the-user / plan-approval features are ruled out
+    expect(system).toContain("- Nobody is at this terminal. Never use this CLI's ask-the-user or plan-approval features");
+    expect(system).toContain("To ask the owner something, use the kernel tools");
+    // docs/05-proposals/02 §二: the CLI's own sub-agents are the cell's business
+    expect(system).toContain("This CLI's own sub-agents are yours to use for your own work");
+    expect(system).not.toMatch(/(do not|don't|never) use (this CLI's own )?sub-?agents/i);
+    // docs/05-proposals/03: nothing reserves a directory — no write-queue promise, no "read" cell note
+    expect(system).toContain(`- Directory: \`${s.root}\`. You work with this CLI's own file and shell tools`);
+    expect(system).toContain("Nothing reserves this directory for you: another cell, or the owner, may be working in it at the same time.");
+    expect(system).not.toContain("no other cell writes in this work tree");
+    expect(system).not.toContain("You are here to look");
+    expect(system).toContain("When a kernel tool result says the run has ended, stop at once");
+  });
+
+  it("launches a cell whose spec still carries the deprecated cwdMode exactly like one without it", async () => {
     const turn = (text: string): FakeCliTurn => ({ actions: [{ native: "Edit", kind: "edit", path: "/etc/hosts", input: {} }, { text }] });
     const s = setup(engine, [turn("Looked."), turn("Changed.")]);
-    const bounds = makeBounds({ ...writerBounds(), tools: [...writerBounds().tools], isolation: "none" });
-    const reader = s.run({ bounds, spec: { processor: { kind: "llm", toolsets: TOOLSETS }, cwdMode: "read" } });
-    // as the kernel's ports do: every tool in bounds, plus the cell's cwdMode
-    const access = reader.ports.workspaceAccess!.bind(reader.ports);
-    reader.ports.workspaceAccess = async () => ({ ...(await access()), cwdMode: "read" });
-    expect(await runOf(s, reader)).toBe("completed");
-    const writer = s.run({ bounds, spec: { processor: { kind: "llm", toolsets: TOOLSETS }, cwdMode: "write" } });
-    expect(await runOf(s, writer)).toBe("completed");
-    const [lr, lw] = launches(s);
-    // cwdMode is reported, nothing is taken away: the same write/edit/bash, the same host access and launch
-    expect(lr!.caps).toEqual({ root: s.root, isolation: "none", write: true, edit: true, bash: true, readOnly: false, web: true, access: "host", cwdMode: "read" });
-    expect(lr!.caps).toEqual({ ...lw!.caps, cwdMode: "read" });
-    expect(lr!.permissions).toBe(lw!.permissions);
-    expect(lr!.cwd).toBe(lw!.cwd);
-    // run-specific values (temp dirs, the bridge port) and codex's inline system text (compared below) set aside
+    const legacy = s.run({ bounds: hostBounds(), spec: { processor: { kind: "llm", toolsets: TOOLSETS }, cwdMode: "read" } });
+    expect(await runOf(s, legacy)).toBe("completed");
+    const plain = s.run({ bounds: hostBounds(), spec: { processor: { kind: "llm", toolsets: TOOLSETS } } });
+    expect(await runOf(s, plain)).toBe("completed");
+    const [ll, lp] = launches(s);
+    expect(ll!.caps).toEqual(lp!.caps);
+    expect(ll!.caps).not.toHaveProperty("cwdMode");
+    expect(ll!.permissions).toBe(lp!.permissions);
+    expect(ll!.cwd).toBe(lp!.cwd);
+    // run-specific values (temp dirs, the bridge port) set aside
     const normalize = (argv: readonly string[]) =>
-      argv.map((a) =>
-        a.startsWith("developer_instructions=")
-          ? "developer_instructions=<system>"
-          : a.replace(/ng-(cli-[a-z]+|bridge)-[A-Za-z0-9]+/g, "<tmp>").replace(/NG_BRIDGE_PORT = "\d+"/, "NG_BRIDGE_PORT = <port>"),
-      );
-    expect(normalize(lr!.argv)).toEqual(normalize(lw!.argv));
-    if (engine === "claude") expect(lr!.argv[lr!.argv.indexOf("--permission-mode") + 1]).toBe("bypassPermissions");
-    else if (engine === "codex") expect(lr!.argv[lr!.argv.indexOf("-s") + 1]).toBe("danger-full-access");
+      argv.map((a) => a.replace(/ng-(cli-[a-z]+|bridge)-[A-Za-z0-9]+/g, "<tmp>").replace(/NG_BRIDGE_PORT = "\d+"/, "NG_BRIDGE_PORT = <port>"));
+    expect(normalize(ll!.argv)).toEqual(normalize(lp!.argv));
+    if (engine === "claude") expect(ll!.argv[ll!.argv.indexOf("--permission-mode") + 1]).toBe("bypassPermissions");
+    else if (engine === "codex") expect(ll!.argv[ll!.argv.indexOf("-s") + 1]).toBe("danger-full-access");
     else {
-      expect(lr!.argv).not.toContain("--sandbox");
-      // the read cell's edit outside the cwd is allowed exactly as the writer's is
+      expect(ll!.argv).not.toContain("--sandbox");
       expect(s.fake.log().filter((e) => e.type === "permission").map((e) => [e["tool"], e["allowed"]])).toEqual([["Edit", true], ["Edit", true]]);
     }
     const ready = s.fake.log().filter((e) => e.type === "mcp_ready").map((e) => e["tools"] as string[]);
     expect(ready).toHaveLength(2);
     expect(ready[0]).toEqual(ready[1]);
-    expect(ready[0]).toEqual(expect.arrayContaining(["job_start", "job_observe"]));
-    // the only difference is the "How this cell runs" directory note (claude's system file is removed after the run)
-    const systems =
-      engine === "codex"
-        ? s.fake.log().filter((e) => e.type === "codex_config").map((e) => e["developerInstructions"] as string)
-        : engine === "agy"
-          ? s.fake.log().filter((e) => e.type === "acp_session").map((e) => e["systemPrompt"] as string)
-          : [];
-    if (engine !== "claude") {
-      const [readText, writeText] = systems;
-      expect(readText).toContain("## How this cell runs");
-      expect(readText).toContain("You are here to look, not to change");
-      expect(readText).not.toContain("While you run, no other cell writes in this work tree.");
-      expect(writeText).toContain("While you run, no other cell writes in this work tree.");
-      expect(writeText).not.toContain("You are here to look, not to change");
-      const withoutNote = (t: string) =>
-        t
-          .replace(/ You are here to look, not to change:[^\n]*/, "")
-          .replace(" While you run, no other cell writes in this work tree.", "");
-      expect(withoutNote(readText!)).toBe(withoutNote(writeText!));
-    }
+    // the very same system text
+    const systems = systemTexts(s);
+    expect(systems).toHaveLength(2);
+    expect(systems[0]).toBe(systems[1]);
+  });
+
+  it("tells a read-only cell its workspace is read-only, and hands the CLI's cache reads to the meter as cachedTokens", async () => {
+    const s = setup(engine, [{ actions: [{ native: "Read", kind: "read", input: { file_path: "a.md" }, output: "a" }, { usage: { tokens: 700, cached: 300 } }, { text: "read it" }] }]);
+    const r = s.run();
+    expect(await runOf(s, r)).toBe("completed");
+    const [system] = systemTexts(s);
+    expect(system).toContain(`- Directory: \`${s.root}\`. This workspace is read-only`);
+    expect(system).toContain("Never use this CLI's ask-the-user or plan-approval features");
+    // cache reads reach the kernel's meter as cachedTokens, whichever CLI reported them
+    expect(r.ports.totalUsage().cachedTokens).toBe(300);
   });
 
   it("ends the Run when a kernel tool says so, refuses later calls and stops the CLI", async () => {
@@ -486,6 +523,152 @@ describe.each(ENGINES)("CLI loop with a fake %s", (engine) => {
       expect(rec.sessionId).not.toBe(parentRec.sessionId);
       expect(child.ports.state.has(CLI_FORK_SESSION_KEY)).toBe(false);
     }
+  });
+});
+
+describe("CLI usage metering (BUG-002)", () => {
+  const usageTurn = (tokens: number, cached = 0): FakeCliTurn => ({ actions: [{ usage: { tokens, cached } }, { text: `used ${tokens}` }] });
+
+  /** Runs one cell `n` times in a row, handing each Run the CLI session record the previous one left (as the kernel does). */
+  async function runInSequence(s: Setup, n: number, first?: CliSessionRecord): Promise<FakeRun[]> {
+    const runs: FakeRun[] = [];
+    let rec = first;
+    for (let i = 1; i <= n; i++) {
+      const r = s.run({ runId: `run_${i}`, batch: [`step ${i}`] });
+      if (rec) r.ports.state.set(CLI_SESSION_KEY, rec);
+      expect(await runOf(s, r)).toBe("completed");
+      runs.push(r);
+      rec = sessionOf(r);
+    }
+    return runs;
+  }
+
+  it("codex: meters only what each resumed turn added to the session's running total (1000, 500, 2000 — not 1000, 1500, 3500)", async () => {
+    const s = setup("codex", [usageTurn(1_000, 200), usageTurn(500, 100), usageTurn(2_000, 1_500)]);
+    const runs = await runInSequence(s, 3);
+    expect(launches(s).map((l) => l.session?.mode ?? "fresh")).toEqual(["fresh", "resume", "resume"]);
+    const rec = sessionOf(runs[2]!);
+    expect(launches(s).slice(1).map((l) => l.session?.id)).toEqual([rec.sessionId, rec.sessionId]);
+    // the fake reports the session's totals (1000, 1500, 3500), like the real CLI after `exec resume`
+    expect(runs.map(meteredOf)).toEqual([
+      [{ tokens: 1_000, billedCents: 0, cachedTokens: 200 }],
+      [{ tokens: 500, billedCents: 0, cachedTokens: 100 }],
+      [{ tokens: 2_000, billedCents: 0, cachedTokens: 1_500 }],
+    ]);
+    // the totals already metered travel with the session
+    expect(runs.map((r) => sessionOf(r).reported)).toEqual([
+      { tokens: 1_000, cached: 200 },
+      { tokens: 1_500, cached: 300 },
+      { tokens: 3_500, cached: 1_800 },
+    ]);
+    expect(rec.runs).toBe(3);
+  });
+
+  it("codex: a running total below the one already metered means the counters restarted — all of it is new", async () => {
+    const s = setup("codex", [usageTurn(1_000), usageTurn(500)]);
+    const [first] = await runInSequence(s, 1);
+    const rec = { ...sessionOf(first!), reported: { tokens: 9_000, cached: 0 } };
+    const [second] = await runInSequence(s, 1, rec);
+    expect(launches(s)[1]!.session).toEqual({ id: rec.sessionId, mode: "resume" });
+    expect(meteredOf(second!)).toEqual([{ tokens: 1_500, billedCents: 0 }]);
+    expect(sessionOf(second!).reported).toEqual({ tokens: 1_500, cached: 0 });
+  });
+
+  it("codex: a session rebuilt after a failed resume is metered from its own total, not the lost session's", async () => {
+    const s = setup("codex", [usageTurn(700, 100)]);
+    const stale: CliSessionRecord = {
+      engine: "codex",
+      sessionId: "00000000-0000-4000-8000-000000000000",
+      model: null,
+      cwd: s.root,
+      systemHash: "fake",
+      createdAt: 0,
+      updatedAt: 0,
+      runs: 4,
+      reported: { tokens: 200, cached: 50 },
+    };
+    const [r] = await runInSequence(s, 1, stale);
+    expect(launches(s).map((l) => l.session?.mode ?? "fresh")).toEqual(["resume", "fresh"]);
+    // not 500 / 50: the new session's counters start at zero
+    expect(meteredOf(r!)).toEqual([{ tokens: 700, billedCents: 0, cachedTokens: 100 }]);
+    const rec = sessionOf(r!);
+    expect(rec.sessionId).not.toBe(stale.sessionId);
+    expect(rec.reported).toEqual({ tokens: 700, cached: 100 });
+    expect(rec.runs).toBe(1);
+  });
+
+  it("codex: a fork_prefix child starts from its parent's metered total (the fork's figures include the parent's)", async () => {
+    const s = setup("codex", [usageTurn(1_000, 400), usageTurn(300, 100)]);
+    const parent = s.run({ cellId: "parent", runId: "run_p" });
+    expect(await runOf(s, parent)).toBe("completed");
+    const parentRec = sessionOf(parent);
+    expect(parentRec.reported).toEqual({ tokens: 1_000, cached: 400 });
+    const child = s.run({
+      cellId: "child",
+      runId: "run_c",
+      parentId: "parent",
+      spec: { processor: { kind: "llm", toolsets: TOOLSETS, allowedTools: ["read"] }, contextMode: "fork_prefix" },
+      batch: ["do the subtask"],
+      history: [{ role: "user", content: [{ type: "text", text: `${FORK_NOTE_PREFIX} "parent" up to the moment it created this cell. You are now "child".` }] }],
+    });
+    child.ports.state.set(CLI_FORK_SESSION_KEY, parentRec);
+    expect(await runOf(s, child)).toBe("completed");
+    expect(launches(s)[1]!.session).toEqual({ id: parentRec.sessionId, mode: "fork" });
+    expect(meteredOf(child)).toEqual([{ tokens: 300, billedCents: 0, cachedTokens: 100 }]);
+    expect(sessionOf(child).reported).toEqual({ tokens: 1_300, cached: 500 });
+  });
+
+  it.each(["claude", "agy"] as const)("%s: meters each turn as reported (its figures are per turn) and keeps no session total", async (engine) => {
+    const s = setup(engine, [usageTurn(1_000, 200), usageTurn(500, 100)]);
+    const runs = await runInSequence(s, 2);
+    expect(launches(s).map((l) => l.session?.mode ?? "fresh")).toEqual(["fresh", "resume"]);
+    const sum = (us: Usage[], k: "tokens" | "cachedTokens") => us.reduce((n, u) => n + (u[k] ?? 0), 0);
+    // the fake claude also counts 2 tokens for each assistant message (here: the usage and the text message)
+    const overhead = engine === "claude" ? 4 : 0;
+    expect(runs.map((r) => sum(meteredOf(r), "tokens"))).toEqual([1_000 + overhead, 500 + overhead]);
+    expect(runs.map((r) => sum(meteredOf(r), "cachedTokens"))).toEqual([200, 100]);
+    for (const r of runs) expect(sessionOf(r).reported).toBeUndefined();
+  });
+});
+
+describe("CLI loop with a fake codex: hidden tool items (BUG-008)", () => {
+  const exec = (callId: string, input: string, rest: Record<string, unknown> = {}) => ({ item: { type: "custom_tool_call", call_id: callId, name: "exec", input, ...rest } });
+
+  it("mirrors code-mode custom_tool_call items into the evidence as tool calls with their results", async () => {
+    const s = setup("codex", [
+      {
+        actions: [
+          exec("call_1", "1 + 1", { output: "2", status: "completed" }),
+          exec("call_2", "await tools.shell('ls')", { status: "completed" }),
+          { item: { type: "custom_tool_call_output", call_id: "call_2", output: "README.md" } },
+          { item: { type: "reasoning", text: "thinking" } },
+          { text: "computed" },
+        ],
+      },
+    ]);
+    const r = s.run();
+    expect(await runOf(s, r)).toBe("completed");
+    const ev = r.ports.log.evidence.flatMap((e) =>
+      e.kind === "tool_call" ? [{ id: e.toolUseId, step: ["call", e.name, e.input] }] : e.kind === "tool_result" ? [{ id: e.toolUseId, step: ["result", e.name, e.output] }] : [],
+    );
+    expect(ev.map((e) => e.step)).toEqual([
+      ["call", "exec", { input: "1 + 1" }],
+      ["result", "exec", "2"],
+      ["call", "exec", { input: "await tools.shell('ls')" }],
+      ["result", "exec", "README.md"],
+    ]);
+    // each result is paired with its call
+    expect(ev[1]!.id).toBe(ev[0]!.id);
+    expect(ev[3]!.id).toBe(ev[2]!.id);
+    expect(ev[2]!.id).not.toBe(ev[0]!.id);
+    expect(r.ports.log.evidence.some((e) => e.kind === "assistant_text" && e.text === "computed")).toBe(true);
+  });
+
+  it("counts them as steps: a turn of many exec calls stops at maxSteps", async () => {
+    const s = setup("codex", [{ actions: [1, 2, 3, 4].map((n) => exec(`call_${n}`, `step(${n})`, { output: "ok", status: "completed" })) }]);
+    const r = s.run({ spec: { processor: { kind: "llm", toolsets: TOOLSETS, allowedTools: ["read"], maxSteps: 2 } } });
+    expect(await runOf(s, r)).toBe("step_limit");
+    expect(r.ports.log.evidence.some((e) => e.kind === "system_note" && e.text.includes("run stopped after 2 tool calls (step limit)"))).toBe(true);
   });
 });
 

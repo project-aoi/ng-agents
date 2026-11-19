@@ -22,6 +22,7 @@ import {
 import { TOOLSETS, type PresetsConfig } from "../shared/config";
 import { errorText, isCwdError, parseIso, scheduleInput, toSchedule, toWatch, watchInput } from "../shared/inputs";
 import { notifyOwner } from "../shared/notify";
+import { PROBE, probeProcessor } from "../shared/probe";
 import { CHECKER_PROCESSOR, WORKER_PROCESSOR } from "../shared/processors";
 import { clip, newAction, newProject, patchAction, patchProject, statusLine } from "../shared/records";
 import { replyWatcherSpec, type ReplyParty } from "../shared/watcher";
@@ -52,6 +53,35 @@ async function save(ctx: ToolContext, patches: Record<string, unknown>): Promise
   await ctx.ports.context.commit(ctx.ports.self.cellId, { statePatches: patches });
 }
 
+const checkInput = z
+  .object({
+    command: z
+      .string()
+      .min(1)
+      .describe(
+        'a shell command run in the watcher\'s directory (the project\'s) whose exit status says yes or no, e.g. "gh pr view 142 --json state -q .state | grep -qx MERGED", "test -d /abs/path/to/dir", "glab ci status --branch feat/x | grep -q success"',
+      ),
+    everySec: z.number().int().min(PROBE.minEverySec).optional().describe(`seconds between checks (default ${PROBE.everySec}, at least ${PROBE.minEverySec})`),
+    until: z
+      .enum(["exit_zero", "output_changes"])
+      .optional()
+      .describe('"exit_zero" (default): it reports when the command exits 0. "output_changes": the first check records what the command prints, and it reports when a later check prints something else'),
+    deadlineHours: z.number().positive().optional().describe("stop after this many hours and report failed (default: no deadline)"),
+  })
+  .describe(
+    'watcher only — a command that tests the condition. No model runs for such a watcher: the command runs now and then every everySec seconds, costing nothing while the answer is "not yet". You are woken once: when the condition holds (with what the command printed), when the deadline passes, or when the command cannot run at all twice in a row (not found, not executable, timed out). Use it whenever an exit status can say yes or no; leave it out when deciding needs reading and judgment.',
+  );
+
+/** What a model watcher is told about the schedule it was given, so it does not set reminders on top of it. */
+function scheduleNote(rules: NonNullable<CellSpec["schedules"]>): string {
+  const lines: string[] = [];
+  for (const r of rules) {
+    if (r.cron) lines.push(`[You are woken on a fixed schedule: cron "${r.cron}"${r.tz ? ` (${r.tz})` : ""}. Do not set reminders of your own — when the answer is "not yet", just wait with waitingFor "external".]`);
+    else if (r.deliverAt !== undefined) lines.push(`[You are also woken once at ${new Date(r.deliverAt).toISOString()}.]`);
+  }
+  return lines.join("\n");
+}
+
 function spawnRefusal(err: unknown): ToolResult {
   if (isCwdError(err)) {
     return {
@@ -71,9 +101,9 @@ export function projectToolset(cfg: PresetsConfig): Toolset {
   const dispatch = tool({
     name: "dispatch",
     description: [
-      "Hand one piece of work to a new one-shot child and put it on the books in the same step.",
-      'preset "worker" (default): reads or changes code, runs tests, researches — it reports once and closes. preset "watcher": a light checker of one outside condition (an MR merged, CI green, a path exists); it looks now, keeps checking, and reports when the condition holds.',
-      "The child sees nothing of your conversation: the instruction carries everything. Its result wakes you, and the action it carries is closed for you when it reports.",
+      "Hand one piece of work to a new child and put it on the books in the same step.",
+      'preset "worker" (default): reads or changes code, runs tests, researches. You are woken when its turn is over; it then rests and a send_message to it continues it with everything it knows. preset "watcher": a light checker of one outside condition (an MR merged, CI green, a path exists); it looks now, keeps checking, reports when the condition holds and is then closed — with check, a command does the checking and no model runs until it reports.',
+      "The child sees nothing of your conversation: the instruction carries everything. It starts at once — nothing queues or locks a directory, so if someone is already changing that repository (the note \"active workspaces\"), say in the instruction how to share it. The action it carries is closed for you when its turn ends well.",
     ].join(" "),
     input: z.object({
       title: z.string().min(1).describe("short Chinese title of this piece of work (shown to the owner)"),
@@ -81,39 +111,70 @@ export function projectToolset(cfg: PresetsConfig): Toolset {
         .string()
         .min(1)
         .describe("the goal; the directory; what the previous step left (branch, commits, uncommitted changes); material (paths, links, artifact id and version); the owner's preferences; how to verify; what to report"),
-      preset: z.enum(["worker", "watcher"]).optional(),
-      cwd: z.string().optional().describe("absolute path of the directory it works in. Default: the project's for a worker; a private directory of its own for a watcher (name the paths, repositories and links it must check in the instruction)"),
-      cwdMode: z.enum(["read", "write"]).optional().describe('"write" (default): it queues for that work tree, one writer at a time. "read": it only looks (analysis, review) and runs in parallel with anything'),
+      preset: z.enum(["worker", "watcher"]).optional().describe('default "worker" ("watcher" when check is given)'),
+      cwd: z.string().optional().describe("absolute path of the directory it works in. Default: the project's (for a second writer in the same repository, give the path of a git worktree, or tell it in the instruction to create one)"),
       actionId: z.string().optional().describe("an action already on the books that this carries out (e.g. a planned step); default: a new action"),
       phase: z.number().int().min(1).optional().describe("phase of a staged project"),
       modelTier: z.enum(["fast", "strong"]).optional(),
-      watches: z.array(watchInput).optional().describe("watcher: messages to route to it (e.g. the MR's thread)"),
-      schedules: z.array(scheduleInput).optional().describe("watcher: when to look again"),
+      check: checkInput.optional(),
+      watches: z.array(watchInput).optional().describe("watcher: messages to route to it (e.g. the MR's thread); each one makes it look at once"),
+      schedules: z
+        .array(scheduleInput)
+        .optional()
+        .describe(
+          'watcher without check, rarely needed: a fixed rhythm to wake it on, as cron (e.g. {"cron": "*/10 * * * *"}), instead of the one reminder at a time it sets itself, fitted to what it saw. It is told so in its task and sets no reminders of its own. Usually leave it out. Not with check (the command keeps its own timer), and not idleSec (it fires once after the watcher has gone quiet, not on a rhythm).',
+        ),
     }),
     async run(args, ctx) {
-      const preset = args.preset ?? "worker";
+      const check = args.check;
+      const preset = args.preset ?? (check ? "watcher" : "worker");
+      // One timer source per watcher (BUG-005): a check keeps its own, a model watcher either gets a fixed cron
+      // rhythm (and is told so) or sets its own reminders; an idle schedule would not repeat for it.
+      if (check && preset !== "watcher") return { output: 'Not started: check is for a watcher — give preset "watcher" (or leave preset out).', isError: true };
+      if (check && args.schedules?.length) return { output: "Not started: a watcher with check keeps its own timer (check.everySec); leave schedules out.", isError: true };
+      if (preset === "watcher" && args.schedules?.some((r) => r.idleSec !== undefined)) {
+        return {
+          output:
+            'Not started: idleSec does not repeat for a watcher — it fires once after the watcher has gone quiet. For a fixed rhythm use cron (e.g. "*/10 * * * *"), give a check command, or leave schedules out and let the watcher set its own reminders.',
+          isError: true,
+        };
+      }
       const project = await readProject(ctx.ports);
       const actions = await readActions(ctx.ports);
       const existing = args.actionId !== undefined ? actions.find((a) => a.id === args.actionId) : undefined;
       const base: ProcessorSpec = preset === "watcher" ? CHECKER_PROCESSOR : WORKER_PROCESSOR;
       const actionId = existing?.id ?? newId("act", ctx.clock);
-      const spec: CellSpec = { preset, title: args.title, processor: args.modelTier && base.kind === "llm" ? { ...base, modelTier: args.modelTier } : base, meta: { gtd: { actionId } } };
-      // Defaults only: a worker works where the project works; a watcher has a private directory of its own (so it
-      // does not queue for the project's work tree). Whatever the project passes explicitly is what the child gets.
-      const cwd = args.cwd ?? (preset === "worker" && project?.cwd && project.cwd !== ctx.ports.self.spec.cwd ? project.cwd : undefined);
+      const now = ctx.clock.now();
+      const everySec = check?.everySec ?? PROBE.everySec;
+      const processor: ProcessorSpec = check
+        ? probeProcessor({
+            command: check.command,
+            everySec,
+            until: check.until ?? "exit_zero",
+            ...(check.deadlineHours !== undefined ? { deadlineAt: now + check.deadlineHours * 3_600_000 } : {}),
+            timeoutMs: Math.min(PROBE.timeoutMs, everySec * 1000),
+          })
+        : args.modelTier && base.kind === "llm"
+          ? { ...base, modelTier: args.modelTier }
+          : base;
+      const spec: CellSpec = { preset, title: args.title, processor, meta: { gtd: { actionId } } };
+      // Default: where the project works — a worker to do the work there, a watcher so the repository, its remotes
+      // and the forge CLI's context are at hand. Whatever the project passes explicitly is what the child gets.
+      const cwd = args.cwd ?? (project?.cwd && project.cwd !== ctx.ports.self.spec.cwd ? project.cwd : undefined);
       if (cwd) spec.cwd = cwd;
-      if (args.cwdMode) spec.cwdMode = args.cwdMode;
       let addr: InboxAddr;
+      let instruction = args.instruction;
       try {
         if (args.watches?.length) spec.watches = args.watches.map((w) => toWatch(w));
         if (args.schedules?.length) spec.schedules = args.schedules.map(toSchedule);
-        addr = await ctx.ports.spawnCell(spec, args.instruction);
+        const note = preset === "watcher" && !check && spec.schedules ? scheduleNote(spec.schedules) : "";
+        if (note) instruction = `${instruction}\n\n${note}`;
+        addr = await ctx.ports.spawnCell(spec, instruction);
       } catch (err) {
         return spawnRefusal(err);
       }
       const childId = cellIdOf(addr);
       const owner: BallOwner = preset === "watcher" ? "waiting" : "agent";
-      const now = ctx.clock.now();
       const action = existing
         ? patchAction(existing, { title: args.title, owner, cellId: childId, nextStep: null, ...(existing.status !== "open" ? { status: "open" as const, completedAt: null } : {}), ...(args.phase ? { phase: args.phase } : {}), ...(owner === "waiting" ? { waiting: waitingFor(args.title) } : {}) }, now)
         : newAction(
@@ -121,12 +182,13 @@ export function projectToolset(cfg: PresetsConfig): Toolset {
             now,
           );
       await save(ctx, { [gtdKeys.action(actionId)]: action });
-      const queued = preset === "worker" && (args.cwdMode ?? "write") === "write" ? " If another writer is in that work tree, it starts when that one is done." : "";
-      return {
-        output: `Started ${preset} ${childId} for action ${actionId}「${args.title}」 (recorded as ${owner === "agent" ? "being handled by an agent" : "waiting"}).${queued} Its result wakes you and closes the action.`,
-        data: { cellId: childId, actionId },
-        awaitsWakeup: true,
-      };
+      const started = `Started ${preset} ${childId} for action ${actionId}「${args.title}」 (recorded as ${owner === "agent" ? "being handled by an agent" : "waiting"}).`;
+      const where = cwd ?? ctx.ports.self.spec.cwd;
+      const deadline = check?.deadlineHours !== undefined;
+      const next = check
+        ? ` No model runs for it: it runs \`${clip(check.command, 200)}\` now and then every ${everySec}s${where ? ` in ${where}` : ""}${deadline ? ` for up to ${check.deadlineHours}h` : ""}, at no cost while the answer is "not yet". You are woken once: when the condition holds, ${deadline ? "when the deadline passes, " : ""}or if the command cannot run at all.`
+        : ` It is running now; you are woken when its turn is over${preset === "worker" ? " — then inspect_cell shows what it did, and send_message continues it" : ""}.`;
+      return { output: started + next, data: { cellId: childId, actionId }, awaitsWakeup: true };
     },
   });
 
@@ -146,11 +208,18 @@ export function projectToolset(cfg: PresetsConfig): Toolset {
       artifactId: z.string().optional(),
       effort: effort.optional(),
       dueAt: z.string().optional().describe("ISO 8601 with offset"),
+      cellId: z
+        .string()
+        .optional()
+        .describe("the cell of yours carrying it — e.g. a worker you sent more work with send_message; when that cell's turn ends well, the action is closed for you"),
     }),
     async run(args, ctx) {
       const now = ctx.clock.now();
       const due = args.dueAt !== undefined ? parseIso(args.dueAt, "dueAt") : undefined;
       if (typeof due === "string") return { output: due, isError: true };
+      if (args.cellId !== undefined && !ctx.snapshot.tail.roster.some((c) => c.cellId === args.cellId && c.parentId === self(ctx))) {
+        return { output: `${args.cellId} is not one of your cells (see the list at the end of your wake-up message).`, isError: true };
+      }
       const fields = {
         ...(args.title ? { title: args.title } : {}),
         ...(args.owner ? { owner: args.owner } : {}),
@@ -159,6 +228,7 @@ export function projectToolset(cfg: PresetsConfig): Toolset {
         ...(args.artifactId ? { artifactId: args.artifactId } : {}),
         ...(args.effort ? { effort: args.effort } : {}),
         ...(due !== undefined ? { dueAt: due } : {}),
+        ...(args.cellId ? { cellId: args.cellId } : {}),
       };
       let action: ActionRecord;
       if (args.id === undefined) {
@@ -179,7 +249,7 @@ export function projectToolset(cfg: PresetsConfig): Toolset {
           : action.owner === "human"
             ? `${action.nextStep ? "" : "It has no nextStep yet: the owner sees it on their list without knowing what to do — add the concrete step. "}Tell the owner once (send_message), then wait with waitingFor "human"; you are woken when they tick it off or answer.`
             : action.owner === "agent" && !action.cellId
-              ? "Nobody is on it yet: dispatch it with this actionId when it is time."
+              ? "Nobody is on it yet: dispatch it with this actionId when it is time — or, when a worker that already knows the work takes it (send_message), record that worker here with cellId."
               : "";
       return { output: `Recorded action ${action.id}「${action.title}」: ${OWNER_LABEL[action.owner]}, ${action.status}. ${next}`.trim(), data: { id: action.id } };
     },

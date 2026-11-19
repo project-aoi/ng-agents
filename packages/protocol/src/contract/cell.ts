@@ -37,24 +37,30 @@ export interface CellSpec {
    */
   cwd?: string;
   /**
-   * [ext] docs/05 — what the cell may do in `cwd`. `"read"`: truly read-only (the kernel's workspace port and the CLI
-   * adapters refuse write/edit/bash/code_rpc). `"write"`: may change files and run commands, and takes the
-   * directory's write slot: the dispatcher runs at most one writing cell per work tree (`git toplevel` of the cwd, or
-   * its real path) at a time, counting a cell's running Jobs. Default: the preset's (`worker` → write; everything else
-   * → read).
+   * @deprecated Accepted and stored for specs written before the kernel stopped scheduling by it; it has no effect.
+   * The kernel no longer queues writers per work tree and no longer tells a cell it is "read-only" by this field:
+   * every dispatched cell starts at once, who is active in which directory is shown to the cells
+   * (WorkspaceOccupancy, the "active workspaces" note), and the prompts say how to share a directory.
    */
   cwdMode?: "read" | "write";
   /**
-   * [ext] docs/05 guard 1 — `"one_shot"` (the `worker` preset's default): when a Run ends `completed` (or `refused`)
-   * with the inbox drained, the kernel delivers the cell's single final `cell.result` (id
-   * `${cellId}:${epoch}:cell.result`) to its parent and closes the cell, in the transaction that completes the claim.
-   * `"persistent"` (default): the cell lives until someone closes it (or it calls complete_self).
+   * [ext] How long the cell lives and how its parent hears from it.
+   * - `"wakeable"` (the `worker` preset's default): a leaf that is never closed for finishing a turn. When a Run ends
+   *   `completed` (or `refused`) with the inbox drained, no wait open, no Job running and no card pending, the kernel
+   *   tells the parent — a `cell.result` carrying `turn` (id `${cellId}:${runId}:settled`, so every settled turn is
+   *   announced, also the third one after the owner woke it twice) — and the cell stays `active` and dormant: no
+   *   process, no timer, nothing that would wake it by itself. Any message wakes it again on its CLI session. It is
+   *   closed with its parent (or by an explicit close).
+   * - `"one_shot"` (the `watcher` preset's default): a probe. When a Run ends `completed` (or `refused`) with the
+   *   inbox drained, the kernel delivers the cell's single final `cell.result` (id `${cellId}:${epoch}:cell.result`)
+   *   and closes the cell — with its watches and timers — in the transaction that completes the claim.
+   * - `"persistent"` (default): the cell lives until someone closes it (or it calls complete_self).
    */
-  lifetime?: "one_shot" | "persistent";
+  lifetime?: "one_shot" | "wakeable" | "persistent";
   /**
    * [ext] docs/05 §3.3 — the running Loop takes messages that arrive mid-Run into the same Run (`RunPorts.drainInbound`)
-   * instead of leaving them for the next one. On for hubs; any cell absorbs what arrives before it settles when it is
-   * one_shot (so a follow-up is never answered with a stale result).
+   * instead of leaving them for the next one. On for hubs; a one_shot or wakeable cell absorbs what arrives before it
+   * settles anyway (so a follow-up is never answered with a stale result).
    */
   absorbInbound?: boolean;
 }
@@ -94,12 +100,16 @@ export type SpawnSpec = Omit<CellSpec, "processor"> & { processor?: ProcessorSpe
 //   `{ $in: [...] }` (the field equals one of them), `{ $contains: "x" }` (string field contains it, or array field
 //   has it as an element, case-insensitive for strings) and `{ $anyKeyword: [...] }` (string field contains at least
 //   one of them, case-insensitive). `coalesceMs` on a watch batches what it routes: see ScheduleRule.coalesce.
-// - [docs/05] cwd is inherited from the parent when absent; cwdMode and lifetime come from the preset's defaults.
+// - [docs/05] cwd is inherited from the parent when absent; lifetime comes from the preset's defaults.
 
 export type PresetName = NonNullable<CellSpec["preset"]>;
 export const PRESET_NAMES = ["inline", "worker", "watcher", "sensor", "project", "hub"] as const satisfies readonly PresetName[];
 export type CwdMode = NonNullable<CellSpec["cwdMode"]>;
 export type CellLifetime = NonNullable<CellSpec["lifetime"]>;
+/** A leaf executor (wakeable worker or one-shot probe), as opposed to a persistent coordinator. */
+export function isLeafLifetime(lifetime: CellSpec["lifetime"]): lifetime is "one_shot" | "wakeable" {
+  return lifetime === "one_shot" || lifetime === "wakeable";
+}
 export type CellStatus = "active" | "paused" | "closed";
 export type CloseReason = "completed" | "cancelled";
 export type CellWatch = NonNullable<CellSpec["watches"]>[number];
@@ -132,8 +142,8 @@ export interface RunPorts extends CellPorts {
   drainSteer(): string[];
   /**
    * Commit with inboxOut to `inbox:<parentId>` (envelope from `inbox:<selfId>`, expectedEpoch = parent's epoch). Throws
-   * for root cells. [docs/05] A `cell.result` from a `one_shot` cell is not sent from here: it is stored as the cell's
-   * result candidate and delivered once by the kernel when the cell settles (CELL_RESULT_CANDIDATE_KEY).
+   * for root cells. [docs/05] A `cell.result` from a leaf (`one_shot` / `wakeable`) cell is not sent from here: it is
+   * stored as the cell's result candidate and delivered by the kernel when the turn settles (CELL_RESULT_CANDIDATE_KEY).
    */
   emitToParent(type: string, payload: unknown, opts?: EmitOptions): Promise<void>;
   /** Enqueue to this cell's own inbox (reminders, timeout nudges with cancelGroup, cron); expectedEpoch = self.epoch. */
@@ -190,8 +200,39 @@ export interface RunPorts extends CellPorts {
    * children, unless `force`); `pause`: status → paused. The last call of a Run wins; the Run should end right after.
    */
   settleSelf?(request: SelfSettleRequest): Promise<void>;
-  /** Directory occupancy across the whole kernel (docs/05 §3.2): who is writing/queued in which work tree. */
+  /** Directory occupancy across the whole kernel: which cells are active in which work tree right now. */
   activeWorkspaces?(): WorkspaceOccupancy[];
+  /**
+   * What another cell did and was told since `afterSeq` (default: since this cell last inspected it): inbound
+   * messages — the owner's direct ones marked as such —, what it said, the files it changed and commands it ran, the
+   * artifacts it touched. Same account whatever engine ran the cell. Inspecting one of this cell's descendants moves
+   * this cell's cursor for it (the "new since your last inspect" figure in the roster) to the end of what was returned.
+   */
+  inspectCell?(cellId: string, opts?: InspectCellOptions): Promise<CellInspection>;
+}
+
+export interface InspectCellOptions {
+  /** Evidence seq to start after. Default: this cell's cursor for the target (0 = from the beginning). */
+  afterSeq?: number;
+  /** `summary` (default): one line per step; `full`: tool inputs and outputs as recorded (large outputs as res:// links). */
+  detail?: "summary" | "full";
+  /** Upper bound of the returned text in characters (default 12 000 for summary, 40 000 for full). */
+  maxChars?: number;
+}
+
+export interface CellInspection {
+  cellId: string;
+  title: string | null;
+  /** Where the cell stands now: working, dormant, waiting, …, or closed. */
+  state: string;
+  /** Records covered: `fromSeq`..`toSeq` (both 0 when nothing is new). */
+  fromSeq: number;
+  toSeq: number;
+  /** More records exist after `toSeq` (the text limit was reached): call again with `afterSeq: toSeq`. */
+  more: boolean;
+  directChats: number;
+  artifactIds: string[];
+  text: string;
 }
 
 /** [ext] RunPorts.sendToCell input. */
@@ -222,31 +263,62 @@ export interface SelfSettleRequest {
   force?: boolean;
 }
 
-/** One work tree and the cells using it. `key` = `git rev-parse --show-toplevel` of the cwd, else its real path. */
+/**
+ * One work tree and the cells active in it right now. `key` = `git rev-parse --show-toplevel` of the cwd, else its
+ * real path. A fact the kernel shows, not a lock it holds: cells and their coordinators decide how to share a
+ * directory (message the cell already there, wait for it, look without changing, or work in a `git worktree`).
+ */
 export interface WorkspaceOccupancy {
   key: string;
-  /** The writing cell that holds the slot now (a Run or a Job of it is in flight), if any. */
-  holder: WorkspaceUser | null;
-  /** Writing cells with due work waiting for the slot, in arrival order. */
-  queued: WorkspaceUser[];
-  /** Writing cells that are idle (sleeping/waiting) and read-mode cells with a Run in flight. */
-  others: WorkspaceUser[];
+  /** Cells with a Run or a background Job in flight whose directory is in this work tree. */
+  active: WorkspaceUser[];
 }
 export interface WorkspaceUser {
   cellId: string;
   title: string | null;
   preset: PresetName | null;
   parentId: string | null;
+  /** The project the cell belongs to (meta.projectCellId), with its title, when it has one. */
+  projectCellId: string | null;
+  projectTitle: string | null;
   cwd: string;
-  cwdMode: CwdMode;
-  state: "running" | "job" | "queued" | "waiting" | "paused";
+  state: "running" | "job";
   statusLine: string | null;
 }
 
 /**
- * [ext] docs/05 guard 1 — state key where a one_shot cell's `report_to_parent(kind: "result")` stashes its candidate
- * result (CellResultCandidate). The kernel reads it when the cell settles and is the only sender of the final
- * `cell.result`.
+ * [ext] State key on a wakeable leaf: what its parent has already been told. `settledSeq` = last evidence seq covered
+ * by a turn-settled notice (the next notice starts after it).
+ */
+export const CELL_TURN_KEY = "cell:turn";
+export interface CellTurnState {
+  settledSeq: number;
+  settledAt: number;
+  notices: number;
+}
+
+/**
+ * [ext] State key on a cell the owner (or their agent) has spoken to directly, past its parent. `unsettled` counts the
+ * messages since the last turn-settled notice; `seen` holds recent client message ids (a retried send is not delivered
+ * twice).
+ */
+export const CELL_DIRECT_CHAT_KEY = "cell:direct_chat";
+export interface CellDirectChatState {
+  total: number;
+  unsettled: number;
+  lastAt: number;
+  seen: string[];
+}
+
+/** [ext] State key in an inspecting cell: the last evidence seq of `targetCellId` it has seen through inspect_cell. */
+export function pullCursorKey(targetCellId: string): string {
+  return `pull:${targetCellId}`;
+}
+
+/**
+ * [ext] docs/05 guard 1 — state key where a leaf cell's `report_to_parent(kind: "result")` stashes its candidate
+ * result (CellResultCandidate). The kernel reads it when the turn settles and is the only sender of the cell's
+ * `cell.result` (a wakeable cell's candidate is cleared once delivered: the next turn reports for itself).
  */
 export const CELL_RESULT_CANDIDATE_KEY = "cell:result";
 export interface CellResultCandidate {
@@ -269,12 +341,9 @@ export interface WorkspaceAccess {
   isolation: IsolationLevel;
   /**
    * Workspace tool kinds the kernel's own workspace port would allow this Run right now: `bounds.tools`, minus
-   * everything but read on "shared_ro". `cwdMode` removes nothing (it is a scheduling declaration, reported below).
-   * `processor.allowedTools` is not applied here (the Loop applies it).
+   * everything but read on "shared_ro". `processor.allowedTools` is not applied here (the Loop applies it).
    */
   tools: ToolKind[];
-  /** [ext] docs/05 — the cell's effective cwdMode. */
-  cwdMode?: CwdMode;
 }
 
 export interface EmitOptions {
@@ -298,9 +367,8 @@ export interface PresetDef {
   defaults: Partial<Omit<CellSpec, "id" | "parentId" | "preset" | "fork">>;
   requestBounds?(ctx: { parentCellId: string; parentBounds: PolicyBounds }): Partial<PolicyBounds>;
   /**
-   * [ext] docs/05 — false: cells of this preset do not inherit their parent's `cwd` (watchers and sensors: they check
-   * things with commands in a private directory of their own instead of queueing for the project's work tree).
-   * Default true.
+   * [ext] docs/05 — false: cells of this preset do not inherit their parent's `cwd` (sensors: they check things with
+   * commands in a private directory of their own). Default true.
    */
   inheritCwd?: boolean;
   /**

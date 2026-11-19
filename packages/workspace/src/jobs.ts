@@ -25,9 +25,12 @@ import {
 import type { IsolationDriver } from "./drivers/types";
 import type { WorkspaceStore } from "./store";
 import type { CommandRunner, JobObservation, WorkspaceLimits, WorkspaceManagerOptions } from "./types";
-import { errorMessage, groupAlive, killGroup, markedAlive, sleep } from "./util";
+import { errorMessage, groupAlive, killGroup, markedAlive, processHasMarker, sleep } from "./util";
 
 export const JOB_MARKER = "NG_JOB_ID";
+
+/** Consecutive polls on which a re-attached job's process was alive but unidentifiable before it counts as gone. */
+const UNREADABLE_POLLS = 3;
 
 /**
  * POSIX sh wrapper every job runs under: `sh -c WRAPPER ng-job <exitFile> <shell> -c <command>`. It records the
@@ -394,7 +397,7 @@ export class JobManager {
    * 1. the request is written to the row (`cancel_requested_at`, the job stays `running` = "cancelling");
    * 2. TERM → grace → KILL on the process group (and inside a container);
    * 3. only when nothing of the job is alive any more does it become `cancelled`, with its job.result.
-   * Whoever counts running jobs (the dispatcher's per-directory write slot) therefore never sees the directory as free
+   * Whoever counts running jobs (the kernel's view of who is active in which directory) therefore never sees the directory as free
    * while an old process can still write to it, and a kernel that dies between 1 and 3 leaves a row `recover()`
    * finishes the same way. Resolves when the job is recorded; false when it was not running.
    */
@@ -531,8 +534,16 @@ export class JobManager {
   #reattach(job: JobRecord): void {
     const pid = job.pid!;
     const live = this.#register(job.jobId, job.cellId, pid, job.logPath ?? "", null);
+    let unreadable = 0;
     live.poller = setInterval(() => {
-      if (markedAlive(pid, JOB_MARKER, job.jobId)) return;
+      const marked = processHasMarker(pid, JOB_MARKER, job.jobId);
+      if (marked === true) {
+        unreadable = 0;
+        return;
+      }
+      // Alive but not readable just now (no /proc and `ps` failed): a passing failure must not end a job that may still
+      // be writing, so look again on the next polls before treating it as gone.
+      if (marked === null && ++unreadable < UNREADABLE_POLLS) return;
       if (live.cancelReason !== null) {
         // cancel() is waiting on the same condition and records the outcome.
         this.#markExited(live);

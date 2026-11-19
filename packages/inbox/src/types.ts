@@ -37,6 +37,12 @@ export interface InboxOptions {
   maxTimerDelayMs?: number;
   /** Errors thrown by background ticks started with `start()`. Default: console.error. */
   onError?: (err: unknown) => void;
+  /**
+   * Monotonic milliseconds that stand still while the host is suspended, compared with `clock` to tell a machine that
+   * slept from a lease that really ran out. Default `performance.now` when `clock` is the system clock; with any
+   * other clock (manual, demo: its jumps are deliberate) suspend detection is off unless a source is passed here.
+   */
+  monotonicNow?: () => number;
 }
 
 export type InboxClaimStatus = "active" | "completed" | "released" | "expired";
@@ -93,4 +99,6 @@ export interface InboxService extends Inbox {
    * process. Counts as a failed attempt. Returns the number of claims released.
    */
   recoverClaimsSync(opts?: { workerId?: string; reason?: string }): number;
+  /** The last host suspend this process detected (wall time at detection, time asleep); active leases were extended by it. */
+  lastSuspendSync(): { at: number; sleptMs: number } | null;
 }

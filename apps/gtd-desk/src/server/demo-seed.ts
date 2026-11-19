@@ -136,7 +136,7 @@ function registerPlans(brain: DemoBrain, o: { quoteDue: string }): void {
     // An idea for later: research, a report, parked as someday (docs/05 scenario 5).
     {
       key: "极简模式",
-      first: [t("dispatch", { title: "调研其他产品的极简模式", instruction: "调研对象：极简模式。看看其他 AI 编程产品怎么帮用户省 Token，写一份调研报告（存成 artifact），给出建议的阶段。", cwdMode: "read" })],
+      first: [t("dispatch", { title: "调研其他产品的极简模式", instruction: "调研对象：极简模式。看看其他 AI 编程产品怎么帮用户省 Token，写一份调研报告（存成 artifact），给出建议的阶段。" })],
       afterResult: [
         [
           t("update_project", { summary: "调研报告已完成：建议先做“极简档”（只留最近 3 轮上下文、关闭自动预读）" }),
@@ -149,7 +149,7 @@ function registerPlans(brain: DemoBrain, o: { quoteDue: string }): void {
       key: "Harness 对比",
       first: [
         t("track_action", { title: "要 Doubao work 的代码", owner: "human", nextStep: "找张三要 Doubao work 的代码，放到 ~/code/doubao，然后在这里勾掉", effort: "15m" }),
-        t("dispatch", { title: "分析 trae 的 harness 实现", instruction: "分析对象：trae harness。读本地 trae cli / trae ide 的代码，写对比报告的 trae 部分（存成 artifact）。", cwdMode: "read" }),
+        t("dispatch", { title: "分析 trae 的 harness 实现", instruction: "分析对象：trae harness。读本地 trae cli / trae ide 的代码，写对比报告的 trae 部分（存成 artifact）。" }),
         t("update_project", { summary: "trae 部分正在分析；Doubao work 的代码要等你要来" }),
       ],
       afterResult: [
@@ -167,7 +167,6 @@ function registerPlans(brain: DemoBrain, o: { quoteDue: string }): void {
           t("dispatch", {
             title: "分析 Doubao work 的 harness 实现",
             instruction: "分析对象：Doubao work harness。主人已把代码放到 ~/code/doubao。读 read_artifact art_demo_harness（v1）后，补上 Doubao work 部分，保存为 v2。",
-            cwdMode: "read",
           }),
         ],
       ],
@@ -181,7 +180,7 @@ function registerPlans(brain: DemoBrain, o: { quoteDue: string }): void {
     // Running right now: one worker reported, the next one is still at it.
     {
       key: "排查支付回调偶发 500",
-      first: [t("dispatch", { title: "复现并定位支付回调 500", instruction: "排查对象：支付回调偶发 500。复现、定位原因，不改代码，汇报原因和证据。", cwdMode: "read" })],
+      first: [t("dispatch", { title: "复现并定位支付回调 500", instruction: "排查对象：支付回调偶发 500。复现、定位原因，不改代码，汇报原因和证据。" })],
       afterResult: [
         [
           t("update_project", { summary: "已定位：并发回调时幂等键 60 秒就过期；正在修复并补测试" }),

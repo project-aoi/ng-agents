@@ -23,6 +23,17 @@ export function whenText(at: number, now: number): string {
   return `${d.getMonth() + 1}月${d.getDate()}日 ${hhmm(at)}`;
 }
 
+/** Timeline stamps: "16:12" today, otherwise "昨天 16:12" · "11月20日 16:12". */
+export function clockText(at: number, now: number): string {
+  return midnight(at) === midnight(now) ? hhmm(at) : whenText(at, now);
+}
+
+/** One line, at most `max` characters, for chips that quote a longer text. */
+export function excerpt(text: string, max = 40): string {
+  const line = text.replace(/\s+/g, " ").trim();
+  return line.length > max ? `${line.slice(0, max - 1)}…` : line;
+}
+
 /** "今天到期" · "明天到期" · "3 天后到期" · "已超时 2 天" */
 export function dueText(dueAt: number, now: number): string {
   const diff = Math.round((midnight(dueAt) - midnight(now)) / DAY);

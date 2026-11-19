@@ -101,7 +101,7 @@ export function backgroundText(running: number, waiting: number): string {
   if (running === 0 && waiting === 0) return "后台没有在途任务";
   const parts: string[] = [];
   if (running > 0) parts.push(`${running} 项后台分身运行中`);
-  if (waiting > 0) parts.push(`${waiting} 项在等外部回复`);
+  if (waiting > 0) parts.push(`${waiting} 项在等外部`);
   return parts.join(" · ");
 }
 

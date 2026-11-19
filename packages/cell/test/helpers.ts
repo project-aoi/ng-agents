@@ -117,47 +117,46 @@ export const TOOLSETS = STANDARD_TOOLSETS;
 
 /**
  * Minimal ad-hoc presets: just enough processor wiring for kernel tests (the real presets live in @ng/presets).
- * They mirror the docs/05 shapes: the desk, projects and hubs coordinate read-only and persist; a worker is a one-shot
- * writer on the host (isolation "none") that the kernel closes once it has reported and its inbox is drained;
- * watchers keep to a directory of their own.
+ * They mirror the real shapes: the desk, projects and hubs coordinate and persist; a worker is a wakeable leaf on the
+ * host (isolation "none") — its parent is told when a turn settles and it stays, dormant; a watcher is a one-shot
+ * leaf the kernel closes once it has reported and its inbox is drained.
  */
 export function registerTestPresets(registry: Registry): void {
   const all = [TOOLSETS.context, TOOLSETS.comms, TOOLSETS.schedule, TOOLSETS.cells, TOOLSETS.workspace];
   registry.presets.register({
     name: "inline",
     description: "test desk",
-    defaults: { processor: { kind: "llm", toolsets: all }, cwdMode: "read", lifetime: "persistent", meta: { role: "desk" } },
+    defaults: { processor: { kind: "llm", toolsets: all }, lifetime: "persistent", meta: { role: "desk" } },
   });
   registry.presets.register({
     name: "project",
     description: "test project coordinator",
-    defaults: { processor: { kind: "llm", toolsets: all }, cwdMode: "read", lifetime: "persistent", meta: { role: "project" } },
+    defaults: { processor: { kind: "llm", toolsets: all }, lifetime: "persistent", meta: { role: "project" } },
   });
   registry.presets.register({
     name: "hub",
     description: "test domain hub",
-    defaults: { processor: { kind: "llm", toolsets: all }, cwdMode: "read", lifetime: "persistent", absorbInbound: true, meta: { role: "hub" } },
+    defaults: { processor: { kind: "llm", toolsets: all }, lifetime: "persistent", absorbInbound: true, meta: { role: "hub" } },
   });
   registry.presets.register({
     name: "worker",
     description: "test worker",
     defaults: {
       processor: { kind: "llm", toolsets: [TOOLSETS.workspace, TOOLSETS.context, TOOLSETS.comms, TOOLSETS.cells] },
-      cwdMode: "write",
-      lifetime: "one_shot",
+      lifetime: "wakeable",
       meta: { role: "worker" },
     },
+    requestBounds: () => ({ maxDepth: 0 }),
   });
   registry.presets.register({
     name: "watcher",
     description: "test watcher",
-    inheritCwd: false,
     defaults: {
       processor: { kind: "llm", modelTier: "fast", toolsets: [TOOLSETS.context, TOOLSETS.comms, TOOLSETS.schedule] },
-      cwdMode: "write",
-      lifetime: "persistent",
+      lifetime: "one_shot",
       meta: { role: "watcher" },
     },
+    requestBounds: () => ({ maxDepth: 0 }),
   });
 }
 

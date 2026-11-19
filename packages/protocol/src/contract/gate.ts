@@ -26,7 +26,7 @@ export interface Gate {
     "approved" | "version_mismatch" | "already_cancelled" | "not_found" /* [ext] not_found */
   >;
   revoke(cellId: string): Promise<void>;
-  meter(cellId: string, usage: { tokens: number; billedCents: number }): "ok" | "warn" | "hard_stop";
+  meter(cellId: string, usage: Usage /* [ext] cachedTokens */, opts?: LedgerViewOptions /* [ext] */): "ok" | "warn" | "hard_stop";
 
   // [ext] attenuate semantics (never widens, clamps instead of failing):
   //   omitted field → tools = parent.tools, secretRefs = ∅,
@@ -37,7 +37,10 @@ export interface Gate {
   //   (it can always report back) plus every `inbox:` pattern the parent holds, whether or not requested (a parent with
   //   `inbox:*` passes on `inbox:*`; transitively every ancestor's inbox, so a deep worker can reach `inbox:desk` to ask
   //   for arbitration). `channel:` entries only on request, intersected with the parent's.
-  //   maxTokens / maxCents are further capped by what the parent and every ancestor still have left in the ledger.
+  //   maxTokens / maxCents are static caps only: a child without a limit of its own gets its parent's number and is
+  //   governed, like every cell, by the live ledgers of its whole ancestor chain (meter / authorize look at the chain
+  //   on every call). What the parent happens to have left at spawn time is NOT frozen into the child — a budget the
+  //   owner raises later, or one a sibling did not use up, is available to it at once.
   //   When parentCellId is a stored cell, the passed bounds are first met with its stored bounds.
   //   Throws NgError("bounds_violation") only when parent.maxDepth < 1. Result satisfies
   //   isSubsetBounds(result, parent, { parentCellId }).
@@ -49,8 +52,8 @@ export interface Gate {
   //   cell or any ancestor → deny; draft artifact unknown / outside the cell's lineage / version out of range → deny;
   //   effective sideEffect = max(declared, derived from the action) (a channel.send outside the owner's addresses is
   //   always external; project.start is always external; [docs/05] workspace.exec with a mutating tool and job.start
-  //   are internal whatever the isolation — work in the owner's real directories is guarded by cwdMode, the
-  //   dispatcher's per-directory write queue and the prompts' red lines); an enabled matching PolicyRule decides (most
+  //   are internal whatever the isolation — work in the owner's real directories is guarded by the prompts' red lines
+  //   and their look-before-you-change rule, not by the kernel); an enabled matching PolicyRule decides (most
   //   specific first); otherwise none/internal/notify_owner → allow, external → defer (approval row + card).
   //   Every allow mints a single-use token bound to hashAction(action).
   //
@@ -66,6 +69,11 @@ export interface Gate {
   approveSync(actionId: string, approverId: string, seenArtifactVersion?: number): ApproveResult;
   /** Invalidate the cell's unused tokens and cancel its pending approvals (cancel/close). */
   revokeSync(cellId: string): void;
+  /**
+   * [ext] Undo revokeSync for this one cell (not its descendants): a closed leaf that is brought back to take a message
+   * may act again. Tokens and cards cancelled by the revoke stay cancelled.
+   */
+  reinstateSync(cellId: string): void;
 
   // ---------- [ext] approvals administration (sync-only; the UI's synchronous transaction API) ----------
   listPendingSync(filter?: PendingFilter): ApprovalRecord[];
@@ -102,9 +110,16 @@ export interface Gate {
   authorizeControlSync(cellId: string, principalId: string, action: ControlAction): { ok: true } | { ok: false; reason: string };
 
   // ---------- [ext] dual ledger ----------
-  usageSync(cellId: string): LedgerUsage;
+  usageSync(cellId: string, opts?: LedgerViewOptions): LedgerUsage;
   /** Human-granted extra allowance for one cell ("追加额度继续"). Owner principal only. */
   raiseBudgetSync(cellId: string, add: { tokens?: number; cents?: number }, approverId: string): LedgerUsage;
+  /**
+   * [ext] "Continue" on a budget card, in one step: every ledger on the chain cell → root that is at hard_stop *right
+   * now* is raised (by `add` — a field left out adds nothing — or by default half its limit and at least enough to leave hard_stop); ledgers that are
+   * not stopped are left alone. So one click lifts a project and its exhausted ancestor together, and a second click
+   * on a sibling's card does not raise the shared ancestor twice. Owner principal only. Returns what was raised.
+   */
+  raiseChainSync(cellId: string, approverId: string, add?: { tokens?: number; cents?: number }): BudgetRaise[];
 
   // ---------- [ext] policy rules: trust grows gradually (docs/03 principle 4) ----------
   listPolicyRulesSync(): PolicyRule[];
@@ -192,6 +207,8 @@ export interface AuthorizeMeta {
   principalId: string;
   epoch: number;
   artifactVersion?: number;
+  /** [ext] The Run asking is a coordinator's wrap-up turn (LedgerViewOptions.wrapUp): the budget stop sits at limit + allowance. */
+  wrapUp?: boolean;
 }
 
 export type AuthorizeResult =
@@ -269,12 +286,37 @@ export interface ApprovalFilter {
 export interface Usage {
   tokens: number;
   billedCents: number;
+  /**
+   * [ext] How many of `tokens` were prompt-cache reads. They are charged against token limits at the Gate's
+   * `cacheReadWeight` (default 0.1) — a resumed CLI session re-reads its whole history from cache every turn, and
+   * counting that at full price exhausts a budget several times faster than the real cost.
+   */
+  cachedTokens?: number;
+}
+
+/**
+ * [ext] How a ledger is read. `wrapUp`: the caller is a coordinating cell with nothing in flight beneath it (the
+ * kernel decides that at the start of a Run). Such a turn — recording a result, parking or finishing a project — may
+ * overdraw each limit on its chain by the Gate's small wrap-up allowance, so a project whose workers used the budget
+ * up can still close its books instead of being stopped one tool call short. Past limit + allowance it is stopped
+ * like everyone else.
+ */
+export interface LedgerViewOptions {
+  wrapUp?: boolean;
+}
+
+/** [ext] One ledger raised by raiseChainSync. */
+export interface BudgetRaise {
+  cellId: string;
+  tokens: number;
+  cents: number;
 }
 
 export type MeterResult = "ok" | "warn" | "hard_stop";
 
 /**
  * Own usage is this cell's Runs; subtree usage includes all descendants. Effective limits = bounds.max* + raised.
+ * Token figures are *charged* tokens: cache reads count at the Gate's cacheReadWeight (usage_log keeps the raw numbers).
  * meter() returns hard_stop if the cell or any ancestor has subtree usage ≥ its effective limit; warn at ≥ 80%.
  * A limit of 0 is therefore exhausted from the start (a cell meant to spend nothing on paid models still needs maxCents > 0
  * if it is to act at all; subscription models that bill $0 are governed by maxTokens).
@@ -293,6 +335,11 @@ export interface LedgerUsage {
   state: MeterResult;
   /** [ext] Nearest cell (self or ancestor) whose ledger causes `state`; null when ok. Raise *that* cell's budget to continue. */
   limitedBy: string | null;
+  /**
+   * [ext] False when the owner has switched budget limits off: usage is still counted and the limits are still
+   * reported, but nothing is warned about, stopped, held or refused for them — `state` is always "ok".
+   */
+  enforced: boolean;
 }
 
 export type TokenCheck =

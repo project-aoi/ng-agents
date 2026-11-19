@@ -1,6 +1,6 @@
 # 上下文交付物（`Artifact`）、提示词组装与偏好治理缺陷单
 
-> **状态**：`open`  
+> **状态**：`fixed（2026-11-19）`  
 > **发现来源**：[2026-11-18 trae-x 真实端到端压测审计](./audits/2026-11-18-traex-live-e2e.md)  
 > **关联设计原则与用例**：[01-product-principles.md](../01-principles/01-product-principles.md)（`P-UX-1`、`P-UX-7`）、[02-kernel-principles.md](../01-principles/02-kernel-principles.md)（`P-KERN-5`）、[uc03](../02-workflows/uc03-human-collaboration-and-engage.md)、[uc04](../02-workflows/uc04-someday-research-and-reactivate.md)
 
@@ -18,6 +18,11 @@
 - **目标修复方向（对齐 `INV-UC03-03` 与 `P-KERN-5`）**：
   - 修复 `artifacts.ts` 更新语句为 `title = COALESCE(?, title)`（仅在显式传入非空新标题时更新，否则保留原标题），并补单元测试；
   - 新增带 `expectedVersion` 乐观锁保护的局部修订工具 `patch_artifact`（支持按目标片段/章节替换或追加），并适当放宽显式读取资源时的单页字符上限。
+- **修复结论（`fixed（2026-11-19）`）**：
+  - 升版未传标题时保留原标题，只有显式传入非空新标题才替换（[packages/context/src/artifacts.ts](../../packages/context/src/artifacts.ts)）。
+  - 新增工具 `patch_artifact`：在 `expectedVersion` 保护下做 `replace` / `append` / `prepend` / `replace_section`（Markdown 章节替换到同级或更高级标题为止）局部修订，版本过期时不覆盖、按 `save_artifact` 的冲突方式报告（[packages/loop/src/tools/context.ts](../../packages/loop/src/tools/context.ts)）。
+  - `read_resource` 默认单页仍为 8,000 字符，显式传 `limit` 时单页最多 64,000 字符（[packages/loop/src/tools/context.ts](../../packages/loop/src/tools/context.ts)、[packages/context/src/evidence.ts](../../packages/context/src/evidence.ts)）。
+  - 回归测试：[packages/context/test/artifacts.test.ts](../../packages/context/test/artifacts.test.ts)（「a version saved without a title keeps the artifact's title; only a non-empty new title replaces it (BUG-006)」）、[packages/loop/test/tools.test.ts](../../packages/loop/test/tools.test.ts)（「kernel.context」下的「patch_artifact」组，以及「reads/writes state, notes, skills, search and resources」中的 `read_resource` 分页断言）。
 
 ---
 
@@ -37,3 +42,9 @@
   - 为偏好存储与 `save_preference` 增加可选 `cwdPrefix?: string` 与 `roles?: string[]` 过滤条件（不传则保持全局通用，向后完全兼容）；
   - 精确改写 `prompts.ts:19`：禁止向用户暴露 `ng-desk` 工作台自身的内部调度黑话，但**必须原样保留被分析代码库、协议与工程领域的真实文件名、标识符及标准技术术语**；
   - 在 `project / worker` 提示词中明确：只读分析允许正常只读 `git fetch`、按需拉取 Git 对象与 `/tmp` 临时文件；调研报告聚焦架构结论与核心生产路径，大批量测试/机械匹配仅给聚合统计与规则，禁止倾倒上百行原始路径清单。
+- **修复结论（`fixed（2026-11-19）`，四个子项全部完成）**：
+  1. **已内联技能不再列入 `# Skills`**：`hydrate` 从待读索引中滤掉已内联进当前角色系统提示词的技能，滤完为空时不再输出索引（[packages/context/src/hydrate.ts](../../packages/context/src/hydrate.ts)）。
+  2. **偏好作用域**：偏好可用 `cwdPrefix`（绝对目录）与 `roles` 限定适用范围（`KnowledgeApplies`，上下文 schema v4 新增 `applies` 列，旧行为空即全局适用）；`save_note` 与控制面的 `save_preference` 均可传入，普通笔记不接受这两个限定（[packages/context/src/knowledge.ts](../../packages/context/src/knowledge.ts)、[packages/protocol/src/schema/context.ts](../../packages/protocol/src/schema/context.ts)、[packages/loop/src/tools/context.ts](../../packages/loop/src/tools/context.ts)、[apps/gtd-desk/src/agent/tools.ts](../../apps/gtd-desk/src/agent/tools.ts)）。
+  3. **禁词规则收窄**：`COMMON` 只禁止把工作台自身的调度机制写进给人看的文字，并写明被描述代码或系统的真实文件名、标识符、命令、分支名与协议 / API 术语（如 `code_cell.rs`、`token`、`queue`、`epoch`）一律原样保留、不翻译不转述（[presets/src/shared/prompts.ts](../../presets/src/shared/prompts.ts)）。
+  4. **只读工作与报告篇幅**：`project` 与 `worker` 提示词写明只读工作可以 `git fetch`、构建、跑测试并在临时目录写草稿文件，协调器不要再自行加码禁令；报告给结论与支撑推理，大批量证据只给数量与规则，不倾倒原始路径清单（[presets/src/shared/prompts.ts](../../presets/src/shared/prompts.ts)）。
+  - 回归测试：[packages/context/test/hydrate.test.ts](../../packages/context/test/hydrate.test.ts)（「does not list an inlined skill again as one to read on demand; with nothing else left there is no index」及「hydrate: preferences limited to a directory or a role」组）、[packages/context/test/knowledge.test.ts](../../packages/context/test/knowledge.test.ts)（「limits only preferences, to an absolute directory and/or role names」）、[presets/test/conventions.test.ts](../../presets/test/conventions.test.ts)（「conventions: every prompt names only tools its role has」：校验各角色提示词只点名本角色拥有的工具，`COMMON` 中的术语示例列为非工具词）。子项 3、4 为提示词措辞，测试中没有针对其文字本身的断言。

@@ -99,7 +99,8 @@ function toBounds(b: z.infer<typeof boundsInput>): Partial<PolicyBounds> {
 const canSpawn = ({ bounds }: { bounds: PolicyBounds }) => bounds.maxDepth > 0;
 
 /**
- * `kernel.cells`: spawn_cell, update_cell, control_cell, close_cell. All but update_cell (own watches/schedules) need `bounds.maxDepth > 0`.
+ * `kernel.cells`: spawn_cell, inspect_cell, update_cell, control_cell, close_cell. All but update_cell (own
+ * watches/schedules) need `bounds.maxDepth > 0` — a leaf (worker, watcher) has none of them.
  * The kernel attenuates the requested bounds (child ⊆ parent) and enforces maxConcurrentChildren; control is limited to
  * descendants by Gate.
  */
@@ -110,8 +111,8 @@ export function cellsToolset(registry: Registry): Toolset {
     availableFor: canSpawn,
     description: [
       "Start a child cell for work that should not block you. It runs in the background and reports to your inbox (cell.result / cell.progress); your in-flight cells are listed at the end of every wake-up message.",
-      "Presets — worker: a one-shot executor for one piece of work (reads/changes code, runs commands, researches); it reports once and the kernel closes it. project: a persistent coordinator that owns one outcome over many steps (keeps the plan, the records and the shared artifacts; hands every piece of heavy work to one-shot workers). watcher: a light one-shot checker that looks at a condition now and then (an MR merged? a reply arrived? a file appeared?) and reports when it holds. sensor: a persistent scheduled source. hub: a persistent router for one stream of direct messages. inline: a light helper.",
-      "cwd is the directory on this machine the child works in (an absolute path that exists; ask the owner when you do not know it — never guess). cwdMode read = analysis only, runs in parallel with anything; write = may change files and run commands — the kernel lets one writer at a time into a work tree and queues the rest, so just spawn. A child without cwd inherits yours.",
+      "Presets — worker: an executor for one piece of work (reads/changes code, runs commands, researches). When its turn is over you are told, and it stays dormant — costing nothing — until a message wakes it with everything it knows; it is closed with you. project: a persistent coordinator that owns one outcome over many steps (keeps the plan, the records and the shared artifacts; hands every piece of heavy work to workers). watcher: a light checker that looks at a condition now and then (an MR merged? a reply arrived? a file appeared?), reports when it holds and is then closed. sensor: a persistent scheduled source. hub: a persistent router for one stream of direct messages. inline: a light helper.",
+      "cwd is the directory on this machine the child works in (an absolute path that exists; ask the owner when you do not know it — never guess). A child without cwd inherits yours. It starts at once: nothing queues or locks a directory. The note \"active workspaces\" at the end of your wake-up message shows who is working where right now — if someone is already changing that repository, say in the instruction how to share it (only look; or work in a `git worktree` of its own), or send the work to the cell that is already there.",
       "Its permissions are always a subset of yours. Give it everything it needs in the instruction: it does not see your conversation (unless contextMode fork_prefix).",
     ].join(" "),
     input: z.object({
@@ -120,7 +121,6 @@ export function cellsToolset(registry: Registry): Toolset {
       instruction: z.string().min(1).describe("what to do, the context it needs (branch, earlier findings, artifact ids), what done looks like, what to report back"),
       input: z.unknown().optional().describe("structured data for the child"),
       cwd: z.string().optional().describe("absolute path of the directory it works in; default: yours"),
-      cwdMode: z.enum(["read", "write"]).optional().describe("default: write for worker/watcher/sensor, read for project/hub/inline"),
       contextMode: z.enum(["isolated", "fork_prefix"]).optional(),
       modelTier: z.enum(["fast", "strong"]).optional(),
       allowedTools: z.array(z.enum(TOOL_KINDS)).optional().describe("workspace tools the child's model may see"),
@@ -153,21 +153,38 @@ export function cellsToolset(registry: Registry): Toolset {
       }
       const spec: CellSpec = { preset: args.preset, title: args.title, processor };
       if (args.cwd) spec.cwd = args.cwd;
-      if (args.cwdMode) spec.cwdMode = args.cwdMode;
       if (args.contextMode) spec.contextMode = args.contextMode;
       if (args.bounds) spec.bounds = toBounds(args.bounds);
       if (args.watches?.length) spec.watches = toWatches(args.watches);
       if (args.schedules?.length) spec.schedules = toSchedules(args.schedules);
       if (args.meta && Object.keys(args.meta).length) spec.meta = args.meta;
       const addr = await ctx.ports.spawnCell(spec, args.input === undefined ? args.instruction : { instruction: args.instruction, input: args.input });
-      const mode = args.cwdMode ?? preset.defaults.cwdMode ?? "read";
-      const queue = mode === "write" ? " If another cell is writing in the same work tree it starts when that one is done — nothing for you to manage." : "";
       return {
-        output: `Spawned "${args.title}" (${args.preset}) as ${addr} — cell id ${cellIdOf(addr)}. It reports back to your inbox.${queue}`,
+        output: `Spawned "${args.title}" (${args.preset}) as ${addr} — cell id ${cellIdOf(addr)}. It starts now; you are woken when its turn is over.`,
         data: { addr },
         // It will wake this cell with its result: a run that ends here is waiting, not finished.
         awaitsWakeup: true,
       };
+    },
+  });
+  const inspectCellTool = defineTool({
+    name: "inspect_cell",
+    kind: "kernel",
+    availableFor: canSpawn,
+    description: [
+      "Read what one of your cells did and was told — the factual record, not its own account: messages it received (the owner's direct ones are marked), what it said, the files it changed, the commands it ran and how they ended, the artifacts it touched. The same view whichever agent ran it.",
+      "Use it when a cell's turn is over (you are told so, with the range of records the turn covers), before you rely on its work, and whenever the owner may have talked to it directly. Without afterSeq you get what is new since you last looked, and the roster's \"new since your last inspect_cell\" mark for that cell is cleared up to where the answer ends.",
+    ].join(" "),
+    input: z.object({
+      cellId: z.string().min(1).describe("the cell to look into (any cell id; usually one of yours from the in-flight list)"),
+      afterSeq: z.number().int().min(0).optional().describe("show records after this number (0 = from the start). Default: after the last one you have seen"),
+      detail: z.enum(["summary", "full"]).optional().describe('summary (default): one line per step. full: every tool input and output as recorded — use it with afterSeq for the one stretch you need'),
+    }),
+    async handler(args, ctx) {
+      const inspect = ctx.ports.inspectCell;
+      if (!inspect) return { output: "inspect_cell is not available in this environment.", isError: true };
+      const r = await inspect.call(ctx.ports, args.cellId, { ...(args.afterSeq !== undefined ? { afterSeq: args.afterSeq } : {}), ...(args.detail ? { detail: args.detail } : {}) });
+      return { output: r.text, data: { fromSeq: r.fromSeq, toSeq: r.toSeq, more: r.more, state: r.state, directChats: r.directChats, artifactIds: r.artifactIds } };
     },
   });
   const updateCell = defineTool({
@@ -215,7 +232,7 @@ export function cellsToolset(registry: Registry): Toolset {
       const closed = /closed/i.test(r.reason ?? "");
       return {
         output: closed
-          ? `NOT APPLIED — ${args.cellId} is closed (it already finished). If the work still needs doing, start a new worker with spawn_cell and give it the context.`
+          ? `NOT APPLIED — ${args.cellId} is closed. If the work still needs doing, start a new worker with spawn_cell and give it the context.`
           : `Not applied to ${args.cellId}: ${r.reason ?? "refused"}.`,
         isError: true,
         data: r,
@@ -239,7 +256,7 @@ export function cellsToolset(registry: Registry): Toolset {
   return {
     name: CELLS_TOOLSET,
     description: "Spawn, steer and close child cells (requires maxDepth > 0).",
-    tools: [spawnCell, updateCell, controlCell, closeCell],
+    tools: [spawnCell, inspectCellTool, updateCell, controlCell, closeCell],
   };
 }
 

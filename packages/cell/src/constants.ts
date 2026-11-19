@@ -2,10 +2,10 @@ import { TOOL_KINDS, type Address, type BoundsInit, type ToolKind } from "@ng/pr
 
 /**
  * What a root cell (the desk) holds when its creator does not say otherwise. The desk delegates, so it holds the
- * top-level authority (every tool, any channel with Gate approval, every inbox) while its own cwdMode is "read";
+ * top-level authority (every tool, any channel with Gate approval, every inbox) and by its prompt only reads;
  * isolation "none" (docs/05: the owner's real machine) is a floor a child may raise explicitly. Budgets are
  * cumulative and must be positive: a zero budget is exhausted from the start (the owner raises them from a card).
- * maxConcurrentChildren counts active one-shot children only (docs/05 §3.1), so parked projects never fill it.
+ * maxConcurrentChildren counts leaf children that are at work only, so parked projects and dormant workers never fill it.
  */
 export const DEFAULT_ROOT_BOUNDS: Readonly<Required<Omit<BoundsInit, "secretRefs">>> & Pick<BoundsInit, "secretRefs"> = {
   tools: [...TOOL_KINDS],

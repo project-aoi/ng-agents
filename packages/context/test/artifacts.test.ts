@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { artifactsRepo, isNgError, markdownDeliverable, textDeliverable } from "@ng/protocol";
+import { artifactsRepo, get, isNgError, markdownDeliverable, textDeliverable, type Deliverable } from "@ng/protocol";
 import { setup } from "./helpers";
 
 const agent = (body: string, expectedVersion?: number) => ({
@@ -36,6 +36,30 @@ describe("versioned artifacts", () => {
     expect(h.store.listArtifactsSync("desk").map((x) => x.artifactId)).toEqual(["draft"]);
     // Gate and the kernel read the same rows through the protocol's read-only repo.
     expect(artifactsRepo(h.db).getVersion("draft", 3)?.content.body).toBe("v3 by me");
+  });
+
+  it("a version saved without a title keeps the artifact's title; only a non-empty new title replaces it (BUG-006)", () => {
+    const h = setup();
+    const write = (content: Deliverable, updatedBy: "agent" | "human", expectedVersion?: number) =>
+      h.store.commitSync("desk", { artifact: { artifactId: "rep", content, updatedBy, ...(expectedVersion !== undefined ? { expectedVersion } : {}) } });
+    const titleColumn = () => get<{ title: string | null }>(h.db, "SELECT title FROM artifacts WHERE artifact_id = 'rep'")?.title;
+
+    expect(write(markdownDeliverable("v1", "调研报告"), "agent")).toEqual({ ok: true, artifactVersion: 1 });
+    expect(write(markdownDeliverable("v2"), "agent", 1)).toEqual({ ok: true, artifactVersion: 2 });
+    expect(h.store.getArtifactSync("rep")?.content).toEqual({ format: "markdown", title: "调研报告", body: "v2" });
+    expect(h.store.getArtifactVersionSync("rep", 2)?.content.title).toBe("调研报告");
+    expect(titleColumn()).toBe("调研报告");
+    // An empty or blank title is "no title given", from a human edit too.
+    expect(write({ format: "markdown", title: "  ", body: "v3" }, "human", 2)).toEqual({ ok: true, artifactVersion: 3 });
+    expect(h.store.getArtifactSync("rep")?.content.title).toBe("调研报告");
+
+    expect(write(markdownDeliverable("v4", "调研报告（终稿）"), "agent", 3)).toEqual({ ok: true, artifactVersion: 4 });
+    expect(h.store.getArtifactSync("rep")?.content).toMatchObject({ title: "调研报告（终稿）", body: "v4" });
+    expect(titleColumn()).toBe("调研报告（终稿）");
+    expect(h.store.listArtifactVersionsSync("rep").map((v) => v.content.title)).toEqual(["调研报告", "调研报告", "调研报告", "调研报告（终稿）"]);
+    // The title stays searchable after an untitled revision.
+    expect(write(markdownDeliverable("v5"), "agent", 4)).toEqual({ ok: true, artifactVersion: 5 });
+    expect(h.store.searchHistorySync("desk", "终稿", { scope: "global" }).some((s) => s.source === "artifact")).toBe(true);
   });
 
   it("a background refresh never overwrites a human edit: it is rejected and parked", async () => {

@@ -12,6 +12,7 @@ import {
   type Address,
   type AuthorizeResult,
   type CancelScope,
+  type CellInspection,
   type CellMessageDraft,
   type CellSpec,
   type ChildSummary,
@@ -25,6 +26,7 @@ import {
   type EvidenceAppendResult,
   type ExecResult,
   type InboxAddr,
+  type InspectCellOptions,
   type KnowledgePatch,
   type MeterResult,
   type ModelMessage,
@@ -92,6 +94,26 @@ export interface FakeRunOptions {
   settleSelf?: (request: SelfSettleRequest) => void | Promise<void>;
   /** What `activeWorkspaces()` reports. Default []. */
   activeWorkspaces?: WorkspaceOccupancy[];
+  /**
+   * Kernel stand-in for `inspectCell`: a fixed answer or a function of the call. Default: `fakeInspection(cellId)`.
+   * Every call is recorded in `log.inspections` with its result.
+   */
+  inspectCell?: CellInspection | ((cellId: string, opts: InspectCellOptions | undefined) => CellInspection | Promise<CellInspection>);
+}
+
+/** The canned answer of the fake `inspectCell` port. */
+export function fakeInspection(cellId: string): CellInspection {
+  return {
+    cellId,
+    title: "fake worker",
+    state: "dormant",
+    fromSeq: 1,
+    toSeq: 3,
+    more: false,
+    directChats: 0,
+    artifactIds: [],
+    text: `#1 inbound: do the task\n#2 bash: pnpm test → exit 0\n#3 said: done`,
+  };
 }
 
 export interface FakeLog {
@@ -123,6 +145,8 @@ export interface FakeLog {
   clearedWaits: string[];
   /** settleSelf requests, in call order (the kernel acts on the last one). */
   settled: SelfSettleRequest[];
+  /** inspectCell calls (opts as passed), with what the (fake) kernel answered. */
+  inspections: Array<{ cellId: string; opts?: InspectCellOptions; result: CellInspection }>;
 }
 
 export interface FakeRunPorts extends RunPorts {
@@ -138,7 +162,7 @@ export interface FakeRunPorts extends RunPorts {
   readonly openWaits: Map<string, { reason: string; timeoutAt?: number }>;
   /** Simulate the human saving a new version in the Engage editor. */
   humanEdit(artifactId: string, body: string): VersionedArtifact;
-  /** Sum of everything metered so far. */
+  /** Sum of everything metered so far (`cachedTokens` only once some were metered). */
   totalUsage(): Usage;
 }
 
@@ -223,6 +247,7 @@ export function createFakeRun(opts: FakeRunOptions = {}): FakeRun {
     waits: [],
     clearedWaits: [],
     settled: [],
+    inspections: [],
   };
   const state = new Map<string, unknown>();
   const artifacts = new Map<string, VersionedArtifact>();
@@ -411,9 +436,10 @@ export function createFakeRun(opts: FakeRunOptions = {}): FakeRun {
       return result;
     },
     meter(usage) {
-      log.metered.push(usage);
+      log.metered.push({ ...usage });
       total.tokens += usage.tokens;
       total.billedCents += usage.billedCents;
+      if (usage.cachedTokens) total.cachedTokens = (total.cachedTokens ?? 0) + usage.cachedTokens;
       return (opts.meter ?? defaultMeter)(usage, { ...total });
     },
     drainSteer() {
@@ -465,6 +491,12 @@ export function createFakeRun(opts: FakeRunOptions = {}): FakeRun {
     activeWorkspaces() {
       return opts.activeWorkspaces ?? [];
     },
+    async inspectCell(target, o) {
+      const answer = opts.inspectCell ?? fakeInspection;
+      const result = typeof answer === "function" ? await answer(target, o) : answer;
+      log.inspections.push({ cellId: target, ...(o !== undefined ? { opts: o } : {}), result });
+      return result;
+    },
     openWaits,
     pushInbound(...messages) {
       inboundQueue.push(...messages.map(asInbound));
@@ -485,7 +517,7 @@ export function createFakeRun(opts: FakeRunOptions = {}): FakeRun {
     ...(opts.workspaceRoot !== undefined
       ? {
           async workspaceAccess() {
-            return { root: opts.workspaceRoot!, isolation: bounds.isolation, tools: opts.workspaceTools ?? [...bounds.tools], cwdMode: spec.cwdMode === "write" ? "write" : "read" };
+            return { root: opts.workspaceRoot!, isolation: bounds.isolation, tools: opts.workspaceTools ?? [...bounds.tools] };
           },
         }
       : {}),

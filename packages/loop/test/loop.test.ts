@@ -59,7 +59,7 @@ describe("llm run", () => {
     expect(names).toContain("read");
     expect(names).toContain("peek");
     // complete_self / pause_self need a parent too (and a persistent cell)
-    for (const hidden of ["bash", "write", "edit", "job_start", "shell", "spawn_cell", "close_cell", "control_cell", "report_to_parent", "handback", "complete_self", "pause_self"]) {
+    for (const hidden of ["bash", "write", "edit", "job_start", "shell", "spawn_cell", "inspect_cell", "close_cell", "control_cell", "report_to_parent", "handback", "complete_self", "pause_self"]) {
       expect(names).not.toContain(hidden);
     }
     expect(names).toContain("request_approval");
@@ -70,17 +70,18 @@ describe("llm run", () => {
     expect(names).toContain("update_cell");
     expect(model.calls[1]!.tools).toEqual(model.calls[0]!.tools);
 
-    // a child with depth left, a channel grant and cwdMode "write" sees spawn, send and the mutating workspace tools
+    // a child with depth left and a channel grant sees spawn, inspect, send and the mutating workspace tools (here with
+    // the deprecated cwdMode "write" still on its spec, which changes nothing)
     const model2 = new ScriptedModelClient([say("ok")]);
     const run2 = createFakeRun({ spec: { ...llm(toolsets), cwdMode: "write" }, batch: ["hi"] });
     await createAgentLoop({ model: model2, registry }).run(run2.snapshot, run2.ports, run2.controller.signal);
     const names2 = model2.calls[0]!.tools.map((t) => t.name);
-    for (const shown of ["bash", "write", "edit", "code_rpc", "job_start", "spawn_cell", "send_message", "report_to_parent", "handback", "shell", "complete_self", "pause_self"]) {
+    for (const shown of ["bash", "write", "edit", "code_rpc", "job_start", "spawn_cell", "inspect_cell", "send_message", "report_to_parent", "handback", "shell", "complete_self", "pause_self"]) {
       expect(names2).toContain(shown);
     }
 
-    // the same cell in cwdMode "read" (the default) is shown exactly the same tools: cwdMode only says whether the cell
-    // queues for its work tree's write slot; what it does with its tools is the prompt's business, not a filter's
+    // the same cell without cwdMode is shown exactly the same tools: the field is deprecated and has no effect; what a
+    // cell does with its tools is the prompt's business, not a filter's
     const model3 = new ScriptedModelClient([say("ok")]);
     const run3 = createFakeRun({ spec: llm(toolsets), batch: ["hi"] });
     await createAgentLoop({ model: model3, registry }).run(run3.snapshot, run3.ports, run3.controller.signal);
@@ -91,14 +92,16 @@ describe("llm run", () => {
     expect(names3).toEqual(names2);
     expect(model3.calls[0]!.tools).toEqual(model2.calls[0]!.tools);
 
-    // a one-shot child reports a result once instead of closing itself
-    const model4 = new ScriptedModelClient([say("ok")]);
-    const run4 = createFakeRun({ spec: { ...llm(toolsets), lifetime: "one_shot" }, batch: ["hi"] });
-    await createAgentLoop({ model: model4, registry }).run(run4.snapshot, run4.ports, run4.controller.signal);
-    const names4 = model4.calls[0]!.tools.map((t) => t.name);
-    expect(names4).toContain("report_to_parent");
-    expect(names4).not.toContain("complete_self");
-    expect(names4).not.toContain("pause_self");
+    // a leaf child (one-shot or wakeable) reports a result instead of closing itself
+    for (const lifetime of ["one_shot", "wakeable"] as const) {
+      const model4 = new ScriptedModelClient([say("ok")]);
+      const run4 = createFakeRun({ spec: { ...llm(toolsets), lifetime }, batch: ["hi"] });
+      await createAgentLoop({ model: model4, registry }).run(run4.snapshot, run4.ports, run4.controller.signal);
+      const names4 = model4.calls[0]!.tools.map((t) => t.name);
+      expect(names4).toContain("report_to_parent");
+      expect(names4).not.toContain("complete_self");
+      expect(names4).not.toContain("pause_self");
+    }
   });
 
   it("refuses a channel send from a cell without any channel grant (send_message is offered for inbox messages)", async () => {
@@ -346,8 +349,8 @@ describe("llm run", () => {
     expect(await createAgentLoop({ model: waiting, registry }).run(w.snapshot, w.ports, w.controller.signal)).toBe("yielded_waiting");
     expect(waiting.calls).toHaveLength(1);
 
-    // job_start is a bash-kind tool: only a cell that holds cwdMode "write" has it
-    const j = createFakeRun({ spec: { ...llm(["workspace"]), cwdMode: "write" }, batch: ["run the tests"] });
+    // job_start (a bash-kind tool) is offered to any cell whose bounds allow bash
+    const j = createFakeRun({ spec: llm(["workspace"]), batch: ["run the tests"] });
     const jobs = new ScriptedModelClient([call("job_start", { command: "pnpm test" }), say("Tests are running; I'll report when done.")]);
     expect(await createAgentLoop({ model: jobs, registry }).run(j.snapshot, j.ports, j.controller.signal)).toBe("yielded_waiting");
     expect(j.ports.log.jobs[0]!.command).toBe("pnpm test");

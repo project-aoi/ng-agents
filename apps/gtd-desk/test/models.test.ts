@@ -67,10 +67,12 @@ describe("GET/PUT /api/models on a CLI backend", () => {
       engine: "claude",
       models: [OPUS, SONNET, HAIKU],
       recommended: { model: "opus", label: "Opus 5.5", effort: "xhigh" },
+      // the fast tier's auto choice is the light model the CLI lists, not the flagship at its top effort
+      recommendedFast: { model: "haiku", label: "Haiku 5" },
       fetchedAt: T0,
       error: null,
       selection: { strong: { mode: "auto" }, fast: { mode: "auto" } },
-      effective: { strong: { model: "opus", label: "Opus 5.5", effort: "xhigh" }, fast: { model: "opus", label: "Opus 5.5", effort: "xhigh" } },
+      effective: { strong: { model: "opus", label: "Opus 5.5", effort: "xhigh" }, fast: { model: "haiku", label: "Haiku 5" } },
     });
     // fetched once (at kernel start); a plain GET uses the cached list
     expect(src.calls).toEqual(["claude"]);
@@ -84,7 +86,7 @@ describe("GET/PUT /api/models on a CLI backend", () => {
     expect(r.status).toBe(200);
     expect(r.json.selection.strong).toEqual({ mode: "fixed", model: "sonnet", effort: "medium" });
     expect(r.json.effective.strong).toEqual({ model: "sonnet", label: "Sonnet 5", effort: "medium" });
-    expect(r.json.effective.fast).toEqual({ model: "opus", label: "Opus 5.5", effort: "xhigh" });
+    expect(r.json.effective.fast).toEqual({ model: "haiku", label: "Haiku 5" });
 
     const m = await d.get<ModelsDTO>("/api/models");
     expect(m.selection).toEqual({ strong: { mode: "fixed", model: "sonnet", effort: "medium" }, fast: { mode: "auto" } });
@@ -145,6 +147,9 @@ describe("GET/PUT /api/models on a CLI backend", () => {
     expect(m.fetchedAt).toBe(T0 + 5 * MIN);
     // auto follows the new recommendation, and so does the top bar
     expect(m.effective.strong).toEqual({ model: "opus-6", label: "Opus 6", effort: "xhigh" });
+    // no light model in the new list: fast runs the new first choice at a lower effort
+    expect(m.recommendedFast).toEqual({ model: "opus-6", label: "Opus 6", effort: "high" });
+    expect(m.effective.fast).toEqual({ model: "opus-6", label: "Opus 6", effort: "high" });
     expect((await d.get<StatusDTO>("/api/status")).model).toBe("Opus 6 · xhigh");
 
     src.failNext("claude: not logged in");

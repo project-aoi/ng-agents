@@ -3,7 +3,7 @@ import type { ButtonDTO, ProjectMutationResponse, ProjectRowDTO, RadarDTO, Revie
 import { api, callButton } from "../api";
 import { BallChip, ButtonRow, Chevron, ProgressBar } from "../components/controls";
 import { Empty, ErrorState, Loading } from "../components/states";
-import { syncServerClock, toFailure, useNavigate, useNow, useResource, useStatus, useToast } from "../state";
+import { parseRoute, syncServerClock, toFailure, useNavigate, useNow, useOpenReport, useResource, useStatus, useToast } from "../state";
 import { dueText, whenText } from "../text";
 
 export function RadarView() {
@@ -96,9 +96,13 @@ export function RadarView() {
 
 function ProjectRow({ row, now, onRun }: { row: ProjectRowDTO; now: number; onRun(b: ButtonDTO, input?: Record<string, unknown>): Promise<void> }) {
   const navigate = useNavigate();
+  const openReport = useOpenReport();
   const [open, setOpen] = useState(false);
   const ball = row.ball;
   const hiddenActions = row.openActions.length;
+  // Older servers may not send these yet: a row without them simply shows no links.
+  const reports = row.artifacts ?? [];
+  const agents = row.agents ?? null;
 
   return (
     <li className={`project${row.stalled ? " stalled" : ""}${row.paused ? " paused" : ""}${row.lifecycle === "someday" ? " is-someday" : ""}`}>
@@ -136,6 +140,30 @@ function ProjectRow({ row, now, onRun }: { row: ProjectRowDTO; now: number; onRu
         </div>
       ) : (
         row.lifecycle === "someday" && <p className="muted small">后台资源已全部停下，重新启动后再推进。</p>
+      )}
+
+      {(reports.length > 0 || agents) && (
+        <div className="project-links">
+          {reports.map((a) => (
+            <button key={a.artifactId} type="button" className="btn sm report-btn" onClick={() => openReport(a)} title={`打开「${a.title}」v${a.version}`}>
+              查看报告：{a.title} (v{a.version})
+            </button>
+          ))}
+          {agents && (
+            <a
+              className="link-btn agents-link"
+              href={agents.href}
+              onClick={(e) => {
+                // Same route the hash would give, through the app's own navigation (closes panels, keeps history).
+                if (!agents.href.startsWith("#")) return;
+                e.preventDefault();
+                navigate(parseRoute(agents.href));
+              }}
+            >
+              {agents.label}
+            </a>
+          )}
+        </div>
       )}
 
       {(row.progress || row.waiting) && (

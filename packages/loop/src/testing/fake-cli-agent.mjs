@@ -9,10 +9,14 @@
 //   { text }                                   assistant text
 //   { mcp, args }                              tools/call on the kernel bridge (result logged)
 //   { native, input, output, kind?, path? }    a native tool (agy: asks the client for permission first)
-//   { usage: { tokens, costUsd? } }            reported usage for this turn (claude: also mid-turn)
+//   { usage: { tokens, costUsd?, cached? } }   reported usage for this turn (claude: also mid-turn; codex: reported as the
+//                                              session's running total, like the real CLI; cached: cache reads among tokens,
+//                                              reported in each CLI's own cache-read field)
+//   { item: {...} }                            codex only: a raw item emitted as item.completed (e.g. custom_tool_call)
 //   { sleep: ms }                              interruptible wait (cancel/interrupt/steer)
 //   { fail: message }                          the turn fails
-// Everything observable is appended to `log` as JSON lines (argv, cwd, env names, prompts, MCP results, decisions).
+// Everything observable is appended to `log` as JSON lines (argv, cwd, env names, prompts, MCP results, decisions, the
+// system text each CLI was handed: claude_system / codex_config.developerInstructions / acp_session.systemPrompt).
 import { spawn } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
@@ -111,7 +115,7 @@ function mcpClient(server) {
 
 // ---------- turn runner (format-neutral; emitters per engine) ----------
 async function runTurn(turn, emit, mcp, signal) {
-  let usage = { tokens: 0, costUsd: 0 };
+  let usage = { tokens: 0, costUsd: 0, cached: 0 };
   for (const a of turn.actions ?? []) {
     if (signal?.aborted) return { stopped: true, usage };
     if (a.text !== undefined) emit.text(a.text);
@@ -124,9 +128,10 @@ async function runTurn(turn, emit, mcp, signal) {
       const callId = `tool_${randomUUID().slice(0, 8)}`;
       await emit.native(callId, a);
     } else if (a.usage !== undefined) {
-      usage = { tokens: usage.tokens + (a.usage.tokens ?? 0), costUsd: usage.costUsd + (a.usage.costUsd ?? 0) };
+      usage = { tokens: usage.tokens + (a.usage.tokens ?? 0), costUsd: usage.costUsd + (a.usage.costUsd ?? 0), cached: usage.cached + (a.usage.cached ?? 0) };
       emit.usage?.(a.usage);
-    } else if (a.sleep !== undefined) await sleep(a.sleep, signal);
+    } else if (a.item !== undefined) emit.item?.(a.item);
+    else if (a.sleep !== undefined) await sleep(a.sleep, signal);
     else if (a.fail !== undefined) return { error: a.fail, usage };
   }
   return { usage, stopped: signal?.aborted === true };
@@ -142,6 +147,8 @@ async function claude() {
   const mcpConfig = JSON.parse(readFileSync(argValue("--mcp-config"), "utf8"));
   const server = Object.values(mcpConfig.mcpServers)[0];
   const serverName = Object.keys(mcpConfig.mcpServers)[0];
+  const systemFile = argValue("--append-system-prompt-file");
+  if (systemFile) log({ type: "claude_system", text: readFileSync(systemFile, "utf8") });
   const resume = argValue("--resume");
   const fork = argv.includes("--fork-session");
   let sessionId;
@@ -208,7 +215,7 @@ async function claude() {
         out({ type: "assistant", message: { id: `msg_${++msgN}`, role: "assistant", content: [{ type: "tool_use", id, name: a.native, input: a.input ?? {} }], usage: { input_tokens: 1, output_tokens: 1 } }, parent_tool_use_id: null, session_id: sessionId });
         out({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: a.output ?? "ok", is_error: false }] }, parent_tool_use_id: null, session_id: sessionId });
       },
-      usage: (u) => out({ type: "assistant", message: { id: `msg_${++msgN}`, role: "assistant", content: [], usage: { input_tokens: u.tokens ?? 0, output_tokens: 0 } }, parent_tool_use_id: null, session_id: sessionId }),
+      usage: (u) => out({ type: "assistant", message: { id: `msg_${++msgN}`, role: "assistant", content: [], usage: { input_tokens: (u.tokens ?? 0) - (u.cached ?? 0), output_tokens: 0, cache_read_input_tokens: u.cached ?? 0 } }, parent_tool_use_id: null, session_id: sessionId }),
     };
     const r = await runTurn(nextTurn(), emit, mcp, current.signal);
     const tokens = r.usage.tokens + msgN * 2;
@@ -221,7 +228,7 @@ async function claude() {
       session_id: sessionId,
       total_cost_usd: 999,
       queued_turn_count: queue.length,
-      model_usage_since_last_result: { "claude-fake": { inputTokens: tokens, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUSD: r.usage.costUsd } },
+      model_usage_since_last_result: { "claude-fake": { inputTokens: tokens - r.usage.cached, outputTokens: 0, cacheReadInputTokens: r.usage.cached, cacheCreationInputTokens: 0, costUSD: r.usage.costUsd } },
     });
     msgN = 0;
     current = null;
@@ -285,6 +292,7 @@ async function codex() {
     text: (t) => out({ type: "item.completed", item: { id: `item_${item++}`, type: "agent_message", text: t } }),
     mcpStart: (id, name, args) => out({ type: "item.started", item: { id: `item_${item}`, type: "mcp_tool_call", server: serverName, tool: name, arguments: args, status: "in_progress" } }),
     mcpEnd: (id, name, args, r) => out({ type: "item.completed", item: { id: `item_${item++}`, type: "mcp_tool_call", server: serverName, tool: name, arguments: args, result: { content: [{ type: "text", text: r.text }] }, status: "completed" } }),
+    item: (raw) => out({ type: "item.completed", item: { id: `item_${item++}`, ...raw } }),
     native: async (id, a) => {
       out({ type: "item.started", item: { id: `item_${item}`, type: "command_execution", command: a.input?.command ?? "true", status: "in_progress" } });
       out({ type: "item.completed", item: { id: `item_${item++}`, type: "command_execution", command: a.input?.command ?? "true", aggregated_output: a.output ?? "", exit_code: 0, status: "completed" } });
@@ -297,7 +305,14 @@ async function codex() {
   });
   const r = await runTurn(nextTurn(), emit, mcp, ac.signal);
   if (r.error) out({ type: "turn.failed", error: { message: r.error } });
-  else out({ type: "turn.completed", usage: { input_tokens: r.usage.tokens, cached_input_tokens: 0, output_tokens: 0 } });
+  else {
+    // Like the real CLI: the usage of a (resumed or forked) thread is its running total since it was created.
+    const sess = JSON.parse(readFileSync(sessionFile(threadId), "utf8"));
+    const base = sess.usage ?? (sess.from && sessionExists(sess.from) ? JSON.parse(readFileSync(sessionFile(sess.from), "utf8")).usage : null) ?? { tokens: 0, cached: 0 };
+    sess.usage = { tokens: base.tokens + r.usage.tokens, cached: base.cached + r.usage.cached };
+    writeFileSync(sessionFile(threadId), JSON.stringify(sess));
+    out({ type: "turn.completed", usage: { input_tokens: sess.usage.tokens, cached_input_tokens: sess.usage.cached, output_tokens: 0 } });
+  }
   mcp.close();
   log({ type: "exit" });
   process.exit(0);
@@ -338,7 +353,7 @@ async function agy() {
     };
     const r = await runTurn(nextTurn(), emit, mcp, signal);
     current = null;
-    const usage = { inputTokens: r.usage.tokens, outputTokens: 0, cachedReadTokens: 0, cachedWriteTokens: 0, thoughtTokens: 0, totalTokens: r.usage.tokens };
+    const usage = { inputTokens: r.usage.tokens - r.usage.cached, outputTokens: 0, cachedReadTokens: r.usage.cached, cachedWriteTokens: 0, thoughtTokens: 0, totalTokens: r.usage.tokens };
     if (r.error) out({ jsonrpc: "2.0", id, error: { code: -32603, message: r.error } });
     else out({ jsonrpc: "2.0", id, result: { stopReason: signal.aborted ? "cancelled" : "end_turn", usage } });
   }

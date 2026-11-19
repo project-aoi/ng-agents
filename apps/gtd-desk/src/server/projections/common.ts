@@ -12,7 +12,26 @@ import {
 /** What the projections read: the kernel's stores and read models, never its mutating methods. */
 export type DeskKernel = Pick<
   Kernel,
-  "context" | "gate" | "hub" | "inbox" | "clock" | "registry" | "getCell" | "listCells" | "tree" | "stats" | "deskCellId" | "ownerPrincipal"
+  | "context"
+  | "gate"
+  | "hub"
+  | "inbox"
+  | "clock"
+  | "registry"
+  | "getCell"
+  | "listCells"
+  | "tree"
+  | "stats"
+  | "deskCellId"
+  | "ownerPrincipal"
+  | "ownerAddresses"
+  | "db"
+  | "workspace"
+  | "agentBackend"
+  | "activityOf"
+  | "activeWorkspaces"
+  | "listWaits"
+  | "budgetLimits"
 >;
 
 export interface DeskSettings {

@@ -59,7 +59,7 @@ describe("a project's books are kept before its model runs", () => {
     expect(acts.find((a) => a.owner === "waiting")?.waiting).toMatchObject({ description: "等设计稿", parties: [] });
   });
 
-  it("a child's result closes the action it carried; a failed child leaves it open without a cell; a plain spawn_cell child is put on the books", async () => {
+  it("a child's result closes the action it carried; a failed turn leaves it open with its worker, which rests and can be told what to change; a plain spawn_cell child is put on the books", async () => {
     const h = await boot();
     h.script.add(
       "project",
@@ -90,8 +90,9 @@ describe("a project's books are kept before its model runs", () => {
     const byTitle = Object.fromEntries(h.actions(projectId).map((a) => [a.title, a]));
     const cellOf = (title: string) => childrenOf(h, projectId).find((id) => h.kernel.getCell(id)!.title === title)!;
     expect(byTitle["写方案"]).toMatchObject({ status: "done", owner: "agent", artifactId: "art_plan", cellId: cellOf("写方案") });
-    expect(byTitle["跑基准"]).toMatchObject({ status: "open", owner: "agent" });
-    expect(byTitle["跑基准"]!.cellId).toBeUndefined();
+    // The worker whose turn failed is still there (dormant, with what it learned): the action stays with it.
+    expect(byTitle["跑基准"]).toMatchObject({ status: "open", owner: "agent", cellId: cellOf("跑基准") });
+    expect(h.kernel.activityOf([cellOf("跑基准")]).get(cellOf("跑基准"))!.state).toBe("dormant");
     expect(byTitle["顺手查一下日志"]).toMatchObject({ status: "open", owner: "agent", cellId: cellOf("顺手查一下日志"), projectCellId: projectId });
     expect(byTitle["盯一下 CI"]).toMatchObject({ status: "open", owner: "waiting", cellId: cellOf("盯一下 CI") });
     expect(h.actions(projectId)).toHaveLength(4);

@@ -2,6 +2,7 @@
 export {
   createFakeRun,
   defaultFakeBounds,
+  fakeInspection,
   renderEnvelope,
   userMessage,
   type FakeLog,

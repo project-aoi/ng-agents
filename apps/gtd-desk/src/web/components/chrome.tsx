@@ -1,10 +1,11 @@
 import { useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type RefObject } from "react";
-import { relativeTimeZh, type ActivityKind, type ActivityListDTO, type StatusDTO } from "../../shared/api";
+import { BALL_LABEL, relativeTimeZh, type ActivityKind, type ActivityListDTO, type StatusDTO } from "../../shared/api";
 import { api } from "../api";
-import { toFailure, useNow, useResource, useStatus, useToast, useToasts, type ViewKey } from "../state";
+import { routeHash, toFailure, useDeskId, useNavigate, useNow, useResource, useStatus, useToast, useToasts, type ViewKey } from "../state";
 import { clientId, whenText } from "../text";
 import { SourceText } from "./bits";
-import { ButtonRow, Chevron, Kbd, Spinner, useOutsidePress } from "./controls";
+import { BudgetSwitch, budgetState } from "./budget";
+import { ButtonRow, Chevron, Kbd, Spinner, stripIcon, useOutsidePress } from "./controls";
 import { ModelSwitch } from "./models";
 import { ErrorState, Loading } from "./states";
 
@@ -14,7 +15,11 @@ const TABS: Array<{ key: ViewKey; icon: string; zh: string; en: string; n: strin
   { key: "clarify", icon: "📥", zh: "待确认", en: "Clarify", n: "1" },
   { key: "engage", icon: "🎯", zh: "专注工作区", en: "Engage", n: "2" },
   { key: "radar", icon: "🧭", zh: "项目全局", en: "Radar", n: "3" },
+  { key: "agents", icon: "👥", zh: "分身实况", en: "Agents", n: "4" },
 ];
+
+/** "等待外部" — the waiting ball's own words, without its icon (BUG-011: not only replies are waited for). */
+const WAITING_WORDS = stripIcon(BALL_LABEL.waiting);
 
 export function TopBar(props: { view: ViewKey; status: StatusDTO | null; onView(v: ViewKey): void; drawerOpen: boolean; onDrawer(): void }) {
   const { status } = props;
@@ -23,6 +28,8 @@ export function TopBar(props: { view: ViewKey; status: StatusDTO | null; onView(
       <nav className="tabs" aria-label="视图">
         {TABS.map((t) => {
           const count = t.key === "clarify" ? status?.clarify.pending : undefined;
+          // From the status the app already keeps current: no extra request for the live count.
+          const live = t.key === "agents" ? (status?.background.running ?? 0) : 0;
           const on = props.view === t.key;
           return (
             <button
@@ -47,13 +54,15 @@ export function TopBar(props: { view: ViewKey; status: StatusDTO | null; onView(
                 </span>
               )}
               {t.key === "engage" && status?.focus.on && <span className="focus-dot" title="免打扰已开启" aria-label="免打扰已开启" />}
+              {live > 0 && <span className="tab-live">· {live} 在跑</span>}
             </button>
           );
         })}
       </nav>
       <div className="topbar-right">
         {status && (status.demo ? <span className="mode-badge" title={`后端：${status.backend}`}>演示模式</span> : <ModelSwitch status={status} />)}
-        <button type="button" className={`drawer-trigger${props.drawerOpen ? " on" : ""}`} aria-expanded={props.drawerOpen} aria-controls="drawer" onClick={props.onDrawer} title="随手记 / 信源（快捷键 4）">
+        {status && <BudgetSwitch status={status} />}
+        <button type="button" className={`drawer-trigger${props.drawerOpen ? " on" : ""}`} aria-expanded={props.drawerOpen} aria-controls="drawer" onClick={props.onDrawer} title="随手记 / 信源（快捷键 5）">
           <span aria-hidden="true">⚡</span> <span className="dt-label">随手记 / 信源</span>
         </button>
       </div>
@@ -65,7 +74,8 @@ export function TopBar(props: { view: ViewKey; status: StatusDTO | null; onView(
 
 export function StatusLine(props: { view: ViewKey; status: StatusDTO | null; connected: boolean; open: boolean; onToggle(): void; onClose(): void }) {
   const { status } = props;
-  const text = status ? status.statusLine[props.view] : "正在连接工作台…";
+  const text = !status ? "正在连接工作台…" : props.view === "agents" ? agentsLine(status) : status.statusLine[props.view];
+  const budgetOff = status !== null && !budgetState(status).enforced;
   const wrap = useRef<HTMLDivElement>(null);
   useOutsidePress(props.open, wrap, props.onClose);
 
@@ -77,6 +87,11 @@ export function StatusLine(props: { view: ViewKey; status: StatusDTO | null; con
           实时更新已断开，正在重连…
         </span>
       )}
+      {budgetOff && (
+        <span className="budget-hint" title="任务不会因额度暂停；在顶栏的额度设置里可以重新开启">
+          额度限制已关闭
+        </span>
+      )}
       <button type="button" className="status-toggle" aria-expanded={props.open} aria-controls="status-panel" onClick={props.onToggle}>
         <span className="status-text">{text}</span>
         <Chevron open={props.open} />
@@ -84,6 +99,13 @@ export function StatusLine(props: { view: ViewKey; status: StatusDTO | null; con
       {props.open && status && <StatusPanel view={props.view} status={status} />}
     </div>
   );
+}
+
+/** The status line has no ready-made text for 分身实况 (StatusDTO.statusLine covers three views): built from the counts. */
+function agentsLine(s: StatusDTO): string {
+  const bg = s.background;
+  if (bg.total === 0) return "后台没有分身在岗";
+  return `${bg.running} 个分身在跑 · ${bg.waiting} 个${WAITING_WORDS}${bg.jobs > 0 ? ` · ${bg.jobs} 个长任务` : ""}${bg.paused > 0 ? ` · ${bg.paused} 个已暂停` : ""} · 共 ${bg.total} 个在岗`;
 }
 
 const KIND_FILTERS: Array<{ key: ActivityKind | "all"; label: string }> = [
@@ -115,7 +137,7 @@ function StatusPanel({ view, status }: { view: ViewKey; status: StatusDTO }) {
               今天：静默归档 {t.archivedNotifications} 条通知 · 存好 {t.notesSaved} 条随手笔记 · 设好 {t.remindersSet} 个提醒 · 撤下 {t.cardsWithdrawn} 张卡
             </p>
             <p className="muted">
-              后台：{bg.running} 项分身运行中 · {bg.waiting} 项在等外部回复{bg.jobs > 0 ? ` · ${bg.jobs} 个长任务` : ""}
+              后台：{bg.running} 项分身运行中 · {bg.waiting} 项{WAITING_WORDS}{bg.jobs > 0 ? ` · ${bg.jobs} 个长任务` : ""}
               {bg.paused > 0 ? ` · ${bg.paused} 项已暂停` : ""}
               {status.clarify.snoozed > 0 ? ` · ${status.clarify.snoozed} 张卡已推迟` : ""}
             </p>
@@ -133,6 +155,12 @@ function StatusPanel({ view, status }: { view: ViewKey; status: StatusDTO }) {
               {status.radar.activeProjects} 个进行中项目 · {status.radar.stalledProjects} 个停滞 · {status.radar.somedayProjects} 个以后再说
             </p>
             <p className="muted">下次周回顾 {whenText(status.radar.nextReviewAt, now)}</p>
+          </>
+        )}
+        {view === "agents" && (
+          <>
+            <p>{agentsLine(status)}</p>
+            <p className="muted">在这里可以看每个分身做了什么，也可以直接给它发话；需要你拍板的事仍在待确认里。</p>
           </>
         )}
       </div>
@@ -240,6 +268,10 @@ export function BottomBar({ view, inputRef, workspace }: { view: ViewKey; inputR
   const id = useRef(clientId());
   const toast = useToast();
   const { setStatus } = useStatus();
+  const navigate = useNavigate();
+  const deskId = useDeskId();
+  // 分身实况 has its own box for the selected node: the bar folds to the key hints and leaves the height to the panes.
+  const folded = view === "agents";
 
   const submit = async () => {
     const value = text.trim();
@@ -270,45 +302,61 @@ export function BottomBar({ view, inputRef, workspace }: { view: ViewKey; inputR
     }
   };
 
+  const desk = { view: "agents" as const, cellId: deskId };
   return (
-    <footer className="bottombar">
-      <form
-        className="quick"
-        onSubmit={(e) => {
-          e.preventDefault();
-          void submit();
-        }}
-      >
-        <span className="quick-icon" aria-hidden="true">
-          ⚡
-        </span>
-        <input
-          ref={inputRef}
-          value={text}
-          onChange={(e) => {
-            setText(e.target.value);
+    <footer className={`bottombar${folded ? " folded" : ""}`}>
+      {!folded && (
+        <form
+          className="quick"
+          onSubmit={(e) => {
+            e.preventDefault();
+            void submit();
           }}
-          onKeyDown={onKey}
-          placeholder="随手记一句，回车收进信箱：微事直接办好，重活交给后台分身"
-          aria-label="随手记"
-          enterKeyHint="send"
-          maxLength={4000}
-        />
-        <button type="submit" className="btn sm" disabled={busy || !text.trim()}>
-          {busy && <Spinner />}收进信箱
-        </button>
-      </form>
+        >
+          <span className="quick-icon" aria-hidden="true">
+            ⚡
+          </span>
+          <input
+            ref={inputRef}
+            value={text}
+            onChange={(e) => {
+              setText(e.target.value);
+            }}
+            onKeyDown={onKey}
+            placeholder="随手记一句，回车收进信箱：微事直接办好，重活交给后台分身"
+            aria-label="随手记"
+            enterKeyHint="send"
+            maxLength={4000}
+          />
+          <button type="submit" className="btn sm" disabled={busy || !text.trim()}>
+            {busy && <Spinner />}收进信箱
+          </button>
+        </form>
+      )}
+      {!folded && (
+        <a
+          className="desk-link"
+          href={routeHash(desk)}
+          onClick={(e) => {
+            e.preventDefault();
+            navigate(desk);
+          }}
+        >
+          查看与总助理对话
+        </a>
+      )}
       <div className="hints" aria-label="快捷键">
         <span>
           <Kbd>1</Kbd>
           <Kbd>2</Kbd>
-          <Kbd>3</Kbd> 切换视图
+          <Kbd>3</Kbd>
+          <Kbd>4</Kbd> 切换视图
         </span>
         <span>
-          <Kbd>/</Kbd> 随手记
+          <Kbd>/</Kbd> {folded ? "发话" : "随手记"}
         </span>
         <span>
-          <Kbd>4</Kbd> 信源
+          <Kbd>5</Kbd> 信源
         </span>
         {view === "clarify" && (
           <>
@@ -333,6 +381,19 @@ export function BottomBar({ view, inputRef, workspace }: { view: ViewKey; inputR
           <span>
             <Kbd>Ctrl/⌘ S</Kbd> 保存
           </span>
+        )}
+        {folded && (
+          <>
+            <span>
+              <Kbd>↑</Kbd>
+              <Kbd>↓</Kbd>
+              <Kbd>←</Kbd>
+              <Kbd>→</Kbd> 在拓扑里移动
+            </span>
+            <span>
+              <Kbd>Enter</Kbd> 发送 · <Kbd>Shift Enter</Kbd> 换行
+            </span>
+          </>
         )}
         <span>
           <Kbd>Esc</Kbd> 关闭

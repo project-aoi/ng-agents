@@ -62,16 +62,15 @@ const OPS = [
 ];
 
 describe("workspace port", () => {
-  it("a read cell (cwdMode read) works in the owner's real directory with all its tools: nothing is refused, it is reported as a reader and takes no write slot", async () => {
+  it("a coordinator works in the owner's real directory with all its tools: nothing is refused, and while its Run is in flight it is listed as active there", async () => {
     const repo = initRepo();
     const h = await boot({ setup, desk: false, kernel: { repoPath: repo } });
     h.kernel.createRootCell({ id: "desk", preset: "inline", processor: { kind: "code", entry: "test.try_tools", args: { ops: OPS } } });
-    expect(h.kernel.getCell("desk")!.spec.cwdMode).toBe("read");
     h.kernel.inbox.enqueueSync("desk", { id: "go", from: "channel:ui:owner", principalId: "owner", kind: "event", type: PAYLOAD.userMessage, payload: { text: "go" }, createdAt: h.clock.now() });
     await h.kernel.idle();
     const s = (k: string) => h.kernel.context.readStateSync<string>("desk", `op:${k}`)!;
     expect(s("list")).toMatch(/^ok: .*README\.md/s);
-    // cwdMode is a scheduling declaration, not a lock: every write path works
+    // nothing about a coordinator locks it out of writing: every write path works
     expect(s("write")).toMatch(/^ok:/);
     expect(s("edit")).toMatch(/^ok:/);
     expect(s("bash")).toBe("ok: hi\n");
@@ -82,43 +81,42 @@ describe("workspace port", () => {
     // its job ran to the end and its result woke the cell
     await waitFor(() => h.kernel.context.readStateSync("desk", "woken") === PAYLOAD.jobResult, 10_000, "the job result");
     expect(h.kernel.workspace.listJobsSync({ cellId: "desk" })).toHaveLength(1);
-    // reported: every tool in bounds, plus its cwdMode
-    const access = h.kernel.context.readStateSync<{ root: string; isolation: string; tools: ToolKind[]; cwdMode: string }>("desk", "access")!;
-    expect(access).toMatchObject({ root: repo, isolation: "none", cwdMode: "read" });
-    expect(access.tools).toEqual(expect.arrayContaining(["read", "write", "edit", "bash", "code_rpc"]));
-    // while it ran, the work tree had no slot holder: the reader is listed among the others
+    // reported: every tool in bounds, and nothing about a mode
+    const access = h.kernel.context.readStateSync<{ root: string; isolation: string; tools: ToolKind[] }>("desk", "access")!;
+    expect(access).toEqual({ root: repo, isolation: "none", tools: expect.arrayContaining(["read", "write", "edit", "bash", "code_rpc"]) });
+    // while it ran, it was the one cell active in that work tree
     const occ = h.kernel.context.readStateSync<WorkspaceOccupancy[]>("desk", "occupancy")!;
-    const tree = occ.find((o) => o.key === repo)!;
-    expect(tree.holder).toBeNull();
-    expect(tree.queued).toEqual([]);
-    expect(tree.others.map((u) => [u.cellId, u.cwdMode, u.state])).toEqual([["desk", "read", "running"]]);
+    expect(occ).toEqual([{ key: repo, active: [expect.objectContaining({ cellId: "desk", state: "running", cwd: repo, projectCellId: null, projectTitle: null })] }]);
+    // and once nothing of it is in flight, the work tree is no longer listed
+    await h.kernel.idle();
+    expect(h.kernel.activeWorkspaces()).toEqual([]);
   });
 
-  it("cwdMode only decides the write slot: a root cell without it reads and writes as a reader (allowHostWrites does nothing); one with cwdMode write holds the slot, in the owner's directory itself", async () => {
+  it("cwdMode is accepted and stored but changes nothing: root cells with or without it work in the owner's directory itself with every tool (allowHostWrites does nothing either) and are listed only while running", async () => {
     const repo = initRepo();
     const h = await boot({ setup, desk: false, kernel: { repoPath: repo, allowHostWrites: true } });
     const go = (cellId: string) =>
       h.kernel.inbox.enqueueSync(cellId, { id: `go-${cellId}`, from: "channel:cli:owner", principalId: "owner", kind: "event", type: PAYLOAD.userMessage, payload: { text: "go" }, createdAt: h.clock.now() });
     const occupancyOf = (cellId: string) => h.kernel.context.readStateSync<WorkspaceOccupancy[]>(cellId, "occupancy")!.find((o) => o.key === repo)!;
-    // the deprecated kernel option is ignored: a root cell without cwdMode is a reader — which no longer limits its tools
     h.kernel.createRootCell({ id: "ro", processor: { kind: "code", entry: "test.try_tools", args: { ops: OPS.slice(0, 4) } } }, { bounds: { maxDepth: 0 } });
     go("ro");
     await h.kernel.idle();
     expect(h.kernel.context.readStateSync<string>("ro", "op:bash")).toBe("ok: hi\n");
     expect(h.kernel.context.readStateSync("ro", "root")).toBe(repo);
     expect(readFileSync(join(repo, "note.txt"), "utf8")).toBe("y");
-    expect(h.kernel.context.readStateSync("ro", "access")).toMatchObject({ cwdMode: "read" });
-    expect(occupancyOf("ro")).toMatchObject({ holder: null, others: [{ cellId: "ro", cwdMode: "read" }] });
-    // the single-local-cell CLI shape: a root cell that holds "write"
+    expect(h.kernel.context.readStateSync("ro", "access")).not.toHaveProperty("cwdMode");
+    expect(occupancyOf("ro").active.map((u) => [u.cellId, u.state])).toEqual([["ro", "running"]]);
+    // the single-local-cell CLI shape, with the old declaration: the same
     h.kernel.createRootCell({ id: "cli", cwdMode: "write", processor: { kind: "code", entry: "test.try_tools", args: { ops: OPS.slice(0, 4) } } }, { bounds: { maxDepth: 0 } });
+    expect(h.kernel.getCell("cli")!.spec.cwdMode).toBe("write");
     go("cli");
     await h.kernel.idle();
     expect(h.kernel.context.readStateSync<string>("cli", "op:bash")).toBe("ok: hi\n");
     expect(h.kernel.context.readStateSync("cli", "root")).toBe(repo);
     expect(readFileSync(join(repo, "note.txt"), "utf8")).toBe("y");
-    expect(h.kernel.context.readStateSync("cli", "access")).toMatchObject({ cwdMode: "write" });
-    expect(occupancyOf("cli")).toMatchObject({ holder: { cellId: "cli", cwdMode: "write", state: "running" }, queued: [] });
-    expect(occupancyOf("cli").others.map((u) => u.cellId)).not.toContain("cli");
+    expect(h.kernel.context.readStateSync("cli", "access")).not.toHaveProperty("cwdMode");
+    // "ro" is done: only the cell that is running is listed
+    expect(occupancyOf("cli").active.map((u) => [u.cellId, u.state])).toEqual([["cli", "running"]]);
     expect(existsSync(join(repo, "note.txt"))).toBe(true);
   });
 
@@ -171,8 +169,9 @@ describe("workspace port", () => {
     expect(git(repo, "rev-parse", "--abbrev-ref", "HEAD")).toBe("main");
     expect(git(repo, "branch", "--list")).toBe("* main");
     expect(existsSync(join(h.dataDir, "workspace", "worktrees"))).toBe(false);
-    // the one-shot worker settled and was closed; the file it wrote is the owner's now
-    expect(h.kernel.getCell("fix")).toMatchObject({ status: "closed", closeReason: "completed" });
+    // the worker's turn settled and it rests, dormant; the file it wrote is the owner's now
+    expect(h.kernel.getCell("fix")!.status).toBe("active");
+    expect(h.kernel.activityOf(["fix"]).get("fix")!.state).toBe("dormant");
     expect(readFileSync(join(repo, "note.txt"), "utf8")).toBe("y");
   });
 
@@ -191,9 +190,9 @@ describe("workspace port", () => {
     expect(readFileSync(join(root, "note.txt"), "utf8")).toBe("y");
     expect(existsSync(join(repo, "note.txt"))).toBe(false);
     expect(git(root, "rev-parse", "--abbrev-ref", "HEAD")).toBe("ng/fix");
-    // the one-shot worker was closed by the kernel once it settled; guard 4: worktree, branch and files stay as they are
-    expect(h.kernel.getCell("fix")).toMatchObject({ status: "closed", closeReason: "completed" });
-    expect(await h.kernel.closeCell("fix", "completed")).toEqual({ closed: [] });
+    // the worker rests once its turn settled; closing it — guard 4 — leaves worktree, branch and files as they are
+    expect(h.kernel.getCell("fix")!.status).toBe("active");
+    expect(await h.kernel.closeCell("fix", "completed")).toEqual({ closed: ["fix"] });
     expect(readFileSync(join(root, "note.txt"), "utf8")).toBe("y");
     expect(git(root, "status", "--porcelain")).toBe("?? note.txt");
     expect(git(repo, "branch", "--list", "ng/fix")).toContain("ng/fix");

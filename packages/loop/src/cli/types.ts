@@ -28,11 +28,6 @@ export interface CliCapabilities {
    *   and shell limited to `root`, no network, the user's settings files ignored.
    */
   access: "host" | "workspace";
-  /**
-   * [docs/05] The cell's declared intent for its directory. "read" = it did not queue for the work tree's write slot.
-   * It changes what the cell is *told*, never what the CLI is allowed to do. Default "write".
-   */
-  cwdMode?: "read" | "write";
 }
 
 /** Normalized events parsed from a CLI's output stream. MCP calls to the kernel bridge are not reported here (the bridge records them). */
@@ -41,8 +36,13 @@ export type CliEvent =
   | { type: "text"; text: string }
   | { type: "tool_start"; id: string; name: string; input: unknown }
   | { type: "tool_end"; id: string; name: string; output: string; isError?: boolean }
-  /** Usage not yet reported, as an increment (adapters reconcile partial and final figures themselves). */
-  | { type: "usage"; tokens: number; cents: number }
+  /**
+   * Usage not yet reported, as an increment (adapters reconcile partial and final figures themselves). `cached`: how
+   * many of `tokens` were prompt-cache reads. `sessionTotal`: this CLI reports running totals of the whole session,
+   * not of the turn (Codex: a resumed session's `turn.completed.usage` counts everything since the session was
+   * created) — the loop meters only what was added since the total it last saw (CliSessionRecord.reported).
+   */
+  | { type: "usage"; tokens: number; cents: number; cached?: number; sessionTotal?: boolean }
   /**
    * The CLI finished processing its input. `more`: it has further queued input of ours to answer (another turn_end
    * follows). `stopped`: the turn was interrupted on our request.
@@ -134,4 +134,6 @@ export interface CliSessionRecord {
   updatedAt: number;
   runs: number;
   forkedFrom?: string;
+  /** Session totals already metered, for CLIs whose usage events are running totals (CliEvent usage.sessionTotal). */
+  reported?: { tokens: number; cached: number };
 }

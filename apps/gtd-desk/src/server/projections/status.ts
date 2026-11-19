@@ -1,11 +1,17 @@
 import type { NotificationDTO, StatusDTO } from "../../shared/api";
 import { backgroundText, projectClarify } from "./clarify";
-import { readActivities, type ProjectionInput } from "./common";
+import { readActivities, readProjects, type DeskKernel, type ProjectionInput } from "./common";
 import { focusText } from "./engage";
 import { radarProjects } from "./radar";
 import { localMidnight, nextWeekly, whenText } from "./time";
 
 const NOTIFICATION_LIMIT = 20;
+
+/** The owner's switch for token/cost limits, ready to display. */
+export function budgetLimitsOf(kernel: Pick<DeskKernel, "budgetLimits">): StatusDTO["budgetLimits"] {
+  const enforced = kernel.budgetLimits().enforced;
+  return { enforced, label: enforced ? "额度限制：开" : "额度限制：已关闭" };
+}
 
 /** Light notices to the owner are the `ui` channel's outbox rows (the workbench itself is the transport). */
 export function notifications(input: ProjectionInput): NotificationDTO[] {
@@ -20,6 +26,44 @@ export function notifications(input: ProjectionInput): NotificationDTO[] {
     });
   }
   return out;
+}
+
+/**
+ * BUG-011.3: cells paused by the owner. A project parked in "以后再说" is paused underneath (and so is everything below
+ * it), but that is its parked state, not a pause — it is counted in the Radar's someday list instead.
+ */
+function pausedCount(kernel: DeskKernel): number {
+  const parked = new Set(readProjects(kernel).filter((p) => p.record.lifecycle === "someday").map((p) => p.cellId));
+  const cells = new Map(kernel.listCells({ status: ["active", "paused"] }).map((c) => [c.id, c]));
+  let n = 0;
+  for (const c of cells.values()) {
+    if (c.status !== "paused") continue;
+    let underParked = false;
+    for (let p: typeof c | undefined = c; p; p = p.parentId ? cells.get(p.parentId) : undefined) {
+      if (parked.has(p.id)) {
+        underParked = true;
+        break;
+      }
+    }
+    if (!underParked) n++;
+  }
+  return n;
+}
+
+/** "2 个分身在跑 · 1 个在等 · 3 个待命可唤醒" — the cells below the desk, by what they are doing. */
+function agentsLine(kernel: DeskKernel): string {
+  const open = kernel.listCells({ status: ["active", "paused"] }).filter((c) => c.parentId !== null);
+  const n = { working: 0, waiting: 0, dormant: 0 };
+  for (const a of kernel.activityOf(open.map((c) => c.id)).values()) {
+    if (a.state === "working") n.working++;
+    else if (a.state === "waiting") n.waiting++;
+    else if (a.state === "dormant") n.dormant++;
+  }
+  const parts: string[] = [];
+  if (n.working) parts.push(`${n.working} 个分身在跑`);
+  if (n.waiting) parts.push(`${n.waiting} 个在等`);
+  if (n.dormant) parts.push(`${n.dormant} 个待命可唤醒`);
+  return parts.length ? parts.join(" · ") : "没有在途的分身";
 }
 
 export function projectStatus(input: ProjectionInput): StatusDTO {
@@ -60,7 +104,7 @@ export function projectStatus(input: ProjectionInput): StatusDTO {
       jobs: stats.runningJobs,
       waiting: stats.waitingCells,
       total: stats.backgroundCells,
-      paused: stats.pausedCells,
+      paused: pausedCount(kernel),
     },
     today,
     radar: { activeProjects: radar.counts.active, stalledProjects: radar.counts.stalled, somedayProjects: radar.counts.someday, nextReviewAt },
@@ -68,7 +112,9 @@ export function projectStatus(input: ProjectionInput): StatusDTO {
       clarify: clarifyLine.join(" · "),
       engage: focusText(focus.on, focus.buffered),
       radar: radarLine.join(" · "),
+      agents: agentsLine(kernel),
     },
     notifications: notifications(input),
+    budgetLimits: budgetLimitsOf(kernel),
   };
 }

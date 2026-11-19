@@ -1,5 +1,8 @@
 # 架构演进提案（2026-11-19）：对话式主台、直连可唤醒 Worker、退场主动 Pull、AI 目录协同与「分身实况」第 4 视图
 
+> [!NOTE]
+> **状态：已于 2026-11-19 落地。** 本目录四册提案现作为当前架构的设计记录保留，不再随代码修订；现行权威规范是 [`01-principles/`](../01-principles/) 与 [`02-workflows/`](../02-workflows/)（第四节的修订已完成，直连对话见新增的 [`uc08`](../02-workflows/uc08-direct-worker-chat-and-pull-sync.md)），提案原文与之不一致处以它们为准。主要实现差异：`worker` 的生命周期是新值 `lifetime: "wakeable"`，`watcher` 保持 `"one_shot"`（回报即关）；退场通知不是独立的 `cell.turn_settled` 类型，而是携带 `turn` 与 `childState: "dormant"` 的 `cell.result`（幂等键 `${cellId}:${runId}:settled`）；`cwdMode` 仍可存储但处处被忽略，`sensor` 只看是其提示词契约而非内核门禁；Pull 游标是检视者状态里的 `pull:<cellId>`，只在调用 `inspect_cell` 时推进。
+
 > [!IMPORTANT]
 > 本目录存放经讨论拍板定稿的**下一代架构与交互演进蓝图（Proposal）**。实际推进编码落地时，按本文件第五节的合流批次依次实施，并在每批落地时同步刷新 [`01-principles/`](../01-principles/)、[`02-workflows/`](../02-workflows/) 与 [`03-bugs/`](../03-bugs/) 台账状态。
 

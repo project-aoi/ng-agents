@@ -1,13 +1,17 @@
 import { useEffect, useRef, useState } from "react";
 import type { NotificationDTO, StatusDTO, ViewName } from "../shared/api";
 import { eventsUrl } from "./api";
-import type { ArtifactEvent } from "./state";
+import type { ArtifactEvent, CellTailEvent, JobChunkEvent } from "./state";
 
 export interface DeskEventHandlers {
   hello(status: StatusDTO, reconnected: boolean): void;
   refresh(views: ViewName[]): void;
   artifact(e: ArtifactEvent): void;
   notification(n: NotificationDTO): void;
+  /** New records on one cell's timeline (the open Agents pane fetches what it lacks). */
+  cellTail(e: CellTailEvent): void;
+  /** Live output of a cell's background command. */
+  jobChunk(e: JobChunkEvent): void;
 }
 
 const MIN_DELAY = 1_000;
@@ -59,6 +63,14 @@ export function useDeskEvents(handlers: DeskEventHandlers): boolean {
       es.addEventListener("notification", (e) => {
         const d = parse<NotificationDTO>(e);
         if (d) ref.current.notification(d);
+      });
+      es.addEventListener("cell_tail", (e) => {
+        const d = parse<CellTailEvent>(e);
+        if (d && typeof d.cellId === "string" && typeof d.lastSeq === "number") ref.current.cellTail(d);
+      });
+      es.addEventListener("job_chunk", (e) => {
+        const d = parse<JobChunkEvent>(e);
+        if (d && typeof d.cellId === "string" && typeof d.jobId === "string" && typeof d.chunk === "string") ref.current.jobChunk(d);
       });
       es.onerror = () => {
         es?.close();

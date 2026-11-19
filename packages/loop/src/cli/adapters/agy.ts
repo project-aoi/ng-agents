@@ -220,7 +220,8 @@ class AgyDriver implements CliDriver {
         this.#promptId = null;
         const usage = asRecord(result["usage"]);
         const tokens = num(usage["totalTokens"]) || num(usage["inputTokens"]) + num(usage["outputTokens"]) + num(usage["cachedReadTokens"]) + num(usage["cachedWriteTokens"]) + num(usage["thoughtTokens"]);
-        if (tokens > 0) out.push({ type: "usage", tokens, cents: 0 });
+        const cached = Math.min(num(usage["cachedReadTokens"]), tokens);
+        if (tokens > 0) out.push({ type: "usage", tokens, cents: 0, ...(cached > 0 ? { cached } : {}) });
         const stopped = this.#cancelled || result["stopReason"] === "cancelled";
         const next = this.#queued.shift();
         if (next !== undefined) {

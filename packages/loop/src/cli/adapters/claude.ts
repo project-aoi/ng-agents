@@ -133,7 +133,9 @@ class ClaudeDriver implements CliDriver {
   readonly #seenText = new Set<string>();
   /** Tokens already reported per assistant message id (stream figures are partial; the result reconciles). */
   readonly #msgTokens = new Map<string, number>();
+  readonly #msgCached = new Map<string, number>();
   #turnTokens = 0;
+  #turnCached = 0;
   #controlSeq = 0;
   #stopping = false;
   /** stop_reason of the latest top-level assistant message ("refusal" → the turn is reported as refused). */
@@ -207,9 +209,13 @@ class ClaudeDriver implements CliDriver {
         const tokens = num(u["input_tokens"]) + num(u["output_tokens"]) + num(u["cache_read_input_tokens"]) + num(u["cache_creation_input_tokens"]);
         const prev = this.#msgTokens.get(id) ?? 0;
         if (tokens > prev) {
+          const cachedNow = Math.min(num(u["cache_read_input_tokens"]), tokens);
+          const cached = Math.max(0, Math.min(tokens - prev, cachedNow - (this.#msgCached.get(id) ?? 0)));
           this.#msgTokens.set(id, tokens);
+          this.#msgCached.set(id, Math.max(cachedNow, this.#msgCached.get(id) ?? 0));
           this.#turnTokens += tokens - prev;
-          out.push({ type: "usage", tokens: tokens - prev, cents: 0 });
+          this.#turnCached += cached;
+          out.push({ type: "usage", tokens: tokens - prev, cents: 0, ...(cached > 0 ? { cached } : {}) });
         }
         break;
       }
@@ -227,11 +233,14 @@ class ClaudeDriver implements CliDriver {
         break;
       }
       case "result": {
-        const { tokens, costUsd } = resultUsage(msg);
+        const { tokens, cached, costUsd } = resultUsage(msg);
         const rest = Math.max(0, tokens - this.#turnTokens);
+        const restCached = Math.min(rest, Math.max(0, cached - this.#turnCached));
         this.#turnTokens = 0;
+        this.#turnCached = 0;
         this.#msgTokens.clear();
-        if (rest > 0 || costUsd > 0) out.push({ type: "usage", tokens: rest, cents: costUsd * 100 });
+        this.#msgCached.clear();
+        if (rest > 0 || costUsd > 0) out.push({ type: "usage", tokens: rest, cents: costUsd * 100, ...(restCached > 0 ? { cached: restCached } : {}) });
         const isError = msg["is_error"] === true;
         const subtype = str(msg["subtype"]) ?? "";
         if (isError && this.#req.session && num(msg["num_turns"]) === 0 && subtype === "error_during_execution") {
@@ -262,21 +271,24 @@ class ClaudeDriver implements CliDriver {
 }
 
 /** This turn's usage: `model_usage_since_last_result` (per turn) when present, else the result's own totals. */
-function resultUsage(msg: Record<string, unknown>): { tokens: number; costUsd: number } {
+function resultUsage(msg: Record<string, unknown>): { tokens: number; cached: number; costUsd: number } {
   const since = asRecord(msg["model_usage_since_last_result"]);
   const models = Object.values(since).map(asRecord);
   if (models.length > 0) {
     let tokens = 0;
+    let cached = 0;
     let costUsd = 0;
     for (const m of models) {
       tokens += num(m["inputTokens"]) + num(m["outputTokens"]) + num(m["cacheReadInputTokens"]) + num(m["cacheCreationInputTokens"]);
+      cached += num(m["cacheReadInputTokens"]);
       costUsd += num(m["costUSD"]);
     }
-    return { tokens, costUsd };
+    return { tokens, cached, costUsd };
   }
   const u = asRecord(msg["usage"]);
   return {
     tokens: num(u["input_tokens"]) + num(u["output_tokens"]) + num(u["cache_read_input_tokens"]) + num(u["cache_creation_input_tokens"]),
+    cached: num(u["cache_read_input_tokens"]),
     costUsd: num(msg["total_cost_usd"]),
   };
 }

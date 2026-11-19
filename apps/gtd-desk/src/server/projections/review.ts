@@ -65,6 +65,9 @@ export function projectReview(input: ProjectionInput): WeeklyReviewDTO {
     const linked = linkedApprovalId(a.record);
     if (linked) linkedSends.add(linked);
     if (a.record.status !== "done" || (a.record.completedAt ?? a.record.updatedAt) < ws) continue;
+    // BUG-011.2: "本周完结" is what was delivered — whole projects (below) and what the owner did themselves; the
+    // agent and waiting steps inside a project are the project's own detail, not the owner's week.
+    if (a.record.owner !== "human") continue;
     const pid = projectOfAction(kernel, a, projectCells);
     completed.push({ kind: "action", title: a.record.title, at: a.record.completedAt ?? a.record.updatedAt, project: pid ? (projectTitle.get(pid) ?? null) : null });
   }

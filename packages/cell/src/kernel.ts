@@ -25,6 +25,7 @@ import {
   NgError,
   openDatabase,
   systemClock,
+  withTx,
   type AgentEngine,
   type AgentLoop,
   type Clock,
@@ -33,14 +34,17 @@ import {
 } from "@ng/protocol";
 import { createWorkspaceManager } from "@ng/workspace";
 import { createApprovals } from "./approvals";
+import { createBudgetSwitch } from "./budget-switch";
+import { createKeepAwake } from "./awake";
 import { DEFAULT_ROOT_BOUNDS, DEFAULTS } from "./constants";
 import type { KernelCore } from "./core";
 import { createDispatcher } from "./dispatcher";
-import { createEscalations } from "./escalations";
+import { createEscalations, isKernelEscalation } from "./escalations";
 import { createLifecycle } from "./lifecycle";
 import { createModelSettings, type ModelSettings } from "./models";
 import { createReadModel } from "./readmodel";
-import { sendCellMessage } from "./messages";
+import { inspectCell } from "./inspect";
+import { ccDirectChat, directMessage, isPersonPrincipal, sendCellMessage } from "./messages";
 import { ingest } from "./routing";
 import { createStallMonitor } from "./stall";
 import type { Kernel, KernelOptions } from "./types";
@@ -99,12 +103,14 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
   const cells = cellsRepo(db, clock);
 
   // ---------- primitives ----------
+  const budgetSwitch = createBudgetSwitch({ dataDir, ...(opts.budgetLimits !== undefined ? { initial: opts.budgetLimits } : {}) });
   const gate = createGate({
     db,
     bus,
     clock,
     ownerPrincipal,
     ownerAddresses,
+    budgetEnforced: () => budgetSwitch.enforced(),
     ...(opts.secrets ? { secrets: opts.secrets } : {}),
     ...opts.gate,
   });
@@ -257,6 +263,11 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
   core.readModel = createReadModel(core);
   core.stall = createStallMonitor(core);
   const { dispatcher, lifecycle } = core;
+  const keepAwake = createKeepAwake({
+    bus,
+    isBusy: () => dispatcher.activeRuns().length > 0 || workspace.listJobsSync({ state: ["running"] }).length > 0,
+    onError: (err) => onError(err, "keep awake"),
+  });
 
   for (const ch of opts.channels ?? []) hub.register(ch);
   hub.onIngress(async (raw, channelId) => {
@@ -266,12 +277,8 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
   // ---------- wiring ----------
   const unsubscribe: Array<() => void> = [];
   unsubscribe.push(bus.on("inbox.enqueued", (e) => dispatcher.notify(e.cellId)));
-  // A Job that ended frees its work tree's write slot for whoever is queued behind it (docs/05 §3.2).
-  unsubscribe.push(
-    bus.on("job.changed", (e) => {
-      if (e.state !== "running") dispatcher.slotsChanged();
-    }),
-  );
+  // A raised budget lets the cells that were held at the budget stop start, with every message that waited for them.
+  unsubscribe.push(bus.on("ledger.raised", () => dispatcher.budgetChanged()));
   unsubscribe.push(
     bus.on("inbox.dead", (e) => {
       core.escalations.deadLetter(e);
@@ -375,12 +382,14 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
       inbox.start();
       for (const id of inbox.dueCellIdsSync()) dispatcher.notify(id);
       core.stall.start();
+      keepAwake.start();
     },
 
     async stop() {
       if (stopped) return;
       stopped = true;
       core.stall.stop();
+      keepAwake.stop();
       inbox.stop();
       unsubscribeClock?.();
       if (heartbeat) clearInterval(heartbeat);
@@ -409,12 +418,18 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     spawnCell: (parentId, spec, initialPayload, o) => lifecycle.spawnCell(parentId, spec, initialPayload, o),
     updateCell: (cellId, patch, o) => lifecycle.updateCell(cellId, patch, o),
     closeCell: (cellId, reason, o) => lifecycle.closeCell(cellId, reason, o),
-    control: (cellId, cmd, o) =>
-      inbox.controlSync(cellId, {
-        action: cmd.action,
-        principalId: o?.principalId ?? ownerPrincipal,
-        ...(cmd.steerMessage !== undefined ? { steerMessage: cmd.steerMessage } : {}),
-      }),
+    control: (cellId, cmd, o) => {
+      const principalId = o?.principalId ?? ownerPrincipal;
+      const command = { action: cmd.action, principalId, ...(cmd.steerMessage !== undefined ? { steerMessage: cmd.steerMessage } : {}) };
+      if (cmd.action !== "steer" || !isPersonPrincipal(core, principalId)) return inbox.controlSync(cellId, command);
+      // A person's steer is a direct message like any other: the worker's parent gets the words in the same transaction.
+      return withTx(db, () => {
+        const r = inbox.controlSync(cellId, command);
+        const target = cells.get(cellId);
+        if (r.applied && target) ccDirectChat(core, target, { text: cmd.steerMessage ?? "", mode: "steer", messageId: newId("msg", clock), principalId });
+        return r;
+      });
+    },
 
     ingest: (raw, channelId) => ingest(core, raw, channelId),
     resolveApproval: (actionId, decision) => core.approvals.resolve(actionId, decision),
@@ -433,6 +448,9 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     stats: () => core.readModel.stats(),
     activeRuns: () => dispatcher.activeRuns(),
     activeWorkspaces: () => core.readModel.activeWorkspaces(),
+    activityOf: (cellIds) => core.readModel.activityOf(cellIds),
+    directMessage: (cellId, message, o) => directMessage(core, cellId, message, o?.principalId ?? ownerPrincipal),
+    inspectCell: (cellId, o) => inspectCell(core, cellId, o),
     anchorsOf: (cellId) => core.readModel.anchorsOf(cellId),
     listWaits: (cellIds) => core.waits.list(cellIds),
     sendToCell: (cellId, message, o) => {
@@ -440,6 +458,31 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
       return sendCellMessage(core, { from: KERNEL_FROM.control, principalId, sender: principalId, toCellId: cellId, id: message.id ?? newId("msg", clock), message });
     },
     checkStalls: () => void core.stall.evaluate(),
+
+    budgetLimits: () => ({ enforced: budgetSwitch.enforced() }),
+    setBudgetLimits(enforced, o) {
+      const principalId = o?.principalId ?? ownerPrincipal;
+      if (principalId !== ownerPrincipal) throw new NgError("bounds_violation", `switching budget limits needs the owner; ${principalId} may not`);
+      if (typeof enforced !== "boolean") throw new NgError("invalid_argument", "setBudgetLimits takes true (enforce) or false (off)");
+      const changed = budgetSwitch.set(enforced);
+      const releasedCells: string[] = [];
+      const continuedCards: string[] = [];
+      if (changed && !enforced) {
+        // Nothing is left to decide on a budget card: each is answered "continue" for the owner (no budget is raised —
+        // no ledger is stopped any more), which wakes the cell it was about exactly as a click on the card would.
+        for (const rec of gate.listPendingSync({ includeSnoozed: true })) {
+          if (!isKernelEscalation(rec.action) || rec.action.args.reason !== "budget_exhausted") continue;
+          continuedCards.push(rec.actionId);
+          void core.approvals
+            .resolve(rec.actionId, { decision: "continue", approverId: ownerPrincipal, note: "budget limits were switched off" })
+            .catch((err: unknown) => onError(err, `continue budget card ${rec.actionId}`));
+        }
+        // And nothing holds the cells that waited at their budget stop.
+        releasedCells.push(...dispatcher.heldForBudget());
+        dispatcher.budgetChanged();
+      }
+      return { enforced: budgetSwitch.enforced(), changed, releasedCells, continuedCards };
+    },
   };
   return kernel;
 }

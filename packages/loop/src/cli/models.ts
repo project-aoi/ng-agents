@@ -33,6 +33,11 @@ export interface CliModelCatalog {
   models: CliModelInfo[];
   /** The CLI's own first choice at the effort `preferredEffort` picks; null when the list is empty. */
   recommended: CliModelChoice | null;
+  /**
+   * The lighter choice for fast-tier work, derived from this same list by `recommendFast`; null when the list is empty.
+   * `listCliModels` always fills it; a catalogue built elsewhere may leave it out (read it with `fastRecommendation`).
+   */
+  recommendedFast?: CliModelChoice | null;
   fetchedAt: number;
 }
 
@@ -65,8 +70,53 @@ function recommend(models: readonly CliModelInfo[], preferredId?: string): CliMo
   return effort ? { model: m.id, effort } : { model: m.id };
 }
 
+/**
+ * Words vendors put in the names of their light, quick models — the only heuristic here; no model id is kept. Matched
+ * against the id and label the CLI gave, as a whole word: "gemini" is not "mini", "minimal" is not "mini".
+ */
+const LIGHT_WORDS = ["mini", "flash", "haiku", "lite", "nano", "fast", "small", "spark"] as const;
+const LIGHT_NAME = new RegExp(`(?<![a-z])(?:${LIGHT_WORDS.join("|")})(?![a-z])`, "i");
+const isLight = (m: CliModelInfo) => LIGHT_NAME.test(m.id) || LIGHT_NAME.test(m.label);
+
+/** A moderate effort for quick work: "medium", else "low", else the weakest offered; undefined when none is offered. */
+function moderateEffort(efforts: readonly string[]): string | undefined {
+  const offered = (e: string) => efforts.find((x) => x.toLowerCase() === e);
+  return offered("medium") ?? offered("low") ?? [...efforts].sort((a, b) => rank(a) - rank(b))[0];
+}
+
+/**
+ * The fast tier's automatic choice, from the list the CLI gave: the first model whose name marks it as the vendor's
+ * light line, at a moderate effort; without one, the recommended model at a moderate effort (the same choice as
+ * `recommended` when that model has no effort setting). Null when there is nothing to choose from.
+ */
+export function recommendFast(models: readonly CliModelInfo[], recommended: CliModelChoice | null): CliModelChoice | null {
+  const light = models.find(isLight);
+  if (light) {
+    const effort = moderateEffort(light.efforts);
+    return effort ? { model: light.id, effort } : { model: light.id };
+  }
+  if (!recommended) return null;
+  const info = models.find((m) => m.id === recommended.model);
+  // Nothing to lower (no effort setting, or an unlisted model whose efforts are unknown): the recommendation as it is.
+  if (!info || info.efforts.length === 0) return recommended;
+  return { model: recommended.model, effort: moderateEffort(info.efforts)! };
+}
+
+type ParsedModels = { models: CliModelInfo[]; recommended: CliModelChoice | null; recommendedFast: CliModelChoice | null };
+
+/** Both automatic choices for a parsed list, so every engine's catalogue carries them. */
+function parsed(models: CliModelInfo[], preferredId?: string): ParsedModels {
+  const recommended = recommend(models, preferredId);
+  return { models, recommended, recommendedFast: recommendFast(models, recommended) };
+}
+
+/** A catalogue's fast-tier choice; derived from its list when the catalogue does not carry one. */
+export function fastRecommendation(catalog: Pick<CliModelCatalog, "models" | "recommended" | "recommendedFast">): CliModelChoice | null {
+  return catalog.recommendedFast !== undefined ? catalog.recommendedFast : recommendFast(catalog.models, catalog.recommended);
+}
+
 /** Claude Code `initialize` control response → models. The "default" alias is not listed; it names the recommendation. */
-export function parseClaudeModels(response: unknown): { models: CliModelInfo[]; recommended: CliModelChoice | null } {
+export function parseClaudeModels(response: unknown): ParsedModels {
   const raw = Array.isArray(asRecord(response)["models"]) ? (asRecord(response)["models"] as unknown[]).map(asRecord) : [];
   const models: CliModelInfo[] = [];
   let defaultResolved: string | undefined;
@@ -89,11 +139,11 @@ export function parseClaudeModels(response: unknown): { models: CliModelInfo[]; 
     });
   }
   const preferred = defaultResolved ? models.find((m) => resolvedOf.get(m.id) === defaultResolved)?.id : undefined;
-  return { models, recommended: recommend(models, preferred) };
+  return parsed(models, preferred);
 }
 
 /** `codex debug models` JSON → the listed models in the catalogue's own order (priority 1 first). */
-export function parseCodexModels(json: unknown): { models: CliModelInfo[]; recommended: CliModelChoice | null } {
+export function parseCodexModels(json: unknown): ParsedModels {
   const root = asRecord(json);
   const raw = (Array.isArray(root["models"]) ? (root["models"] as unknown[]) : Array.isArray(json) ? (json as unknown[]) : []).map(asRecord);
   const listed = raw
@@ -109,7 +159,7 @@ export function parseCodexModels(json: unknown): { models: CliModelInfo[]; recom
       efforts: sortEfforts(levels.map((l) => (typeof l === "string" ? l : str(asRecord(l)["effort"]))).filter((e): e is string => Boolean(e))),
     };
   });
-  return { models, recommended: recommend(models) };
+  return parsed(models);
 }
 
 const AGY_EFFORT_LABEL = /^(.*\S)\s*\((minimal|low|medium|high|xhigh|max|ultra)\)$/i;
@@ -118,7 +168,7 @@ const AGY_EFFORT_LABEL = /^(.*\S)\s*\((minimal|low|medium|high|xhigh|max|ultra)\
  * `agy models` text → models, in the order families first appear. `gemini-4-carbon-high  Gemini 4 Carbon (High)` and
  * its siblings become one model `gemini-4-carbon` with efforts; an entry without an effort stays as it is.
  */
-export function parseAgyModels(text: string): { models: CliModelInfo[]; recommended: CliModelChoice | null } {
+export function parseAgyModels(text: string): ParsedModels {
   const models: CliModelInfo[] = [];
   const byId = new Map<string, CliModelInfo>();
   for (const line of text.split("\n")) {
@@ -144,7 +194,7 @@ export function parseAgyModels(text: string): { models: CliModelInfo[]; recommen
       models.push(info);
     }
   }
-  return { models, recommended: recommend(models) };
+  return parsed(models);
 }
 
 /**
@@ -221,10 +271,10 @@ export async function listCliModels(engine: CliEngine, opts: ListCliModelsOption
   const bin = opts.bin ?? DEFAULT_BIN[engine];
   const env = cliEnvironment(opts.env ?? process.env);
   const timeoutMs = opts.timeoutMs ?? 45_000;
-  let parsed: { models: CliModelInfo[]; recommended: CliModelChoice | null };
-  if (engine === "claude") parsed = parseClaudeModels(await claudeInitialize(bin, env, timeoutMs));
-  else if (engine === "codex") parsed = parseCodexModels(JSON.parse(await run(bin, ["debug", "models"], env, timeoutMs)));
-  else parsed = parseAgyModels(await run(bin, ["models"], env, timeoutMs));
-  if (parsed.models.length === 0) throw new Error(`${bin} listed no models`);
-  return { engine, ...parsed, fetchedAt: (opts.now ?? Date.now)() };
+  let list: ParsedModels;
+  if (engine === "claude") list = parseClaudeModels(await claudeInitialize(bin, env, timeoutMs));
+  else if (engine === "codex") list = parseCodexModels(JSON.parse(await run(bin, ["debug", "models"], env, timeoutMs)));
+  else list = parseAgyModels(await run(bin, ["models"], env, timeoutMs));
+  if (list.models.length === 0) throw new Error(`${bin} listed no models`);
+  return { engine, ...list, fetchedAt: (opts.now ?? Date.now)() };
 }

@@ -13,7 +13,7 @@ import {
   type PolicyBounds,
 } from "@ng/protocol";
 import { attenuateBounds, intersectPatterns, meetBounds } from "../src";
-import { rng, setup } from "./helpers";
+import { exec, expectType, meta, rng, setup } from "./helpers";
 
 const PARENT_PATTERNS = [
   "inbox:*",
@@ -101,8 +101,7 @@ describe("attenuateBounds — property: the child is always ⊆ the parent", () 
       const parent = randomParent(r);
       const parentCellId = pick(r, ["desk", "p1", "w-9", "x:y", ""]);
       const requested = randomRequest(r);
-      const remaining = r() < 0.4 ? { tokens: Math.floor(r() * 500_000), cents: Math.round(r() * 5_000) } : undefined;
-      const run = () => attenuateBounds(parent, parentCellId, requested, remaining ? { remaining } : {});
+      const run = () => attenuateBounds(parent, parentCellId, requested);
       if (parent.maxDepth === 0) {
         expect(run).toThrow();
         try {
@@ -123,10 +122,9 @@ describe("attenuateBounds — property: the child is always ⊆ the parent", () 
       // inbox reachability is inherited whatever the request; channels only on request
       for (const p of parent.canSendTo) if (p.startsWith("inbox:")) expect(anyCovers(child.canSendTo, p), JSON.stringify(ctx)).toBe(true);
       if (requested?.canSendTo === undefined) expect(child.canSendTo.filter((a) => !a.startsWith("inbox:"))).toEqual([]);
-      if (remaining) {
-        expect(child.maxTokens).toBeLessThanOrEqual(remaining.tokens);
-        expect(child.maxCents).toBeLessThanOrEqual(remaining.cents);
-      }
+      // budget limits are static caps: an omitted one is the parent's number
+      if (requested?.maxTokens === undefined) expect(child.maxTokens).toBe(parent.maxTokens);
+      if (requested?.maxCents === undefined) expect(child.maxCents).toBe(parent.maxCents);
       if (requested?.secretRefs === undefined) expect(child.secretRefs.size).toBe(0);
     }
     expect(derived).toBeGreaterThan(3000);
@@ -288,22 +286,53 @@ describe("attenuateBounds — field rules", () => {
 });
 
 describe("Gate.attenuate — persisted state", () => {
-  it("caps the child's budget by what the parent and its ancestors still have left", () => {
+  /** desk (1M tokens) → proj (400k, 150k already spent) → leaf (300k). */
+  function projectWithLeaf() {
+    const f = setup();
+    const proj = f.gate.attenuate(f.cells.require("desk").bounds, "desk", { maxTokens: 400_000, maxCents: 5_000, maxDepth: 2 });
+    f.cells.insert({ id: "proj", parentId: "desk", bounds: proj });
+    f.gate.meter("proj", { tokens: 150_000, billedCents: 0 });
+    f.cells.insert({ id: "leaf", parentId: "proj", bounds: f.gate.attenuate(proj, "proj", { maxTokens: 300_000 }) });
+    return f;
+  }
+
+  it("a child gets the parent's static cap, not what the chain has left at spawn time", () => {
     const f = setup();
     const proj = f.gate.attenuate(f.cells.require("desk").bounds, "desk", { maxTokens: 400_000, maxCents: 5_000 });
     f.cells.insert({ id: "proj", parentId: "desk", bounds: proj });
     f.gate.meter("proj", { tokens: 150_000, billedCents: 4_000 });
-    // desk has 850k / 6000¢ left, proj has 250k / 1000¢ left.
-    const child = f.gate.attenuate(proj, "proj", { maxTokens: 300_000 });
-    expect(child.maxTokens).toBe(250_000);
-    expect(child.maxCents).toBe(1_000);
+    // proj has only 250k / 1000¢ left; none of that is frozen into a new child
+    expect(f.gate.attenuate(proj, "proj", {})).toMatchObject({ maxTokens: 400_000, maxCents: 5_000 });
+    expect(f.gate.attenuate(proj, "proj", { maxTokens: 300_000 })).toMatchObject({ maxTokens: 300_000, maxCents: 5_000 });
+    // still clamped to the parent's static number
+    expect(f.gate.attenuate(proj, "proj", { maxTokens: 900_000, maxCents: 9_000 })).toMatchObject({ maxTokens: 400_000, maxCents: 5_000 });
 
-    // An ancestor's remaining budget binds too.
+    // an almost spent ancestor does not shrink a new child either
     f.addCell("other", "desk", { maxTokens: 900_000, maxCents: 9_000, maxDepth: 2, tools: ["read"] });
     f.gate.meter("other", { tokens: 800_000, billedCents: 0 });
-    const desk = f.cells.require("desk").bounds;
-    const sibling = f.gate.attenuate(desk, "desk", {});
-    expect(sibling.maxTokens).toBe(1_000_000 - 950_000);
+    expect(f.gate.usageSync("desk").subtreeTokens).toBe(950_000);
+    expect(f.gate.attenuate(f.cells.require("desk").bounds, "desk", {})).toMatchObject({ maxTokens: 1_000_000, maxCents: 10_000 });
+  });
+
+  it("an exhausted ancestor still stops the child's spending through the live chain ledgers", () => {
+    const f = projectWithLeaf();
+    expect(f.gate.usageSync("leaf")).toMatchObject({ limitTokens: 300_000, state: "ok" });
+    // 250k is within the leaf's own 300k, but proj (150k + 250k) reaches its 400k
+    expect(f.gate.meter("leaf", { tokens: 250_000, billedCents: 0 })).toBe("hard_stop");
+    expect(f.gate.usageSync("leaf")).toMatchObject({ subtreeTokens: 250_000, limitTokens: 300_000, state: "hard_stop", limitedBy: "proj" });
+    expect(expectType(f.gate.authorizeSync(exec("read"), meta("leaf")), "deny").feedback).toMatch(/ancestor cell "proj"/);
+  });
+
+  it("a later raise of the ancestor reaches the child at once, without re-deriving its bounds", () => {
+    const f = projectWithLeaf();
+    f.gate.meter("leaf", { tokens: 250_000, billedCents: 0 });
+    const before = serializeBounds(f.cells.require("leaf").bounds);
+    f.gate.raiseBudgetSync("proj", { tokens: 200_000 }, "owner");
+    expect(serializeBounds(f.cells.require("leaf").bounds)).toEqual(before);
+    // proj is at 400k / 600k now; only the leaf's own 250k / 300k is left to warn about
+    expect(f.gate.usageSync("leaf")).toMatchObject({ limitTokens: 300_000, state: "warn", limitedBy: "leaf" });
+    expectType(f.gate.authorizeSync(exec("read"), meta("leaf")), "allow");
+    expect(f.gate.meter("leaf", { tokens: 40_000, billedCents: 0 })).toBe("warn");
   });
 
   it("never exceeds the stored parent bounds even when the caller passes wider ones", () => {
@@ -316,16 +345,17 @@ describe("Gate.attenuate — persisted state", () => {
     expect(serializeBounds(c)).toMatchObject({ tools: ["read"], canSendTo: ["inbox:desk", "inbox:narrow"], secretRefs: [], isolation: "container", maxDepth: 0 });
   });
 
-  it("randomized: always ⊆ the passed parent and the stored parent, budget ≤ remaining", () => {
+  it("randomized: always ⊆ the passed parent and the stored parent, whatever the ledgers say", () => {
     const r = rng(99);
     for (let i = 0; i < 200; i++) {
       const f = setup();
       const stored = randomParent(r);
       f.addCell("p", "desk", serializeBounds(stored));
       if (r() < 0.7) f.gate.meter("p", { tokens: Math.floor(r() * 600_000), billedCents: Math.floor(r() * 2_000) });
+      if (r() < 0.3) f.gate.meter("desk", { tokens: Math.floor(r() * 1_200_000), billedCents: Math.floor(r() * 12_000) });
       const passed = randomParent(r);
-      const usage = f.gate.usageSync("p");
-      const run = () => f.gate.attenuate(passed, "p", randomRequest(r));
+      const requested = randomRequest(r);
+      const run = () => f.gate.attenuate(passed, "p", requested);
       if (Math.min(stored.maxDepth, passed.maxDepth) === 0) {
         expect(run).toThrow();
         continue;
@@ -333,8 +363,9 @@ describe("Gate.attenuate — persisted state", () => {
       const c = run();
       expect(isSubsetBounds(c, passed, { parentCellId: "p" })).toBe(true);
       expect(isSubsetBounds(c, stored, { parentCellId: "p" })).toBe(true);
-      expect(c.maxTokens).toBeLessThanOrEqual(Math.max(0, usage.limitTokens - usage.subtreeTokens));
-      expect(c.maxCents).toBeLessThanOrEqual(Math.max(0, usage.limitCents - usage.subtreeCents));
+      // spending is not frozen in: the result is what the static parent bounds alone give
+      const unspent = attenuateBounds(meetBounds(passed, f.cells.require("p").bounds), "p", requested);
+      expect(serializeBounds(c)).toEqual(serializeBounds(unspent));
     }
   });
 });

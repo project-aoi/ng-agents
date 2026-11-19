@@ -2,13 +2,15 @@
 
 export {
   createGate,
+  DEFAULT_CACHE_READ_WEIGHT,
   DEFAULT_OWNER_ADDRESSES,
   DEFAULT_TOKEN_TTL_MS,
   DEFAULT_TRUST_STREAK,
+  DEFAULT_WRAP_UP,
   type GateOptions,
   type GateService,
 } from "./gate";
-export { attenuateBounds, intersectPatterns, isAddressPattern, meetBounds, minimizePatterns, type AttenuateOptions } from "./attenuate";
+export { attenuateBounds, intersectPatterns, isAddressPattern, meetBounds, minimizePatterns } from "./attenuate";
 export {
   ACTION_TYPES,
   SIDE_EFFECTS,

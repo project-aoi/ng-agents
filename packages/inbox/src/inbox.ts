@@ -15,6 +15,7 @@ import {
   parsePrincipal,
   PAYLOAD,
   run,
+  systemClock,
   toBool,
   toJson,
   validatePayload,
@@ -83,6 +84,9 @@ interface FireResult {
 
 const CONTROL_ACTIONS = new Set(["cancel", "pause", "resume", "steer"]);
 
+/** Wall-over-monotonic advance above this is a host suspend; below it, timer jitter and clock slewing. */
+const SUSPEND_SKEW_MS = 5_000;
+
 // "Real work" = anything except idle firings. Idle firings must not count as activity, otherwise an idle rule
 // would re-arm itself through its own Run and fire every idleSec forever (and two idle rules would ping-pong).
 const SQL_CLAIM_HAD_REAL_WORK = `SELECT 1 AS x FROM inbox_messages m LEFT JOIN inbox_schedules s ON s.id = m.schedule_id
@@ -141,6 +145,15 @@ export function createInbox(opts: InboxOptions): InboxService {
   let recheckAfterTick = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let unsubscribeClock: (() => void) | undefined;
+
+  // ---------- host suspend detection ----------
+  // Wall time keeps running while the host sleeps; the monotonic clock does not (performance.now() is CLOCK_MONOTONIC
+  // on Linux and mach_absolute_time on macOS, and both stop during system sleep). A wall advance clearly larger than
+  // the monotonic advance since the last sample is therefore time the machine was suspended: no Run could work or
+  // renew its lease in it. A manual or demo clock jumps on purpose, so detection is off for them by default.
+  const monotonicNow = opts.monotonicNow ?? (clock === systemClock ? () => performance.now() : null);
+  let sample = monotonicNow ? { wall: clock.now(), mono: monotonicNow() } : null;
+  let lastSuspend: { at: number; sleptMs: number } | null = null;
 
   // ==================== small helpers ====================
 
@@ -358,6 +371,31 @@ export function createInbox(opts: InboxOptions): InboxService {
     return res;
   }
 
+  /** Time the host spent suspended since the last sample (0 under the threshold), and the sample to keep. */
+  function measureSuspend(now: number): { sleptMs: number; next: { wall: number; mono: number } } | null {
+    if (!monotonicNow || !sample) return null;
+    const mono = monotonicNow();
+    const skew = now - sample.wall - (mono - sample.mono);
+    return { sleptMs: skew > SUSPEND_SKEW_MS ? Math.round(skew) : 0, next: { wall: now, mono } };
+  }
+
+  /**
+   * Called inside a transaction before anything compares leases with `now`: after a suspend every active lease is
+   * pushed forward by the time slept, so the first tick after wake-up (which can run before the kernel's heartbeat
+   * renews them) does not expire Runs that were frozen with the machine and deliver their batches twice. The sample
+   * advances only when the transaction commits: after a rollback the next check finds the same suspend again.
+   */
+  function absorbSuspend(now: number): void {
+    const m = measureSuspend(now);
+    if (!m) return;
+    if (m.sleptMs > 0) {
+      run(db, "UPDATE inbox_claims SET lease_expires_at = lease_expires_at + ? WHERE status = 'active'", [m.sleptMs]);
+      afterCommit(db, () => (lastSuspend = { at: now, sleptMs: m.sleptMs }));
+      scheduleChanged();
+    }
+    afterCommit(db, () => (sample = m.next));
+  }
+
   function expireClaims(now: number, cellId?: string): ClaimRow[] {
     const rows =
       cellId === undefined
@@ -385,6 +423,7 @@ export function createInbox(opts: InboxOptions): InboxService {
       const cell = requireCell(cellId);
       if (cell.status !== "active") return null;
       const now = clock.now();
+      absorbSuspend(now);
       const expired = expireClaims(now, cellId);
       dropStale(cell, now);
 
@@ -464,6 +503,8 @@ export function createInbox(opts: InboxOptions): InboxService {
   function renewLeaseSync(claimId: string, leaseMs: number): boolean {
     if (!Number.isFinite(leaseMs) || leaseMs <= 0) throw new NgError("invalid_argument", `leaseMs must be > 0 (got ${leaseMs})`);
     return withTx(db, () => {
+      // First, so the suspend is not added again later on top of this fresh lease.
+      absorbSuspend(clock.now());
       const r = run(db, "UPDATE inbox_claims SET lease_expires_at = ? WHERE claim_id = ? AND status = 'active'", [clock.now() + leaseMs, claimId]);
       if (r.changes > 0) scheduleChanged();
       return r.changes > 0;
@@ -732,7 +773,7 @@ export function createInbox(opts: InboxOptions): InboxService {
         case "steer": {
           const env = createEnvelope<ControlSteerPayload>(
             {
-              id: newId("steer", clock),
+              id: cmd.steerEnvelopeId ?? newId("steer", clock),
               from: KERNEL_FROM.control,
               to: inboxAddr(cellId),
               principalId: cmd.principalId,
@@ -827,8 +868,10 @@ export function createInbox(opts: InboxOptions): InboxService {
     // `at` before the query: a delayed row inserted after it has deliver_at > created_at >= at, so it stays above the watermark.
     const at = clock.now();
     const next = nextWakeAtSync();
-    if (next === null || next > at) {
-      // Nothing expired, no rule due, no delayed row in (watermark, now]: skip the write transaction.
+    const suspend = measureSuspend(at);
+    if ((next === null || next > at) && !suspend?.sleptMs) {
+      // Nothing expired, no rule due, no delayed row in (watermark, now], no suspend to absorb: skip the write transaction.
+      if (suspend) sample = suspend.next;
       if (at > watermark) watermark = at;
       return { fired: 0, dueCellIds: [], expiredClaims: 0 };
     }
@@ -838,6 +881,7 @@ export function createInbox(opts: InboxOptions): InboxService {
         const now = clock.now();
         const touched = new Map<string, EnqueuedReason>();
 
+        absorbSuspend(now);
         const expired = expireClaims(now);
         for (const c of expired) touched.set(c.cell_id, "released");
 
@@ -1103,6 +1147,7 @@ export function createInbox(opts: InboxOptions): InboxService {
     getClaimSync,
     listClaimsSync,
     recoverClaimsSync,
+    lastSuspendSync: () => lastSuspend,
 
     async enqueue(cellId, env, schedule) {
       return enqueueSync(cellId, env, schedule);

@@ -3,6 +3,9 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { gtdKeys, PAYLOAD, type ActionRecord, type ModelRequest, type ProjectRecord } from "@ng/protocol";
 import { BUILTIN_SKILLS, seedBuiltinSkills, setProjectLifecycleSync, startApprovedProjectSync, startProjectSync } from "../src";
+import { skillDigest } from "../src/shared/seed";
+import { SUPERSEDED_SKILL_DIGESTS } from "../src/shared/skills";
+import shippedBefore from "./fixtures/builtin-skills-2026-11-18.json";
 import { boot, childrenOf, cleanupAll, gitRepo, lastToolResult, projects, systemOf, tool } from "./helpers";
 
 afterEach(cleanupAll);
@@ -87,9 +90,10 @@ describe("project tools", () => {
     expect(h.actions(projectId)).toEqual([expect.objectContaining({ id, status: "done", cellId: worker })]);
   });
 
-  it("dispatch passes an explicit cwd and cwdMode through, for a watcher too; by default a watcher keeps to a directory of its own", async () => {
+  it("dispatch: a worker and a watcher work in the project's directory by default, an explicit cwd is passed through, and nothing is queued", async () => {
     const h = await boot();
     const repo = gitRepo("w");
+    const other = gitRepo("w2");
     const started: string[] = [];
     const startedBy = (req: ModelRequest) => {
       const out = lastToolResult(req);
@@ -101,26 +105,32 @@ describe("project tools", () => {
       tool("dispatch", { preset: "watcher", title: "等 CI", instruction: "CI 绿了报告" }),
       (req) => {
         startedBy(req);
-        return tool("dispatch", { preset: "watcher", title: "看仓库里的发布标记", instruction: "仓库出现 v2 tag 就报告", cwd: repo, cwdMode: "read" });
+        return tool("dispatch", { preset: "watcher", title: "看另一个仓库里的发布标记", instruction: "仓库出现 v2 tag 就报告", cwd: other });
       },
       (req) => {
         startedBy(req);
-        return tool("dispatch", { title: "读代码", instruction: "数一数入口", cwdMode: "read" });
+        return tool("dispatch", { title: "读代码", instruction: "数一数入口。当前有人在这个仓库改代码：只做查阅，不要改文件、不要切分支" });
       },
       (req) => {
-        // a reader does not queue for the work tree, and is not told it might
-        expect(startedBy(req)).not.toContain("If another writer is in that work tree");
+        // it starts at once; nothing says it waits for anyone
+        expect(startedBy(req)).toContain("It is running now; you are woken when its turn is over — then inspect_cell shows what it did, and send_message continues it.");
         return {};
       },
     );
+    h.script.setDefault("worker", () => tool("wait", { reason: "reading" }));
+    h.script.setDefault("checker", () => tool("wait", { reason: "not yet", waitingFor: "external" }));
     const { projectId } = startProjectSync(h.kernel, { title: "t", outcome: "o", brief: "b", cwd: repo });
     await h.kernel.idle();
     expect(h.script.pending("project")).toBe(0);
     const [byDefault, explicit, reader] = started.map((id) => h.kernel.getCell(id)!);
-    expect(byDefault!.spec.cwd).toBeUndefined();
-    expect(byDefault!.spec).toMatchObject({ preset: "watcher", cwdMode: "write" });
-    expect(explicit!.spec).toMatchObject({ preset: "watcher", cwd: repo, cwdMode: "read" });
-    expect(reader!.spec).toMatchObject({ preset: "worker", cwdMode: "read" });
+    // The watcher sees the project's repository, remotes and tools (no private directory any more).
+    expect(byDefault!.spec).toMatchObject({ preset: "watcher", cwd: repo, lifetime: "one_shot" });
+    expect(explicit!.spec).toMatchObject({ preset: "watcher", cwd: other });
+    expect(reader!.spec).toMatchObject({ preset: "worker", cwd: repo, lifetime: "wakeable" });
+    for (const c of [byDefault!, explicit!, reader!]) {
+      expect(c.spec.cwdMode).toBeUndefined();
+      expect(c.bounds.maxDepth).toBe(0);
+    }
     expect(childrenOf(h, projectId)).toEqual(started);
   });
 
@@ -189,11 +199,13 @@ describe("project tools", () => {
     ]);
   });
 
-  it("finish_project: refused only while child cells are open (nothing recorded); closeChildren or cancelled stops them; cancelled closes the books", async () => {
+  it("finish_project: refused only while a child cell is still at work (nothing recorded); closeChildren or cancelled stops it; cancelled closes the books", async () => {
     const h = await boot();
     const repo = gitRepo("x");
     let worker = "";
-    h.script.setDefault("worker", () => tool("wait", { reason: "busy" }));
+    // Still at work: it asked the desk something and waits for the answer. (A worker that simply ends its turn is
+    // dormant, and a dormant worker is no reason to keep a project open.)
+    h.script.setDefault("worker", () => tool("wait", { reason: "等 desk 回复", waitingFor: "inbox:desk" }));
     const stillActive = () => {
       expect(h.kernel.getCell(projectId)).toMatchObject({ status: "active" });
       expect(h.project(projectId)).toMatchObject({ lifecycle: "active" });
@@ -213,8 +225,8 @@ describe("project tools", () => {
         return tool("finish_project", { outcome: "completed", summary: "完成" });
       },
       (req) => {
-        // the open action alone would not stop it; the open child does
-        expect(lastToolResult(req)).toContain("Nothing was recorded or closed: 1 child cell(s) are still open");
+        // the open action alone would not stop it; a child still at work does (it waits for something)
+        expect(lastToolResult(req)).toContain("Nothing was recorded or closed: 1 child cell(s) are still at work");
         expect(lastToolResult(req)).toContain(`${worker} "实现"`);
         expect(lastToolResult(req)).toContain("before you finish");
         expect(lastToolResult(req)).toContain("Call again with closeChildren: true if stopping them is what you mean.");
@@ -222,7 +234,7 @@ describe("project tools", () => {
         return tool("finish_project", { outcome: "someday", summary: "以后再说", retro: "none" });
       },
       (req) => {
-        expect(lastToolResult(req)).toContain("Nothing was recorded or closed: 1 child cell(s) are still open");
+        expect(lastToolResult(req)).toContain("Nothing was recorded or closed: 1 child cell(s) are still at work");
         expect(lastToolResult(req)).toContain("before you park");
         stillActive();
         // cancelled needs no closeChildren: it always stops what runs below
@@ -249,7 +261,7 @@ describe("project tools", () => {
     const h = await boot();
     const repo = gitRepo("y");
     let worker = "";
-    h.script.setDefault("worker", () => tool("wait", { reason: "busy" }));
+    h.script.setDefault("worker", () => tool("wait", { reason: "busy", waitingFor: "inbox:desk" }));
     h.script.add(
       "project",
       tool("dispatch", { title: "实现", instruction: "实现" }),
@@ -428,5 +440,44 @@ describe("built-in skills", () => {
     await h.kernel.idle();
     expect(systemOf(h, "desk")).toContain("- workspace-arbitration:");
     expect(systemOf(h, "desk")).not.toContain("# Skill: workspace-arbitration");
+  });
+
+  it("an install from before a playbook changed gets the new text; a playbook the owner edited is left alone", async () => {
+    const h = await boot();
+    // What an earlier version seeded (the texts as shipped on 2026-11-18), one of them since edited by the owner.
+    for (const old of shippedBefore) {
+      h.kernel.context.upsertSkillOrNoteSync("desk", { kind: "skill", name: old.name, description: old.description, body: old.body, tags: old.tags, scope: "global", mode: "upsert" });
+    }
+    const mine = shippedBefore.find((x) => x.name === "workspace-arbitration")!;
+    h.kernel.context.upsertSkillOrNoteSync("desk", { kind: "skill", name: mine.name, description: mine.description, body: `${mine.body}\n## 我的补充\n先问我。\n`, tags: mine.tags, scope: "global", mode: "upsert" });
+
+    // Replaced: the untouched copies of texts that changed. Kept: the owner's edit, and what has not changed.
+    expect(seedBuiltinSkills(h.kernel.context, "desk")).toEqual(["project-relay", "domain-hub"]);
+    const relay = h.kernel.context.getKnowledgeSync({ kind: "skill", name: "project-relay", scope: "global" })!;
+    expect(relay.body).toBe(BUILTIN_SKILLS.find((x) => x.name === "project-relay")!.body);
+    expect(readFileSync(join(h.kernel.dataDir, "skills", "project-relay", "SKILL.md"), "utf8")).toContain("it rests (dormant)");
+    expect(readFileSync(join(h.kernel.dataDir, "skills", "domain-hub", "SKILL.md"), "utf8")).not.toContain("cwdMode");
+    expect(h.kernel.context.getKnowledgeSync({ kind: "skill", name: "workspace-arbitration", scope: "global" })!.body).toContain("## 我的补充");
+    expect(seedBuiltinSkills(h.kernel.context, "desk")).toEqual([]);
+
+    // The list of earlier texts is exactly what was shipped, and never names the current one.
+    for (const old of shippedBefore) {
+      const current = BUILTIN_SKILLS.find((x) => x.name === old.name)!;
+      const superseded = SUPERSEDED_SKILL_DIGESTS[old.name] ?? [];
+      if (skillDigest(current) === skillDigest(old)) expect(superseded).toEqual([]);
+      else expect(superseded).toContain(skillDigest(old));
+      expect(superseded).not.toContain(skillDigest(current));
+    }
+  });
+
+  it("a changed playbook is noticed here, so that the text it replaces is recorded and existing installs get the new one", () => {
+    // Failing because you changed a playbook? Add its previous digest (the expected value below) to
+    // SUPERSEDED_SKILL_DIGESTS in skills.ts — otherwise installs that still have the old text keep it — then update it here.
+    expect(Object.fromEntries(BUILTIN_SKILLS.map((s) => [s.name, skillDigest(s)]))).toEqual({
+      "project-relay": "4b065c12c6a48438292d8b85bf840628d8f5e1feac591130fec0f027799c323b",
+      "domain-hub": "e180da2ffb0a7c0251f94f16f036fd5aeea230f04e1cef4580022f4156165e53",
+      "workspace-arbitration": "ec1b4870c4c4cbcba535712f7331837a06000b4b120028ff3919b3a3e98de5d0",
+      "habit-and-routine-discovery": "83ec914cbc32826910118b0100d5770b9e7d5b81c79607f25a3da1adc2efa430",
+    });
   });
 });

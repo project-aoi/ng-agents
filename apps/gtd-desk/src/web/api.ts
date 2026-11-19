@@ -9,6 +9,7 @@ import type {
   ButtonDTO,
   CaptureRequest,
   CaptureResponse,
+  CellTimelineDTO,
   ClarifyQueueDTO,
   CreateSourceRequest,
   Effort,
@@ -18,10 +19,16 @@ import type {
   HttpMethod,
   ModelsDTO,
   RadarDTO,
+  ResourcePageDTO,
+  SendCellMessageRequest,
+  SendCellMessageResponse,
+  SetBudgetLimitsRequest,
+  SetBudgetLimitsResponse,
   SourcesDTO,
   SetModelRequest,
   SourcesMutationResponse,
   StatusDTO,
+  TopologyDTO,
   WeeklyReviewDTO,
 } from "../shared/api";
 
@@ -144,6 +151,8 @@ export const api = {
   /** The CLI agent's models; `refresh` asks the CLI again instead of using the cached list. */
   models: (refresh = false) => request<ModelsDTO>("GET", refresh ? "/api/models?refresh=1" : "/api/models"),
   setModel: (req: SetModelRequest) => request<ModelsDTO>("PUT", "/api/models", req),
+  /** The owner's budget-limits switch (false = nothing is stopped for its budget; usage is still counted). */
+  setBudgetLimits: (enforced: boolean) => request<SetBudgetLimitsResponse>("PUT", "/api/settings/budget-limits", { enforced } satisfies SetBudgetLimitsRequest),
 
   clarify: () => request<ClarifyQueueDTO>("GET", "/api/clarify"),
 
@@ -161,4 +170,18 @@ export const api = {
 
   sources: () => request<SourcesDTO>("GET", "/api/sources"),
   createSource: (req: CreateSourceRequest) => request<SourcesMutationResponse>("POST", "/api/sources", req),
+
+  topology: (opts: { includeArchived: boolean; projectId?: string | undefined }) =>
+    request<TopologyDTO>("GET", `/api/agents/topology?includeArchived=${opts.includeArchived ? 1 : 0}${opts.projectId ? `&projectId=${enc(opts.projectId)}` : ""}`),
+  /** No range = the newest page; `afterSeq` = only what came after it; `beforeSeq` = the page before it. */
+  timeline: (cellId: string, range: { afterSeq?: number; beforeSeq?: number; limit?: number } = {}) => {
+    const q = new URLSearchParams();
+    if (range.afterSeq !== undefined) q.set("afterSeq", String(range.afterSeq));
+    if (range.beforeSeq !== undefined) q.set("beforeSeq", String(range.beforeSeq));
+    if (range.limit !== undefined) q.set("limit", String(range.limit));
+    const qs = q.toString();
+    return request<CellTimelineDTO>("GET", `/api/cells/${enc(cellId)}/timeline${qs ? `?${qs}` : ""}`);
+  },
+  resource: (uri: string, offset: number, limit: number) => request<ResourcePageDTO>("GET", `/api/resources?uri=${enc(uri)}&offset=${offset}&limit=${limit}`),
+  sendCellMessage: (cellId: string, req: SendCellMessageRequest) => request<SendCellMessageResponse>("POST", `/api/cells/${enc(cellId)}/messages`, req),
 };

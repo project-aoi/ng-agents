@@ -1,6 +1,6 @@
 # 用例 4：远期想法预研停靠（`research_then_park`）、协调器质检补证与跨周查重唤醒
 
-> **遵循原则**：`P-UX-4`（消灭中长期技术债空白页）、`P-UX-6`（`Someday` 独立展示与报告抽屉）、`P-KERN-1`（持久 `Project` 上下文冻结保留）、`P-KERN-5`（精炼报告与局部修订）、`P-SAFE-2`（只读调研合理边界）
+> **遵循原则**：`P-UX-4`（消灭中长期技术债空白页）、`P-UX-6`（`Someday` 独立展示与报告抽屉）、`P-KERN-1`（持久 `Project` 上下文冻结保留）、`P-KERN-5`（精炼报告与局部修订）、`P-SAFE-2`（「只做查阅」是协调器下达的指令，查阅不等于禁止 `git fetch`）
 
 ---
 
@@ -23,17 +23,17 @@ sequenceDiagram
     participant Owner as "主人 (Chat / Web Radar)"
     participant Entry as "主 Agent / desk"
     participant Proj as "Project Cell (mode='research_then_park')"
-    participant W as "只读 Worker (cwdMode='read')"
+    participant W as "Worker (指令: 只做查阅)"
     participant DB as "Context & Radar Someday 专区"
 
     Owner->>Entry: "'以后可能做个极简模式 / 先摸底产物隔离方案'"
     Entry->>DB: "search 全局查重 (未命中)"
     Entry->>Proj: "create_project(mode='research_then_park') (无需强求写代码路径)"
-    Proj->>W: "dispatch(worker 1, cwdMode='read'): 调研源码/业界做法 -> save_artifact(v1)"
-    W-->>Proj: "report_to_parent(artifactId, 核心结论与待核缺口摘要)"
+    Proj->>W: "dispatch(worker 1, 只做查阅): 调研源码/业界做法 -> save_artifact(v1)"
+    W-->>Proj: "回合结束通知 cell.result (附 report_to_parent 的 artifactId、核心结论与待核缺口摘要)"
     opt 协调器质检发现关键证据缺口
-        Proj->>W: "dispatch(worker 2, cwdMode='read'): 核查缺失源码 -> patch_artifact(expectedVersion=1) 升 v2"
-        W-->>Proj: "report_to_parent(v2 已补齐)"
+        Proj->>W: "dispatch(worker 2, 只做查阅): 核查缺失源码 -> patch_artifact(expectedVersion=1) 升 v2"
+        W-->>Proj: "回合结束通知 (v2 已补齐)"
     end
     Proj->>DB: "update_project(一句话结论) + finish_project(outcome='someday')"
     Note over Proj,DB: "内核执行 pause_self: lifecycle='someday', Cell 冻结零开销, 不占活跃并发配额\nRadar『以后再说』专区挂出项目行 + 一键展开完整报告抽屉!"
@@ -80,4 +80,4 @@ sequenceDiagram
   - [presets/test/scenario-someday.test.ts](../../presets/test/scenario-someday.test.ts)（预研停靠 $\rightarrow$ 重提先告知询问 $\rightarrow$ 原项目恢复分阶段推进）
   - [apps/gtd-desk/test/projects.test.ts](../../apps/gtd-desk/test/projects.test.ts)（停靠激活与旧库已关闭停靠项无损迁移）
 - **当前待修实现偏差（详见 [03-bugs](../03-bugs/README.md)）**：
-  - `BUG-010`（Web UI `Radar` 尚未透出项目 `artifacts` 阅读抽屉）、`BUG-011`（`someday` 与 `paused` 双徽章及计数混淆）、`BUG-007`（协调器对只读指令过度加码与巨无霸附录反模式）。
+  - 无待修条目（原列条目已于 2026-11-19 修复）；`BUG-010` 的 `Radar` 报告阅读抽屉尚未在真实浏览器中目视验证（构建环境无浏览器）。

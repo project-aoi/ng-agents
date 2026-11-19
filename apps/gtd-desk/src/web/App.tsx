@@ -1,16 +1,21 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { StatusDTO, ViewName } from "../shared/api";
+import type { ArtifactRefDTO, StatusDTO, ViewName } from "../shared/api";
 import { api } from "./api";
+import { COMPOSER_INPUT_ID } from "./components/agents/composer";
 import { BottomBar, StatusLine, Toasts, TopBar } from "./components/chrome";
 import { Drawer, type DrawerTab } from "./components/drawer";
+import { ReportDrawer } from "./components/report";
 import { useDeskEvents } from "./live";
 import {
   NavProvider,
   RefreshProvider,
+  ReportProvider,
   StatusProvider,
   ToastProvider,
   dispatchViewKey,
   emitArtifactEvent,
+  emitCellTail,
+  emitJobChunk,
   isActivatableTarget,
   isTypingTarget,
   parseRoute,
@@ -23,11 +28,12 @@ import {
   type Route,
   type ViewKey,
 } from "./state";
+import { AgentsView } from "./views/Agents";
 import { ClarifyView } from "./views/Clarify";
 import { EngageView } from "./views/Engage";
 import { RadarView } from "./views/Radar";
 
-const ALL_VIEWS: ViewName[] = ["clarify", "engage", "radar", "review", "status", "sources", "activity"];
+const ALL_VIEWS: ViewName[] = ["clarify", "engage", "radar", "agents", "review", "status", "sources", "activity"];
 
 export function App() {
   return (
@@ -40,8 +46,9 @@ export function App() {
 }
 
 /**
- * Being in 🎯 Engage is what turns focus (DND) on; any other view turns it off (docs/04 §一, §三). Requests are
- * serialized and coalesced to the latest wish, so quick tab switching cannot leave the server in the wrong state.
+ * Being in 🎯 Engage is what turns focus (DND) on; any other view — 分身实况 included — turns it off (docs/04 §一,
+ * §三). Requests are serialized and coalesced to the latest wish, so quick tab switching cannot leave the server in
+ * the wrong state.
  */
 function useFocusMode(on: boolean, onStatus: (s: StatusDTO) => void) {
   const toast = useToast();
@@ -114,6 +121,7 @@ function Shell() {
   const [route, setRoute] = useState<Route>(() => parseRoute(window.location.hash));
   const [drawer, setDrawer] = useState<{ open: boolean; tab: DrawerTab }>({ open: false, tab: "capture" });
   const [panelOpen, setPanelOpen] = useState(false);
+  const [report, setReport] = useState<ArtifactRefDTO | null>(null);
   const statusRes = useResource<StatusDTO>("status", api.status, ["status"]);
   const { bump } = useRefresh();
   const toast = useToast();
@@ -139,6 +147,7 @@ function Shell() {
     setRoute(r);
     setPanelOpen(false);
     setDrawer((d) => (d.open ? { ...d, open: false } : d));
+    setReport(null);
     mainRef.current?.scrollTo({ top: 0 });
   }, []);
   const goView = useCallback((v: ViewKey) => navigate({ view: v }), [navigate]);
@@ -163,6 +172,12 @@ function Shell() {
     notification(n) {
       toast({ tone: "info", ...(n.title ? { title: n.title } : {}), text: n.text });
     },
+    cellTail(e) {
+      emitCellTail(e);
+    },
+    jobChunk(e) {
+      emitJobChunk(e);
+    },
   });
 
   useEffect(() => {
@@ -171,13 +186,21 @@ function Shell() {
   }, [status?.clarify.pending]);
 
   const closePanel = useCallback(() => setPanelOpen(false), []);
+  const openReport = useCallback((r: ArtifactRefDTO) => {
+    setDrawer((d) => (d.open ? { ...d, open: false } : d));
+    setReport(r);
+  }, []);
+  const viewRef = useRef(route.view);
+  viewRef.current = route.view;
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.defaultPrevented || e.isComposing || e.keyCode === 229) return;
       if (document.querySelector("dialog[open]")) return;
       if (e.key === "Escape") {
-        if (drawer.open) {
+        if (report) {
+          setReport(null);
+        } else if (drawer.open) {
           setDrawer((d) => ({ ...d, open: false }));
         } else if (panelOpen) {
           setPanelOpen(false);
@@ -207,14 +230,24 @@ function Shell() {
           goView("radar");
           break;
         case "4":
+          goView("agents");
+          break;
+        case "5":
+          setReport(null);
           setDrawer((d) => ({ open: !d.open, tab: d.open ? d.tab : "sources" }));
           break;
-        case "/":
+        case "/": {
           setDrawer((d) => ({ ...d, open: false }));
-          quickRef.current?.focus();
+          setReport(null);
+          // In 分身实况 the bottom bar is folded away: "/" goes to the selected node's own box instead.
+          const box = viewRef.current === "agents" ? document.getElementById(COMPOSER_INPUT_ID) : null;
+          if (box) box.focus();
+          else if (viewRef.current === "agents") setDrawer({ open: true, tab: "capture" });
+          else quickRef.current?.focus();
           break;
+        }
         default:
-          if (drawer.open || panelOpen) return;
+          if (drawer.open || panelOpen || report) return;
           if (e.key === "Enter" && isActivatableTarget(e.target)) return;
           if (!dispatchViewKey(e)) return;
       }
@@ -222,30 +255,34 @@ function Shell() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [drawer.open, panelOpen, goView]);
+  }, [drawer.open, panelOpen, report, goView]);
 
   const statusApi = useMemo(() => ({ status, setStatus }), [status, setStatus]);
-  const overlay = drawer.open;
+  const overlay = drawer.open || report !== null;
 
   return (
     <StatusProvider value={statusApi}>
       <NavProvider value={navigate}>
-        <div className="app">
-          <div className="chrome-top" inert={overlay}>
-            <TopBar view={route.view} status={status} onView={goView} drawerOpen={drawer.open} onDrawer={() => setDrawer((d) => ({ open: !d.open, tab: d.tab }))} />
-            <StatusLine view={route.view} status={status} connected={connected} open={panelOpen} onToggle={() => setPanelOpen((o) => !o)} onClose={closePanel} />
+        <ReportProvider value={openReport}>
+          <div className="app">
+            <div className="chrome-top" inert={overlay}>
+              <TopBar view={route.view} status={status} onView={goView} drawerOpen={drawer.open} onDrawer={() => setDrawer((d) => ({ open: !d.open, tab: d.tab }))} />
+              <StatusLine view={route.view} status={status} connected={connected} open={panelOpen} onToggle={() => setPanelOpen((o) => !o)} onClose={closePanel} />
+            </div>
+            <main className={`stage${route.view === "agents" ? " stage-fill" : ""}`} ref={mainRef} inert={overlay} tabIndex={-1}>
+              {route.view === "clarify" && <ClarifyView cardId={route.cardId} />}
+              {route.view === "engage" && <EngageView item={route.item} />}
+              {route.view === "radar" && <RadarView />}
+              {route.view === "agents" && <AgentsView cellId={route.cellId} projectId={route.projectId} />}
+            </main>
+            <div inert={overlay}>
+              <BottomBar view={route.view} inputRef={quickRef} workspace={route.view === "engage" && route.item !== undefined} />
+            </div>
+            <Drawer open={drawer.open} tab={drawer.tab} onTab={(tab) => setDrawer({ open: true, tab })} onClose={() => setDrawer((d) => ({ ...d, open: false }))} />
+            <ReportDrawer report={report} onClose={() => setReport(null)} />
+            <Toasts />
           </div>
-          <main className="stage" ref={mainRef} inert={overlay} tabIndex={-1}>
-            {route.view === "clarify" && <ClarifyView cardId={route.cardId} />}
-            {route.view === "engage" && <EngageView item={route.item} />}
-            {route.view === "radar" && <RadarView />}
-          </main>
-          <div inert={overlay}>
-            <BottomBar view={route.view} inputRef={quickRef} workspace={route.view === "engage" && route.item !== undefined} />
-          </div>
-          <Drawer open={drawer.open} tab={drawer.tab} onTab={(tab) => setDrawer({ open: true, tab })} onClose={() => setDrawer((d) => ({ ...d, open: false }))} />
-          <Toasts />
-        </div>
+        </ReportProvider>
       </NavProvider>
     </StatusProvider>
   );

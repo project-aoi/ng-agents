@@ -1,9 +1,9 @@
 import type { Kernel } from "@ng/cell";
-import { gtdKeys, type BusTopic, type BusTopics } from "@ng/protocol";
+import { CELL_DIRECT_CHAT_KEY, CELL_TURN_KEY, gtdKeys, type BusTopic, type BusTopics } from "@ng/protocol";
 import type { DeskEvent, NotificationDTO, ViewName } from "../shared/api";
 import { SENSOR_SUGGESTION_PREFIX, SKILL_SUGGESTION_PREFIX } from "./projections/common";
 
-const ALL: readonly ViewName[] = ["clarify", "engage", "radar", "review", "status", "sources", "activity"];
+const ALL: readonly ViewName[] = ["clarify", "engage", "radar", "agents", "review", "status", "sources", "activity"];
 
 function stateViews(keys: readonly string[]): ViewName[] {
   const v = new Set<ViewName>();
@@ -13,7 +13,9 @@ function stateViews(keys: readonly string[]): ViewName[] {
     else if (k.startsWith(gtdKeys.activityPrefix)) ["activity", "status", "clarify"].forEach((x) => v.add(x as ViewName));
     else if (k === gtdKeys.source) ["sources", "review"].forEach((x) => v.add(x as ViewName));
     else if (k.startsWith(SKILL_SUGGESTION_PREFIX) || k.startsWith(SENSOR_SUGGESTION_PREFIX)) v.add("review");
-    else if (k === "cell:status") ["radar", "status"].forEach((x) => v.add(x as ViewName));
+    else if (k === "cell:status") ["radar", "status", "agents"].forEach((x) => v.add(x as ViewName));
+    // What the Agents view shows of a cell: the owner spoke to it, its turn was announced, a parent pulled from it.
+    else if (k === CELL_DIRECT_CHAT_KEY || k === CELL_TURN_KEY || k.startsWith("pull:")) v.add("agents");
   }
   return [...v];
 }
@@ -22,19 +24,19 @@ function stateViews(keys: readonly string[]): ViewName[] {
 export function viewsForBusEvent<K extends BusTopic>(topic: K, data: BusTopics[K]): ViewName[] {
   switch (topic) {
     case "approval.changed":
-      return ["clarify", "status", "radar", "engage", "review"];
+      return ["clarify", "status", "radar", "agents", "engage", "review"];
     case "artifact.changed":
-      return ["clarify", "engage"];
+      return ["clarify", "engage", "radar", "agents"];
     case "state.changed":
       return stateViews((data as BusTopics["state.changed"]).keys);
     case "cell.changed":
     case "inbox.control":
-      return ["radar", "status", "sources"];
+      return ["radar", "agents", "status", "sources"];
     case "run.started":
     case "run.finished":
-      return ["status", "radar", "clarify"];
+      return ["status", "radar", "agents", "clarify"];
     case "job.changed":
-      return ["status", "radar"];
+      return ["status", "radar", "agents"];
     case "outbox.changed":
       return (data as BusTopics["outbox.changed"]).channelId === "ui" ? ["status"] : ["status", "clarify", "sources"];
     case "channel.focus":
@@ -44,7 +46,10 @@ export function viewsForBusEvent<K extends BusTopic>(topic: K, data: BusTopics[K
     case "knowledge.changed":
       return ["review", "engage"];
     case "inbox.enqueued":
-      return (data as BusTopics["inbox.enqueued"]).reason === "due" ? ["clarify", "status", "radar"] : [];
+      // Any message can wake a cell (the Agents view shows it about to start); a due one can also surface a card.
+      return (data as BusTopics["inbox.enqueued"]).reason === "due" ? ["clarify", "status", "radar", "agents"] : ["agents"];
+    case "ledger.raised":
+      return ["status", "agents"];
     default:
       return [];
   }
@@ -59,7 +64,9 @@ export interface EventHub {
 
 /**
  * One bus subscription for all SSE clients. `refresh` events are coalesced over `debounceMs` so a burst of commits
- * (a Run writing several records) becomes one refetch; drafts and notices are forwarded at once.
+ * (a Run writing several records) becomes one refetch; drafts and notices are forwarded at once. New records on a
+ * cell's timeline become `cell_tail` (coalesced per cell over the same window, the latest seq wins); live output of a
+ * previewed background command is forwarded as `job_chunk`.
  */
 export function createEventHub(kernel: Pick<Kernel, "bus" | "hub">, opts: { debounceMs?: number } = {}): EventHub {
   const debounceMs = opts.debounceMs ?? 80;
@@ -67,6 +74,7 @@ export function createEventHub(kernel: Pick<Kernel, "bus" | "hub">, opts: { debo
   const closers = new Set<() => void>();
   let pending = new Set<ViewName>();
   let timer: ReturnType<typeof setTimeout> | null = null;
+  const tails = new Map<string, { lastSeq: number; timer: ReturnType<typeof setTimeout> }>();
 
   const send = (e: DeskEvent) => {
     for (const l of [...listeners]) {
@@ -85,8 +93,35 @@ export function createEventHub(kernel: Pick<Kernel, "bus" | "hub">, opts: { debo
     send({ event: "refresh", data: { views } });
   };
 
+  const tail = (cellId: string, seq: number) => {
+    const t = tails.get(cellId);
+    if (t) {
+      t.lastSeq = Math.max(t.lastSeq, seq);
+      return;
+    }
+    const entry = {
+      lastSeq: seq,
+      timer: setTimeout(() => {
+        tails.delete(cellId);
+        send({ event: "cell_tail", data: { cellId, lastSeq: entry.lastSeq } });
+      }, debounceMs),
+    };
+    entry.timer.unref?.();
+    tails.set(cellId, entry);
+  };
+
   const off = kernel.bus.on("*", (topic, data) => {
     if (listeners.size === 0) return;
+    if (topic === "evidence.appended") {
+      const d = data as BusTopics["evidence.appended"];
+      tail(d.cellId, d.seq);
+      return;
+    }
+    if (topic === "job.output") {
+      const d = data as BusTopics["job.output"];
+      send({ event: "job_chunk", data: { cellId: d.cellId, jobId: d.jobId, chunk: d.chunk } });
+      return;
+    }
     if (topic === "artifact.changed") {
       const d = data as BusTopics["artifact.changed"];
       send({ event: "artifact", data: { artifactId: d.artifactId, version: d.version, updatedBy: d.updatedBy, parked: d.parked === true } });
@@ -110,7 +145,10 @@ export function createEventHub(kernel: Pick<Kernel, "bus" | "hub">, opts: { debo
     const views = viewsForBusEvent(topic, data);
     if (views.length === 0) return;
     for (const v of views) pending.add(v);
-    timer ??= setTimeout(flush, debounceMs);
+    if (!timer) {
+      timer = setTimeout(flush, debounceMs);
+      timer.unref?.();
+    }
   });
 
   return {
@@ -126,6 +164,8 @@ export function createEventHub(kernel: Pick<Kernel, "bus" | "hub">, opts: { debo
       off();
       if (timer) clearTimeout(timer);
       timer = null;
+      for (const t of tails.values()) clearTimeout(t.timer);
+      tails.clear();
       listeners.clear();
       for (const c of [...closers]) c();
       closers.clear();

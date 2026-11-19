@@ -1,6 +1,7 @@
 // docs/05 Phase 3 — the built-in playbooks. A role prompt states the contract; these show it carried out, step by
-// step, with the exact tool calls. They are ordinary global skills (SKILL.md under <dataDir>/skills): seeded once when
-// missing, never overwritten — the owner's edits are the point of having them as files.
+// step, with the exact tool calls. They are ordinary global skills (SKILL.md under <dataDir>/skills): seeded when
+// missing, and replaced by a newer text only while the installed one is exactly a text shipped before (seed.ts) — the
+// owner's edits are the point of having them as files.
 
 export interface BuiltinSkill {
   name: string;
@@ -17,57 +18,66 @@ export const SKILL_HABIT_DISCOVERY = "habit-and-routine-discovery";
 const projectRelay: BuiltinSkill = {
   name: SKILL_PROJECT_RELAY,
   description:
-    "For a project cell: how to run a multi-step outcome as a relay of one-shot workers — what to put in each hand-off, how to wait for outside events and for the owner, staged work, and finishing with preferences saved.",
+    "For a project cell: how to run a multi-step outcome as a relay of workers — what to put in each hand-off, reading what a worker did when its turn is over, sending the next step to the worker that already knows the work or to a new one, waiting for outside events and for the owner, staged work, and finishing with preferences saved.",
   tags: ["project", "builtin"],
   body: `# Project relay
 
-A project is a relay race: you hold the baton (goal, plan, records, the shared report) and each worker runs one leg and hands it back. The runner leaves; the baton stays with you.
+A project is a relay race: you hold the baton — the goal, the plan, the records, the shared report and your "board" note — and each worker runs a leg. A worker that has run its leg does not leave the track: you are told that its turn is over, and it rests (dormant), remembering everything about its leg, until a message sends it out again. So the next leg goes either to the worker that already knows the ground (send_message) or to a new runner (dispatch). That choice, and the baton, are yours.
 
 ## The hand-off: what a dispatch instruction contains
-A worker knows only what you write. Use this shape and leave nothing implicit:
+A new worker knows only what you write. Use this shape and leave nothing implicit:
 
 \`\`\`
 目标：<这一棒要交付什么，一句话>
-目录：<绝对路径>（<只读分析 | 可以改动>）
-现场：<上一棒留下的分支、提交、未合入的改动；或“干净的主干”>
+目录：<绝对路径>（<只读分析：不改文件、不切分支 | 可以改动>）
+同仓：<"active workspaces" 里此刻还有谁在这个仓库改代码；有人在改时写明：只做查阅，或用 git worktree add 另建工作树、在那里改；没有就写"无">
+现场：<上一棒留下的分支、提交、未合入的改动；或"干净的主干">
 材料：<要读的路径、链接、artifact id 与版本>
 做法与约束：<主人的偏好、不能碰的东西>
 验证：<怎么算做对了>
-交付：<report 里要写清的：分支、MR 链接、artifact id、没验证到的部分>
+交付：<结束时要说清的：分支、MR 链接、artifact id、没验证到的部分>
 \`\`\`
+A follow-up to a worker that already ran a leg is shorter: it knows the goal, the directory and what it did, so say what is new and what to deliver.
+
+## When a worker's turn is over
+The notice (\`cell.result\`) carries the worker's own summary, the stretch of its record the turn covers, and whether the owner talked to it directly. Then:
+1. Look before you rely on it: inspect_cell shows what it was told, what it said, the files it changed and the commands it ran with how they ended. Always look when the owner spoke to it directly — that is where a changed requirement shows up.
+2. Take what matters into your books (update_project, track_action) and rewrite your board note (save_note kind "note", scope "cell", name "board"): per worker what it is for, where it works, how far you have read its record, what the owner changed along the way.
+3. Decide the next leg: more work on what it just did → send_message to that worker; a different piece, or one that should run alongside → dispatch; a delivery → the owner's review (Pattern B).
 
 ## Pattern A — some parts can start now, one part waits for the owner
 Example: compare three code bases; two are on disk, the third must be requested from a colleague.
-1. dispatch a read-only worker for the parts that can start. Ask it to create the report artifact and report its id.
-2. track_action owner "human": title "要到 Doubao work 的代码", nextStep "向 <谁> 要代码，放到 <路径> 后在这里勾掉". Tell the owner once. If the code will land at a known path, also dispatch a watcher that checks \`test -d <路径>\` — then you continue even if the owner forgets to tick the box.
-3. wait with waitingFor "human". (The first worker keeps running; its result wakes you too.)
-4. When the owner ticks the action or the watcher reports: dispatch the next worker with the report's artifact id and current version, to add the missing part — not to start a new report.
-5. The report is complete: tell the owner where it is, record "验收：对比报告" as a human action and wait. The owner asks for additions: one more dispatch on the same artifact. Report version numbers go up; nothing is lost. Finish when they accept it.
+1. dispatch a worker for the parts that can start, told to only read. Ask it to create the report artifact and give its id.
+2. track_action owner "human": title "要到 Doubao work 的代码", nextStep "向 <谁> 要代码，放到 <路径> 后在这里勾掉". Tell the owner once. If the code will land at a known path, also dispatch a watcher with check { command: "test -d <路径>" } — it costs nothing while the directory is missing, and you continue even if the owner forgets to tick the box.
+3. wait with waitingFor "human". (The first worker keeps working; the notice that its turn is over wakes you too.)
+4. When the owner ticks the action or the watcher reports: the missing part goes into the same report. The first worker is dormant and knows the report — send it the new path ("Doubao work 的代码已在 <路径>，按同样的维度补上这一部分，更新 artifact <id>"), or dispatch a new worker with the artifact id and its current version. Either way it extends the report; it does not start a new one.
+5. The report is complete: tell the owner where it is, record "验收：对比报告" as a human action and wait. The owner asks for additions: one more message to the worker that wrote it, or one more dispatch on the same artifact. Report version numbers go up; nothing is lost. Finish when they accept it.
 
 ## Pattern B — code change, then MR, then "one more thing", then wait for the merge
-1. dispatch a writer into the repository. Its report gives the branch and what was verified. Tell the owner (what changed, branch, what was and was not verified), record track_action owner "human" "验收：<改动>", and wait with waitingFor "human". Do not finish: unpushed code on a local branch is a delivery, not the end.
-2. The owner says "用 /ship-mr 跟进": dispatch a second writer into the same directory — "现场：分支 <上一棒的分支>，改动已提交；用 /ship-mr 推分支并建 MR，报告 MR 链接". Note for later that this is a habit worth saving.
-3. The owner says "补个录屏": a third dispatch, same directory, same branch.
-4. As soon as the MR exists, dispatch a watcher for it: "检查 MR <链接> 是否已合入：先看当前状态（gh pr view / glab mr view），未合入则每 10 分钟再看；合入后报告合入时间". The action is now "waiting".
-5. The watcher reports "merged" while the screencast worker is still running: do **not** finish yet. Finish when every accepted piece is done.
+1. dispatch a worker into the repository to make the change. When its turn is over, inspect_cell: which branch, which commits, what was verified. Tell the owner (what changed, branch, what was and was not verified), record track_action owner "human" "验收：<改动>", and wait with waitingFor "human". Do not finish: unpushed code on a local branch is a delivery, not the end.
+2. The owner says "用 /ship-mr 跟进": that is more work on what the worker just did, so it goes to the same worker — send_message to inbox:<its id>: "用 /ship-mr 推分支并建 MR，报告 MR 链接". It wakes with the branch and its changes in mind. Its first action is already closed, so record this step: track_action owner "agent", title "用 /ship-mr 提 MR", cellId <its id>. Note for later that this is a habit worth saving.
+3. The owner says "补个录屏": a recording takes a while and can run beside the MR work — dispatch a second worker into the same directory: "现场：分支 <分支>；只录屏，不改文件、不切分支".
+4. As soon as the MR exists, dispatch a watcher for it, with a check command so that the waiting costs nothing: instruction "检查 MR <链接> 是否已合入", check { command: "gh pr view <n> --json state -q .state | grep -qx MERGED", everySec: 600 } (for GitLab, \`glab mr view <n>\` and its state). The action is now "waiting".
+5. The watcher reports "merged" while the screencast worker is still working: do **not** finish yet. Finish when every accepted piece is done. A dormant worker is not in the way: it is archived with the project.
 6. Before finish_project: save_note kind "preference", scope "global" — e.g. name "code-change-followup", body "改完代码后直接用 /ship-mr 提 MR，并附一段验证录屏，不用再等我说". Name it in finish_project's retro.
 
 ## Pattern C — an idea for later, then a staged build
-1. Started with mode "research_then_park": dispatch one read-only worker to research how others do it (web allowed) and save a report artifact. When it reports: update_project with a one-line summary, then finish_project outcome "someday". You are parked with everything kept.
+1. Started with mode "research_then_park": dispatch one worker, told to only read, to research how others do it (web allowed) and save a report artifact. When its turn is over: update_project with a one-line summary, then finish_project outcome "someday". You are parked with everything kept.
 2. Woken later (the owner raised it again): read your report (read_artifact), tell the owner in two lines what it concluded, ask what changed. Then split the work into phases: track_action for each with its phase number, owner "agent".
 3. Run phase 1 only. When it is done: request_approval kind "action", title "阶段 1 完成，是否开始阶段 2", with what was delivered and what phase 2 would do. Start phase 2 only after the answer. One phase in flight at a time, even though the machine could run them all.
 
 ## When a worker comes back with a problem
-- "directory not in the expected state, asked the desk": nothing for you to do until it reports again — it is waiting for the desk, not for you.
-- status "failed" with a reason: read the reason. Missing input → get the input (human action or another worker). Wrong plan → change the plan and say so in update_project. Never dispatch the same instruction again unchanged.
-- You forwarded a follow-up with send_message and got "NOT DELIVERED … closed": dispatch a new worker with the context; that is the normal path, not an error.
+- It asks you about its directory ("工作区冲突/公共受阻，请指示": changes it was not told about, an unexpected branch, another cell changing the same files) and waits for your answer. Answer it with send_message: whose changes they are (your board note, inspect_cell on your other workers, the note "active workspaces"), which branch to be on, whether to wait or to work in a work tree of its own (\`git worktree add\`). If another project's cell is in the way, ask the desk; if the changes belong to no cell, they are the owner's — ask the owner, and never tell the worker to discard them.
+- It asked the desk instead (a CI failure that is everybody's, changes that belong to nobody it knows of): nothing for you to do until the desk answers it; its next turn tells you how it went.
+- Its turn ended with status "failed": read what happened (inspect_cell), not only the reason it gave. Missing input → get the input (human action or another worker). Wrong plan → change the plan and say so in update_project. The worker is dormant with everything it learned, so a corrected instruction sent to it is often the quickest way on. Never send the same instruction again unchanged.
+- send_message answers "NOT DELIVERED … closed": that cell is really gone (it was stopped, or it was a watcher that has reported). Dispatch a new worker with the context it needs — what the previous one did, the branch or artifact it left.
 `,
 };
 
 const domainHub: BuiltinSkill = {
   name: SKILL_DOMAIN_HUB,
   description:
-    "For a hub cell: how to turn a batched stream of direct messages (review requests, incident pings) into topics, forward follow-ups to the worker already on a topic, and continue seamlessly when that worker has just closed.",
+    "For a hub cell: how to turn a batched stream of direct messages (review requests, incident pings) into topics, forward follow-ups to the worker already on a topic — working or resting, it continues with everything it knows — and start a new one only when that worker is gone.",
   tags: ["hub", "builtin"],
   body: `# Domain hub
 
@@ -84,18 +94,22 @@ Pick the key from what identifies the topic outside (MR number, incident id, a s
 Messages in the batch:
 1. "@bot 看下 MR !41" (张三)   2. "@bot !41 补充：重点看并发" (张三)   3. "@bot 帮忙订会议室" (李四)   4. "@bot !38 改好了再看一眼" (王五)
 
-- 1 + 2 are one topic, mr-41, new → spawn_cell preset "worker", cwd = the repository's directory, cwdMode "read", instruction: "评审 MR !41（<链接>），仓库 <目录>，默认分支 <分支>。张三特别提到：重点看并发。交付：评审意见（阻塞项/建议项），写成 artifact 并报告 id。"
+- 1 + 2 are one topic, mr-41, new → spawn_cell preset "worker", cwd = the repository's directory, instruction: "评审 MR !41（<链接>），仓库 <目录>，默认分支 <分支>。张三特别提到：重点看并发。只做查阅，不要改文件、不要切分支。交付：评审意见（阻塞项/建议项），写成 artifact 并报告 id。"
 - 3 is not yours → handback with its id, reason "不是代码评审的事".
 - 4 is mr-38; the ledger says worker cell_abc is on it → send_message to "inbox:cell_abc": "王五说 !38 改好了，请再看一眼（<原话>）".
-  - "Delivered" → done; the worker takes it before it finishes.
-  - "NOT DELIVERED … closed" → the previous round just ended. spawn_cell a new worker: "继续评审 MR !38：上一轮结论见 artifact <id>（ledger 里记着）；作者王五称已修改，请复核上一轮的阻塞项是否解决。"
+  - "Delivered" → done. A worker still reviewing takes it before its turn ends; one whose review turn is over is resting, and the message wakes it — it re-checks with its first review and everything it learned in mind.
+  - "NOT DELIVERED … closed" → that worker is gone (someone stopped it). spawn_cell a new worker: "继续评审 MR !38：上一轮结论见 artifact <id>（ledger 里记着）；作者王五称已修改，请复核上一轮的阻塞项是否解决。只做查阅，不要改文件、不要切分支。"
 - Update the ledger for mr-41 and mr-38, end the turn.
 
+## When a worker's turn is over
+You are told (\`cell.result\`, with its summary). The summary is its own account; before you pass an outcome on, or when the summary leaves doubt, inspect_cell shows what it actually did. Update the topic in the ledger: done — or, for a review with blocking issues, "waiting for the author", with the worker left as it is, resting and ready for the next round.
+
 ## Rules of thumb
-- Reviewing and investigating are read-only work (cwdMode "read"): they never queue and never disturb whoever is writing in that repository.
-- A fix is a writer (cwdMode "write") in the repository's directory; if another writer is in there, the kernel starts yours when it is done. Do not wait, lock, or pick another directory to dodge the queue.
+- Nothing queues for a repository and nothing locks it: every worker starts the moment you spawn it. Reviewing and investigating only read — say "只做查阅，不要改文件、不要切分支" in the instruction — so they can run beside anyone.
+- A fix changes files. Look at the note "active workspaces" first: nobody is changing code in that repository → start the worker there; someone is → tell it "用 \`git worktree add <新目录> <默认分支>\` 建独立工作树，在那里改，不要动 <目录> 的检出". A fix that belongs to a topic whose worker already knows the code goes to that worker instead.
+- A worker that asks you what to do about a directory that is not as expected is waiting for your answer: answer it, or pass the question to the desk and tell the worker so.
 - A reply to the people in the thread is the owner's to approve: send_message to the thread creates the draft and the card. Say in the summary which topic it answers.
-- You never close a topic by silence: either its worker reported, or you handed it back.
+- You never close a topic by silence: either its worker's turn brought the outcome, or you handed it back.
 `,
 };
 
@@ -106,13 +120,13 @@ const workspaceArbitration: BuiltinSkill = {
   tags: ["desk", "arbitration", "builtin"],
   body: `# Workspace arbitration
 
-A cell wrote to you and is now asleep, waiting for inbox:desk. It has let go of its directory. Until you answer, it stays asleep — so every request ends with a send_message to that cell.
+A cell wrote to you and is now asleep, waiting for inbox:desk. It stopped before changing anything — that is what a cell does when its directory is not as described or something outside its task blocks it. Until you answer, it stays asleep, and nothing else wakes it for this — so every request ends with a send_message to that cell. Trouble inside one project goes to that project first; what reaches you is shared by several cells, crosses projects, or belongs to nobody the cell knows — or it is a question a project passed on.
 
 ## Step 0 — read the request
 It should give: directory, branch, \`git status\` (or the failing job and error), its task, what it needs. If something essential is missing, ask it (send_message to inbox:<id>) — it wakes, answers and waits again.
 
 ## Step 1 — whose problem is it?
-Look at the live note "active workspaces", the in-flight list, and read_state "desk:arbitration" (open blockers).
+Look at the live note "active workspaces" (who is working in which directory right now, in which project), the in-flight list, and read_state "desk:arbitration" (open blockers). inspect_cell on a cell shows what it was told and what it did.
 
 ### A. Shared blocker — the cause is outside the reporter's task and hits others too
 Signs: a CI job fails on the main branch as well; several cells report the same error; a shared service or dependency is broken.
@@ -120,13 +134,13 @@ Keep your own note of open blockers in state: set_state { patches: { "desk:arbit
 - First report of a cause: start one fixer — spawn_cell { preset: "worker", title: "修复公共 CI", cwd: <repo>, instruction: "…" } — and note the blocker with the reporter as its first waiter.
   - The repository's checkout is on the reporter's feature branch? Then the fixer should not work in it: instruct "在独立目录修复：\`git -C <repo> worktree add <临时目录> origin/develop\`（或另行 clone），在那里修、提 MR、合入后删除你自己建的这个 worktree；不要动 <repo> 当前检出".
 - Every further report of the same cause: add that reporter to the waiters in your note; no second fixer. Tell it, if useful, that a fix is under way — it keeps waiting.
-- The fixer's cell.result arrives: for each waiter in the note, send_message { to: "inbox:<waiter>", summary: "公共问题已处理", text: "ci已修复（<MR 链接>），可以 rebase develop 然后继续推进" }. A send that comes back "closed" means that cell finished or was stopped meanwhile — its project will dispatch a successor; nothing more for you to do. Then remove the blocker from your note.
+- You are told the fixer's turn is over (\`cell.result\`): check that it really is fixed — its summary, and inspect_cell when the summary leaves doubt. Something left to do: send it to the fixer (send_message; it rests between turns and continues where it stopped). Fixed: for each waiter in the note, send_message { to: "inbox:<waiter>", summary: "公共问题已处理", text: "ci已修复（<MR 链接>），可以 rebase develop 然后继续推进" }. A send that comes back "NOT DELIVERED … closed" means that cell was stopped, or its project ended, meanwhile — nothing more for you to do; its project decides whether someone carries on. Then remove the blocker from your note.
 - The fixer failed: tell the waiters what you know and raise it to the owner (request_approval, reason "blocked") — do not leave them waiting on a fix that is not coming.
 
-### B. Leftover from another cell
-Signs: an unexpected branch or uncommitted changes that match what an earlier worker of the same project reported (read the project's records: read_state with cellId = the project, prefix "gtd:"; read its artifacts; search_history scope "global" for the branch name).
-- Answer the asker: "这是上一棒 <谁> 留下的 <分支/改动>，属于本项目：留在该分支上继续，不要丢弃" — or "切回 <分支>：\`git switch <分支>\`（改动已提交在 <提交>）".
-- If the earlier worker is still running in the "active workspaces" note, the asker should not be in that directory at all: tell it to wait, and tell its project.
+### B. Somebody else's work in the same place
+Signs: an unexpected branch or uncommitted changes that match what another cell did (inspect_cell on the cells of the project in question; its records: read_state with cellId = the project, prefix "gtd:"; its artifacts; search_history scope "global" for the branch name), or a cell of another project changing the same files right now (the note "active workspaces").
+- Left by an earlier step of the same work: "这是上一棒 <谁> 留下的 <分支/改动>，属于本项目：留在该分支上继续，不要丢弃" — or "切回 <分支>：\`git switch <分支>\`（改动已提交在 <提交>）".
+- Two cells really are in each other's way (both changing code in one work tree): decide who goes first — the other waits for your word — or tell the asker to do its part in a work tree of its own: "用 \`git worktree add <新目录> <分支>\` 建独立工作树，在那里改，不要动 <目录> 的检出". Tell the other cell's project what you decided when it changes anything for them.
 
 ### C. Nobody's — it is the owner's
 Signs: uncommitted changes, no cell has worked in this directory recently, nothing in any project's records explains them.
@@ -167,3 +181,15 @@ A correction the owner makes twice ("报告先写结论", "提 MR 后贴录屏")
 };
 
 export const BUILTIN_SKILLS: readonly BuiltinSkill[] = [projectRelay, domainHub, workspaceArbitration, habitDiscovery];
+
+/**
+ * Per playbook, the digests (seed.ts skillDigest) of every text an earlier version shipped. An installed playbook that
+ * is still exactly one of them was never touched by the owner, so seeding replaces it with the current text; anything
+ * else is theirs and stays. When you change a playbook, add the digest of the text it had before to its list.
+ */
+export const SUPERSEDED_SKILL_DIGESTS: Readonly<Record<string, readonly string[]>> = {
+  // 2026-11-18: one-shot workers, cwdMode read/write, writers queued by the kernel.
+  [SKILL_PROJECT_RELAY]: ["862adcc1128d43b0fe9e80a897e16be0eccafa56e3f0c0f828eb248e5c669528"],
+  [SKILL_DOMAIN_HUB]: ["ab567185e4c44b045ec9388f8352e6daf44bfecc44d61f91d6758bb0f7d04762"],
+  [SKILL_WORKSPACE_ARBITRATION]: ["2fd6bd61786138935a735117b3f8f23391574330e476cfcad2717c005dc74c3e"],
+};

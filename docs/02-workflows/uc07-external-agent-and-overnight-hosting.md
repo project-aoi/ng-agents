@@ -62,26 +62,28 @@ sequenceDiagram
 
 1. **外部主 Agent 的服务生命周期与防越位边界**：
    - **不私自启停服务**：工作台服务由主人手动管理；若 `127.0.0.1:8790` 未启动，主 Agent 如实告知主人，绝不私跑 `pnpm start` 或悄悄在当前对话里硬干原本属于后台项目的重活（若会话启动时工作台离线导致 MCP 仅挂载占位工具，待工作台上线后支持直调本地 `/api/agent/tools/*` 回退）。
-   - **不抢后台写锁**：主 Agent 自己在终端动任何代码仓库前，必先看 `list_workspaces` 确认无后台写分身正在改该工作树。
+   - **不与后台分身抢同一现场**：主 Agent 自己在终端动任何代码仓库前，必先看 `list_workspaces`（即内核的活跃目录事实，见 `P-SAFE-2`）确认没有后台分身正在该工作树里干活；有则把改动交给那个分身或其项目（直连发话 / 追加到项目），或自己另开 `git worktree` 再改。内核不替它排队或加锁。
 2. **为什么必须「先存带作用域的偏好，再建项目」，且已内联技能要从待读列表剔除？**
    - 持久 `Cell` 在第 1 轮 `hydrate` 时冻结系统提示词前缀以命中大模型 KV-Cache：先存偏好再建项目，使协调器从第 1 轮起就拿到完整规范且后续前缀字节不变。
    - 给偏好加上 `cwdPrefix` 与 `roles` 过滤，保证特定仓库的严苛改码红线只注入该仓库下的 `project / worker`，既不塞给轻量 `watcher`，也不污染其他无关项目。
    - `Context.hydrate` 对已全文内联进系统提示词的技能（如 `project` 角色的 `project-relay`）自动从 `# Skills` 按需读取索引中过滤掉，消除协调器开局白花一轮调 `read_resource` 重复搬运同一份文本。
 3. **跨夜无人值守的四道账本与电源防线推导**：
-   - **防线 A（认领前预检 + 收尾免死缓冲）**：在把收件箱消息标为 `claimed/done` 并写入 CLI 会话证据**之前**先做零成本预算检查——若已超限则直接挂起出卡，子分身刚交回的长篇 `cell.result` 完好留在 `pending` 队列，续费后原样送达模型，绝不蒸发；若协调器名下所有子任务已完结、仅剩最后一步调 `finish_project` 收尾，给予极小额免死缓冲直接完结，不让跑完马拉松的项目卡死在终点线前。
-   - **防线 B（会话增量与缓存折算）**：CLI `resume` 返回会话累计总用量时，驱动层严格记录 `lastReportedTokens` 只向 `Gate.meter` 报单轮差值，并将 95%+ 命中的缓存输入按真实折扣计入预算（不再按 1:1 原价虚扣或把美元记成 `$0`）。
-   - **防线 C（祖先链一键联调续费 + 动态继承余额）**：派生子 `Cell` 时不把父节点瞬时余额静态焊死为子上限；当子项目与根 `desk` 同时超限时，点击一次 `continue` 沿祖先链幂等解除所有卡住节点，杜绝几十毫秒内背靠背连弹两张预算卡。
+   - **防线 A（认领前挂起 + 收尾缓冲）**：`Dispatcher` 在认领信封、推进 CLI 会话**之前**先读账本——自身或任一祖先已到硬上限的 `llm` `Cell` 不启动、不认领，只提起一张预算卡；子分身刚交回的长篇 `cell.result` 完好留在 `pending` 队列，续费后在一轮里原样送达模型，绝不蒸发。名下已无任何在途工作的非根协调器（仅剩记录结果、停靠或调 `finish_project` 收尾）可越过上限一段收尾额度（上限的 5%，最多 200k tokens / 200 美分），不让跑完马拉松的项目卡死在终点线前。
+   - **防线 B（会话增量与缓存折算）**：CLI 以会话累计值上报用量时，驱动记住已结算的累计值，只向 `Gate.meter` 报本轮差值（累计值回落即会话重建，整段计为新增）；前缀缓存读取（`cachedTokens`）按 `cacheReadWeight`（默认 `0.1`）折算计入 token 上限，实际美分照实记账。
+   - **防线 C（祖先链一键联调续费 + 动态继承余额）**：派生子 `Cell` 时不把父节点瞬时余额静态焊死为子上限；当子项目与根 `desk` 同时超限时，点击一次「继续」由 `Gate.raiseChainSync` 给链上**此刻**触顶的每个账本一并加额，未触顶的不动，杜绝背靠背连弹两张预算卡，兄弟卡上再点也不会给共享祖先重复加额。
+   - 以上三道防线在预算限制开启时生效；主人也可以整体关闭预算限制（`P-SAFE-7`），此时无任何拦停与预算卡，用量照常记账。
    - **防线 D（防空闲休眠 + 合盖唤醒续租）**：有活跃运行任务时自动持有系统防空闲休眠断言（macOS `caffeinate -i`）；遇到强制物理合盖休眠唤醒时，内核对比 `Date.now()` 与 `performance.now()` 识别出休眠时长 $\Delta_{\text{sleep}}$，**先为所有活跃租约顺延 $\Delta_{\text{sleep}}$，再跑过期回收**，确保活着的 CLI 进程绝不被误杀重发。
 
 ---
 
 ## 三、不可破坏的不变量（MUST NOT BREAK）
 
-- **`INV-UC07-01`（主 Agent 异步交办零阻塞与服务手动边界）**：外部主 Agent 严禁自行启停工作台进程、严禁在立项后循环轮询进度、严禁与后台活跃写分身并发修改同一工作树。
+- **`INV-UC07-01`（主 Agent 异步交办零阻塞与服务手动边界）**：外部主 Agent 严禁自行启停工作台进程、严禁在立项后循环轮询进度、严禁在后台分身正活跃于其中的工作树里并发改动（先看活跃目录，有人则转交或另开 `git worktree`）。
 - **`INV-UC07-02`（`ownerOnly` 双红线全入口硬拒 `agent:*`）**：外部主 Agent 凭证在 HTTP 与 MCP 任何入口均不得放行对外发送卡片或超预算续费卡片。
-- **`INV-UC07-03`（`resume` 单轮增量精准记账）**：多轮复用同一 CLI 会话的持久 `Cell`，其账本累计 Token 必须严格等于各轮真实新增消耗之和，严禁将历史累计值重复叠加。
-- **`INV-UC07-04`（预算拦截零丢信封）**：因预算触顶触发 `budget_stopped` 时，尚未真正送入模型推理的入站信封（特别是子分身汇报的 `cell.result`）严禁被标记为已消费或从续跑输入中丢失。
+- **`INV-UC07-03`（`resume` 单轮增量精准记账）**：多轮复用同一 CLI 会话的 `Cell`（含被反复唤醒的待命 `worker`），其账本累计 Token 必须严格等于各轮真实新增消耗之和（缓存读取按 `cacheReadWeight` 折算），严禁将会话历史累计值重复叠加；CLI 计数器归零（会话重建）时新会话的用量整段计入，不得被抵扣成零。
+- **`INV-UC07-04`（预算挂起零丢信封）**：预算限制开启时，处于硬上限（自身或任一祖先）的 `Cell` 必须在认领前被挂起，尚未真正送入模型推理的入站信封（特别是子分身汇报的 `cell.result`）严禁被标记为已消费或从续跑输入中丢失；续费后挂起期间到达的全部信封一并送达。
 - **`INV-UC07-05`（合盖休眠唤醒零误判租约过期）**：宿主机跨越物理休眠唤醒瞬间，不得将休眠前仍在正常存活的 `Run` 误判为租约超时而重复投递。
+- **`INV-UC07-06`（预算限制总开关仅主人可拨、关闭照常记账）**：开启或关闭预算限制只接受人类 `owner`，`agent:*` 与任何 `Cell` 一律以 `bounds_violation` 拒绝，控制面不暴露该开关；关闭期间每一次计量照常写入账本与 `usage_log` 并在界面展示，重新开启后据此从下一次判定起恢复拦截。
 
 ---
 
@@ -89,10 +91,14 @@ sequenceDiagram
 
 - **核心源码**：
   - 外部主 Agent 控制面与插件：[apps/gtd-desk/src/agent/guide.ts](../../apps/gtd-desk/src/agent/guide.ts)、[apps/gtd-desk/src/agent/tools.ts](../../apps/gtd-desk/src/agent/tools.ts)、[apps/gtd-desk/bin/ng-mcp.mjs](../../apps/gtd-desk/bin/ng-mcp.mjs)、[apps/gtd-desk/main-agent/](../../apps/gtd-desk/main-agent)
-  - 调度、计量与预算审批：[packages/cell/src/dispatcher.ts](../../packages/cell/src/dispatcher.ts)、[packages/cell/src/approvals.ts](../../packages/cell/src/approvals.ts)、[packages/gate/src/gate.ts](../../packages/gate/src/gate.ts)、[packages/loop/src/cli/adapters/codex.ts](../../packages/loop/src/cli/adapters/codex.ts)
+  - 调度、计量与预算审批：[packages/cell/src/dispatcher.ts](../../packages/cell/src/dispatcher.ts)、[packages/cell/src/approvals.ts](../../packages/cell/src/approvals.ts)、[packages/cell/src/budget-switch.ts](../../packages/cell/src/budget-switch.ts)、[packages/gate/src/gate.ts](../../packages/gate/src/gate.ts)、[packages/loop/src/cli/loop.ts](../../packages/loop/src/cli/loop.ts)、[packages/loop/src/cli/adapters/codex.ts](../../packages/loop/src/cli/adapters/codex.ts)
+  - 宿主防休眠：[packages/cell/src/awake.ts](../../packages/cell/src/awake.ts)
   - 上下文前缀组装与队列租约：[packages/context/src/hydrate.ts](../../packages/context/src/hydrate.ts)、[packages/inbox/src/inbox.ts](../../packages/inbox/src/inbox.ts)
 - **自动化回归测试（修改相关代码必跑）**：
   - [apps/gtd-desk/test/agent.test.ts](../../apps/gtd-desk/test/agent.test.ts)（`agent:*` 控制面全工具与 `ownerOnly` 硬拦截）
   - [packages/gate/test/ledger.test.ts](../../packages/gate/test/ledger.test.ts)、[packages/gate/test/control-revoke.test.ts](../../packages/gate/test/control-revoke.test.ts)
+  - [packages/cell/test/wakeable.test.ts](../../packages/cell/test/wakeable.test.ts)（认领前挂起、挂起期间信封续费后全部送达、一卡一键解开祖先链、收尾缓冲只给协调器）、[packages/cell/test/budget-switch.test.ts](../../packages/cell/test/budget-switch.test.ts)（总开关仅主人可拨、关闭即放行挂起节点并以「继续」回答预算卡、关闭期间照常计量）
+  - [packages/cell/test/awake.test.ts](../../packages/cell/test/awake.test.ts)、[packages/inbox/test/sleep.test.ts](../../packages/inbox/test/sleep.test.ts)（防空闲休眠与合盖唤醒续租）
 - **当前待修实现偏差（详见 [03-bugs](../03-bugs/README.md)）**：
-  - `BUG-001`（`budget_stopped` 吞信封）、`BUG-002`（`CodexDriver` 累计 Token 重复记账）、`BUG-003`（预算四连环：无收尾缓冲、缓存 1:1 计费、连弹双卡、派生锁死余额）、`BUG-007`（已内联技能重复提示读取、偏好缺作用域）、`BUG-009`（宿主机休眠防空闲断言与唤醒续租）、`BUG-012`（`get_project` / `read_artifact` 排障与分页缺口）。
+  - `BUG-012` 余项（P3）：经立项提案卡批准启动的项目，其 `Cell` 的创建主体仍记在主台名下，原发起人保留在项目记录的 `source` 中（改动主体意味着允许一个 `Cell` 以另一主体身份行事，内核按设计拒绝）。
+  - `BUG-009` 已修复但尚未在真实 Mac 上验证（防空闲休眠与合盖唤醒续租仅在 Linux 上开发与测试）。

@@ -80,6 +80,35 @@ describe("upsertSkillOrNote", () => {
     expect(bad({ kind: "fact", scope: "global", name: "n", description: "d", body: "b", mode: "upsert" })).toBe(true);
   });
 
+  it("limits only preferences, to an absolute directory and/or role names", () => {
+    const h = setup();
+    const pref = { kind: "preference", scope: "global", name: "gate", description: "d", body: "b", mode: "upsert" } as const;
+    const error = (patch: object) => {
+      try {
+        h.store.upsertSkillOrNoteSync("desk", patch as never);
+      } catch (e) {
+        return isNgError(e, "invalid_argument") ? e.message : `unexpected ${String(e)}`;
+      }
+      return null;
+    };
+    expect(error({ ...pref, kind: "note", applies: { roles: ["worker"] } })).toMatch(/only limit preferences, not a note/);
+    expect(error({ ...pref, kind: "skill", applies: { cwdPrefix: "/repo" } })).toMatch(/only limit preferences/);
+    expect(error({ ...pref, applies: { cwdPrefix: "repo/sub" } })).toMatch(/cwdPrefix must be an absolute directory path/);
+    expect(error({ ...pref, applies: { cwdPrefix: "  " } })).toMatch(/cwdPrefix must be an absolute directory path/);
+    expect(error({ ...pref, applies: { roles: "worker" } })).toMatch(/roles must be an array of strings/);
+    expect(error({ ...pref, applies: { cwd: "/repo" } })).toMatch(/only cwdPrefix and roles/);
+    expect(h.store.getKnowledgeSync({ kind: "preference", scope: "global", name: "gate" })).toBeNull();
+
+    expect(error({ ...pref, applies: { cwdPrefix: "/repo/./sub/" } })).toBeNull();
+    expect(h.store.getKnowledgeSync({ kind: "preference", scope: "global", name: "gate" })?.applies).toEqual({ cwdPrefix: "/repo/sub" });
+    // an empty limit is no limit
+    expect(error({ ...pref, applies: { roles: [] } })).toBeNull();
+    expect(h.store.getKnowledgeSync({ kind: "preference", scope: "global", name: "gate" })).not.toHaveProperty("applies");
+    expect(h.store.listKnowledgeSync({ kind: "preference" }).map((k) => k.applies)).toEqual([undefined]);
+    // a note saved without applies is unaffected
+    expect(error({ ...pref, kind: "note", name: "n" })).toBeNull();
+  });
+
   it("notes and preferences live in the database, scoped per cell with ancestor inheritance", () => {
     const h = setup({ cells: [{ id: "desk" }, { id: "p", parentId: "desk" }, { id: "w", parentId: "p" }, { id: "x", parentId: "desk" }] });
     h.store.upsertSkillOrNoteSync("p", { kind: "note", scope: "cell", name: "供应商联系人", description: "联系人", body: "A: 张三", mode: "upsert" });

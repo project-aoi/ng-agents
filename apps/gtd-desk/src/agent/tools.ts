@@ -3,7 +3,10 @@ import type { UiChannel } from "@ng/channel";
 import { ownerOnlyApproval } from "@ng/gate";
 import { ROLES, startProjectSync, type ProjectInit, type ProjectMode } from "@ng/presets";
 import {
+  CELL_DIRECT_CHAT_KEY,
   CELL_STATUS_KEY,
+  DEFAULT_RESOURCE_PAGE_CHARS,
+  MAX_RESOURCE_PAGE_CHARS,
   createEnvelope,
   gtdKeys,
   inboxAddr,
@@ -13,13 +16,17 @@ import {
   type ActionRecord,
   type ApprovalRecord,
   type BallOwner,
+  type CellDirectChatState,
+  type CellRecord,
   type CellStatusLine,
   type ProjectRecord,
   type SendToCellResult,
   type UserMessagePayload,
 } from "@ng/protocol";
-import type { ClarifyCardDTO, EngageItemDTO, ProjectRowDTO } from "../shared/api";
+import type { ClarifyCardDTO, EngageItemDTO, ProjectRowDTO, SendCellMessageRequest, TimelineItemDTO } from "../shared/api";
+import type { Delivery } from "../server/agents";
 import { DeskError, type Desk, type DeskActor, type ProjectOp } from "../server/desk";
+import { isLeafCell, unpulledOf } from "../server/projections/agents";
 import { inputOf, projectOfAction, readActions, readProjects, type DeskSettings, type Located } from "../server/projections/common";
 import { projectClarify } from "../server/projections/clarify";
 import { projectEngage } from "../server/projections/engage";
@@ -90,9 +97,13 @@ const ARG_ALIASES: Readonly<Record<string, readonly string[]>> = {
   brief: ["description", "instruction", "details"],
 };
 
+/** Arguments tools no longer take, still sent by agents that learnt the old schemas: dropped, not refused. */
+const RETIRED_ARGS: readonly string[] = ["cwdMode"];
+
 export function normalizeArgs(doc: AgentToolDoc, args: Args): Args {
   const props = (doc.inputSchema as { properties?: Record<string, unknown> }).properties ?? {};
   const out: Args = { ...args };
+  for (const k of RETIRED_ARGS) if (!(k in props)) delete out[k];
   for (const [real, aliases] of Object.entries(ARG_ALIASES)) {
     if (!(real in props) || out[real] !== undefined) continue;
     for (const alias of aliases) {
@@ -258,20 +269,42 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
     return `${title}（${lines.length}）\n${lines.length ? lines.join("\n") : "（无）"}`;
   }
 
+  /** Who is active in which work tree right now — a fact, not a lock: nobody is queued. */
   function workspaceLines(): { lines: string[]; data: unknown[] } {
     const occ = kernel.activeWorkspaces();
-    const who = (u: { cellId: string; title: string | null; state: string; cwdMode: string }) => `${u.cellId}${u.title ? `「${u.title}」` : ""}`;
     const lines = occ.map((o) => {
-      const parts: string[] = [];
-      parts.push(o.holder ? `写入中：${who(o.holder)}（${o.holder.state}）` : "没有人在写");
-      if (o.queued.length) parts.push(`排队：${o.queued.map(who).join("、")}`);
-      const sleeping = o.others.filter((u) => u.cwdMode === "write");
-      if (sleeping.length) parts.push(`有写权限但在休眠：${sleeping.map((u) => `${who(u)}（${u.state}）`).join("、")}`);
-      const readers = o.others.filter((u) => u.cwdMode === "read");
-      if (readers.length) parts.push(`只读：${readers.map(who).join("、")}`);
-      return `- ${o.key} — ${parts.join("；")}`;
+      const who = o.active.map(
+        (u) =>
+          `${u.cellId}${u.title ? `「${u.title}」` : ""}${u.projectTitle ? `（项目「${u.projectTitle}」）` : ""}${u.cwd !== o.key ? ` 在 ${u.cwd}` : ""}：${u.state === "job" ? "后台命令在跑" : "正在工作"}${u.statusLine ? ` — ${oneLine(u.statusLine, 80)}` : ""}`,
+      );
+      return `- ${o.key} — ${who.join("；")}`;
     });
     return { lines, data: occ };
+  }
+
+  /** One plain line when the owner switched budget limits off, so nobody suggests raising a budget. */
+  function budgetLine(): string | null {
+    return kernel.budgetLimits().enforced ? null : "额度限制已关闭：不会因额度暂停（用量照常统计）。";
+  }
+
+  /** A cell's state in a few words for a person (and for the agent relaying it). */
+  function cellStateText(c: CellRecord): string {
+    if (c.status === "closed") return c.closeReason === "cancelled" ? "已取消" : "已归档";
+    const a = kernel.activityOf([c.id]).get(c.id);
+    switch (a?.state) {
+      case "working":
+        return "运行中";
+      case "paused":
+        return "已暂停";
+      case "waiting": {
+        const w = kernel.listWaits([c.id])[0];
+        return w ? `等待中（waiting for ${w.waitingFor}：${oneLine(w.reason, 60)}）` : `等待中（${a.why}）`;
+      }
+      case "dormant":
+        return "待命可唤醒";
+      default:
+        return isLeafCell(c) ? "待命可唤醒" : "待命";
+    }
   }
 
   function runningLines(): { lines: string[]; data: unknown[] } {
@@ -363,6 +396,8 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         finished = recent.map((p) => ({ id: p.cellId, title: p.record.title, lifecycle: p.record.lifecycle, at: p.record.completedAt ?? p.record.updatedAt, summary: p.record.summary ?? null }));
       }
       if (clarify.snoozed > 0) parts.push(`另有 ${clarify.snoozed} 张卡被推迟，到点会回到待确认。`);
+      const budget = budgetLine();
+      if (budget) parts.push(budget);
       return ok(`工作台概览（${isoMin(now())}）\n\n${parts.join("\n\n")}`, {
         generatedAt: now(),
         humanActions: human.map((h) => h.data),
@@ -372,6 +407,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         running: running.data,
         workspaces: ws.data,
         snoozedCards: clarify.snoozed,
+        budgetLimits: kernel.budgetLimits().enforced,
         ...(finished ? { finished } : {}),
       });
     },
@@ -391,6 +427,69 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         `Handed to the desk (message ${env.id}). It triages it in the background: a note or a reminder is filed at once, a message to answer becomes a card, a task may become a project. Nothing more to do now; the result shows up in workbench_overview.`,
         { envelopeId: env.id },
       );
+    },
+
+    chat_with_desk(args, principalId) {
+      const text = str(args["text"]);
+      const since = typeof args["since"] === "number" ? Math.max(0, Math.floor(args["since"])) : undefined;
+      if (!text && since === undefined) return fail("Give text (the owner's words for the desk), or since (to read the desk's replies after that cursor).");
+      const conversationId = str(args["conversationId"]) ?? principalId;
+      const replyToId = str(args["replyToId"]);
+      const from = since ?? context.lastEvidenceSeqSync(deskId);
+      let sent: Delivery | null = null;
+      if (text) {
+        sent = desk.deliverCellMessage(deskId, { text, clientId: newId("agchat", clock), conversationId, ...(replyToId ? { replyToId } : {}) }, { principalId });
+        if (!sent.ok) return fail(`Not passed on: ${sent.message}`, { outcome: sent.outcome });
+      }
+      const t = desk.timeline(deskId, { afterSeq: from, limit: 50 });
+      const replies = t.items.filter((i): i is Extract<TimelineItemDTO, { kind: "assistant_reply" }> => i.kind === "assistant_reply");
+      const cursor = Math.max(from, t.lastSeq);
+      const lines = replies.map((r) => `- [${r.id}${r.question ? ", a question — answer with replyToId " + r.id : ""}] ${r.text}`);
+      const head = sent ? `Passed to the desk as the owner's words (message ${sent.id}, conversation ${conversationId}${replyToId ? `, answering ${replyToId}` : ""}). ` : "";
+      const body = replies.length
+        ? `The desk's replies after #${from}:\n${lines.join("\n")}\nRelay them to the owner. To read later replies: chat_with_desk with since ${cursor}.`
+        : `No reply from the desk yet — it answers in the background. When the owner asks (never in a loop), read its answer with chat_with_desk { since: ${cursor} }.`;
+      return ok(`${head}${body}`, {
+        ...(sent ? { messageId: sent.id } : {}),
+        conversationId,
+        cursor,
+        replies: replies.map((r) => ({ id: r.id, text: r.text, question: r.question, toOwner: r.toOwner, at: r.at })),
+      });
+    },
+
+    message_cell(args, principalId) {
+      const id = str(args["id"])!;
+      const mode = (str(args["mode"]) ?? "enqueue") as "enqueue" | "steer";
+      const notifyParent = str(args["notifyParent"]) as "silent" | "wakeup" | undefined;
+      const replyToId = str(args["replyToId"]);
+      const req: SendCellMessageRequest & { conversationId: string } = {
+        text: str(args["text"])!,
+        clientId: newId("agmsg", clock),
+        mode,
+        ...(notifyParent ? { notifyParent } : {}),
+        ...(replyToId ? { replyToId } : {}),
+        conversationId: str(args["conversationId"]) ?? principalId,
+      };
+      return deliveredToCell(id, desk.deliverCellMessage(id, req, { principalId }), mode, notifyParent);
+    },
+
+    inspect_cell(args) {
+      const id = str(args["id"])!;
+      const afterSeq = typeof args["afterSeq"] === "number" ? Math.max(0, Math.floor(args["afterSeq"])) : 0;
+      const detail = str(args["detail"]) === "full" ? "full" : "summary";
+      const r = kernel.inspectCell(id, { afterSeq, detail });
+      const more = r.more ? `\n(More follows: inspect_cell ${id} with afterSeq ${r.toSeq}.)` : "";
+      return ok(`${r.text}${more}`, { cellId: r.cellId, title: r.title, state: r.state, fromSeq: r.fromSeq, toSeq: r.toSeq, more: r.more, directChats: r.directChats, artifactIds: r.artifactIds });
+    },
+
+    read_resource(args) {
+      const uri = str(args["uri"])!;
+      const offset = typeof args["offset"] === "number" ? Math.max(0, Math.floor(args["offset"])) : 0;
+      const limit = typeof args["limit"] === "number" ? Math.max(1, Math.min(MAX_RESOURCE_PAGE_CHARS, Math.floor(args["limit"]))) : DEFAULT_RESOURCE_PAGE_CHARS;
+      const page = desk.resource(uri, offset, limit);
+      const end = offset + page.content.length;
+      const where = `${uri} — characters ${offset}–${end} of ${page.totalChars}${page.hasMore ? `; the rest: read_resource { uri, offset: ${end} }` : " (to the end)"}`;
+      return ok(`${where}\n---\n${page.content}`, page);
     },
 
     create_project(args, principalId) {
@@ -438,32 +537,48 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const open = actions.filter((a) => a.record.status === "open");
       const closed = actions.filter((a) => a.record.status !== "open").slice(0, 8);
       const ids = subtreeIds(id);
-      const live = ids.filter((cid) => cid !== id && kernel.getCell(cid)?.status !== "closed");
+      // Every cell below it, the archived ones included: what ran for it, what rests and can be woken, what is history.
+      const below = ids.filter((cid) => cid !== id).map((cid) => kernel.getCell(cid)!);
       const waits = kernel.listWaits(ids.filter((cid) => kernel.getCell(cid)?.status !== "closed"));
       const running = new Set(kernel.activeRuns().map((r) => r.cellId));
       const artifacts = ids.flatMap((cid) => context.listArtifactsSync(cid)).sort((a, b) => b.updatedAt - a.updatedAt);
       const cards = gate.listPendingSync({ includeSnoozed: true }).filter((r) => ids.includes(r.cellId) || r.subjectKey === `project:${id}`);
       const anchors = cell && cell.status !== "closed" ? kernel.anchorsOf(id) : null;
-      const state = cell?.status === "closed" ? `cell closed (${cell.closeReason ?? "?"})` : cell?.status === "paused" ? "paused" : "active";
+      // BUG-011.3: a parked project is paused underneath, but it is brought back with activate — never resume.
+      const state =
+        record.lifecycle === "someday"
+          ? "以后再说（停靠中，什么都不运行；要它继续：set_project_state activate，不是 resume）"
+          : cell?.status === "closed"
+            ? `${record.lifecycle}（cell closed: ${cell.closeReason ?? "?"}）`
+            : cell?.status === "paused"
+              ? `${record.lifecycle}；已暂停（set_project_state resume 继续）`
+              : record.lifecycle;
+      const usage = kernel.gate.usageSync(id);
+      const budget = budgetLine() ?? `已用 ${usage.subtreeTokens} / ${usage.limitTokens} tokens${usage.state === "hard_stop" ? "（已用完：暂停推进，等主人在工作台追加额度）" : usage.state === "warn" ? "（快用完了）" : ""}`;
       const actionLine = (a: Located<ActionRecord>) => {
         const r = a.record;
         const carrier = r.cellId ? `，由 ${r.cellId} 承担` : "";
         return `- ${r.id}「${r.title}」${OWNER_TEXT[r.owner]}，${r.status}${carrier}${r.nextStep && r.nextStep !== r.title ? ` — 下一步：${oneLine(r.nextStep, 120)}` : ""}${r.dueAt ? `，到期 ${isoMin(r.dueAt)}` : ""}`;
       };
-      const cellLines = live.map((cid) => {
-        const c = kernel.getCell(cid)!;
-        const w = waits.filter((x) => x.cellId === cid).map((x) => x.waitingFor);
-        const st = running.has(cid) ? "running" : c.status === "paused" ? "paused" : w.length ? `waiting for ${w.join(", ")}` : "asleep";
-        const line = statusLineOf(cid);
-        return `- ${cid}${c.title ? `「${c.title}」` : ""}（${c.preset ?? "cell"}，${st}${c.spec.cwd ? `，目录 ${c.spec.cwd}` : ""}）${line ? ` — ${oneLine(line, 120)}` : ""}`;
+      const cellLines = below.map((c) => {
+        const line = statusLineOf(c.id);
+        return `- ${c.id}${c.title ? `「${c.title}」` : ""}（${c.preset ?? "cell"}，${cellStateText(c)}${c.spec.cwd ? `，目录 ${c.spec.cwd}` : ""}）${line && c.status !== "closed" ? ` — ${oneLine(line, 120)}` : ""}`;
       });
+      // Proposal 02 §四.2: what its workers did or were told past the project's own cursor, read live — the project
+      // may not have woken since, but whoever asks sees it now (the owner's direct words included).
+      const unpulled = below
+        .filter((c) => isLeafCell(c) && c.parentId !== null)
+        .map((c) => ({ c, ...unpulledOf(kernel, c) }))
+        .filter((u) => u.count > 0)
+        .map((u) => ({ cellId: u.c.id, count: u.count, text: kernel.inspectCell(u.c.id, { afterSeq: u.cursor, maxChars: 3_000 }).text }));
       const ownWaits = waits.filter((w) => w.cellId === id).map((w) => `${w.waitingFor}（${oneLine(w.reason, 80)}）`);
       const head = [
         `项目 ${id}「${record.title}」`,
-        `状态：${record.lifecycle}；${state}${row?.stalled || record.stalledSince ? `；⚠ 停滞（自 ${isoMin(record.stalledSince)}）` : ""}`,
+        `状态：${state}${row?.stalled || record.stalledSince ? `；⚠ 停滞（自 ${isoMin(record.stalledSince)}）` : ""}`,
         `目标：${record.outcome ?? "—"}`,
         `摘要：${record.summary ?? "—"}`,
         `目录：${record.cwd ?? cell?.spec.cwd ?? "—"}`,
+        `额度：${budget}`,
         `来源：${record.source?.label ?? "—"}；创建 ${isoMin(record.createdAt)}；更新 ${isoMin(record.updatedAt)}`,
         ...(row?.ball ? [`球在：${OWNER_TEXT[row.ball.owner]} · ${oneLine(row.ball.text, 120)}`] : []),
         ...(ownWaits.length ? [`项目本身在等：${ownWaits.join("；")}`] : []),
@@ -473,7 +588,8 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         head.join("\n"),
         section("未完成的动作", open.map(actionLine)),
         ...(closed.length ? [section("最近完成/取消的动作", closed.map(actionLine))] : []),
-        section("正在为它工作的分身", cellLines),
+        section("它的分身（运行中 / 等待中 / 待命可唤醒 / 已归档）", cellLines),
+        ...(unpulled.length ? [section("尚未汇总至项目的 Worker 最新动态", unpulled.map((u) => `- ${u.cellId}：${u.count} 条新记录\n${u.text.split("\n").map((l) => `  ${l}`).join("\n")}`))] : []),
         section("报告与草稿", artifacts.map((a) => `- ${a.artifactId} v${a.version}${a.content.title ? `「${a.content.title}」` : ""}（${a.content.format}，${a.updatedBy} 更新于 ${isoMin(a.updatedAt)}）`)),
         section("待确认卡片", cards.map((r) => `- ${r.actionId}「${r.card.title ?? r.action.summary}」${ownerOnlyOf(r) ? " [ownerOnly]" : ""}${r.snoozedUntil && r.snoozedUntil > now() ? `（推迟到 ${isoMin(r.snoozedUntil)}）` : ""}`)),
       ].join("\n\n");
@@ -488,8 +604,10 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         stalled: Boolean(row?.stalled),
         stalledSince: record.stalledSince ?? null,
         ball: row?.ball ? { owner: row.ball.owner, text: row.ball.text } : null,
+        usage: { tokens: usage.subtreeTokens, limitTokens: usage.limitTokens, enforced: kernel.budgetLimits().enforced },
         actions: actions.map((a) => ({ id: a.record.id, cellId: a.cellId, title: a.record.title, owner: a.record.owner, status: a.record.status, nextStep: a.record.nextStep ?? null, carriedBy: a.record.cellId ?? null })),
-        cells: live.map((cid) => ({ id: cid, title: kernel.getCell(cid)?.title ?? null, preset: kernel.getCell(cid)?.preset ?? null, status: kernel.getCell(cid)?.status, running: running.has(cid), waitingFor: waits.filter((w) => w.cellId === cid).map((w) => w.waitingFor), statusLine: statusLineOf(cid) })),
+        cells: below.map((c) => ({ id: c.id, title: c.title, preset: c.preset, status: c.status, state: cellStateText(c), running: running.has(c.id), waitingFor: waits.filter((w) => w.cellId === c.id).map((w) => w.waitingFor), statusLine: statusLineOf(c.id) })),
+        unpulled: unpulled.map((u) => ({ cellId: u.cellId, count: u.count })),
         waits: waits.map((w) => ({ cellId: w.cellId, waitingFor: w.waitingFor, reason: w.reason })),
         artifacts: artifacts.map((a) => ({ id: a.artifactId, title: a.content.title ?? null, version: a.version, cellId: a.cellId, updatedAt: a.updatedAt })),
         cards: cards.map((r) => ({ id: r.actionId, title: r.card.title ?? r.action.summary, ownerOnly: ownerOnlyOf(r) !== null })),
@@ -608,8 +726,33 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const id = str(args["id"])!;
       const a = context.getArtifactSync(id);
       if (!a) return fail(`There is no artifact "${id}". Artifact ids come from get_project or search.`);
-      const head = `artifact ${a.artifactId} v${a.version}${a.content.title ? `「${a.content.title}」` : ""} — ${a.content.format}，${a.updatedBy} 更新于 ${isoMin(a.updatedAt)}，属于 ${a.cellId}`;
-      return ok(`${head}\n---\n${a.content.body}`, { id: a.artifactId, version: a.version, title: a.content.title ?? null, format: a.content.format, cellId: a.cellId, updatedBy: a.updatedBy, updatedAt: a.updatedAt, body: a.content.body });
+      const wanted = typeof args["version"] === "number" ? Math.floor(args["version"]) : null;
+      const ver = wanted !== null && wanted !== a.version ? context.getArtifactVersionSync(id, wanted) : null;
+      if (wanted !== null && wanted !== a.version && !ver) return fail(`Artifact ${id} has no version ${wanted}; its current version is v${a.version}.`);
+      const content = ver?.content ?? a.content;
+      const version = ver?.version ?? a.version;
+      const body = content.body;
+      const offset = typeof args["offset"] === "number" ? Math.max(0, Math.floor(args["offset"])) : 0;
+      const limit = typeof args["limit"] === "number" ? Math.max(1, Math.min(MAX_RESOURCE_PAGE_CHARS, Math.floor(args["limit"]))) : 16_000;
+      const page = body.slice(offset, offset + limit);
+      const end = offset + page.length;
+      const hasMore = end < body.length;
+      const head = `artifact ${a.artifactId} v${version}${content.title ? `「${content.title}」` : ""} — ${content.format}，${(ver?.updatedBy ?? a.updatedBy)} 更新于 ${isoMin(ver?.createdAt ?? a.updatedAt)}，属于 ${a.cellId}${ver ? `（当前版本是 v${a.version}）` : ""}`;
+      const paging = offset > 0 || hasMore ? `\ncharacters ${offset}–${end} of ${body.length}${hasMore ? `; the rest: read_artifact { id: "${id}"${ver ? `, version: ${version}` : ""}, offset: ${end} }` : " (to the end)"}` : "";
+      return ok(`${head}${paging}\n---\n${page}`, {
+        id: a.artifactId,
+        version,
+        currentVersion: a.version,
+        title: content.title ?? null,
+        format: content.format,
+        cellId: a.cellId,
+        updatedBy: ver?.updatedBy ?? a.updatedBy,
+        updatedAt: ver?.createdAt ?? a.updatedAt,
+        body: page,
+        offset,
+        totalChars: body.length,
+        hasMore,
+      });
     },
 
     search(args) {
@@ -636,25 +779,49 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const name = str(args["name"])!;
       const text = str(args["text"])!;
       if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name)) return fail(`name must be a short slug (letters, digits, "-", "_", "."), e.g. "code-change-followup"; got "${name}".`);
+      const cwdPrefix = str(args["cwdPrefix"]);
+      const roles = Array.isArray(args["roles"]) ? (args["roles"] as string[]).map((r) => r.trim()).filter(Boolean) : [];
+      const applies = { ...(cwdPrefix ? { cwdPrefix } : {}), ...(roles.length > 0 ? { roles } : {}) };
       const existed = context.getKnowledgeSync({ kind: "preference", name, scope: "global" }) !== null;
-      context.upsertSkillOrNoteSync(deskId, { kind: "preference", name, description: oneLine(text.split("\n")[0], 120), body: text, scope: "global", mode: "upsert" });
-      return ok(`${existed ? "Replaced" : "Saved"} the global preference "${name}": every background agent sees it from its next turn on.`, { name, replaced: existed });
+      try {
+        context.upsertSkillOrNoteSync(deskId, {
+          kind: "preference",
+          name,
+          description: oneLine(text.split("\n")[0], 120),
+          body: text,
+          scope: "global",
+          mode: "upsert",
+          ...(cwdPrefix || roles.length > 0 ? { applies } : {}),
+        });
+      } catch (err) {
+        if (isNgError(err, "invalid_argument")) return fail(`${err.message}. cwdPrefix is the absolute path of a directory on this machine; roles are names like "worker" or "project".`);
+        throw err;
+      }
+      const stored = context.getKnowledgeSync({ kind: "preference", name, scope: "global" })?.applies;
+      if (!stored) return ok(`${existed ? "Replaced" : "Saved"} the global preference "${name}": every background agent sees it from its next turn on.`, { name, replaced: existed });
+      const who = [stored.cwdPrefix ? `working in ${stored.cwdPrefix} or below` : "", stored.roles ? `whose role is ${stored.roles.join(" or ")}` : ""].filter(Boolean).join(" and ");
+      return ok(`${existed ? "Replaced" : "Saved"} the preference "${name}": only background agents ${who} see it, from their next turn on.`, { name, replaced: existed, applies: stored });
     },
 
     list_preferences() {
       const prefs = context.listKnowledgeSync({ kind: "preference", includeGlobal: true }).filter((k) => k.scope === "global");
       const skills = context.listKnowledgeSync({ kind: "skill", includeGlobal: true }).filter((k) => k.scope === "global");
-      const prefLines = prefs.map((k) => `- ${k.name}（${isoMin(k.updatedAt)}）: ${k.body.replace(/\s+/g, " ").trim()}`);
+      const limitOf = (a: NonNullable<(typeof prefs)[number]["applies"]>) =>
+        [a.cwdPrefix ? `仅限目录 ${a.cwdPrefix}` : "", a.roles ? `仅限角色 ${a.roles.join("/")}` : ""].filter(Boolean).join("，");
+      const prefLines = prefs.map((k) => `- ${k.name}（${isoMin(k.updatedAt)}${k.applies ? `；${limitOf(k.applies)}` : ""}）: ${k.body.replace(/\s+/g, " ").trim()}`);
       const skillLines = skills.map((k) => `- ${k.name}: ${k.description}`);
-      return ok(`${section("主人的长期偏好", prefLines)}\n\n${section("做事手册（skills）", skillLines)}\nTo change a preference, save_preference under the same name.`, {
-        preferences: prefs.map((k) => ({ name: k.name, text: k.body, updatedAt: k.updatedAt })),
+      return ok(`${section("主人的长期偏好", prefLines)}\n\n${section("做事手册（skills）", skillLines)}\nTo change a preference, save_preference under the same name (with its cwdPrefix / roles again, if it has them).`, {
+        preferences: prefs.map((k) => ({ name: k.name, text: k.body, updatedAt: k.updatedAt, ...(k.applies ? { applies: k.applies } : {}) })),
         skills: skills.map((k) => ({ name: k.name, description: k.description })),
       });
     },
 
     list_workspaces() {
       const ws = workspaceLines();
-      return ok(`${section("工作目录占用", ws.lines)}\nOne writer per work tree at a time; others are queued by the kernel. Do not change a directory yourself while a cell is writing there.`, { workspaces: ws.data });
+      return ok(
+        `${section("工作目录占用", ws.lines)}\nNothing is locked: several cells may work in one work tree at the same time. Before you change files yourself in a directory listed here, tell that cell's project (message_project) or pause it, so nobody's work is overwritten.`,
+        { workspaces: ws.data },
+      );
     },
 
     get_cell(args) {
@@ -662,6 +829,8 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const c = kernel.getCell(id);
       if (!c) return fail(`There is no cell "${id}".`);
       const n = typeof args["tail"] === "number" ? Math.max(0, Math.min(100, Math.floor(args["tail"]))) : 12;
+      const activity = c.status === "closed" ? null : (kernel.activityOf([id]).get(id) ?? null);
+      const chats = context.readStateSync<CellDirectChatState>(id, CELL_DIRECT_CHAT_KEY)?.total ?? 0;
       const waits = kernel.listWaits([id]);
       const running = kernel.activeRuns().some((r) => r.cellId === id);
       const children = kernel.listCells({ parentId: id });
@@ -669,8 +838,8 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const project = projectRecordOf(id);
       const tail = n > 0 ? evidenceTail(id, n) : [];
       const head = [
-        `cell ${id}${c.title ? `「${c.title}」` : ""} — ${c.preset ?? "cell"}，${c.status}${c.closeReason ? `（${c.closeReason}）` : ""}${running ? "，running" : ""}，epoch ${c.epoch}`,
-        `父节点：${c.parentId ?? "—"}；目录：${c.spec.cwd ?? "（继承 / 默认）"}（${c.spec.cwdMode ?? "preset default"}）；lifetime ${c.spec.lifetime ?? "persistent"}`,
+        `cell ${id}${c.title ? `「${c.title}」` : ""} — ${c.preset ?? "cell"}，${cellStateText(c)}（${c.status}${c.closeReason ? `, ${c.closeReason}` : ""}${activity ? `; ${activity.why}` : ""}）`,
+        `父节点：${c.parentId ?? "—"}；目录：${c.spec.cwd ?? "（默认）"}；${isLeafCell(c) ? "叶节点：一轮做完待命，发消息即唤醒" : "常驻"}${chats ? `；主人直接和它说过 ${chats} 次话` : ""}`,
         `状态行：${statusLineOf(id) ?? "—"}`,
         `在等：${waits.length ? waits.map((w) => `${w.waitingFor}（${oneLine(w.reason, 80)}${w.timeoutAt ? `，${isoMin(w.timeoutAt)} 超时` : ""}）`).join("；") : "—"}`,
         ...(project ? [`持有项目记录：${project.lifecycle}「${project.title}」`] : []),
@@ -685,7 +854,8 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         closeReason: c.closeReason,
         parentId: c.parentId,
         cwd: c.spec.cwd ?? null,
-        cwdMode: c.spec.cwdMode ?? null,
+        state: activity?.state ?? "closed",
+        directChats: chats,
         running,
         waits: waits.map((w) => ({ waitingFor: w.waitingFor, reason: w.reason, timeoutAt: w.timeoutAt })),
         children: children.map((x) => ({ id: x.id, preset: x.preset, status: x.status, title: x.title })),
@@ -698,7 +868,6 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const title = str(args["title"])!;
       const instruction = str(args["instruction"])!;
       const cwd = str(args["cwd"]);
-      const cwdMode = str(args["cwdMode"]) as "read" | "write" | undefined;
       const parentId = str(args["parentId"]) ?? deskId;
       const parent = kernel.getCell(parentId);
       if (!parent) return fail(`There is no cell "${parentId}" to attach it to.`);
@@ -710,7 +879,6 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         } else {
           const spec: CellSpecInput = { preset: preset as NonNullable<CellSpecInput["preset"]>, title };
           if (cwd) spec.cwd = cwd;
-          if (cwdMode) spec.cwdMode = cwdMode;
           if (preset === "hub") spec.meta = { role: ROLES.hub, gtd: { source: { title, description: instruction, kind: "channel", mode: "active", processor: "llm" } } };
           const addr = kernel.spawnCell(parentId, spec, { instruction, title }, { principalId });
           cellId = addr.slice("inbox:".length);
@@ -722,7 +890,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         throw err;
       }
       return ok(
-        `Started ${preset} ${cellId}「${title}」 under ${parentId}. It runs in the background${preset === "worker" ? ", reports once and closes" : ""}; look at it with get_cell ${cellId}${preset === "project" ? ` or get_project ${cellId}` : ""}.`,
+        `Started ${preset} ${cellId}「${title}」 under ${parentId}. It runs in the background${preset === "worker" ? "; when its turn is over it stays dormant — message_cell asks it more, inspect_cell reads what it did" : ""}; look at it with get_cell ${cellId}${preset === "project" ? ` or get_project ${cellId}` : ""}.`,
         { cellId, parentId, preset },
       );
     },
@@ -733,10 +901,9 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const text = str(args["text"]);
       const isProject = projectRecordOf(id) !== null;
       if ((action === "message" || action === "steer") && !text) return fail(`control_cell ${action} needs text: what to tell the cell.`);
-      if (action === "message") {
-        const r = kernel.sendToCell(id, { text: text!, summary: "主 Agent 的消息", id: newId("agmsg", clock) }, { principalId });
-        if (r.status !== "delivered") return sendFailure(id, r, isProject);
-        return ok(deliveredText(id, r, isProject), r);
+      if (action === "message" || action === "steer") {
+        const mode = action === "steer" ? "steer" : "enqueue";
+        return deliveredToCell(id, desk.deliverCellMessage(id, { text: text!, clientId: newId("agmsg", clock), mode, conversationId: principalId }, { principalId }), mode, undefined);
       }
       const cell = kernel.getCell(id);
       if (!cell) return sendFailure(id, { status: "not_found" }, isProject);
@@ -744,10 +911,9 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         if (action === "cancel") return ok(`${id} had already closed (${cell.closeReason ?? "?"}); nothing to cancel.`, { applied: false, reason: "closed" });
         return sendFailure(id, { status: "closed", closeReason: cell.closeReason }, isProject);
       }
-      const r = kernel.control(id, { action, ...(action === "steer" ? { steerMessage: text! } : {}) }, { principalId });
+      const r = kernel.control(id, { action }, { principalId });
       if (!r.applied) return fail(`Not applied: ${r.reason ?? "refused"}.`, { applied: false, reason: r.reason ?? null });
-      const what: Record<"steer" | "pause" | "resume" | "cancel", string> = {
-        steer: "it takes the correction between its current steps",
+      const what: Record<"pause" | "resume" | "cancel", string> = {
         pause: "it and everything below it are paused",
         resume: "it continues",
         cancel: "it and everything below it are stopped and closed (files and branches are left as they are)",
@@ -756,7 +922,39 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
     },
   };
 
-  /** The last `n` evidence records of a cell, briefly: kind, tool name, the first ~200 characters. */
+  /** A person's message to a cell (message_cell / control_cell message|steer), told to the agent in plain words. */
+  function deliveredToCell(id: string, d: Delivery, mode: "enqueue" | "steer", notifyParent: "silent" | "wakeup" | undefined): AgentToolResult {
+    const data = { outcome: d.outcome, messageId: d.id, ccTo: d.ccTo };
+    switch (d.outcome) {
+      case "not_found":
+        return fail(`Not delivered: there is no cell "${id}". Check the id with get_project or workbench_overview.`, data);
+      case "refused_script":
+        return fail(`Not delivered: ${id} is a deterministic script probe, not a model — it takes no conversation. control_cell can pause or resume it; to change what it checks, tell its project or the desk.`, data);
+      case "refused_archived":
+        return fail(
+          `Not delivered: ${id} was archived with a project that has finished, so it cannot be brought back. To continue that work, chat_with_desk (or create_project) naming what it did — inspect_cell ${id} shows it.`,
+          data,
+        );
+      case "duplicate":
+        return ok(`Already delivered earlier (same message); not sent again.`, data);
+      default: {
+        const before = d.before;
+        let what: string;
+        if (d.outcome === "reopened") what = `${id} had been closed and was brought back for this: it continues on its previous record (no new cell).`;
+        else if (mode === "steer") what = `${id} was interrupted with it: it sees it now, between its steps.`;
+        else if (before?.state === "paused") what = `${id} is paused: it reads it when it is resumed.`;
+        else if (before?.state === "running") what = `${id} is at work: it takes the message when its current step ends.`;
+        else if (before?.state === "dormant") what = `${id} was dormant and is woken by it, on its previous record (no new cell).`;
+        else what = `${id} reads it at its next turn.`;
+        const cc = d.ccTo
+          ? ` Its project ${d.ccTo}${d.ccTitle ? `「${d.ccTitle}」` : ""} was given a copy of the owner's words${notifyParent === "wakeup" ? " and woken" : " (it reads it at its next wake-up; it is not woken for it)"}.`
+          : "";
+        return ok(`Delivered (message ${d.id}). ${what}${cc} Results arrive asynchronously — look later with get_cell / inspect_cell ${id}.`, data);
+      }
+    }
+  }
+
+  /** The last `n` evidence records of a cell, briefly: kind, tool name, the first ~600 characters. */
   function evidenceTail(cellId: string, n: number): Array<{ line: string; data: Record<string, unknown> }> {
     const last = context.lastEvidenceSeqSync(cellId);
     let rows = context.listEvidenceSync(cellId, { afterSeq: Math.max(0, last - 5_000) });
@@ -794,7 +992,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
           break;
       }
       const at = (r as { at?: number }).at;
-      const brief = oneLine(text, 200);
+      const brief = oneLine(text, 600);
       return {
         line: `#${e.seq} ${typeof at === "number" ? `${isoMin(at)} ` : ""}${r.kind}${name ? ` ${name}` : ""}${brief ? ` — ${brief}` : ""}`,
         data: { seq: e.seq, kind: r.kind, name, at: typeof at === "number" ? at : null, text: brief },

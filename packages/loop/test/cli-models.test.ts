@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { launchChoice, parseAgyModels, parseClaudeModels, parseCodexModels, preferredEffort, sortEfforts } from "../src/cli/models";
+import { fastRecommendation, launchChoice, parseAgyModels, parseClaudeModels, parseCodexModels, preferredEffort, recommendFast, sortEfforts, type CliModelInfo } from "../src/cli/models";
 
 // The model lists as each CLI reports them (fixtures written after their real output shapes). No CLI is launched.
 
@@ -53,6 +53,10 @@ describe("Claude Code: the initialize control response", () => {
     expect(recommended).toEqual({ model: "sonnet", effort: "high" });
   });
 
+  it("recommends the listed light model for fast work, without an effort when it has none", () => {
+    expect(parseClaudeModels(response).recommendedFast).toEqual({ model: "haiku" });
+  });
+
   it("a recommended model without efforts is recommended without one", () => {
     const { recommended } = parseClaudeModels({
       models: [
@@ -64,8 +68,8 @@ describe("Claude Code: the initialize control response", () => {
   });
 
   it("an answer without models gives an empty list and no recommendation", () => {
-    expect(parseClaudeModels({ commands: [] })).toEqual({ models: [], recommended: null });
-    expect(parseClaudeModels(null)).toEqual({ models: [], recommended: null });
+    expect(parseClaudeModels({ commands: [] })).toEqual({ models: [], recommended: null, recommendedFast: null });
+    expect(parseClaudeModels(null)).toEqual({ models: [], recommended: null, recommendedFast: null });
   });
 });
 
@@ -121,6 +125,10 @@ describe("Codex: codex debug models", () => {
     expect(parseCodexModels(catalogue).recommended).toEqual({ model: "gpt-6-codex", effort: "xhigh" });
   });
 
+  it("recommends the light model for fast work at medium, though it is listed after the flagship", () => {
+    expect(parseCodexModels(catalogue).recommendedFast).toEqual({ model: "gpt-6-mini", effort: "medium" });
+  });
+
   it("accepts a bare array and plain-string levels", () => {
     const { models, recommended } = parseCodexModels([{ slug: "gpt-x", priority: 1, supported_reasoning_levels: ["high", "medium"] }]);
     expect(models).toEqual([{ id: "gpt-x", label: "gpt-x", efforts: ["medium", "high"] }]);
@@ -128,7 +136,7 @@ describe("Codex: codex debug models", () => {
   });
 
   it("nothing listed: no recommendation", () => {
-    expect(parseCodexModels({ models: [{ slug: "x", visibility: "hide" }] })).toEqual({ models: [], recommended: null });
+    expect(parseCodexModels({ models: [{ slug: "x", visibility: "hide" }] })).toEqual({ models: [], recommended: null, recommendedFast: null });
   });
 });
 
@@ -155,6 +163,10 @@ describe("Antigravity: agy models", () => {
     expect(parseAgyModels(output).recommended).toEqual({ model: "gemini-4-carbon", effort: "high" });
   });
 
+  it("recommends the flash family for fast work", () => {
+    expect(parseAgyModels(output).recommendedFast).toEqual({ model: "gemini-4-flash" });
+  });
+
   it("a family with xhigh is recommended at xhigh", () => {
     const text = ["Fetching available models...", "gemini-4-ultra-xhigh\tGemini 4 Ultra (XHigh)", "gemini-4-ultra-high\tGemini 4 Ultra (High)", "gemini-4-flash\tGemini 4 Flash"].join("\n");
     const { models, recommended } = parseAgyModels(text);
@@ -171,7 +183,7 @@ describe("Antigravity: agy models", () => {
   });
 
   it("only progress output: nothing listed", () => {
-    expect(parseAgyModels("Fetching available models...\n")).toEqual({ models: [], recommended: null });
+    expect(parseAgyModels("Fetching available models...\n")).toEqual({ models: [], recommended: null, recommendedFast: null });
   });
 });
 
@@ -197,5 +209,81 @@ describe("efforts", () => {
     expect(launchChoice("claude", { model: "opus", effort: "xhigh" })).toEqual({ model: "opus", effort: "xhigh" });
     expect(launchChoice("codex", { model: "gpt-6-codex", effort: "high" })).toEqual({ model: "gpt-6-codex", effort: "high" });
     expect(launchChoice("codex", { model: "gpt-6-codex" })).toEqual({ model: "gpt-6-codex", effort: undefined });
+  });
+});
+
+describe("the fast tier's automatic choice", () => {
+  const FLAGSHIP: CliModelInfo = { id: "flagship-9", label: "Flagship 9", efforts: ["minimal", "low", "medium", "high", "xhigh", "max"] };
+  const GENERAL: CliModelInfo = { id: "general-9", label: "General 9", efforts: ["low", "medium", "high"] };
+  const top = { model: "flagship-9", effort: "xhigh" };
+
+  it("picks the first light model in catalogue order, at medium where offered", () => {
+    const models: CliModelInfo[] = [
+      FLAGSHIP,
+      GENERAL,
+      { id: "vendor-9-mini", label: "Vendor 9 mini", efforts: ["low", "medium", "high"] },
+      { id: "vendor-9-nano", label: "Vendor 9 nano", efforts: ["low"] },
+    ];
+    expect(recommendFast(models, top)).toEqual({ model: "vendor-9-mini", effort: "medium" });
+  });
+
+  it("a light model's effort: medium, else low, else its weakest, else none", () => {
+    const light = (efforts: string[]): CliModelInfo[] => [FLAGSHIP, { id: "quick", label: "Quick Flash", efforts }];
+    expect(recommendFast(light(["low", "medium", "high"]), top)).toEqual({ model: "quick", effort: "medium" });
+    expect(recommendFast(light(["minimal", "low", "high"]), top)).toEqual({ model: "quick", effort: "low" });
+    expect(recommendFast(light(["high", "xhigh"]), top)).toEqual({ model: "quick", effort: "high" });
+    expect(recommendFast(light([]), top)).toEqual({ model: "quick" });
+  });
+
+  it("recognises the light line by id or label, case-insensitively, as a whole word", () => {
+    const pick = (m: CliModelInfo) => recommendFast([FLAGSHIP, m], top)?.model;
+    for (const [id, label] of [
+      ["x-haiku-5", "X"],
+      ["x-flash-lite", "X"],
+      ["x-2-flash", "X"],
+      ["x-5-codex-spark", "X"],
+      ["x-small", "X"],
+      ["x-4o-mini", "X"],
+      ["x1", "X 1 Nano"],
+      ["x2", "X 2 (Fast)"],
+      ["x3", "X3 LITE"],
+    ] as const) {
+      expect(pick({ id, label, efforts: [] }), id).toBe(id);
+    }
+    // a light word inside another word does not count
+    for (const [id, label] of [
+      ["gemini-9-pro", "Gemini 9 Pro"],
+      ["x-minimal", "X minimal"],
+      ["x-smaller", "X"],
+      ["x-sparkle", "Sparkles"],
+      ["x-elite", "Satellite"],
+      ["x-breakfast", "X"],
+    ] as const) {
+      expect(pick({ id, label, efforts: [] }), id).toBe("flagship-9");
+    }
+  });
+
+  it("a list without a light model: the recommended model at a lower effort", () => {
+    expect(recommendFast([FLAGSHIP, GENERAL], top)).toEqual({ model: "flagship-9", effort: "medium" });
+    const highOnly: CliModelInfo = { id: "deep", label: "Deep", efforts: ["high", "xhigh", "max"] };
+    expect(recommendFast([highOnly], { model: "deep", effort: "xhigh" })).toEqual({ model: "deep", effort: "high" });
+    const lowOnly: CliModelInfo = { id: "plain", label: "Plain", efforts: ["minimal", "low"] };
+    expect(recommendFast([lowOnly], { model: "plain", effort: "low" })).toEqual({ model: "plain", effort: "low" });
+  });
+
+  it("nothing to lower: the same as recommended; nothing listed: null", () => {
+    const bare: CliModelInfo = { id: "bare", label: "Bare", efforts: [] };
+    expect(recommendFast([bare], { model: "bare" })).toEqual({ model: "bare" });
+    // a recommendation the list does not describe is kept as given
+    expect(recommendFast([GENERAL], { model: "elsewhere", effort: "high" })).toEqual({ model: "elsewhere", effort: "high" });
+    expect(recommendFast([GENERAL], null)).toBeNull();
+    expect(recommendFast([], null)).toBeNull();
+  });
+
+  it("fastRecommendation: the catalogue's own value when it carries one, derived from its list when it does not", () => {
+    const models = [FLAGSHIP, GENERAL];
+    expect(fastRecommendation({ models, recommended: top, recommendedFast: { model: "general-9", effort: "low" } })).toEqual({ model: "general-9", effort: "low" });
+    expect(fastRecommendation({ models: [], recommended: null, recommendedFast: null })).toBeNull();
+    expect(fastRecommendation({ models, recommended: top })).toEqual({ model: "flagship-9", effort: "medium" });
   });
 });

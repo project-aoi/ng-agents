@@ -30,7 +30,7 @@ describe("await_reply — the zero-token reply watcher reports to its project in
     expect(h.kernel.getCell(watcher)).toMatchObject({
       preset: "watcher",
       status: "active",
-      spec: { lifetime: "persistent", cwdMode: "read", processor: { kind: "code", entry: "gtd.wait_match" }, watches: [{ threadOrFilter: { thread: "memory:dm-zhang" } }] },
+      spec: { lifetime: "persistent", processor: { kind: "code", entry: "gtd.wait_match" }, watches: [{ threadOrFilter: { thread: "memory:dm-zhang" } }] },
     });
     expect(h.actions(project)).toEqual([
       expect.objectContaining({
@@ -133,8 +133,10 @@ describe("the default watcher: a one-shot checker that watches on its own", () =
     h.script.add(
       "checker",
       (req) => {
-        // the general primitives, spawn_cell included: whether a checker delegates is its prompt's business, not a filter's
-        expect(req.tools.map((t) => t.name)).toEqual(expect.arrayContaining(["bash", "update_cell", "set_reminder", "report_to_parent", "wait", "spawn_cell"]));
+        // a leaf: the shell, its own watches and reminders, reporting — but nothing that starts or steers cells
+        const names = req.tools.map((t) => t.name);
+        expect(names).toEqual(expect.arrayContaining(["bash", "update_cell", "set_reminder", "report_to_parent", "wait"]));
+        for (const n of ["spawn_cell", "control_cell", "close_cell"]) expect(names).not.toContain(n);
         return tool("update_cell", { watches: [{ thread: "memory:mr-5" }] });
       },
       tool("wait", { reason: "MR 还没合入", waitingFor: "external" }),
@@ -147,10 +149,8 @@ describe("the default watcher: a one-shot checker that watches on its own", () =
     await h.kernel.idle();
     const [checker] = childrenOf(h, projectId);
     expect(h.kernel.getCell(checker!)).toMatchObject({ status: "active", spec: { watches: [{ threadOrFilter: { thread: "memory:mr-5" } }] } });
-    // no depth cap of its own: it gets what its parent can delegate (child ⊆ parent)
-    const projectDepth = h.kernel.getCell(projectId)!.bounds.maxDepth;
-    expect(h.kernel.getCell(checker!)!.bounds.maxDepth).toBe(projectDepth - 1);
-    expect(h.kernel.getCell(checker!)!.bounds.maxDepth).toBeGreaterThan(0);
+    // a leaf: it starts no cells of its own
+    expect(h.kernel.getCell(checker!)!.bounds.maxDepth).toBe(0);
     expect(h.actions(projectId)[0]).toMatchObject({ owner: "waiting", status: "open" });
 
     await h.memory.inject({ from: "gitlab", text: "MR !5 merged into main", threads: ["memory:mr-5"] });
@@ -161,7 +161,7 @@ describe("the default watcher: a one-shot checker that watches on its own", () =
 });
 
 describe("a source filtered by a small model", () => {
-  it("silent on noise, one hit on a real problem; it may run commands in a directory of its own", async () => {
+  it("silent on noise, one hit on a real problem; it may run commands, in a directory of its own", async () => {
     const h = await boot();
     h.script.add("desk", tool("add_source", { title: "支付反馈", description: "有人反馈付款失败、白屏或扣款异常才算", watchThread: "memory:pay-group" }), tool("wait", { reason: "ok" }));
     h.script.setDefault("sensor", (req) => {
@@ -172,7 +172,8 @@ describe("a source filtered by a small model", () => {
     await h.ui.capture({ text: "帮我盯着支付群，有人反馈付款问题就告诉我" });
     await h.kernel.idle();
     const sensor = h.kernel.listCells({ parentId: "desk", preset: "sensor" })[0]!;
-    expect(sensor.spec).toMatchObject({ cwdMode: "write", lifetime: "persistent", processor: { kind: "llm", modelTier: "fast" } });
+    expect(sensor.spec).toMatchObject({ lifetime: "persistent", processor: { kind: "llm", modelTier: "fast" } });
+    expect(sensor.spec.cwdMode).toBeUndefined();
     expect((sensor.spec.processor as { allowedTools?: unknown }).allowedTools).toBeUndefined();
     expect(h.source(sensor.id)).toMatchObject({ kind: "watch", processor: "llm", runCount: 0, hitCount: 0 });
     const deskRuns = h.deskRuns();
@@ -197,7 +198,9 @@ describe("a source filtered by a small model", () => {
 describe("cells from before docs/05", () => {
   it("an old item root winds itself down as cancelled with a plain explanation; an old redraft helper does nothing", async () => {
     const h = await boot();
-    h.kernel.spawnCell("desk", { id: "prj_old", preset: "worker", lifetime: "persistent", title: "旧事项", processor: { kind: "code", entry: LEGACY.joinAll } });
+    // As an old database has it: an item root stored as a persistent "worker" with the depth it was given then (the
+    // worker preset is a leaf now; stored bounds are not recomputed).
+    h.kernel.spawnCell("desk", { id: "prj_old", preset: "worker", lifetime: "persistent", title: "旧事项", processor: { kind: "code", entry: LEGACY.joinAll }, bounds: { maxDepth: 2 } });
     h.kernel.spawnCell("prj_old", { id: "prj_old-edit1", preset: "inline", title: "按意见改稿", processor: { kind: "llm", prompt: LEGACY.editor, toolsets: [LEGACY.editor, "kernel.context"] }, meta: { role: "editor" } });
     h.script.add("editor", (req) => {
       expect(req.tools.map((t) => t.name)).not.toContain("submit_draft");

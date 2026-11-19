@@ -64,8 +64,8 @@ export function derivedSideEffect(action: ProposedAction, _bounds: PolicyBounds,
     case "channel.send":
       return anyCovers(ownerAddresses, action.target) ? "notify_owner" : "external";
     case "workspace.exec":
-      // docs/05: host work in the owner's real directories (isolation "none", the default) is guarded by cwdMode, the
-      // dispatcher's per-directory write queue and the prompts' red lines, not by a card per command.
+      // docs/05: host work in the owner's real directories (isolation "none", the default) is guarded by the prompts'
+      // red lines and their look-before-you-change rule, not by a card per command.
       return MUTATING_TOOLS.has(action.tool) ? "internal" : "none";
     case "job.start":
       return "internal";

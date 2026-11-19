@@ -14,7 +14,7 @@ export const DESK_PROCESSOR: ProcessorSpec = {
   toolsets: [TOOLSETS.desk, STD.context, STD.comms, STD.schedule, STD.cells, STD.workspace],
 };
 
-/** A project: keeps the records and the shared report, hands every piece of real work to a one-shot worker. */
+/** A project: keeps the records and the shared report, hands every piece of real work to a worker. */
 export const PROJECT_PROCESSOR: ProcessorSpec = {
   kind: "llm",
   prompt: PROMPTS.project,
@@ -23,7 +23,7 @@ export const PROJECT_PROCESSOR: ProcessorSpec = {
   toolsets: [TOOLSETS.project, STD.context, STD.comms, STD.schedule, STD.cells, STD.workspace],
 };
 
-/** A one-shot worker. */
+/** A worker (a leaf: with maxDepth 0 the spawn/steer/close tools of STD.cells are not offered to it). */
 export const WORKER_PROCESSOR: ProcessorSpec = {
   kind: "llm",
   prompt: PROMPTS.worker,

@@ -95,8 +95,9 @@ const isKernelNotice = (env: Envelope) => env.type.startsWith("kernel.");
  * records as they are now and changes only what is still out of step.
  *
  * 1. First Run: the record and the planned actions from the task's seed.
- * 2. A child's `cell.result`: the action it carried is done (completed) or stays open without a cell (anything else —
- *    the model re-dispatches or re-plans).
+ * 2. A child's `cell.result`: the action it carried is done (completed); otherwise it stays open — still with a
+ *    dormant worker, which can be told what to change, or without a cell when the child is gone (the model
+ *    re-dispatches or re-plans). A later turn of a worker whose action is already closed changes nothing here.
  * 3. A reply watcher's progress (timeout, nudge): the waiting party's deadline follows.
  * 4. Every open direct child is on the books: one started with plain spawn_cell (no action names it) gets an action too.
  * 5. A parked or finished record whose cell was woken by something real (resumed, or a follow-up beat the close) is
@@ -136,7 +137,7 @@ export async function prepareProjectRun({ snapshot, ports, clock }: PrepareRunIn
       if (!a) continue;
       if (p.status === "completed") {
         set(patchAction(a, { status: "done", ...(p.artifactId ? { artifactId: p.artifactId } : {}), ...markReplied(a, p, env.createdAt) }, now));
-      } else {
+      } else if (p.childState !== "dormant") {
         set(patchAction(a, { cellId: null }, now));
       }
     } else if (isEnvelopeOfType(env, "cell.progress")) {

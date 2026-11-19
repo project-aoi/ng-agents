@@ -30,6 +30,7 @@ import {
   type ApproveResult,
   type AuthorizeMeta,
   type AuthorizeResult,
+  type BudgetRaise,
   type Bus,
   type CellRecord,
   type Clock,
@@ -38,6 +39,7 @@ import {
   type Deliverable,
   type Gate,
   type LedgerUsage,
+  type LedgerViewOptions,
   type MeterResult,
   type PendingFilter,
   type PolicyRule,
@@ -64,6 +66,10 @@ import { envSecretStore, redactSecrets, type SecretStore } from "./secrets";
 export const DEFAULT_OWNER_ADDRESSES: readonly string[] = ["channel:ui:*", "channel:cli:*"];
 export const DEFAULT_TOKEN_TTL_MS = 10 * 60_000;
 export const DEFAULT_TRUST_STREAK = 5;
+/** What a prompt-cache read costs against a token limit, relative to an uncached token (providers bill it at about a tenth). */
+export const DEFAULT_CACHE_READ_WEIGHT = 0.1;
+/** The wrap-up allowance (LedgerViewOptions.wrapUp): this share of a limit, at most these absolute amounts. */
+export const DEFAULT_WRAP_UP = { ratio: 0.05, maxTokens: 200_000, maxCents: 200 } as const;
 const CONTROL_ACTIONS: readonly ControlAction[] = ["cancel", "pause", "resume", "steer"];
 const TOKEN_PREFIX = "ngt_";
 
@@ -82,6 +88,16 @@ export interface GateOptions {
   warnRatio?: number;
   /** Default `minStreak` of trustCandidatesSync. */
   trustStreak?: number;
+  /** Charge of one prompt-cache read token against token limits, 0..1. Default DEFAULT_CACHE_READ_WEIGHT. */
+  cacheReadWeight?: number;
+  /** Overrides of DEFAULT_WRAP_UP; `ratio: 0` switches the allowance off. */
+  wrapUp?: Partial<{ ratio: number; maxTokens: number; maxCents: number }>;
+  /**
+   * The owner's switch for budget limits, read on every decision. `false` = limits are off: usage is metered into the
+   * ledgers exactly as before (so what was spent stays visible), but no ledger is ever in "warn" or "hard_stop" — no
+   * alert, no denied action, no stopped Run. Default: always enforced.
+   */
+  budgetEnforced?: () => boolean;
 }
 
 /** The Gate contract plus maintenance helpers that only the kernel/app use. */
@@ -255,6 +271,14 @@ export function createGate(opts: GateOptions): GateService {
   const tokenTtlMs = opts.tokenTtlMs ?? DEFAULT_TOKEN_TTL_MS;
   const warnRatio = opts.warnRatio ?? 0.8;
   const trustStreak = opts.trustStreak ?? DEFAULT_TRUST_STREAK;
+  const finiteOr = (v: number | undefined, fallback: number) => (typeof v === "number" && Number.isFinite(v) ? Math.max(0, v) : fallback);
+  const cacheReadWeight = Math.min(1, finiteOr(opts.cacheReadWeight, DEFAULT_CACHE_READ_WEIGHT));
+  const enforced = () => opts.budgetEnforced?.() !== false;
+  const wrapUp = {
+    ratio: finiteOr(opts.wrapUp?.ratio, DEFAULT_WRAP_UP.ratio),
+    maxTokens: finiteOr(opts.wrapUp?.maxTokens, DEFAULT_WRAP_UP.maxTokens),
+    maxCents: finiteOr(opts.wrapUp?.maxCents, DEFAULT_WRAP_UP.maxCents),
+  };
   const cells = cellsRepo(db, clock);
   const artifacts = artifactsRepo(db);
   /** value → ref of every secret handed out by injectSecret in this process (for scrubbing persisted text). */
@@ -344,20 +368,28 @@ export function createGate(opts: GateOptions): GateService {
     state: MeterResult;
   }
 
-  function ownLedger(cell: CellRecord): OwnLedger {
+  /**
+   * `overdraw`: read for a coordinator's wrap-up turn — the stop sits at limit + allowance instead of at the limit
+   * (a limit of 0 gets no allowance: such a cell is not meant to spend at all).
+   */
+  function ownLedger(cell: CellRecord, overdraw = false): OwnLedger {
     const row = ledgerRow(cell.id);
     const limitTokens = cell.bounds.maxTokens + (row?.raised_tokens ?? 0);
     const limitCents = cell.bounds.maxCents + (row?.raised_cents ?? 0);
     const usedTokens = row?.subtree_tokens ?? 0;
     const usedCents = row?.subtree_cents ?? 0;
+    const stopTokens = limitTokens + (overdraw ? Math.min(limitTokens * wrapUp.ratio, wrapUp.maxTokens) : 0);
+    const stopCents = limitCents + (overdraw ? Math.min(limitCents * wrapUp.ratio, wrapUp.maxCents) : 0);
     let state: MeterResult = "ok";
-    if (usedTokens >= limitTokens || usedCents >= limitCents) state = "hard_stop";
+    // Limits switched off by the owner: the numbers are still kept, but they stop nothing.
+    if (!enforced()) return { cell, row, limitTokens, limitCents, state };
+    if (usedTokens >= stopTokens || usedCents >= stopCents) state = "hard_stop";
     else if (usedTokens >= limitTokens * warnRatio || usedCents >= limitCents * warnRatio) state = "warn";
     return { cell, row, limitTokens, limitCents, state };
   }
 
-  function effectiveLedger(chain: readonly CellRecord[]): { own: OwnLedger[]; state: MeterResult; limitedBy: OwnLedger | null } {
-    const own = chain.map(ownLedger);
+  function effectiveLedger(chain: readonly CellRecord[], overdraw = false): { own: OwnLedger[]; state: MeterResult; limitedBy: OwnLedger | null } {
+    const own = chain.map((c) => ownLedger(c, overdraw));
     let limitedBy: OwnLedger | null = null;
     for (const l of own) if (l.state !== "ok" && (limitedBy === null || STATE_RANK[l.state] > STATE_RANK[limitedBy.state])) limitedBy = l;
     return { own, state: limitedBy?.state ?? "ok", limitedBy };
@@ -370,8 +402,8 @@ export function createGate(opts: GateOptions): GateService {
     return `${who} used ${t}/${l.limitTokens} tokens and ${c}/${l.limitCents} cents`;
   }
 
-  function usageOf(cell: CellRecord): LedgerUsage {
-    const eff = effectiveLedger(chainOf(cell));
+  function usageOf(cell: CellRecord, view: LedgerViewOptions = {}): LedgerUsage {
+    const eff = effectiveLedger(chainOf(cell), view.wrapUp === true);
     const self = eff.own[0]!;
     return {
       cellId: cell.id,
@@ -385,6 +417,7 @@ export function createGate(opts: GateOptions): GateService {
       raisedCents: self.row?.raised_cents ?? 0,
       state: eff.state,
       limitedBy: eff.limitedBy?.cell.id ?? null,
+      enforced: enforced(),
     };
   }
 
@@ -574,13 +607,10 @@ export function createGate(opts: GateOptions): GateService {
       const stored = parentCellId ? cells.get(parentCellId) : undefined;
       if (!stored) return attenuateBounds(parent, parentCellId, requested);
       const effectiveParent = meetBounds(parent, stored.bounds);
-      let remTokens = Number.MAX_SAFE_INTEGER;
-      let remCents = Number.MAX_SAFE_INTEGER;
-      for (const l of effectiveLedger(chainOf(stored)).own) {
-        remTokens = Math.min(remTokens, Math.max(0, l.limitTokens - (l.row?.subtree_tokens ?? 0)));
-        remCents = Math.min(remCents, Math.max(0, l.limitCents - (l.row?.subtree_cents ?? 0)));
-      }
-      const child = attenuateBounds(effectiveParent, parentCellId, requested, { remaining: { tokens: remTokens, cents: remCents } });
+      // No ledger cap: what the chain has left at this instant is not frozen into the child. The child shares the
+      // live ledgers of its ancestors (meter and authorize read the whole chain every time), so a later raise or a
+      // sibling's unused share reaches it without anyone re-deriving bounds.
+      const child = attenuateBounds(effectiveParent, parentCellId, requested);
       const violations = boundsViolations(child, parent, { parentCellId });
       if (violations.length > 0) throw new NgError("bounds_violation", `attenuate: ${violations.join("; ")}`);
       return child;
@@ -617,7 +647,7 @@ export function createGate(opts: GateOptions): GateService {
         const outOfBounds = boundsFeedback(action, boundsContext(cell));
         if (outOfBounds) return deny(outOfBounds);
 
-        const ledger = effectiveLedger(chain);
+        const ledger = effectiveLedger(chain, meta.wrapUp === true);
         const exhausted = ledger.state === "hard_stop" ? ledger.limitedBy : null;
 
         let boundVersion: number | undefined;
@@ -743,7 +773,11 @@ export function createGate(opts: GateOptions): GateService {
       });
     },
 
-    meter(cellId, usage) {
+    reinstateSync(cellId) {
+      run(db, "UPDATE ledger SET revoked_at = NULL, revoke_reason = NULL, updated_at = ? WHERE cell_id = ?", [clock.now(), cellId]);
+    },
+
+    meter(cellId, usage, view = {}) {
       const tokens = usage?.tokens;
       const cents = usage?.billedCents;
       if (typeof tokens !== "number" || !Number.isFinite(tokens) || tokens < 0) {
@@ -752,7 +786,14 @@ export function createGate(opts: GateOptions): GateService {
       if (typeof cents !== "number" || !Number.isFinite(cents) || cents < 0) {
         throw new NgError("invalid_argument", "meter: billedCents must be a finite number ≥ 0");
       }
-      const t = Math.ceil(tokens);
+      const cachedIn = usage.cachedTokens;
+      if (cachedIn !== undefined && (typeof cachedIn !== "number" || !Number.isFinite(cachedIn) || cachedIn < 0)) {
+        throw new NgError("invalid_argument", "meter: cachedTokens must be a finite number ≥ 0");
+      }
+      const raw = Math.ceil(tokens);
+      const cached = Math.min(raw, Math.floor(cachedIn ?? 0));
+      // What the limits are charged: cache reads at their weight, everything else in full.
+      const t = Math.ceil(raw - cached + cached * cacheReadWeight);
       return withTx(db, (): MeterResult => {
         const cell = cells.require(cellId);
         const chain = chainOf(cell);
@@ -772,8 +813,9 @@ export function createGate(opts: GateOptions): GateService {
              WHERE cell_id IN (${placeholders(ids.length)})`,
             [t, cents, now, ...ids],
           );
-          run(db, "INSERT INTO usage_log (cell_id, tokens, cents, at) VALUES (?, ?, ?, ?)", [cell.id, t, cents, now]);
+          run(db, "INSERT INTO usage_log (cell_id, tokens, cents, at, raw_tokens, cached_tokens) VALUES (?, ?, ?, ?, ?, ?)", [cell.id, t, cents, now, raw, cached]);
         }
+        // Alerts follow the limits themselves; what the caller is told follows its own view of them.
         const eff = effectiveLedger(chain);
         for (const l of eff.own) {
           if (l.state === "hard_stop" && l.row?.stopped_at == null) {
@@ -784,7 +826,7 @@ export function createGate(opts: GateOptions): GateService {
             afterCommit(db, () => bus.emit("ledger.alert", { cellId: l.cell.id, level: "warn" }));
           }
         }
-        return eff.state;
+        return view.wrapUp ? effectiveLedger(chain, true).state : eff.state;
       });
     },
 
@@ -1034,8 +1076,8 @@ export function createGate(opts: GateOptions): GateService {
 
     // ---------- ledger ----------
 
-    usageSync(cellId) {
-      return usageOf(cells.require(cellId));
+    usageSync(cellId, view) {
+      return usageOf(cells.require(cellId), view);
     },
 
     raiseBudgetSync(cellId, add, approverId) {
@@ -1061,7 +1103,27 @@ export function createGate(opts: GateOptions): GateService {
         // Re-arm the alerts so crossing the new limit is announced again.
         if (own.state !== "hard_stop") run(db, "UPDATE ledger SET stopped_at = NULL WHERE cell_id = ?", [cell.id]);
         if (own.state === "ok") run(db, "UPDATE ledger SET warned_at = NULL WHERE cell_id = ?", [cell.id]);
+        afterCommit(db, () => bus.emit("ledger.raised", { cellId: cell.id }));
         return usageOf(cell);
+      });
+    },
+
+    raiseChainSync(cellId, approverId, add) {
+      assertOwner(approverId, "raising a budget");
+      return withTx(db, () => {
+        const raised: BudgetRaise[] = [];
+        for (const l of chainOf(cells.require(cellId)).map((c) => ownLedger(c))) {
+          if (l.state !== "hard_stop") continue;
+          // Default: half the limit again, and never so little that the ledger is still stopped afterwards.
+          const overTokens = Math.max(0, (l.row?.subtree_tokens ?? 0) - l.limitTokens);
+          const overCents = Math.max(0, (l.row?.subtree_cents ?? 0) - l.limitCents);
+          // An explicit amount is taken as given (a field left out adds nothing, as with raiseBudgetSync).
+          const tokens = add ? (add.tokens ?? 0) : Math.max(1, Math.ceil(l.limitTokens / 2), overTokens + Math.ceil(l.limitTokens / 4));
+          const cents = add ? (add.cents ?? 0) : Math.max(1, Math.ceil(l.limitCents / 2), overCents + Math.ceil(l.limitCents / 4));
+          gate.raiseBudgetSync(l.cell.id, { tokens, cents }, approverId);
+          raised.push({ cellId: l.cell.id, tokens, cents });
+        }
+        return raised;
       });
     },
 

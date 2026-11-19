@@ -186,6 +186,15 @@ function TierSettings(props: {
   const efforts = info?.efforts ?? [];
   const effective = m.effective[tier];
   const recommended = choiceText(m.recommended);
+  // Auto is not the same for both tiers: the fast one runs on a lighter choice picked from the CLI's list.
+  const autoChoice = tier === "fast" ? choiceText(m.recommendedFast ?? null) : recommended;
+  const autoText = !autoChoice
+    ? "自动（跟随 CLI 的默认）"
+    : tier === "fast"
+      ? `自动（从 CLI 的列表里挑轻快的：${autoChoice}）`
+      : `自动（跟随 CLI 推荐：${autoChoice}）`;
+  const autoTitle =
+    tier === "fast" ? "CLI 的列表里有轻量快速的模型时用它，推理强度取中档；没有时用 CLI 推荐的模型，但调低推理强度" : undefined;
   const description = m.models.find((x) => x.id === (fixed?.model ?? effective?.model))?.description;
   // A fixed model without an effort runs at the effort the server prefers for it; the effective choice names it.
   const defaultEffort = fixed && !fixed.effort && effective?.model === fixed.model ? effective.effort : undefined;
@@ -206,7 +215,9 @@ function TierSettings(props: {
               props.onSave(v === AUTO ? { tier, mode: "auto" } : { tier, mode: "fixed", model: v });
             }}
           >
-            <option value={AUTO}>{recommended ? `自动（跟随 CLI 推荐：${recommended}）` : "自动（跟随 CLI 的默认）"}</option>
+            <option value={AUTO} title={autoTitle}>
+              {autoText}
+            </option>
             {fixed && !info && <option value={fixed.model}>{fixed.model}（不在当前列表里）</option>}
             {m.models.map((x) => (
               <option key={x.id} value={x.id} title={x.description}>

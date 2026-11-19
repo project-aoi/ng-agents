@@ -8,7 +8,7 @@ docs/
 ├── 02-workflows/      # 第二层：产品理想工作方式与用例推导（How & Invariants —— 逐步推导，严禁 Break）
 ├── 03-bugs/           # 第三层：Bug 记录与实测审计台账（Point-in-Time Defects —— 独立追踪，修完闭环）
 ├── 04-references/     # 第四层：行业背景调研与历史阶段性演进底稿归档（仅供背景溯源）
-└── 05-proposals/      # 第五层：已拍板的下一代演进提案与合流总排期（按批实施并同步刷新一、二、三层）
+└── 05-proposals/      # 第五层：已于 2026-11-19 落地的架构演进设计记录（现行规范以一、二层为准）
 ```
 
 > **Agent 开发强制铁律**（详见仓库根目录 [AGENTS.md](../AGENTS.md)）：  
@@ -20,9 +20,9 @@ docs/
 
 定义系统“为什么这样设计”以及绝不妥协的体验、架构与安全红线：
 
-1. **[01-product-principles.md](./01-principles/01-product-principles.md)** — GTD 表层极简铁律（`P-UX-1` ～ `P-UX-7`）：内部黑话零泄漏（同时保留业务技术专有名词）、双入口解耦、定时监控归入信源不污染待办、微事秒办免卡与正事备初稿、球权三分明晰与单事项单卡、恒定三视图与渐进信任。
-2. **[02-kernel-principles.md](./01-principles/02-kernel-principles.md)** — 原子内核与编排原则（`P-KERN-1` ～ `P-KERN-6`）：薄内核守确定性机制 vs 厚编排走角色提示词/`SKILL.md`、1 流 + 6 原语 + `Cell`、持久 `Project` 沉淀资产 $\times$ 短命 `Worker` 排空自关、UI 同步事务 vs 异步队列、Level-Triggered 状态监听、`0-Token / fast / strong` 三级算力与前缀缓存、独立无偏见终审。
-3. **[03-safety-and-boundaries.md](./01-principles/03-safety-and-boundaries.md)** — 安全边界与算力治理（`P-SAFE-1` ～ `P-SAFE-7`）：真实宿主目录零误删、按工作树根单写排队 $\times$ 多读零锁并行与只读保护、主人未提交现场零触碰、`owner` vs `agent:*` 身份隔离（`ownerOnly` 双红线）、双版本号防呆、5 锚点防悬空、零丢信封增量预算与宿主休眠续租。
+1. **[01-product-principles.md](./01-principles/01-product-principles.md)** — GTD 表层极简铁律（`P-UX-1` ～ `P-UX-7`）：内部黑话零泄漏（同时保留业务技术专有名词）、常驻 `desk` 主对话 $\times$ 外部主 Agent 伴随入口、定时监控归入信源不污染待办、微事秒办免卡与正事备初稿、球权三分明晰与单事项单卡、四视图分工（含「分身实况 · Agents」）与渐进信任。
+2. **[02-kernel-principles.md](./01-principles/02-kernel-principles.md)** — 原子内核与编排原则（`P-KERN-1` ～ `P-KERN-6`）：薄内核守确定性机制 vs 厚编排走角色提示词/`SKILL.md`、1 流 + 6 原语 + `Cell`、持久 `Project` 沉淀资产 $\times$ 纯叶节点 `Worker` 回合结束即待命（退场通知 + 父节点主动 Pull）、UI 同步事务 vs 异步队列、Level-Triggered 状态监听、`0-Token / fast / strong` 三级算力与前缀缓存、独立无偏见终审。
+3. **[03-safety-and-boundaries.md](./01-principles/03-safety-and-boundaries.md)** — 安全边界与算力治理（`P-SAFE-1` ～ `P-SAFE-7`）：真实宿主目录零误删、内核只亮活跃目录事实 $\times$ AI 决定同仓分工与冲突上报、主人未提交现场零触碰、`owner` vs `agent:*` 身份隔离（`ownerOnly` 红线）、双版本号防呆、5 锚点防悬空、认领前预算挂起与增量计量、主人专属的预算限制开关与宿主休眠续租。
 
 ---
 
@@ -30,14 +30,15 @@ docs/
 
 结合真实办公与重度研发用例，一步一步从表层交互推导到底层角色提示词、工具调用与数据库事务，并列出每条场景**严禁破坏的不变量（`INV-*`）**与对应回归测试：
 
-- **[00-system-mechanics.md](./02-workflows/00-system-mechanics.md)** — 全链路角色拓扑、双层生命周期状态机、`Worker` 单事务排空自关（`Drain-then-Close`）与三视图映射总纲
+- **[00-system-mechanics.md](./02-workflows/00-system-mechanics.md)** — 全链路角色拓扑、双层生命周期状态机、可唤醒 `Worker` 回合结算（待命 + 退场通知 + 主动 Pull）、`watcher` 单事务排空自关（`Drain-then-Close`）与四视图映射总纲
 - **[uc01-capture-reply-and-sources.md](./02-workflows/uc01-capture-reply-and-sources.md)** — 随手记微事直办、外部提问单卡版本保护回复、定时巡检信源与历史周报习惯挖掘
 - **[uc02-code-delivery-and-relay.md](./02-workflows/uc02-code-delivery-and-relay.md)** — `/todo` 缺路径追问、多棒接力追单（`/ship-mr` + 补录屏）、智能 `Watcher` 盯梢 CI 合入、独立源码终审与即时偏好沉淀
 - **[uc03-human-collaboration-and-engage.md](./02-workflows/uc03-human-collaboration-and-engage.md)** — 局部先行与 `@Human` 外部材料等待、专注区左 8 右 4 人工改稿防覆盖与免打扰缓冲、多阶段人类注意力门控
 - **[uc04-someday-research-and-reactivate.md](./02-workflows/uc04-someday-research-and-reactivate.md)** — 远期想法 `research_then_park` 预研停靠、两棒局部补证、网页报告阅读抽屉与跨周查重确认唤醒
-- **[uc05-workspace-concurrency-and-arbitration.md](./02-workflows/uc05-workspace-concurrency-and-arbitration.md)** — 同工作树多读并发与单写排队、主人未提交脏现场保护、多项目公共 CI 共因阻塞单修广播唤醒
-- **[uc06-domain-hub-direct-stream.md](./02-workflows/uc06-domain-hub-direct-stream.md)** — 领域直通中枢（`hub`）、固定时间桶攒批、噪音 `handback` 与在途/刚关 `Worker` 无损追单续接
+- **[uc05-workspace-concurrency-and-arbitration.md](./02-workflows/uc05-workspace-concurrency-and-arbitration.md)** — 同工作树 AI 目录协同（内核只亮事实、协调器分工）、冲突上报停手、主人未提交脏现场保护、多项目公共 CI 共因阻塞单修广播唤醒
+- **[uc06-domain-hub-direct-stream.md](./02-workflows/uc06-domain-hub-direct-stream.md)** — 领域直通中枢（`hub`）、固定时间桶攒批、噪音 `handback` 与在途/待命/已关 `Worker` 无损追单续接
 - **[uc07-external-agent-and-overnight-hosting.md](./02-workflows/uc07-external-agent-and-overnight-hosting.md)** — 外部主 Agent 控制流（先存作用域偏好再立项）与跨夜多战线无人值守算力/休眠治理
+- **[uc08-direct-worker-chat-and-pull-sync.md](./02-workflows/uc08-direct-worker-chat-and-pull-sync.md)** — 主人经 `Agents` 视图或外部主 Agent 直连 `Worker`、同事务静默抄送父项目、退场通知 + `inspect_cell` 主动 Pull 与查询零滞后
 
 ---
 
@@ -61,9 +62,9 @@ docs/
 
 ---
 
-## 五、第五层：已拍板的下一代演进提案与合流总排期（[`05-proposals/`](./05-proposals/)）
+## 五、第五层：已落地的架构演进设计记录（[`05-proposals/`](./05-proposals/)）
 
-存放经讨论定稿的下一阶段架构与交互升级方案，并给出与 `03-bugs/` 去重合流后的零返工执行批次（推进对应批次时同步刷新第一、二层规范与 `INV-*` 单测）：
+存放 2026-11-19 拍板并已全部落地的架构与交互升级方案，作为当前架构的设计记录保留（解释规则的来龙去脉，不随代码修订）；现行权威规范是第一、二层，提案原文与之不一致处以第一、二层为准：
 
 - **[05-proposals/README.md](./05-proposals/README.md)** — 演进总纲、规范拟修订表与 `03-bugs` $\times$ `05-proposals` 四批合流总排期
   - [01-conversational-desk-and-dual-entry.md](./05-proposals/01-conversational-desk-and-dual-entry.md) — 常驻 `desk` 升级为双向持久对话主 Agent 与双入口消息归属

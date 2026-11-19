@@ -19,8 +19,8 @@ async function hubBooks({ snapshot, ports, clock }: PrepareRunInput): Promise<vo
 export function hubPreset(): PresetDef {
   return {
     name: "hub",
-    description: "Persistent router for one stream of direct messages: batches what its watch routes, hands each topic to a one-shot worker, forwards follow-ups.",
-    defaults: { processor: HUB_PROCESSOR, cwdMode: "read", lifetime: "persistent", absorbInbound: true, meta: { role: ROLES.hub } },
+    description: "Persistent router for one stream of direct messages: batches what its watch routes, hands each topic to a worker, forwards follow-ups.",
+    defaults: { processor: HUB_PROCESSOR, lifetime: "persistent", absorbInbound: true, meta: { role: ROLES.hub } },
     // A reply to the people in the thread is drafted with send_message and waits on the owner's card.
     requestBounds: () => ({ canSendTo: ["channel:*"] as unknown as PolicyBounds["canSendTo"] }),
     prepareRun: (input) => hubBooks(input),

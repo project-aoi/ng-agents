@@ -229,6 +229,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
     const own = await ports.context.readState<CliSessionRecord>(cellId, CLI_SESSION_KEY);
     const sameModel = (r: CliSessionRecord) => (r.model ?? "") === (model ?? "");
     let plan: { session?: LaunchRequest["session"]; prompt: string; forkedFrom?: string };
+    let forkBase: CliSessionRecord["reported"];
     if (own && own.engine === engine && own.cwd === access.root && own.systemHash === snapshot.system.hash && sameModel(own)) {
       plan = { session: { id: own.sessionId, mode: "resume" }, prompt: input };
     } else {
@@ -237,6 +238,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
       if (forkIdx >= 0) {
         const parent = await ports.context.readState<CliSessionRecord>(cellId, CLI_FORK_SESSION_KEY);
         if (parent && parent.engine === engine && sameModel(parent)) {
+          forkBase = parent.reported;
           plan = { session: { id: parent.sessionId, mode: "fork" }, prompt: freshPrompt(snapshot.history.slice(forkIdx), input), forkedFrom: parent.sessionId };
           // The fork note is the first "earlier" message the child shows; the parent's part is in the forked session.
           plan.prompt = plan.prompt.replace(/^\[Earlier conversation[^\]]*\]\n\n/, "");
@@ -256,6 +258,10 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
     });
 
     let sessionId: string | null = plan.session?.mode === "resume" ? plan.session.id : null;
+    // Totals of the session that were already metered (CLIs that report running totals). A resumed session continues
+    // from its own record; a fork starts from its parent's history, so from the parent's figure.
+    const zeroUsage = { tokens: 0, cached: 0 };
+    let reported = plan.session?.mode === "resume" ? (own?.reported ?? zeroUsage) : plan.session?.mode === "fork" ? (forkBase ?? zeroUsage) : zeroUsage;
     let sessionModel: string | null = null;
     let sessionCreatedAt = own && plan.session?.mode === "resume" ? own.createdAt : clock.now();
     let endOutcome: EndOutcome | undefined;
@@ -285,6 +291,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
         updatedAt: clock.now(),
         runs: (own && own.sessionId === sessionId ? own.runs : 0) + (final ? 1 : 0),
         ...(plan.forkedFrom ? { forkedFrom: plan.forkedFrom } : {}),
+        ...(reported.tokens > 0 ? { reported } : {}),
       };
       const patches: Record<string, unknown> = { [CLI_SESSION_KEY]: rec };
       if (plan.forkedFrom) patches[CLI_FORK_SESSION_KEY] = null;
@@ -398,6 +405,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
           if (req.session!.mode === "resume") forgetSession();
           else persist = persist.then(() => ports.context.commit(cellId, { statePatches: { [CLI_FORK_SESSION_KEY]: null } })).catch(() => undefined);
           sessionId = null;
+          reported = zeroUsage;
           sessionCreatedAt = clock.now();
           delete plan.forkedFrom;
           nextSession = undefined;
@@ -412,6 +420,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
             // No session to continue (the CLI never reported one): the input must still reach a model — a follow-up
             // that was absorbed into this Run's claim would otherwise be marked done unseen. Start over with the history.
             fellBack = true;
+            reported = zeroUsage;
             nextSession = undefined;
             nextPrompt = freshPrompt(snapshot.history, [input, ...out.relaunchWith].join("\n\n"));
           }
@@ -530,7 +539,19 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
             break;
           }
           case "usage": {
-            const r = ports.meter({ tokens: Math.max(0, Math.round(e.tokens)), billedCents: opts.billReportedCost === false ? 0 : Math.max(0, e.cents) });
+            let tokens = Math.max(0, Math.round(e.tokens));
+            let cached = Math.max(0, Math.round(e.cached ?? 0));
+            if (e.sessionTotal) {
+              // Only what this turn added is metered. A total below the one already seen means the CLI's counters
+              // started over (a rebuilt session): everything it reports is new.
+              const base = tokens >= reported.tokens ? reported : zeroUsage;
+              reported = { tokens, cached };
+              tokens -= base.tokens;
+              cached = Math.max(0, cached - base.cached);
+              persistSession(false);
+            }
+            cached = Math.min(cached, tokens);
+            const r = ports.meter({ tokens, billedCents: opts.billReportedCost === false ? 0 : Math.max(0, e.cents), ...(cached > 0 ? { cachedTokens: cached } : {}) });
             if (r === "hard_stop" && !endOutcome) stop("budget");
             break;
           }
@@ -632,7 +653,7 @@ export function capabilitiesOf(access: WorkspaceAccess, processor: LlmProcessorS
   const bash = has("bash");
   const host = access.isolation === "none";
   // On the host the agent researches like the owner would (docs/05 scenario 5), so its web tools are on.
-  return { root: access.root, isolation: access.isolation, write, edit, bash, readOnly: !(write || edit || bash), web: web || host, access: host ? "host" : "workspace", cwdMode: access.cwdMode ?? "write" };
+  return { root: access.root, isolation: access.isolation, write, edit, bash, readOnly: !(write || edit || bash), web: web || host, access: host ? "host" : "workspace" };
 }
 
 async function workspaceAccess(ports: RunPorts): Promise<WorkspaceAccess> {
@@ -651,21 +672,16 @@ async function workspaceAccess(ports: RunPorts): Promise<WorkspaceAccess> {
 
 /**
  * What a CLI agent must know about being a cell, appended to the cell's frozen system text: a coding CLI arrives with
- * its own habits (its own sub-agents, its own way of asking the user, a final summary nobody reads here), so this says
- * which of them do not apply and where the kernel's tools take over.
+ * its own habits (its own way of asking the user, a task list nobody sees), so this says which of them do not apply
+ * and where the kernel's tools take over. Its own sub-agents are its own business: they run inside this cell's
+ * process and budget and are welcome — what a cell may not do is ask a terminal nobody is sitting at.
  */
 function kernelSystem(frozen: string, adapter: CliAdapter, caps: CliCapabilities, tools: readonly ToolDef[]): string {
   const example = tools[0] ? adapter.mcpToolName(CLI_MCP_SERVER, tools[0].name) : adapter.mcpToolName(CLI_MCP_SERVER, "set_state");
-  // cwdMode "read" is a statement of intent the kernel schedules by (no write slot taken), not a lock: the cell has
-  // its normal tools, and this note says what the intent means.
-  const looking =
-    caps.access === "host" && caps.cwdMode === "read"
-      ? ` You are here to look, not to change: you did not queue for this work tree's write slot, so another cell may be changing it while you run. Read, search and run whatever only looks (git log / diff / show / fetch, a build or test that leaves the tree as it is). Do not edit files, switch branches or commit in this work tree; when the task turns out to need a change, say so in your report or ask your parent for a worker with cwdMode "write" — or make the change in a scratch directory or git worktree you create yourself and name in your report.`
-      : "";
   const directory = caps.readOnly
     ? `- Directory: \`${caps.root}\`. This workspace is read-only (its isolation level allows reading and searching only). ${adapter.readOnlyHowTo(caps)}`
     : caps.access === "host"
-      ? `- Directory: \`${caps.root}\`. You work with this CLI's own file and shell tools, as you normally would, on the owner's real machine with no sandbox — the red lines above are the only guard, so keep to them.${looking || " While you run, no other cell writes in this work tree."}`
+      ? `- Directory: \`${caps.root}\`. You work with this CLI's own file and shell tools, as you normally would, on the owner's real machine with no sandbox — the red lines above are the only guard, so keep to them. Nothing reserves this directory for you: another cell, or the owner, may be working in it at the same time.`
       : `- Directory: \`${caps.root}\`, an isolated workspace of your own. You may change files and run commands inside it.`;
   const lines = [
     frozen.trimEnd(),
@@ -673,7 +689,7 @@ function kernelSystem(frozen: string, adapter: CliAdapter, caps: CliCapabilities
     "## How this cell runs",
     `- Kernel tools: the MCP server "${CLI_MCP_SERVER}" provides them (${tools.map((t) => t.name).join(", ") || "none"}); this client names them like ${example}. They are how what you do reaches the rest of the workbench: reports, waits, messages to cells and people, state, artifacts, reminders, background jobs. Tool names in your instructions (report_to_parent, wait, send_message, …) mean these. Reading files, editing and running commands are not their job — that is what this CLI's own tools are for.`,
     directory,
-    "- Do not use this CLI's own sub-agents, task lists, plan mode or ask-the-user features to coordinate or to ask questions: nobody is at the terminal. Other cells and the owner are reached only through the kernel tools.",
+    "- Nobody is at this terminal. Never use this CLI's ask-the-user or plan-approval features: a question put there blocks the run and is never answered. To ask the owner something, use the kernel tools, or simply say it in your reply when the owner is talking to you directly. This CLI's own sub-agents are yours to use for your own work; other cells are reached only through the kernel tools.",
     "- When a kernel tool result says the run has ended, stop at once: no further tool calls, no further work, no closing summary.",
   ];
   return lines.join("\n");

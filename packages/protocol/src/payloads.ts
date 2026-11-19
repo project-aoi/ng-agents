@@ -58,6 +58,7 @@ export const PAYLOAD = {
   sourceHit: "source.hit",
   // [docs/05]
   cellMessage: "cell.message",
+  cellDirectChat: "cell.direct_chat",
   stalledCheck: "kernel.stalled_check",
   runContinue: "kernel.continue",
   waitTimeout: "kernel.wait_timeout",
@@ -108,14 +109,39 @@ export interface CellTaskPayload {
   input?: unknown;
 }
 
-/** A child's final report to its parent (kind "result"). */
+/**
+ * A child's report to its parent (kind "result"): the final result of a one-shot or persistent child, or — with
+ * `turn` — the kernel's notice that a wakeable worker's turn has settled and it is dormant again.
+ */
 export interface CellResultPayload {
   childCellId: string;
   status: "completed" | "failed" | "cancelled" | "budget_stopped";
+  /** What the child reported (report_to_parent), else the last thing it said, else a placeholder. */
   summary: string;
   deliverable?: Deliverable;
   artifactId?: string;
   data?: unknown;
+  /** Where the child is after this: "dormant" = still there, any message wakes it on its session; "closed" = gone. */
+  childState?: "dormant" | "closed";
+  /** Facts about the settled turn, gathered by the kernel without a model (wakeable children only). */
+  turn?: SettledTurn;
+}
+
+export interface SettledTurn {
+  runId: string;
+  /** The child's evidence this notice covers; `inspect_cell` with `afterSeq: fromSeq - 1` shows exactly it. */
+  fromSeq: number;
+  toSeq: number;
+  /** The owner (or their agent) spoke to the child directly, past its parent, during this turn — and how often. */
+  hadDirectUserChat: boolean;
+  directChats: number;
+  /** Artifacts the child created or revised in this turn. */
+  artifactIds: string[];
+  /** Tool calls made (native CLI tools and kernel tools alike). */
+  steps: number;
+  outcome: "completed" | "failed" | "refused";
+  /** The last thing the child said, shortened; null when it said nothing. */
+  preview: string | null;
 }
 
 /** Intermediate report (e.g. "2/3 quotes back"); parents usually take it silently (delivery silent_inject). */
@@ -174,6 +200,29 @@ export interface CellMessagePayload {
   text: string;
   summary?: string;
   data?: unknown;
+  /** Set when a person wrote it (the owner in the workbench, or their agent passing it on): in which conversation, answering what. */
+  replyToId?: string;
+  replyToText?: string;
+  conversationId?: string;
+}
+
+/**
+ * The owner (or their agent on the control plane) spoke directly to one of this cell's children, past this cell.
+ * Written to the parent's inbox in the transaction that delivers the message itself — by default as background
+ * (`silent_inject`): it wakes nobody, and is in front of the parent at its next wake-up, in the owner's words.
+ */
+export interface CellDirectChatPayload {
+  childCellId: string;
+  childTitle?: string;
+  text: string;
+  /** "enqueue": handed over at the end of the child's current step; "steer": interrupted it. */
+  mode: "enqueue" | "steer";
+  /** Id of the message as the child received it (its envelope id), and of the message it answers, when known. */
+  messageId: string;
+  replyToId?: string;
+  conversationId?: string;
+  projectCellId?: string;
+  at: number;
 }
 
 /**
@@ -214,6 +263,7 @@ export interface KernelPayloadMap {
   handback: HandbackPayload;
   "source.hit": SourceHitPayload;
   "cell.message": CellMessagePayload;
+  "cell.direct_chat": CellDirectChatPayload;
   "kernel.stalled_check": StalledCheckPayload;
   "kernel.continue": RunContinuePayload;
   "kernel.wait_timeout": WaitTimeoutPayload;
@@ -281,6 +331,20 @@ export const kernelPayloadSchemas = {
     deliverable: deliverableSchema.optional(),
     artifactId: z.string().optional(),
     data: z.unknown().optional(),
+    childState: z.enum(["dormant", "closed"]).optional(),
+    turn: z
+      .looseObject({
+        runId: z.string(),
+        fromSeq: z.number().int(),
+        toSeq: z.number().int(),
+        hadDirectUserChat: z.boolean(),
+        directChats: z.number().int(),
+        artifactIds: z.array(z.string()),
+        steps: z.number().int(),
+        outcome: z.enum(["completed", "failed", "refused"]),
+        preview: z.string().nullable(),
+      })
+      .optional(),
   }),
   "cell.progress": z.looseObject({
     childCellId: z.string(),
@@ -316,6 +380,17 @@ export const kernelPayloadSchemas = {
     data: z.unknown().optional(),
   }),
   "cell.message": z.looseObject({ fromCellId: z.string(), text: z.string(), summary: z.string().optional(), data: z.unknown().optional() }),
+  "cell.direct_chat": z.looseObject({
+    childCellId: z.string(),
+    childTitle: z.string().optional(),
+    text: z.string(),
+    mode: z.enum(["enqueue", "steer"]),
+    messageId: z.string(),
+    replyToId: z.string().optional(),
+    conversationId: z.string().optional(),
+    projectCellId: z.string().optional(),
+    at: z.number(),
+  }),
   "kernel.stalled_check": z.looseObject({ projectCellId: z.string(), stalledSince: z.number(), detail: z.string() }),
   "kernel.continue": z.looseObject({ reason: z.literal("step_limit"), count: z.number().int() }),
   "kernel.wait_timeout": z.looseObject({ waitingFor: z.string(), reason: z.string(), since: z.number() }),

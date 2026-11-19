@@ -6,6 +6,7 @@ import {
   createEnvelope,
   inboxAddr,
   isChannelAddr,
+  isLeafLifetime,
   newId,
   parseAddress,
   withTx,
@@ -30,8 +31,9 @@ import {
 import type { ManagedWorkspacePort } from "@ng/workspace";
 import type { KernelCore } from "./core";
 import type { RunHandle } from "./dispatcher";
+import { inspectCell } from "./inspect";
 import { sendCellMessage } from "./messages";
-import { cwdModeOf, ensureCwd } from "./workdir";
+import { ensureCwd } from "./workdir";
 
 export interface RunContext {
   cell: CellRecord;
@@ -44,8 +46,8 @@ export interface RunContext {
 const RENEW_FRACTION = 4;
 
 /**
- * What a cell's workspace is acquired with: its directory and mode (docs/05), plus `meta.workspace` for a cell that
- * explicitly asked for an isolated workspace.
+ * What a cell's workspace is acquired with: its directory, plus `meta.workspace` for a cell that explicitly asked for
+ * an isolated workspace.
  */
 export function acquireOptionsFor(core: KernelCore, cell: CellRecord): WorkspaceAcquireOptions {
   const meta = cell.spec.meta?.["workspace"];
@@ -53,14 +55,13 @@ export function acquireOptionsFor(core: KernelCore, cell: CellRecord): Workspace
   const iso = cell.bounds.isolation;
   if (iso === "none" || iso === "shared_ro") opts.cwd = ensureCwd(core, cell);
   else if (!opts.repoPath) opts.repoPath = cell.spec.cwd ?? core.repoPath;
-  opts.cwdMode = cwdModeOf(cell);
   return opts;
 }
 
 /**
  * RunPorts bound to (cell, epoch, run, principal `cell:<id>`). Ports are the capability boundary — tools are not
  * trusted: every mutating port re-checks that this Run is still the cell's current one, workspace use is limited to
- * the cell's bounds and its cwdMode (a "read" cell cannot change anything), sends need a Gate token and an allowed
+ * the cell's bounds, sends need a Gate token and an allowed
  * target, Context *writes* are pinned to the cell (reads are open across internal cells, docs/05), and cell management
  * is limited to its own descendants plus the few things a cell may change about itself.
  */
@@ -298,12 +299,14 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
         principalId,
         epoch: self.epoch,
         ...(o?.artifactVersion !== undefined ? { artifactVersion: o.artifactVersion } : {}),
+        ...(handle.wrapUp ? { wrapUp: true } : {}),
       });
     },
 
     meter(usage) {
       heartbeat();
-      return gate.meter(cellId, usage);
+      handle.spent += usage.tokens;
+      return gate.meter(cellId, usage, handle.wrapUp ? { wrapUp: true } : undefined);
     },
 
     drainSteer() {
@@ -314,10 +317,10 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
     async emitToParent(type, payload, o = {}) {
       if (!cell.parentId) throw new NgError("invalid_argument", "a root cell has no parent to report to");
       assertLive("emitToParent");
-      if (type === PAYLOAD.cellResult && cell.spec.lifetime === "one_shot") {
-        // docs/05 guard 1: a one-shot cell's final result has exactly one sender — the settle transaction. Whatever
-        // reaches this port (a code processor, a preset tool) becomes the candidate that transaction delivers; sent
-        // from here as well, the parent would get two results, and one of them before the inbox was drained.
+      if (type === PAYLOAD.cellResult && isLeafLifetime(cell.spec.lifetime)) {
+        // docs/05 guard 1: a leaf's result has exactly one sender — the settle transaction. Whatever reaches this port
+        // (a code processor, a preset tool) becomes the candidate that transaction delivers; sent from here as well,
+        // the parent would get two results, and one of them before the inbox was drained.
         const p = (payload ?? {}) as Partial<CellResultPayload>;
         const candidate: CellResultCandidate = {
           status: p.status ?? "completed",
@@ -398,11 +401,9 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
       assertLive("workspace");
       const port = await acquire();
       const b = liveBounds();
-      const mode = cwdModeOf(cell);
-      // cwdMode is reported, not enforced: "read" means the cell did not queue for the work tree's write slot.
       let tools = TOOL_KINDS.filter((t) => b.tools.has(t));
       if (b.isolation === "shared_ro") tools = tools.filter((t) => t === "read");
-      return { root: port.root, isolation: b.isolation, tools, cwdMode: mode };
+      return { root: port.root, isolation: b.isolation, tools };
     },
 
     // ---------- docs/05 ----------
@@ -429,8 +430,8 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
       heartbeat();
       if (runSignal.aborted) return [];
       const spec = cell.spec;
-      // Hubs absorb by design; a one-shot cell absorbs so that a follow-up is answered before it reports and closes.
-      if (!spec.absorbInbound && spec.lifetime !== "one_shot") return [];
+      // Hubs absorb by design; a leaf absorbs so that a follow-up is answered before its turn is reported as settled.
+      if (!spec.absorbInbound && !isLeafLifetime(spec.lifetime)) return [];
       if ((spec.claimMode ?? "serial_coalesce") !== "serial_coalesce") return [];
       return withTx(core.db, () => {
         const rows = inbox.drainInboundSync(cellId, runId);
@@ -469,13 +470,14 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
       }
       if (!cell.parentId) throw new NgError("invalid_argument", "a root cell cannot close or park itself");
       if (!request.force) {
-        const open = cells.children(cellId, { status: ["active", "paused"] });
+        // Dormant workers are not in the way (they are archived with this cell); anything still at work is.
+        const open = core.readModel.blockingChildren(cellId);
         if (open.length > 0) {
           // docs/05 §4.2: closing (or pausing) cascades — never pull the plug on work that is still running.
           throw new NgError(
             "conflict",
-            `${open.length} child cell(s) are still open (${open.map((c) => `${c.id}${c.title ? ` "${c.title}"` : ""}`).join(", ")}). ` +
-              `Wait for their results (or close the ones that are no longer needed) before you ${request.action === "pause" ? "park" : "finish"}.`,
+            `${open.length} child cell(s) are still at work (${open.map((b) => `${b.cell.id}${b.cell.title ? ` "${b.cell.title}"` : ""}: ${b.why}`).join("; ")}). ` +
+              `Wait for them (or close the ones that are no longer needed) before you ${request.action === "pause" ? "park" : "finish"}.`,
           );
         }
       }
@@ -484,6 +486,10 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
 
     activeWorkspaces() {
       return core.readModel.activeWorkspaces();
+    },
+
+    async inspectCell(targetId, o) {
+      return inspectCell(core, targetId, o, { inspectorId: cellId });
     },
   };
   return ports;

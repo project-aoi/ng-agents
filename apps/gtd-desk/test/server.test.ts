@@ -134,9 +134,9 @@ describe("⚡ sources", () => {
     const id = c.sensorId!;
     expect(d.kernel.getCell(id)!.spec).toMatchObject({ preset: "sensor", processor: { kind: "code", entry: "script:checks/metrics.sh" }, schedules: [{ cron: "0 9 * * 1", tz: "Asia/Shanghai" }] });
     expect(d.kernel.inbox.listSchedulesSync({ cellId: id, activeOnly: true })).toHaveLength(1);
-    // a script check runs commands: write mode in a directory of its own — never given a cwd (so never the owner's
-    // repository), no worktree, no sandbox (docs/05)
-    expect(d.kernel.getCell(id)!.spec).toMatchObject({ cwdMode: "write" });
+    // a script check runs commands in a directory of its own — never given a cwd (so never the owner's repository),
+    // no worktree, no sandbox; nothing about read/write modes is asked any more (docs/05 proposal 03)
+    expect(d.kernel.getCell(id)!.spec.cwdMode).toBeUndefined();
     expect(d.kernel.getCell(id)!.spec.cwd).toBeUndefined();
     expect(d.kernel.getCell(id)!.bounds.isolation).toBe("none");
 
@@ -266,6 +266,9 @@ describe("escalations and completion", () => {
   it("extend on a budget card raises the budget; resolve offline closes the waiting task and finishes its records", async () => {
     const d = await bootDesk();
     const before = d.kernel.gate.usageSync("desk").raisedTokens;
+    // "继续" raises the ledgers that are actually stopped (the chain to the root), so the desk has spent its budget.
+    d.kernel.gate.meter("desk", { tokens: d.kernel.gate.usageSync("desk").limitTokens, billedCents: 0 });
+    expect(d.kernel.gate.usageSync("desk").state).toBe("hard_stop");
     const card = { cardType: "escalation", subjectKey: "cell:desk", title: "主台的预算已用完", source: { label: "系统", at: 0 }, rawInput: { text: "x", kind: "system" }, prep: { summary: "", checked: [] }, escalation: { reason: "budget_exhausted", explanation: "已用完" } };
     const b = d.kernel.gate.authorizeSync(
       { type: "custom", name: "escalation.budget_exhausted", summary: "预算", subjectKey: "cell:desk", sideEffect: "external", card: { format: "card", body: "x", data: card } },

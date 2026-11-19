@@ -71,15 +71,15 @@ function setup(over: Partial<ModelSettingsOptions> = {}) {
 const stored = (dataDir: string) => JSON.parse(readFileSync(join(dataDir, "models.json"), "utf8")) as Record<string, unknown>;
 
 describe("createModelSettings", () => {
-  it("defaults to auto: a Run gets the CLI's recommendation", async () => {
+  it("defaults to auto: a strong Run gets the CLI's recommendation, a fast Run the light model it lists", async () => {
     const { settings, src } = setup();
     expect(settings.view()).toMatchObject({ engine: "claude", catalog: null, error: null, selection: { strong: { mode: "auto" }, fast: { mode: "auto" } } });
     expect(settings.view().effective).toEqual({ strong: null, fast: null });
 
     expect(await settings.resolve("strong")).toEqual({ model: "opus", effort: "xhigh" });
-    expect(await settings.resolve("fast")).toEqual({ model: "opus", effort: "xhigh" });
+    expect(await settings.resolve("fast")).toEqual({ model: "haiku" });
     expect(src.calls).toEqual(["claude"]); // one fetch, then the cached list
-    expect(settings.view().effective).toEqual({ strong: { model: "opus", effort: "xhigh" }, fast: { model: "opus", effort: "xhigh" } });
+    expect(settings.view().effective).toEqual({ strong: { model: "opus", effort: "xhigh" }, fast: { model: "haiku" } });
     expect(settings.view().catalog?.models.map((m) => m.id)).toEqual(["opus", "sonnet", "haiku"]);
   });
 
@@ -90,6 +90,67 @@ describe("createModelSettings", () => {
     clock.advance(11 * MIN);
     await settings.catalog();
     expect(await settings.resolve("strong")).toEqual({ model: "sonnet" });
+    // no light model listed any more: fast takes the first choice at a lower effort
+    expect(await settings.resolve("fast")).toEqual({ model: "sonnet", effort: "medium" });
+  });
+
+  it("fast auto picks the first light model the CLI lists, at a moderate effort", async () => {
+    const { settings, src } = setup();
+    const MINI: CliModelInfo = { id: "vendor-mini", label: "Vendor mini", efforts: ["low", "medium", "high"] };
+    const FLASH: CliModelInfo = { id: "vendor-flash", label: "Vendor Flash", efforts: ["low"] };
+    src.plan.push([OPUS, SONNET, MINI, FLASH]);
+    expect(await settings.resolve("fast")).toEqual({ model: "vendor-mini", effort: "medium" });
+    expect(await settings.resolve("strong")).toEqual({ model: "opus", effort: "xhigh" });
+    expect(settings.view().effective).toEqual({ strong: { model: "opus", effort: "xhigh" }, fast: { model: "vendor-mini", effort: "medium" } });
+  });
+
+  it("fast auto on a flagship-only list: the flagship at a lower effort; strong is unchanged", async () => {
+    const { settings, src } = setup();
+    src.plan.push([OPUS]);
+    expect(await settings.resolve("strong")).toEqual({ model: "opus", effort: "xhigh" });
+    expect(await settings.resolve("fast")).toEqual({ model: "opus", effort: "medium" });
+    expect(settings.view().effective).toEqual({ strong: { model: "opus", effort: "xhigh" }, fast: { model: "opus", effort: "medium" } });
+
+    // a flagship without an effort setting: fast is the same as strong
+    const BARE: CliModelInfo = { id: "bare", label: "Bare", efforts: [] };
+    src.plan.push([BARE]);
+    await settings.catalog({ refresh: true });
+    expect(await settings.resolve("fast")).toEqual({ model: "bare" });
+    expect(await settings.resolve("strong")).toEqual({ model: "bare" });
+  });
+
+  it("a catalogue that carries its own fast choice is followed; one without it (older shape) is derived from its list", async () => {
+    const clock = new ManualClock(T0);
+    let withFast = true;
+    const settings = createModelSettings({
+      engine: "codex",
+      dataDir: tempDir(),
+      clock,
+      firstFetchWaitMs: 50,
+      fetch: async (engine) => ({
+        engine,
+        models: [OPUS, SONNET, HAIKU],
+        recommended: { model: "opus", effort: "xhigh" },
+        ...(withFast ? { recommendedFast: { model: "sonnet", effort: "low" } } : {}),
+        fetchedAt: clock.now(),
+      }),
+    });
+    expect(await settings.resolve("fast")).toEqual({ model: "sonnet", effort: "low" });
+    withFast = false;
+    await settings.catalog({ refresh: true });
+    expect(await settings.resolve("fast")).toEqual({ model: "haiku" });
+    expect(settings.view().effective.fast).toEqual({ model: "haiku" });
+  });
+
+  it("a fixed selection is used as chosen for either tier, whatever auto would pick", async () => {
+    const { settings } = setup();
+    await settings.catalog();
+    settings.select("fast", { mode: "fixed", model: "opus" });
+    settings.select("strong", { mode: "fixed", model: "haiku" });
+    expect(await settings.resolve("fast")).toEqual({ model: "opus", effort: "xhigh" });
+    expect(await settings.resolve("strong")).toEqual({ model: "haiku" });
+    settings.select("fast", { mode: "fixed", model: "opus", effort: "max" });
+    expect(settings.view().effective).toEqual({ strong: { model: "haiku" }, fast: { model: "opus", effort: "max" } });
   });
 
   it("static configuration becomes a fixed selection, its effort filled from the catalogue", async () => {

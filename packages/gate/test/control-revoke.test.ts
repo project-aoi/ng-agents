@@ -95,6 +95,43 @@ describe("revoke", () => {
   });
 });
 
+describe("reinstate", () => {
+  it("lifts the revoke of that one cell only; tokens and cards the revoke cancelled stay cancelled", () => {
+    const f = tree();
+    const card = expectType(f.gate.authorizeSync(send("channel:feishu:oc_1", { subjectKey: "p" }), meta("proj")), "defer");
+    const token = expectType(f.gate.authorizeSync(exec("read"), meta("proj")), "allow").actionToken;
+    f.gate.revokeSync("proj");
+    expectType(f.gate.authorizeSync(exec("read"), meta("proj")), "deny");
+
+    f.gate.reinstateSync("proj");
+    expectType(f.gate.authorizeSync(exec("read"), meta("proj")), "allow");
+    // the descendant stays revoked
+    expect(expectType(f.gate.authorizeSync(exec("read"), meta("leaf")), "deny").feedback).toMatch(/this cell's authority was revoked/);
+    expect(all(f.db, "SELECT cell_id FROM ledger WHERE revoked_at IS NOT NULL ORDER BY cell_id")).toEqual([{ cell_id: "leaf" }]);
+    expect(all(f.db, "SELECT revoke_reason FROM ledger WHERE cell_id = 'proj'")).toEqual([{ revoke_reason: null }]);
+    // what the revoke cancelled is not brought back
+    expect(f.gate.verifyTokenSync(token, exec("read"))).toEqual({ ok: false, reason: "revoked" });
+    expect(f.gate.getApprovalSync(card.actionId)).toMatchObject({ status: "cancelled", statusReason: "authority revoked" });
+    expect(f.gate.approveSync(card.actionId, "owner")).toBe("already_cancelled");
+  });
+
+  it("reinstating a descendant does not lift an ancestor's revoke; unknown or never-revoked cells are a no-op", () => {
+    const f = tree();
+    f.gate.revokeSync("proj");
+    f.gate.reinstateSync("leaf");
+    expect(expectType(f.gate.authorizeSync(exec("read"), meta("leaf")), "deny").feedback).toMatch(/ancestor cell "proj" was revoked/);
+    f.gate.reinstateSync("sib");
+    f.gate.reinstateSync("ghost");
+    expectType(f.gate.authorizeSync(exec("read"), meta("sib")), "allow");
+    // with proj reinstated as well, the leaf may act again
+    f.gate.reinstateSync("proj");
+    expectType(f.gate.authorizeSync(exec("read"), meta("leaf")), "allow");
+    // and a later revoke takes hold again
+    f.gate.revokeSync("proj");
+    expectType(f.gate.authorizeSync(exec("read"), meta("proj")), "deny");
+  });
+});
+
 describe("deliveryAllowed (kernel helper for inboxOut / emitToParent)", () => {
   it("covers canSendTo patterns and always the parent's own inbox", () => {
     const f = tree();
