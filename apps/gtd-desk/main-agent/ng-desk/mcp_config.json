@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "ng-desk": {
+      "command": "/opt/homebrew/bin/node",
+      "args": [
+        "/Users/ar8327/dev/ng-agents/apps/gtd-desk/bin/ng-mcp.mjs"
+      ],
+      "env": {
+        "NG_DESK_URL": "http://127.0.0.1:8790"
+      }
+    }
+  }
+}
