@@ -51,9 +51,12 @@ if (typeof window !== "undefined") {
   });
 }
 
-/** The item is finished (sent, archived, done): its leftover unsaved text means nothing any more. */
-export function forgetUnsaved(artifactId: string | null | undefined): void {
-  if (artifactId) unsaved.delete(artifactId);
+/** Keep drafts that still belong to an open or snoozed item. */
+export function retainUnsaved(openArtifactIds: readonly string[]): void {
+  const open = new Set(openArtifactIds);
+  for (const artifactId of unsaved.keys()) {
+    if (!open.has(artifactId)) unsaved.delete(artifactId);
+  }
 }
 
 function restore(a: ArtifactDTO): DraftInner {

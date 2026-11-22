@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import type { ButtonDTO, ProjectMutationResponse, ProjectRowDTO, RadarDTO, ReviewMutationResponse, WeeklyReviewDTO } from "../../shared/api";
+import type { ButtonDTO, ProjectMutationResponse, ProjectRowDTO, RadarDTO, ReviewMutationResponse, StatusDTO, WeeklyReviewDTO } from "../../shared/api";
 import { api, callButton, request } from "../api";
 import { BallChip, ButtonRow, Chevron, ProgressBar } from "../components/controls";
 import { Empty, ErrorState, Loading } from "../components/states";
@@ -9,13 +9,21 @@ import { dueText, whenText } from "../text";
 export function RadarView() {
   // The weekly review rides along in /api/radar, so a review-only change refetches the same view.
   const res = useResource<RadarDTO>("radar", api.radar, ["radar", "review"]);
-  const ended=useResource("recently-closed",()=>request<{projects:{id:string;title:string}[]}>("GET","/api/projects/closed"),["radar"]);
-  const reopen=async (id:string)=>{
-    try {await request("POST",`/api/projects/${encodeURIComponent(id)}/reopen`);res.reload();ended.reload();toast({tone:"success",text:"项目已重新打开"});}
-    catch(err){toast({tone:"error",text:toFailure(err).message});}
-  };
+  const ended = useResource("recently-closed", () => request<{ projects: { id: string; title: string }[] }>("GET", "/api/projects/closed"), ["radar"]);
   const { setStatus } = useStatus();
   const toast = useToast();
+
+  const reopen = async (id: string) => {
+    try {
+      const result = await request<{ deskStatus: StatusDTO }>("POST", `/api/projects/${encodeURIComponent(id)}/reopen`);
+      setStatus(result.deskStatus);
+      res.reload();
+      ended.reload();
+      toast({ tone: "success", text: "项目已重新打开" });
+    } catch (err) {
+      toast({ tone: "error", text: toFailure(err).message });
+    }
+  };
   const now = useNow();
   const [somedayOpen, setSomedayOpen] = useState(false);
 
@@ -65,7 +73,7 @@ export function RadarView() {
             {radar.counts.stalled > 0 && <span className="stalled-count">{radar.counts.stalled} 个停滞，需要补上下一步</span>}
           </div>
           {radar.projects.length === 0 ? (
-            <Empty title="没有进行中的项目">需要多步推进的事，在待确认里确认立项后会出现在这里。</Empty>
+            <Empty title="没有进行中的项目">在「待我处理」批准立项后，可以在这里查看进展。</Empty>
           ) : (
             <ul className="projects">
               {radar.projects.map((p) => (
@@ -108,9 +116,7 @@ function ProjectRow({ row, now, onRun }: { row: ProjectRowDTO; now: number; onRu
   const [open, setOpen] = useState(false);
   const ball = row.ball;
   const hiddenActions = row.openActions.length;
-  // Older servers may not send these yet: a row without them simply shows no links.
-  const reports = row.artifacts ?? [];
-  const agents = row.agents ?? null;
+  const { artifacts: reports, agents } = row;
 
   return (
     <li className={`project${row.stalled ? " stalled" : ""}${row.paused ? " paused" : ""}${row.lifecycle === "someday" ? " is-someday" : ""}`}>
@@ -118,7 +124,7 @@ function ProjectRow({ row, now, onRun }: { row: ProjectRowDTO; now: number; onRu
         <div className="project-name">
           <h3>{row.title}</h3>
           {row.paused && <span className="badge">已暂停</span>}
-          {row.lifecycle === "someday" && <span className="badge">以后再说</span>}
+          {row.lifecycle === "someday" && <span className="badge">已停靠</span>}
         </div>
         {row.outcome && <p className="project-outcome">{row.outcome}</p>}
         {row.summary && <p className="muted small">{row.summary}</p>}
@@ -137,37 +143,31 @@ function ProjectRow({ row, now, onRun }: { row: ProjectRowDTO; now: number; onRu
           <span className="ball-text">{ball.text}</span>
           {ball.cardId && (
             <button type="button" className="link-btn" onClick={() => navigate({ view: "inbox", cardId: ball.cardId! })}>
-              去确认 →
+              去处理 →
             </button>
           )}
         </div>
       ) : (
-        row.lifecycle === "someday" && <p className="muted small">后台资源已全部停下，重新启动后再推进。</p>
+        row.lifecycle === "someday" && <p className="muted small">重新启动后，分身会接着推进。</p>
       )}
 
-      {(reports.length > 0 || agents) && (
-        <div className="project-links">
-          {reports.map((a) => (
-            <button key={a.artifactId} type="button" className="btn sm report-btn" onClick={() => openReport(a)} title={`打开「${a.title}」v${a.version}`}>
-              查看报告：{a.title} (v{a.version})
-            </button>
-          ))}
-          {agents && (
-            <a
-              className="link-btn agents-link"
-              href={agents.href}
-              onClick={(e) => {
-                // Same route the hash would give, through the app's own navigation (closes panels, keeps history).
-                if (!agents.href.startsWith("#")) return;
-                e.preventDefault();
-                navigate(parseRoute(agents.href));
-              }}
-            >
-              {agents.label}
-            </a>
-          )}
-        </div>
-      )}
+      <div className="project-links">
+        {reports.map((a) => (
+          <button key={a.artifactId} type="button" className="btn sm report-btn" onClick={() => openReport(a)} title={`打开「${a.title}」v${a.version}`}>
+            查看报告：{a.title} (v{a.version})
+          </button>
+        ))}
+        <a
+          className="link-btn agents-link"
+          href={agents.href}
+          onClick={(e) => {
+            e.preventDefault();
+            navigate(parseRoute(agents.href));
+          }}
+        >
+          {agents.label}
+        </a>
+      </div>
 
       {(row.progress || row.waiting) && (
         <div className="aggregate">
@@ -193,7 +193,7 @@ function ProjectRow({ row, now, onRun }: { row: ProjectRowDTO; now: number; onRu
             {hiddenActions} 个并行动作
           </button>
         ) : (
-          <span className="muted small">{row.pendingCardId && !ball?.cardId ? "有一张卡在待确认里" : ""}</span>
+          <span className="muted small">{row.pendingCardId && !ball?.cardId ? "有一件事在「待我处理」" : ""}</span>
         )}
         <ButtonRow buttons={row.buttons} onRun={onRun} size="sm" className="project-buttons" />
       </div>

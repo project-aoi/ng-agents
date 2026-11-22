@@ -77,6 +77,22 @@ describe("GET/PUT /api/models on a CLI backend", () => {
     expect(src.calls).toEqual(["claude"]);
     const status = await d.get<StatusDTO>("/api/status");
     expect(status).toMatchObject({ backend: "claude", model: "Opus 5.5 · xhigh" });
+    const stream = await d.server.app.request("/api/events");
+    const reader = stream.body!.getReader();
+    try {
+      let frame = "";
+      const decoder = new TextDecoder();
+      while (!frame.includes("\n\n")) {
+        const chunk = await reader.read();
+        if (chunk.done) throw new Error("status stream closed before hello");
+        frame += decoder.decode(chunk.value, { stream: true });
+      }
+      expect(frame).toContain("event: hello");
+      const data = frame.split("\n").find(line => line.startsWith("data: "))!;
+      expect(JSON.parse(data.slice(6)).status).toEqual(status);
+    } finally {
+      await reader.cancel();
+    }
   });
 
   it("PUT a fixed model and effort: the answer, a later GET and the top bar reflect it, and it is saved", async () => {

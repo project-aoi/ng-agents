@@ -9,7 +9,7 @@ import {
   type HumanItemDTO,
 } from "../../shared/api";
 import { request } from "../api";
-import { useToast, toFailure } from "../state";
+import { useStatus, useToast, toFailure } from "../state";
 import { Spinner } from "./controls";
 
 interface PlanForm {
@@ -36,22 +36,44 @@ export function PlanEditor(props: {
   item: HumanItemDTO;
   onClose(): void;
   onSaved(r: PlanSaveResponse): void;
-  onConflictView(r: PlanSaveResponse): void;
+  reloadItem(): Promise<HumanItemDTO | undefined>;
 }) {
   const card = props.item;
   const toast = useToast();
-  const opened = card.artifactVersion;
-  const [form, setForm] = useState<PlanForm>(() => formOf(card.proposal!));
-  const [expected, setExpected] = useState<number | null>(opened ?? null);
-  const [conflict, setConflict] = useState<ArtifactDTO | null>(null);
+  const { setStatus } = useStatus();
+  const [initial] = useState(() => formOf(card.proposal!));
+  const [form, setForm] = useState<PlanForm>(initial);
+  const [expected] = useState(card.artifactVersion);
+  const [conflict, setConflict] = useState<{ artifact: ArtifactDTO; proposal: HumanItemDTO["proposal"] } | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const saveInFlight = useRef(false);
   const firstRef = useRef<HTMLInputElement>(null);
   useEffect(() => firstRef.current?.focus(), []);
+
+  const dirty = JSON.stringify(form) !== JSON.stringify(initial);
+  useEffect(() => {
+    if (!dirty) return;
+    const warn = (event: BeforeUnloadEvent) => event.preventDefault();
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [dirty]);
+
+  async function loadComparison() {
+    setError(null);
+    const remote = await props.reloadItem();
+    if (!remote?.artifact || !remote.proposal || remote.artifact.artifactId !== card.artifact?.artifactId) {
+      setError("这份方案已不在待办中，你的修改仍在下方。");
+      return;
+    }
+    const baseline = { artifact: remote.artifact, proposal: remote.proposal };
+    setConflict(cur => cur && cur.artifact.version > baseline.artifact.version ? cur : baseline);
+  }
 
   const moved = card.artifactVersion !== null && expected !== null && card.artifactVersion > expected && !conflict;
 
   const save = async (version: number | null) => {
+    if (saveInFlight.current) return;
     if (version === null) {
       setError("这张卡的方案没有可保存的版本");
       return;
@@ -61,6 +83,7 @@ export function PlanEditor(props: {
       setError("请写下完成的样子");
       return;
     }
+    saveInFlight.current = true;
     setSaving(true);
     setError(null);
     try {
@@ -69,7 +92,7 @@ export function PlanEditor(props: {
         proposal: {
           title: form.title.trim() || undefined,
           outcome: form.outcome.trim(),
-          ...(form.background.trim() ? { background: form.background.trim() } : {}),
+          background: form.background.trim(),
           actions: actions.map((a) => ({
             title: a.title.trim(),
             owner: a.owner,
@@ -79,16 +102,18 @@ export function PlanEditor(props: {
         },
       });
       if (r.outcome === "conflict") {
-        setConflict(r.current ?? null);
-        props.onConflictView(r);
+        setConflict({ artifact: r.current, proposal: null });
+        await loadComparison();
         return;
       }
+      setStatus(r.deskStatus);
       props.onSaved(r);
     } catch (err) {
       const f = toFailure(err);
       setError(f.message);
       toast({ tone: "error", text: f.message });
     } finally {
+      saveInFlight.current = false;
       setSaving(false);
     }
   };
@@ -101,7 +126,7 @@ export function PlanEditor(props: {
       className="plan-editor"
       onSubmit={(e) => {
         e.preventDefault();
-        void save(expected);
+        if (!conflict) void save(expected);
       }}
       onKeyDown={(e) => {
         if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s") {
@@ -121,59 +146,60 @@ export function PlanEditor(props: {
 
       {moved && (
         <div className="banner warn" role="status">
-          方案已在后台更新到 v{card.artifactVersion}。你的修改还在下面；保存时会提示你合并。
+          方案已在后台更新到 v{card.artifactVersion}。你可以继续编辑，保存时会显示两个版本供你对照。
         </div>
       )}
       {conflict && (
         <div className="banner conflict" role="alert">
           <div>
             <strong>
-              方案在你编辑时已更新到 v{conflict.version}（{conflict.updatedByLabel}）。
+              方案在你编辑时已更新到 v{conflict.artifact.version}，由{conflict.artifact.updatedByLabel}修改。
             </strong>
-            <span>你的修改还在下面，没有丢，也还没保存。对照最新方案后决定：</span>
+            <span>你的修改仍在下方。请对照最新方案后保存。</span>
           </div>
-          {card.proposal && (
-            <details className="theirs-plan">
-              <summary>看 v{conflict.version} 的方案</summary>
-              <p>
-                {card.proposal.outcome} · {card.proposal.actions.map((a) => a.title).join("、")}
-              </p>
+          {conflict.proposal && (
+            <details className="theirs-plan" open>
+              <summary>看 v{conflict.artifact.version} 的方案</summary>
+              <strong>{conflict.proposal.title}</strong>
+              <p>{conflict.proposal.outcome}</p>
+              {conflict.proposal.background && <p>{conflict.proposal.background}</p>}
+              <ul>{conflict.proposal.actions.map((a, i) => <li key={i}>{a.title} · {BALL_LABEL[a.owner]}
+                {a.effort && ` · ${EFFORT_LABELS[a.effort]}`}{a.nextStep && ` · ${a.nextStep}`}
+              </li>)}</ul>
             </details>
           )}
           <div className="banner-actions">
             <button type="button" className="btn sm ghost" onClick={props.onClose}>
               放弃我的修改
             </button>
-            <button
-              type="button"
-              className="btn sm primary"
-              disabled={saving}
-              onClick={() => {
-                setExpected(conflict.version);
-                setConflict(null);
-                void save(conflict.version);
-              }}
-            >
-              按我的修改保存为 v{conflict.version + 1}
-            </button>
+            {conflict.proposal ? (
+              <button type="button" className="btn sm primary" disabled={saving} onClick={() => void save(conflict.artifact.version)}>
+                按我的修改保存为 v{conflict.artifact.version + 1}
+              </button>
+            ) : (
+              <button type="button" className="btn sm ghost" disabled={saving}
+                onClick={() => { void loadComparison().catch(err => setError(toFailure(err).message)); }}>
+                重新读取最新方案
+              </button>
+            )}
           </div>
         </div>
       )}
 
       <label className="field">
         <span>项目名称</span>
-        <input ref={firstRef} value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} />
+        <input disabled={saving} ref={firstRef} value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} />
       </label>
       <label className="field">
         <span>完成的样子</span>
-        <textarea rows={2} value={form.outcome} onChange={(e) => setForm({ ...form, outcome: e.target.value })} />
+        <textarea disabled={saving} rows={2} value={form.outcome} onChange={(e) => setForm({ ...form, outcome: e.target.value })} />
       </label>
       <label className="field">
         <span>背景（可选）</span>
-        <textarea rows={2} value={form.background} onChange={(e) => setForm({ ...form, background: e.target.value })} />
+        <textarea disabled={saving} rows={2} value={form.background} onChange={(e) => setForm({ ...form, background: e.target.value })} />
       </label>
 
-      <fieldset className="plan-edit-actions">
+      <fieldset disabled={saving} className="plan-edit-actions">
         <legend>推进安排</legend>
         {form.actions.map((a, i) => (
           <div className="plan-edit-row" key={i}>

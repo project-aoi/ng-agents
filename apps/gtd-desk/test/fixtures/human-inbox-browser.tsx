@@ -19,6 +19,7 @@ window.fetch = async (url, init) => {
   }
   if (url === "/api/human-items") {
     return Response.json({
+      openArtifactIds: submissions.length === 4 ? [] : ["draft"],
       items:
         submissions.length === 4
           ? []
@@ -92,6 +93,8 @@ async function exercise() {
   await waitFor(() => !document.querySelector(".banner button"));
   document.querySelector("form")!.requestSubmit();
   await waitFor(() => document.querySelector("h1")?.textContent === "方案 v2");
+  document.querySelector<HTMLButtonElement>(".inbox-paper [role=alert] button")!.click();
+  await waitFor(() => !document.querySelector(".inbox-paper [role=alert]"));
   document.querySelector("form")!.requestSubmit();
   await waitFor(() => document.querySelector(".inbox-actions [role=alert]")?.textContent?.includes("此操作需要主人确认") === true);
   document.querySelector("form")!.requestSubmit();

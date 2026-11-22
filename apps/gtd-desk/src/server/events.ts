@@ -24,7 +24,7 @@ function stateViews(keys: readonly string[]): ViewName[] {
 export function viewsForBusEvent<K extends BusTopic>(topic: K, data: BusTopics[K]): ViewName[] {
   switch (topic) {
     case "approval.changed":
-      return ["inbox", "status", "radar", "agents", "review"];
+      return ["inbox", "status", "radar", "agents", "review", "activity"];
     case "artifact.changed":
       return ["inbox", "radar", "agents"];
     case "state.changed":
@@ -42,8 +42,8 @@ export function viewsForBusEvent<K extends BusTopic>(topic: K, data: BusTopics[K
     case "knowledge.changed":
       return ["review", "inbox"];
     case "inbox.enqueued":
-      // Any message can wake a cell (the Agents view shows it about to start); a due one can also surface a card.
-      return (data as BusTopics["inbox.enqueued"]).reason === "due" ? ["inbox", "status", "radar", "agents"] : ["agents"];
+      // A queued message changes the activity shown in both the tree and the top bar.
+      return (data as BusTopics["inbox.enqueued"]).reason === "due" ? ["inbox", "status", "radar", "agents"] : ["agents", "status"];
     default:
       return [];
   }

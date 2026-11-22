@@ -91,7 +91,7 @@ function CapturePanel() {
 
   return (
     <div className="capture">
-      <p className="drawer-note">随手敲一句丢进信箱，不用选分类、填日期。纯收藏和个人提醒会直接办好，只在顶栏轻提示一句；需要对外回应或拍板的事，Agent 备好初稿再请你确认。</p>
+      <p className="drawer-note">随手敲一句丢进信箱，不用选分类、填日期。纯收藏和个人提醒会直接办好，只在顶栏轻提示一句；需要你拍板的事，主台会准备好材料。</p>
       <textarea ref={ref} rows={5} value={text} onChange={(e) => setText(e.target.value)} onKeyDown={onKey} placeholder="比如：周五下午 3 点提醒我给牙医打电话" aria-label="随手记内容" />
       <input type="url" value={link} onChange={(e) => setLink(e.target.value)} onKeyDown={onKey} placeholder="附一个链接（可选）" aria-label="附带链接" />
       <div className="capture-foot">

@@ -217,12 +217,6 @@ code {
   margin-right: -2px;
 }
 
-.tab-en {
-  color: var(--text-3);
-  font-size: var(--fs-sm);
-  font-weight: 400;
-}
-
 .tab-count {
   min-width: 1.5em;
   padding: 0 6px;
@@ -4056,17 +4050,7 @@ textarea:focus-visible {
 
 /* ==================== narrower windows ==================== */
 
-/* four tabs and two settings: the English names go first */
-@media (max-width: 1380px) {
-  .tab-en {
-    display: none;
-  }
-}
-
 @media (max-width: 1100px) {
-  .tab-en {
-    display: none;
-  }
   .mt-backend {
     display: none;
   }

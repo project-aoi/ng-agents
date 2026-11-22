@@ -10,9 +10,6 @@ import { LiveStrip, Timeline } from "../components/agents/timeline";
 import { Empty, ErrorState, Loading } from "../components/states";
 import { rememberDeskId, syncServerClock, useDebouncedRefresh, useNavigate, useNow, useResource } from "../state";
 
-// 4. 分身实况: the topology on the left (5/12), the selected node's live record and its send box on the right (7/12).
-// The three other views are about matters and decisions; this one shows the cells themselves and what they did.
-
 const DENSITY_KEY = "ng-desk-agents-density";
 
 function savedDensity(): Density {
@@ -60,18 +57,18 @@ export function AgentsView({ cellId, projectId }: { cellId?: string | undefined;
           onClearProject={() => navigate({ view: "agents", ...(selected ? { cellId: selected } : {}) })}
         />
       ) : (
-        <section className="ag-left" aria-label="分身拓扑">
-          {topo.error && !topo.loading ? <ErrorState error={topo.error} onRetry={topo.reload} title="分身拓扑没能载入" /> : <Loading label="正在载入分身拓扑…" />}
+        <section className="ag-left" aria-label="分身关系图">
+          {topo.error && !topo.loading ? <ErrorState error={topo.error} onRetry={topo.reload} title="分身关系图没能载入" /> : <Loading label="正在载入分身关系图…" />}
         </section>
       )}
       {selected ? (
         <NodePane key={selected} cellId={selected} onSelect={select} onChanged={topo.reload} />
       ) : (
         <section className="ag-right" aria-label="选中的分身">
-          {topo.error && !topo.loading ? <Empty title="还没选中分身">拓扑载入后会默认打开总助理的对话。</Empty> : <Loading label="正在打开总助理…" />}
+          {topo.error && !topo.loading ? <Empty title="还没选中分身">分身列表载入后会默认打开总助理的对话。</Empty> : <Loading label="正在打开总助理…" />}
         </section>
       )}
-      {topo.data && topo.error && <p className="stale-note ag-stale">拓扑刷新失败：{topo.error.message}（显示的是上次载入的内容）</p>}
+      {topo.data && topo.error && <p className="stale-note ag-stale">分身列表刷新失败：{topo.error.message}（显示的是上次载入的内容）</p>}
     </div>
   );
 }

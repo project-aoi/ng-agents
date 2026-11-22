@@ -83,7 +83,8 @@ describe("boot with the real presets", () => {
 
 describe("live updates", () => {
   it("maps bus events to coarse view refreshes", () => {
-    expect(viewsForBusEvent("approval.changed", { actionId: "a", cellId: "desk", subjectKey: "s", status: "pending" })).toContain("inbox");
+    expect(viewsForBusEvent("inbox.enqueued", { cellId: "worker", reason: "enqueued" })).toEqual(expect.arrayContaining(["agents", "status"]));
+    expect(viewsForBusEvent("approval.changed", { actionId: "a", cellId: "desk", subjectKey: "s", status: "pending" })).toEqual(expect.arrayContaining(["inbox", "activity"]));
     expect(viewsForBusEvent("state.changed", { cellId: "desk", keys: [gtdKeys.action("x")] })).toEqual(expect.arrayContaining(["inbox", "radar"]));
     expect(viewsForBusEvent("state.changed", { cellId: "s", keys: [gtdKeys.source] })).toEqual(["sources", "review"]);
     expect(viewsForBusEvent("state.changed", { cellId: "desk", keys: ["coord:state"] })).toEqual([]);

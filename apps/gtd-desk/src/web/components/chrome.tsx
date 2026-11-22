@@ -1,6 +1,6 @@
 import { useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type RefObject } from "react";
 import { BALL_LABEL, relativeTimeZh, type ActivityKind, type ActivityListDTO, type StatusDTO } from "../../shared/api";
-import { api } from "../api";
+import { api, callButton } from "../api";
 import { routeHash, toFailure, useDeskId, useNavigate, useNow, useResource, useStatus, useToast, useToasts, type ViewKey } from "../state";
 import { clientId, whenText } from "../text";
 import { SourceText } from "./bits";
@@ -10,10 +10,10 @@ import { ErrorState, Loading } from "./states";
 
 // ==================== top bar ====================
 
-const TABS: Array<{ key: ViewKey; icon: string; zh: string; en: string; n: string }> = [
-  { key: "inbox", icon: "📥", zh: "待我处理", en: "", n: "1" },
-  { key: "radar", icon: "🧭", zh: "项目全局", en: "", n: "2" },
-  { key: "agents", icon: "👥", zh: "分身实况", en: "", n: "3" },
+const TABS: Array<{ key: ViewKey; icon: string; zh: string; n: string }> = [
+  { key: "inbox", icon: "📥", zh: "待我处理", n: "1" },
+  { key: "radar", icon: "🧭", zh: "项目全局", n: "2" },
+  { key: "agents", icon: "👥", zh: "分身实况", n: "3" },
 ];
 
 /** "等待外部" — the waiting ball's own words, without its icon (BUG-011: not only replies are waited for). */
@@ -21,8 +21,6 @@ const WAITING_WORDS = stripIcon(BALL_LABEL.waiting);
 
 export function TopBar(props: { view: ViewKey; status: StatusDTO | null; onView(v: ViewKey): void; drawerOpen: boolean; onDrawer(): void }) {
   const { status } = props;
-  const {setStatus} = useStatus();
-  const toast = useToast();
   return (
     <header className="topbar">
       <nav className="tabs" aria-label="视图">
@@ -47,9 +45,8 @@ export function TopBar(props: { view: ViewKey; status: StatusDTO | null; onView(
                 {t.n}.
               </span>
               <span className="tab-zh">{t.zh}</span>
-              <span className="tab-en">{t.en}</span>
               {count !== undefined && (
-                <span className={`tab-count${count > 0 ? "" : " zero"}`} aria-label={`${count} 张待确认`}>
+                <span className={`tab-count${count > 0 ? "" : " zero"}`} aria-label={`${count} 项待我处理`}>
                   {count}
                 </span>
               )}
@@ -60,7 +57,7 @@ export function TopBar(props: { view: ViewKey; status: StatusDTO | null; onView(
       </nav>
       <div className="topbar-right">
         {status && <ModelSwitch status={status} />}
-        <button type="button" className={`drawer-trigger${props.drawerOpen ? " on" : ""}`} aria-expanded={props.drawerOpen} aria-controls="drawer" onClick={props.onDrawer} title="随手记 / 信源（快捷键 5）">
+        <button type="button" className={`drawer-trigger${props.drawerOpen ? " on" : ""}`} aria-expanded={props.drawerOpen} aria-controls="drawer" onClick={props.onDrawer} title="随手记 / 信源（快捷键 4）">
           <span aria-hidden="true">⚡</span> <span className="dt-label">随手记 / 信源</span>
         </button>
       </div>
@@ -72,7 +69,7 @@ export function TopBar(props: { view: ViewKey; status: StatusDTO | null; onView(
 
 export function StatusLine(props: { view: ViewKey; status: StatusDTO | null; connected: boolean; open: boolean; onToggle(): void; onClose(): void }) {
   const { status } = props;
-  const text = !status ? "正在连接工作台…" : props.view==="inbox" ? `待我处理 ${status.humanPending} 项` : props.view === "agents" ? agentsLine(status) : status.statusLine.radar;
+  const text = status?.statusLine[props.view] ?? "正在连接工作台…";
   const wrap = useRef<HTMLDivElement>(null);
   useOutsidePress(props.open, wrap, props.onClose);
 
@@ -91,13 +88,6 @@ export function StatusLine(props: { view: ViewKey; status: StatusDTO | null; con
       {props.open && status && <StatusPanel view={props.view} status={status} />}
     </div>
   );
-}
-
-/** The status line has no ready-made text for 分身实况 (StatusDTO.statusLine covers three views): built from the counts. */
-function agentsLine(s: StatusDTO): string {
-  const bg = s.background;
-  if (bg.total === 0) return "后台没有分身在岗";
-  return `${bg.running} 个分身在跑 · ${bg.waiting} 个${WAITING_WORDS}${bg.jobs > 0 ? ` · ${bg.jobs} 个长任务` : ""}${bg.paused > 0 ? ` · ${bg.paused} 个已暂停` : ""} · 共 ${bg.total} 个在岗`;
 }
 
 const KIND_FILTERS: Array<{ key: ActivityKind | "all"; label: string }> = [
@@ -144,8 +134,8 @@ function StatusPanel({ view, status }: { view: ViewKey; status: StatusDTO }) {
         )}
         {view === "agents" && (
           <>
-            <p>{agentsLine(status)}</p>
-            <p className="muted">在这里可以看每个分身做了什么，也可以直接给它发话；需要你拍板的事仍在待确认里。</p>
+            <p>{status.statusLine.agents}</p>
+            <p className="muted">可以查看分身的工作记录，也可以直接给它发话。需要你决定的事会出现在「待我处理」。</p>
           </>
         )}
       </div>
@@ -201,7 +191,7 @@ function StatusPanel({ view, status }: { view: ViewKey; status: StatusDTO }) {
                       </>
                     )}
                     {a.remindAt !== null && ` · 到 ${whenText(a.remindAt, now)} 提醒`}
-                    {a.restoredAt !== null && " · 已移回待确认"}
+                    {a.restoredAt !== null && (a.kind === "card_withdrawn" || a.kind === "action_completed" ? " · 已撤销" : " · 已交回主台")}
                   </span>
                   {a.detail && <span className="act-detail">{a.detail}</span>}
                   {a.rawInput && <span className="raw-text small clamp">{a.rawInput}</span>}
@@ -212,6 +202,13 @@ function StatusPanel({ view, status }: { view: ViewKey; status: StatusDTO }) {
                     buttons={a.buttons}
                     onRun={async (b) => {
                       try {
+                        if (b.id === "undo") {
+                          const r = await callButton<{ message: string; deskStatus: StatusDTO }>(b);
+                          setStatus(r.deskStatus);
+                          res.reload();
+                          toast({ tone: "success", text: r.message });
+                          return;
+                        }
                         const r = await api.restoreActivity(b);
                         res.set(r.view);
                         setStatus(r.status);
@@ -327,7 +324,7 @@ export function BottomBar({ view, inputRef }: { view: ViewKey; inputRef: RefObje
           <Kbd>/</Kbd> {folded ? "发话" : "随手记"}
         </span>
         <span>
-          <Kbd>5</Kbd> 信源
+          <Kbd>4</Kbd> 信源
         </span>
         {view === "inbox" && (
           <>

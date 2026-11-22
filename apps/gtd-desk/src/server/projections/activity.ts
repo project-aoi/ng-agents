@@ -48,7 +48,9 @@ export function projectActivity(input: ProjectionInput, kind?: ActivityKind): Ac
         remindAt: r.remindAt ?? null,
         restorable,
         restoredAt: r.restoredAt ?? null,
-        buttons: restorable ? [button({ id: "restore", label: decisionIds.has(r.id) ? "撤销决定" : "移回待确认", primary: true, endpoint: post(`/api/activity/${enc(a.cellId)}/${enc(r.id)}/restore`) })] : [],
+        buttons: restorable ? [decisionIds.has(r.id)
+          ? button({ id: "undo", label: "撤销决定", primary: true, endpoint: post(`/api/human-activity/${enc(r.id)}/undo`) })
+          : button({ id: "restore", label: "交回主台", primary: true, endpoint: post(`/api/activity/${enc(a.cellId)}/${enc(r.id)}/restore`) })] : [],
       };
     });
   return { generatedAt: now, items, counts };

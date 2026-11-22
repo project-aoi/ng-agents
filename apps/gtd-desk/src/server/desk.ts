@@ -384,7 +384,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     if (!r.ok) {
       return { ok: false, outcome: "conflict", message: "方案在你编辑时被更新了，请看一下最新版本再保存", current: artifact(art.artifactId) };
     }
-    return { ok: true, outcome: "saved", message: `已保存方案 v${r.artifactVersion}` };
+    return { ok: true, outcome: "saved", message: `已保存方案 v${r.artifactVersion}`, deskStatus: status() };
   }
 
   // ==================== drafts ====================
@@ -638,10 +638,6 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
   // ==================== activity drawer ====================
 
   async function restoreActivity(cellId: string, activityId: string, as: DeskActor): Promise<ActivityMutationResponse> {
-    if (get(kernel.db, "SELECT 1 FROM human_item_activity WHERE id=?", [activityId])) {
-      const undo = await kernel.humanItems.undo(activityId, principalOf(as));
-      return {ok:true,outcome:"restored",message:undo.message,view:activity(),status:status()};
-    }
     principalOf(as);
     const key = gtdKeys.activity(activityId);
     const found = readActivities(kernel).find((a) => a.cellId === cellId && a.key === key);
@@ -670,7 +666,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
         clock,
       );
       context.commitSync(cellId, { statePatches: { [key]: restored }, inboxOut: [{ to: inboxAddr(desk), envelope: handback }] });
-      return result("restored", true, "已移回待确认，Agent 正在准备卡片");
+      return result("restored", true, "已交回主台处理");
     }
     return result("not_restorable", false, "原始消息已经找不到了，不能移回");
   }
@@ -797,9 +793,13 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     errors: { bad, missing },
   });
 
+  function projectRoot(cell: { preset: string | null }) {
+    return !!cell.preset && kernel.registry.presets.get(cell.preset)?.projectRoot === true;
+  }
+
   function decisionCells(cellId: string | null) {
     const issuer = cellId ? kernel.getCell(cellId) : undefined;
-    const pid = issuer && (issuer.preset === "project" ? issuer.id : projectCellIdOf(issuer.spec));
+    const pid = issuer && (projectRoot(issuer) ? issuer.id : projectCellIdOf(issuer.spec));
     const project = pid ? kernel.getCell(pid) : undefined;
     const paused = project?.status === "paused" ? project : issuer?.status === "paused" ? issuer : undefined;
     return {project, paused};
@@ -807,10 +807,10 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
 
   function closureMembers(target: string) {
     const root = kernel.getCell(target);
-    if (!root || root.preset!=="project" || root.status==="closed") return [];
+    if (!root || !projectRoot(root) || root.status==="closed") return [];
     const members = [root];
     for (const parent of members) members.push(...kernel.listCells({parentId:parent.id}).filter(c=>c.status!=="closed"));
-    return members.map(c=>({id:c.id,title:c.title ?? c.id})).sort((a,b)=>a.id.localeCompare(b.id));
+    return members.map(c=>({id:c.id,title:c.title?.trim() || "未命名任务"})).sort((a,b)=>a.id.localeCompare(b.id));
   }
 
   return {
@@ -834,18 +834,22 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     },
     cellControl: agents.control,
     cellTrigger: agents.trigger,
-    recentlyClosedProjects: () => kernel.listCells({status:["closed"],preset:"project"}).sort((a,b)=>b.updatedAt-a.updatedAt)
-      .slice(0,30).map(c=>({id:c.id,title:c.title ?? c.id,reason:c.closeReason})),
+    recentlyClosedProjects: () => kernel.listCells({status:["closed"]}).filter(projectRoot).sort((a,b)=>b.updatedAt-a.updatedAt)
+      .slice(0,30).map(c=>({id:c.id,title:c.title?.trim() || "未命名任务",reason:c.closeReason})),
+    openArtifactIds: () => all<{artifact_id: string}>(kernel.db, `
+      SELECT DISTINCT artifact_id FROM human_items
+      WHERE status IN ('pending','snoozed') AND artifact_id IS NOT NULL
+    `).map(row => row.artifact_id),
     listHumanItems: (includeSnoozed = false) => kernel.humanItems.list(includeSnoozed).map(item => {
       const {project, paused} = decisionCells(item.cellId);
       const rec = kernel.gate.getApprovalSync(item.id);
       const closeTargets: Record<string,ReturnType<typeof closureMembers>> = {};
       for (const o of item.options) if (o.terminateMode==="cancel_task") closeTargets[o.id]=closureMembers(o.targetCellIds![0]!);
       const projects=item.relatedProjectIds.map(id=>kernel.getCell(id)).filter(p=>p!==undefined)
-        .map(p=>({id:p.id,title:p.title ?? p.id}));
+        .map(p=>({id:p.id,title:p.title?.trim() || "未命名项目"}));
       const plan=item.action?.type==="project.start" ? (item.artifactId ? context.getArtifactSync(item.artifactId)?.content.data : item.action.proposal) : undefined;
-      return {...item, resumeTarget:paused ? {id:paused.id, title:paused.title ?? paused.id} : null, proposal:isProjectProposal(plan) ? plan : null, projects, closeTargets, artifact:item.artifactId ? artifactDTO(kernel,item.artifactId,now()) : null,
-        project:project ? {id:project.id,title:project.title ?? project.id,paused:project.status==="paused",parked:project.pauseReason==="parked"} : null,
+      return {...item, resumeTarget:paused ? {id:paused.id, title:paused.title?.trim() || "未命名任务"} : null, proposal:isProjectProposal(plan) ? plan : null, projects, closeTargets, artifact:item.artifactId ? artifactDTO(kernel,item.artifactId,now()) : null,
+        project:project ? {id:project.id,title:project.title?.trim() || "未命名项目",paused:project.status==="paused",parked:project.pauseReason==="parked"} : null,
         ownerOnly:rec ? ownerOnlyApproval(rec.action)!==null : false,
       };
     }),

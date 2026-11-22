@@ -137,6 +137,11 @@ export function syncServerClock(generatedAt: number | undefined): void {
   if (typeof generatedAt === "number" && Number.isFinite(generatedAt)) serverOffset = generatedAt - Date.now();
 }
 
+/** Convert a wall-clock value from a browser datetime-local field to the workspace clock. */
+export function serverTimeForLocalDate(value: string): number {
+  return new Date(value).getTime() + serverOffset;
+}
+
 export function serverNow(): number {
   return Date.now() + serverOffset;
 }

@@ -1,32 +1,35 @@
-import { useEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { CardOption } from "@ng/protocol";
-import { EFFORT_LABELS, type Effort, type HumanItemDTO as Item } from "../../shared/api";
+import { EFFORT_LABELS, type Effort, type HumanItemDTO as Item, type StatusDTO } from "../../shared/api";
 import { References } from "../components/bits";
 import { PlanEditor } from "../components/PlanEditor";
 import { Parked } from "../components/Parked";
-import { clientId, prettyTarget, dueText } from "../text";
+import { dueText } from "../text";
 import { request } from "../api";
-import { DraftEditor, DraftRefreshNotice, forgetUnsaved, useDraft } from "../components/draft";
+import { DraftEditor, DraftRefreshNotice, retainUnsaved, useDraft } from "../components/draft";
 import { Empty, ErrorState, Loading } from "../components/states";
-import { toFailure, useNavigate, useNow, useResource, useToast, useViewKeys } from "../state";
+import { serverTimeForLocalDate, toFailure, useNavigate, useNow, useResource, useStatus, useToast, useViewKeys } from "../state";
 
-const pool = () => request<{ items: Item[] }>("GET", "/api/human-items");
+const pool = () => request<{ items: Item[]; openArtifactIds: string[] }>("GET", "/api/human-items");
 
 export function HumanInbox({ cardId }: { cardId?: string | undefined }) {
   const res = useResource("human-inbox", pool, ["inbox", "radar", "status"]);
   const navigate = useNavigate();
   const [filter, setFilter] = useState("all");
   const [editing, setEditing] = useState<string | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(cardId ?? null);
   const items = (res.data?.items ?? [])
-    .filter((i) => filter === "all" || i.category === filter)
+    .filter(i => filter === "all" || i.category === filter || i.id === cardId)
     .sort((a, b) => b.category.localeCompare(a.category) || (a.dueAt ?? Infinity) - (b.dueAt ?? Infinity));
-  const [editingChoice, setEditingChoice] = useState<Item | null>(null);
-  const item = editingChoice ?? items.find(i => i.id === cardId) ?? items[0];
-  useEffect(() => setEditingChoice(null), [cardId]);
+  const item = items.find(i => i.id === cardId) ?? items.find(i => i.id === selectedId) ?? items[0];
+  useLayoutEffect(() => setSelectedId(item?.id ?? null), [item?.id]);
+  useEffect(() => {
+    if (res.data) retainUnsaved(res.data.openArtifactIds);
+  }, [res.data]);
   const focused = !!item && editing === item.id;
   const choose = (id: string) => {
     setEditing(null);
-    setEditingChoice(null);
+    setSelectedId(id);
     navigate({ view: "inbox", cardId: id });
   };
   useViewKeys((e) => {
@@ -48,7 +51,10 @@ export function HumanInbox({ cardId }: { cardId?: string | undefined }) {
         <aside className="human-list">
           <div className="section-head">
             <h2>待我处理</h2>
-            <select aria-label="筛选事项" value={filter} onChange={(e) => setFilter(e.target.value)}>
+            <select aria-label="筛选事项" value={filter} onChange={e => {
+              setFilter(e.target.value);
+              if (cardId) navigate({ view: "inbox" });
+            }}>
               <option value="all">全部</option>
               <option value="decision">需拍板</option>
               <option value="action">待我动手</option>
@@ -66,7 +72,7 @@ export function HumanInbox({ cardId }: { cardId?: string | undefined }) {
                       {i.project && (
                         <small>
                           {i.project.title}
-                          {i.project.paused && " · 已暂停"}
+                          {i.project.parked ? " · 已停靠" : i.project.paused && " · 已暂停"}
                         </small>
                       )}
                     </button>
@@ -81,10 +87,14 @@ export function HumanInbox({ cardId }: { cardId?: string | undefined }) {
         <Detail
           key={item.id}
           item={item}
-          pin={setEditingChoice}
           focused={focused}
           toggle={() => setEditing(focused ? null : item.id)}
           refresh={res.reload}
+          reloadItem={async () => {
+            const latest = await pool();
+            res.set(latest);
+            return latest.items.find(i => i.id === item.id);
+          }}
         />
       ) : (
         <Empty title="待办已清空">有新的事项时会出现在这里。</Empty>
@@ -95,26 +105,30 @@ export function HumanInbox({ cardId }: { cardId?: string | undefined }) {
 
 function Detail({
   item,
-  pin,
   focused,
   toggle,
   refresh,
+  reloadItem,
 }: {
   item: Item;
-  pin: (item: Item | null) => void;
   focused: boolean;
   toggle(): void;
   refresh(): void;
+  reloadItem(): Promise<Item | undefined>;
 }) {
   const draft = useDraft(item.artifact);
   const now = useNow();
   const toast = useToast();
-  const [selected, setSelected] = useState<string | null>(null);
+  const { setStatus } = useStatus();
+  const [editingChoice, setEditingChoice] = useState<{ itemId: string; optionId: string } | null>(null);
+  const [reviewedRevision, setReviewedRevision] = useState(item.itemRevision);
+  const itemChanged = reviewedRevision !== item.itemRevision;
   const [notes, setNotes] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
+  const submitting = useRef(false);
   const [message, setMessage] = useState("");
   const plan = item.proposal;
-  const [confirm, setConfirm] = useState<{ id: string; revision: number; text: string } | null>(null);
+  const [confirm, setConfirm] = useState<{ id: string; scope: string; text: string } | null>(null);
   useEffect(() => {
     if (!focused || plan) return;
     const save = (e: KeyboardEvent) => {
@@ -128,12 +142,24 @@ function Detail({
     return () => window.removeEventListener("keydown", save);
   }, [focused, draft, plan]);
   const [postponeTo, setPostponeTo] = useState("");
+  function cancelChoice() {
+    setEditingChoice(null);
+    setConfirm(null);
+    setNotes({});
+    setPostponeTo("");
+    setMessage("");
+  }
   async function decide(o: CardOption) {
-    if (busy) return;
+    if (submitting.current) return;
+    if (itemChanged) {
+      setMessage("请先核对最新事项");
+      return;
+    }
     const note = notes[o.id] ?? "";
-    if ((o.effect === "defer" || (o.input && o.input.mode !== "none")) && selected !== o.id) {
-      pin(item);
-      setSelected(o.id);
+    if ((o.effect === "defer" || (o.input && o.input.mode !== "none")) && (editingChoice?.itemId !== item.id || editingChoice.optionId !== o.id)) {
+      setEditingChoice({ itemId: item.id, optionId: o.id });
+      setConfirm(null);
+      setMessage("");
       return;
     }
     if (o.input?.mode === "required" && !note.trim()) {
@@ -144,37 +170,40 @@ function Detail({
       setMessage("请先保存并核对当前版本");
       return;
     }
-    if (draft?.refreshedTo != null) {
+    if (draft?.refreshedTo != null || (draft && item.artifact && draft.base.version < item.artifact.version)) {
       setMessage("请先核对新版草稿");
       return;
     }
     const resume = item.resumeTarget && o.effect !== "defer" && o.effect !== "terminate";
+    const closure = o.terminateMode === "cancel_task" ? item.closeTargets[o.id] ?? [] : [];
+    const scope = JSON.stringify([item.itemRevision, resume ? item.resumeTarget?.id : null, o.targetCellIds, closure.map(t => t.id)]);
     const prompt = [
       o.confirm,
-      o.terminateMode === "cancel_task" && "将关闭以下任务：" + (item.closeTargets[o.id] ?? []).map((t) => t.title + " · " + t.id).join("、"),
+      o.terminateMode === "cancel_task" && "将关闭以下任务：" + closure.map(t => t.title).join("、"),
       resume && `恢复「${item.resumeTarget?.title}」并处理这件事？`,
     ]
       .filter(Boolean)
       .join("\n");
-    if (prompt && (confirm?.id !== o.id || confirm.revision !== item.itemRevision || confirm.text !== prompt)) {
-      setConfirm({ id: o.id, revision: item.itemRevision, text: prompt });
+    if (prompt && (confirm?.id !== o.id || confirm.scope !== scope || confirm.text !== prompt)) {
+      setConfirm({ id: o.id, scope, text: prompt });
       return;
     }
     setConfirm(null);
+    submitting.current = true;
     setBusy(true);
     try {
-      const result = await request<{ status: string; activityId?: string }>("POST", `/api/human-items/${encodeURIComponent(item.id)}/decide`, {
+      const result = await request<{ status: string; activityId?: string; deskStatus: StatusDTO }>("POST", `/api/human-items/${encodeURIComponent(item.id)}/decide`, {
         optionId: o.id,
         seenItemRevision: item.itemRevision,
         ...(draft ? { seenArtifactVersion: draft.base.version } : {}),
         note,
-        ...(o.effect === "defer" && postponeTo ? { until: new Date(postponeTo).getTime() } : {}),
+        ...(o.effect === "defer" && postponeTo ? { until: serverTimeForLocalDate(postponeTo) } : {}),
         ...(resume && item.resumeTarget ? { resumeProjectId: item.resumeTarget.id } : {}),
         ...(o.terminateMode === "cancel_task"
-          ? { confirmedTargets: o.targetCellIds, confirmedClosure: item.closeTargets[o.id]?.map((t) => t.id) }
+          ? { confirmedTargets: o.targetCellIds, confirmedClosure: closure.map(t => t.id) }
           : {}),
       });
-      forgetUnsaved(item.artifactId);
+      setStatus(result.deskStatus);
       const id = result.activityId;
       toast({
         tone: "success",
@@ -184,8 +213,9 @@ function Detail({
               action: {
                 label: "撤销",
                 run: () => {
-                  void request<{ message: string }>("POST", `/api/human-activity/${encodeURIComponent(id)}/undo`)
+                  void request<{ message: string; deskStatus: StatusDTO }>("POST", `/api/human-activity/${encodeURIComponent(id)}/undo`)
                     .then((r) => {
+                      setStatus(r.deskStatus);
                       toast({ tone: "info", text: r.message });
                       refresh();
                     })
@@ -195,21 +225,20 @@ function Detail({
             }
           : {}),
       });
-      pin(null);
-      setSelected(null);
-      setMessage("");
+      cancelChoice();
     } catch (err) {
-      pin(null);
       const failure = toFailure(err);
       const text = failure.status === 403 || failure.code === "bounds_violation"
         ? "此操作需要主人确认"
         : failure.status === 404 ? "事项已移除"
         : failure.status === 409 && failure.message === "item changed" ? "事项已经更新，请核对最新选项后重新提交。"
-        : failure.status === 409 || /[㐀-鿿]/.test(failure.message) ? failure.message
+        : /[㐀-鿿]/.test(failure.message) ? failure.message
+        : failure.status === 409 ? "事项内容已变动，请核对后重新提交"
         : failure.status === 400 ? "请检查填写的说明和选项" : "提交失败，请稍后重试";
       setMessage(text);
       toast({ tone: "warn", text });
     } finally {
+      submitting.current = false;
       setBusy(false);
       refresh();
     }
@@ -225,7 +254,7 @@ function Detail({
         {o.label}
       </button>
       {o.hint && <small>{o.hint}</small>}
-      {confirm?.id === o.id && (
+      {!itemChanged && confirm?.id === o.id && (
         <div role="alert">
           <p>{confirm.text}</p>
           <button type="button" className="btn" onClick={() => setConfirm(null)}>
@@ -236,7 +265,7 @@ function Detail({
           </button>
         </div>
       )}
-      {selected === o.id && (
+      {editingChoice?.itemId === item.id && editingChoice.optionId === o.id && (
         <form
           onSubmit={(e) => {
             e.preventDefault();
@@ -258,11 +287,10 @@ function Detail({
               onChange={(e) => setNotes({ ...notes, [o.id]: e.target.value })}
             />
           )}
-          {
-            <button type="submit" className="btn sm" disabled={busy}>
-              {o.effect !== "defer" ? "提交" : postponeTo ? "按选定时间提醒" : "明天提醒"}
-            </button>
-          }
+          <button type="submit" className="btn sm" disabled={busy || itemChanged}>
+            {o.effect !== "defer" ? "提交" : postponeTo ? "按选定时间提醒" : "明天提醒"}
+          </button>
+          <button type="button" className="btn sm ghost" disabled={busy} onClick={cancelChoice}>取消</button>
         </form>
       )}
     </div>
@@ -290,11 +318,20 @@ function Detail({
     <article className={focused ? "inbox-detail split split-8-4" : "inbox-detail"}>
       <section className="inbox-paper">
         <h1>{item.title}</h1>
+        {itemChanged && <div className="banner warn" role="alert">
+          <strong>事项已更新，请核对最新内容和选项。</strong>
+          <button type="button" className="btn sm" onClick={() => {
+            setReviewedRevision(item.itemRevision);
+            setConfirm(null);
+            setMessage("");
+          }}>已核对最新事项</button>
+          {(editingChoice || confirm) && <button type="button" className="btn sm ghost" onClick={cancelChoice}>取消</button>}
+        </div>}
         {!focused && reference}
         {item.project && (
           <p>
             {item.project.title}
-            {item.project.paused && " · 所属项目已暂停"}
+            {item.project.parked ? " · 所属项目已停靠" : item.project.paused && " · 所属项目已暂停"}
           </p>
         )}
         {item.projects
@@ -338,17 +375,17 @@ function Detail({
                   item={item}
                   onClose={toggle}
                   onSaved={() => {
-                    pin(null);
+                    cancelChoice();
                     toggle();
                     refresh();
                   }}
-                  onConflictView={refresh}
+                  reloadItem={reloadItem}
                 />
               )
             ) : focused && draft ? (
               <DraftEditor draft={draft} roomy minRows={16} />
             ) : (
-              <pre className="draft-preview">{draft?.base.body ?? item.artifact.body}</pre>
+              <pre className="draft-preview">{draft?.text ?? item.artifact.body}</pre>
             )}
           </>
         )}
@@ -358,10 +395,9 @@ function Detail({
           <>
             <h2>参考资料</h2>
             {reference}
-            {draft && !plan && <Parked draft={draft} />}
           </>
         )}
-        {item.options.length === 0 && <p role="status">正在发送，送达结果会显示在这里。</p>}
+        {draft && !plan && <Parked draft={draft} />}
         {!(focused && plan) && item.options.filter((o) => o.group !== "more").map(renderChoice)}
         {!(focused && plan) && item.options.some((o) => o.group === "more") && (
           <details>
@@ -374,10 +410,7 @@ function Detail({
             {message}{" "}
             <button
               className="btn sm"
-              onClick={() => {
-                pin(null);
-                refresh();
-              }}
+              onClick={refresh}
             >
               查看最新选项
             </button>

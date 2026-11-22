@@ -64,7 +64,7 @@ export interface ButtonDTO {
   endpoint?: { method: HttpMethod; path: string; body?: Record<string, unknown> };
   input?: { field: string; kind: "instruction" | "text" | "datetime"; placeholder: string };
   /** Client-only behaviour when there is no endpoint. */
-  /** One line shown under/next to the button, e.g. "到 今天 14:00 回到待确认". */
+  /** One line shown under/next to the button, e.g. "到 今天 14:00 回到待我处理". */
   hint?: string;
   /** Ask for confirmation first (destructive actions). */
   confirm?: string;
@@ -226,7 +226,7 @@ export interface StatusDTO {
     inbox: string;
     radar: string;
     /** "2 个分身在跑 · 3 个待命可唤醒" */
-    agents?: string;
+    agents: string;
   };
   notifications: NotificationDTO[];
 }
@@ -270,7 +270,7 @@ export interface PlanSaveRequest {
 }
 
 export type PlanSaveResponse =
-  | { ok: true; outcome: "saved"; message: string }
+  | { ok: true; outcome: "saved"; message: string; deskStatus: StatusDTO }
   | { ok: false; outcome: "conflict"; message: string; current: ArtifactDTO };
 
 // ==================== drafts (GET/PUT /api/artifacts/:artifactId) ====================
@@ -339,7 +339,7 @@ export interface ProjectRowDTO {
   progress: ProgressDTO | null;
   waiting: WaitingDTO | null;
   openActions: ProjectActionDTO[];
-  /** A card about this project waits in Clarify. */
+  /** A card about this project is in the human inbox. */
   pendingCardId: string | null;
   /**
    * Nothing moves it: no work running or queued, no watch or timer, no wait on a live cell, no card and no open action

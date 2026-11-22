@@ -59,7 +59,7 @@ export function TopologyPane(props: {
 
   const c = topo.counts;
   return (
-    <section className="ag-left" aria-label="分身拓扑">
+    <section className="ag-left" aria-label="分身关系图">
       <div className="topo-toolbar">
         <div className="topo-tools">
           <span className="tool-label" id="topo-mode-label">
@@ -122,7 +122,7 @@ export function TopologyPane(props: {
           ) : (
             footer.map((t) => (
               <p key={t.gitRoot} className="small" title={t.gitRoot}>
-                <span className="dir-badge on">{t.label}</span> {t.count} 个活跃节点位于 {t.label}
+                <span className="dir-badge on">{t.label}</span> {t.count} 个分身正在这个目录工作
               </p>
             ))
           )}

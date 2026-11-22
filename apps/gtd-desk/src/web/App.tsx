@@ -84,10 +84,7 @@ function Shell() {
     hello(s, reconnected) {
       setStatus(s);
       // Events may have been missed while the stream was down.
-      if (reconnected) {
-        bump(ALL_VIEWS);
-
-      }
+      if (reconnected) bump(ALL_VIEWS);
     },
     refresh(views) {
       bump(views);
@@ -152,7 +149,7 @@ function Shell() {
         case "3":
           goView("agents");
           break;
-        case "5":
+        case "4":
           setReport(null);
           setDrawer((d) => ({ open: !d.open, tab: d.open ? d.tab : "sources" }));
           break;

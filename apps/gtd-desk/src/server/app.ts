@@ -35,13 +35,13 @@ function apiError(c: Context, status: 400 | 401 | 403 | 404 | 409 | 413 | 415 | 
   return c.json(body, status);
 }
 
-const NG_STATUS: Partial<Record<NgError["code"], 400 | 404 | 409>> = {
+const NG_STATUS: Partial<Record<NgError["code"], 400 | 403 | 404 | 409>> = {
   invalid_argument: 400,
   not_found: 404,
   conflict: 409,
   duplicate: 409,
   stale_epoch: 409,
-  bounds_violation: 409,
+  bounds_violation: 403,
   unsupported: 400,
 };
 
@@ -89,7 +89,15 @@ export function createDeskApp(deps: DeskAppDeps): Hono {
     if (err instanceof DeskError) return apiError(c, err.status, err.code, err.message);
     if (err instanceof NgError) {
       const status = NG_STATUS[err.code];
-      if (status) return apiError(c, status, err.code, err.message);
+      if (status) {
+        const fallback = {
+          400: "请求内容有误，请核对后重试",
+          403: "你没有权限执行这项操作",
+          404: "找不到这项内容，请刷新后再试",
+          409: "内容已发生变化，请核对最新状态",
+        }[status];
+        return apiError(c, status, err.code, /\p{Script=Han}/u.test(err.message) ? err.message : fallback);
+      }
     }
     onError(err, `${c.req.method} ${c.req.path}`);
     return apiError(c, 500, "internal_error", "服务器出错了，请稍后再试");
@@ -132,7 +140,8 @@ export function createDeskApp(deps: DeskAppDeps): Hono {
     const label = deps.models?.label();
     return label ? { ...status, model: label } : status;
   };
-  app.get("/api/status", (c) => c.json(withModel(desk.status())));
+  const deskStatus = () => withModel(desk.status());
+  app.get("/api/status", (c) => c.json(deskStatus()));
   // The owner's model switch: the list is whatever the backend CLI reports.
   app.get("/api/models", async (c) => c.json(await (deps.models ? deps.models.view({ refresh: c.req.query("refresh") === "1" }) : NO_MODELS)));
   app.put("/api/models", async (c) => {
@@ -142,14 +151,23 @@ export function createDeskApp(deps: DeskAppDeps): Hono {
   app.post("/api/capture", async (c) => c.json(await desk.ingest(await body(c),ownerActor)));
 
   app.get("/api/projects/closed", c => c.json({projects:desk.recentlyClosedProjects()}));
-  app.get("/api/human-items", c => c.json({items:desk.listHumanItems()}));
-  app.post("/api/human-items/:id/decide", async c => c.json(await desk.decideHumanItem(c.req.param("id"),await body(c),ownerActor)));
-  app.post("/api/human-activity/:id/undo", async c => c.json(await desk.undoHumanDecision(c.req.param("id"),ownerActor)));
-  app.post("/api/projects/:id/reopen", async c => c.json(await desk.reopenProject(c.req.param("id"),ownerActor)));
+  app.get("/api/human-items", c => c.json({ items: desk.listHumanItems(), openArtifactIds: desk.openArtifactIds() }));
+  app.post("/api/human-items/:id/decide", async (c) => {
+    const result = await desk.decideHumanItem(c.req.param("id"), await body(c), ownerActor);
+    return c.json({ ...result, deskStatus: deskStatus() });
+  });
+  app.post("/api/human-activity/:id/undo", async (c) => {
+    const result = await desk.undoHumanDecision(c.req.param("id"), ownerActor);
+    return c.json({ ...result, deskStatus: deskStatus() });
+  });
+  app.post("/api/projects/:id/reopen", async (c) => {
+    const result = await desk.reopenProject(c.req.param("id"), ownerActor);
+    return c.json({ ...result, deskStatus: deskStatus() });
+  });
 
   app.put("/api/human-items/:id/plan", async (c) => {
     const result = await desk.savePlan(c.req.param("id"), await body(c), ownerActor);
-    return c.json(result, result.ok ? 200 : 409);
+    return result.ok ? c.json({ ...result, deskStatus: withModel(result.deskStatus) }) : c.json(result, 409);
   });
 
   // ---------- drafts ----------
@@ -218,7 +236,7 @@ export function createDeskApp(deps: DeskAppDeps): Hono {
       const ping = setInterval(() => void write({ event: "ping", data: {} }), PING_MS);
       stream.onAbort(() => done());
       try {
-        await write({ event: "hello", data: { status: desk.status() } });
+        await write({ event: "hello", data: { status: deskStatus() } });
         await finished;
       } finally {
         clearInterval(ping);

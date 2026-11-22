@@ -371,7 +371,7 @@ function stateOf(v: AgentsView, c: CellRecord): { state: AgentVisualState; state
     let detail: string | null = null;
     if (facts?.watching) detail = facts.threads.length ? `盯着 ${facts.threads.join("、")}` : "盯着外部事件";
     else if (facts?.nextTimerAt != null) detail = `下次检查 ${whenText(facts.nextTimerAt, now)}`;
-    else if (v.snoozedCards.has(c.id)) detail = "有一张卡推迟了，到点回到待确认";
+    else if (v.snoozedCards.has(c.id)) detail = "有一张卡推迟了，到点回到「待我处理」";
     return { state: "waiting", stateLabel: "等待外部", stateDetail: detail };
   }
   if (act.state === "dormant" || isLeafCell(c)) return { state: "dormant", stateLabel: "已待命 · 发消息即唤醒", stateDetail: null };
