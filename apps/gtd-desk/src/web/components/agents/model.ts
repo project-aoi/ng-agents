@@ -111,7 +111,7 @@ export interface ColumnGroup {
 }
 
 /**
- * Column per `node.layer` (0 sources + desk, 1 projects + hubs, 2 workers + watchers), in tree order, with
+ * Column per `node.layer` (0 sources + desk, 1 projects + hubs, 2 workers + checkers), in tree order, with
  * consecutive siblings grouped so each project's workers sit together.
  */
 export function columnGroups(entries: readonly TreeEntry[]): [ColumnGroup[], ColumnGroup[], ColumnGroup[]] {
@@ -229,7 +229,7 @@ export function resolveSelection(topo: TopologyDTO | null, cellId: string | unde
     const order = treeOrder(topo.nodes);
     const running = order.find((e) => e.node.projectId === projectId && e.node.state === "running");
     if (running) return running.node.cellId;
-    const project = topo.nodes.find((n) => n.cellId === projectId) ?? topo.nodes.find((n) => n.preset === "project" && n.projectId === projectId);
+    const project = topo.nodes.find((n) => n.cellId === projectId);
     if (project) return project.cellId;
   }
   return topo.deskCellId;
@@ -287,18 +287,6 @@ export function dirBase(path: string): string {
   return i >= 0 ? t.slice(i + 1) || t : t;
 }
 
-/** 850 · 18k · 1.2k · 3.4M */
-export function compactCount(n: number): string {
-  if (!Number.isFinite(n) || n < 1000) return String(Math.max(0, Math.round(n || 0)));
-  const [v, unit] = n < 1e6 ? [n / 1000, "k"] : [n / 1e6, "M"];
-  return `${v < 10 ? Math.round(v * 10) / 10 : Math.round(v)}${unit}`;
-}
-
-/** "18k/200k", "18k/不限" */
-export function tokensText(used: number, limit: number | null): string {
-  return `${compactCount(used)}/${limit === null ? "不限" : compactCount(limit)}`;
-}
-
 /** "codex · strong", "零算力脚本"; null when nothing is known. */
 export function engineText(node: Pick<TopologyNodeDTO, "processorType" | "engine" | "modelTier">): string | null {
   if (node.processorType === "code") return "零算力脚本";
@@ -314,9 +302,7 @@ export function durationText(ms: number): string {
   return `${Math.floor(s / 60)} 分 ${s % 60} 秒`;
 }
 
-export function isCoordinator(node: Pick<TopologyNodeDTO, "preset">): boolean {
-  return node.preset === "project" || node.preset === "hub";
-}
+
 
 /** Ids the send box generates must match /^[\w.:-]{1,80}$/ (the server's idempotency key). */
 export function isValidClientId(id: string): boolean {

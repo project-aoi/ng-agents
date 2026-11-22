@@ -1,26 +1,25 @@
 import { ownerOnlyApproval } from "@ng/gate";
 import type { HumanDecision } from "@ng/protocol";
-import type { Kernel } from "@ng/cell";
+import { isProjectRoot, type Kernel } from "@ng/cell";
 import type { UiChannel } from "@ng/channel";
-import {PROCESSORS,createSensorSpec,sensorProcessor} from "@ng/presets";
-const SCRIPT_PREFIX="script:";
 import {
-  KEYS,
+  createSensorSpec,
+  gtdKeys,
+  RESTORE_REASON,
+  sensorProcessor,
   notifyProjectOfOwnerChangeSync,
   projectIdForApproval,
   startProjectSync,
   writeActionRecordSync,
   type ProjectInit,
-  type ProposalItem,
 } from "@ng/presets";
 import {
   all,
-  asClarifyCard,
+  asDecisionCard,
   isProjectProposal,
   get,
   cellPrincipal,
   createEnvelope,
-  gtdKeys,
   inboxAddr,
   isEnvelopeOfType,
   KERNEL_FROM,
@@ -31,10 +30,9 @@ import {
   subjectKeys,
   withTx,
   type ActionRecord,
-  type ActivityRecord,
   type ApprovalRecord,
   type BallOwner,
-  type ClarifyCard,
+  type DecisionCard,
   type Effort,
   type Envelope,
   type HandbackPayload,
@@ -67,7 +65,6 @@ import type {
   ActivityListDTO,
 } from "../shared/api";
 import {
-  approvalProjectId,
   inputOf,
   projectOfAction,
   readActions,
@@ -87,7 +84,6 @@ import { projectSources } from "./projections/sources";
 import { projectActivity } from "./projections/activity";
 import { createAgentsApi } from "./agents";
 
-const DAY = 24 * 3_600_000;
 
 /** An HTTP-mappable failure: bad input (400), unknown id (404), wrong state (409). */
 export class DeskError extends Error {
@@ -105,8 +101,7 @@ const bad = (message: string) => new DeskError(400, "invalid_argument", message)
 const missing = (message: string) => new DeskError(404, "not_found", message);
 const wrongState = (message: string) => new DeskError(409, "conflict", message);
 
-/** What the desk tells the desk cell when the owner moves an archived item back to Clarify. */
-export const RESTORE_REASON = "主人把这条从归档记录里移回了待确认：请为它准备一张待确认卡片，不要再静默归档。";
+/** What the desk tells the desk cell when the owner moves an archived item back to the desk. */
 
 export interface DeskDeps {
   kernel: Kernel;
@@ -133,7 +128,7 @@ export type Desk = ReturnType<typeof createDesk>;
 
 /**
  * The synchronous transaction API behind the endpoints (docs/04 "同步事务接口"): each method calls Context / Gate /
- * Inbox / kernel directly and answers with the refreshed view. Messages to a Loop: capture, revise and "移回待确认" go
+ * Inbox / kernel directly and answers with the refreshed view. Messages to a Loop: capture, revise and "交回主台" go
  * to the desk; a change the owner makes to a project's books (an action ticked off, taken over or added, the project
  * brought back from someday) is told to that project cell (docs/05), so it wakes and decides what comes next.
  * Approvals the kernel hands back to a cell are the kernel's business. The project and card operations take a
@@ -173,12 +168,6 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
   function commitState(cellId: string, patches: Record<string, unknown>): void {
     const r = context.commitSync(cellId, { statePatches: patches });
     if (!r.ok) throw new Error("state commit unexpectedly rejected");
-  }
-
-  function addActivity(rec: Omit<ActivityRecord, "id" | "at"> & { at?: number }): ActivityRecord {
-    const full: ActivityRecord = { ...rec, id: newId("acty", clock), at: rec.at ?? now() };
-    commitState(desk, { [gtdKeys.activity(full.id)]: full });
-    return full;
   }
 
   /** Marks open actions finished; returns how many changed. */
@@ -265,13 +254,13 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     return rec;
   }
 
-  function pendingCard(cardId: string): { rec: ApprovalRecord; card: ClarifyCard | null } {
+  function pendingCard(cardId: string): { rec: ApprovalRecord; card: DecisionCard | null } {
     const rec = approval(cardId);
     if (rec.status !== "pending") throw wrongState("这张卡已经处理过了");
-    return { rec, card: asClarifyCard(rec.card.data) };
+    return { rec, card: asDecisionCard(rec.card.data) };
   }
 
-  function proposalOf(rec: ApprovalRecord, card: ClarifyCard | null): ProjectProposal {
+  function proposalOf(rec: ApprovalRecord, card: DecisionCard | null): ProjectProposal {
     if (card?.cardType !== "project_proposal") throw wrongState("这不是立项卡");
     const draftId = rec.artifactId ?? card.draft?.artifactId;
     const proposal = draftId ? context.getArtifactSync(draftId)?.content.data : card.proposal;
@@ -467,8 +456,8 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
   /**
    * Radar's project buttons, and the control plane's set_project_state (same code, the caller's principal):
    * - pause / resume: kernel.control on the project cell (its whole subtree follows).
-   * - someday: pause + lifecycle "someday". Nothing is closed or deleted: records, reports and history stay.
-   * - activate: a parked project cell is resumed with lifecycle "active" and told the owner's words, so it wakes and
+   * - someday: pause the project with the parked reason. Nothing is closed or deleted: records, reports and history stay.
+   * - activate: a parked project cell is resumed and told the owner's words, so it wakes and
    *   continues from its records and report.
    * - cancel / complete: closeCell — the kernel settles the project's records; the project's actions held elsewhere
    *   (e.g. a card taken over on the desk) and cards about it on the desk follow here.
@@ -488,7 +477,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
       }
       case "resume": {
         if (!open) return projectResult("not_applied", false, "这个项目没有可以继续的任务");
-        if (record.lifecycle === "someday") return projectResult("not_applied", false, `「${record.title}」在以后再说里：用“重新启动”让它继续`);
+        if (cell?.pauseReason === "parked") return projectResult("not_applied", false, `「${record.title}」在以后再说里：用“重新启动”让它继续`);
         if (cell.status === "active") return projectResult("resumed", true, `「${record.title}」正在推进`);
         const r = control("resume");
         return r.applied ? projectResult("resumed", true, `「${record.title}」继续推进`) : projectResult("not_applied", false, r.reason ?? "继续没有生效");
@@ -511,7 +500,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
           : projectResult("completed", true, `「${record.title}」已完结`);
       }
       case "someday": {
-        if (record.lifecycle === "someday") return projectResult("someday", true, "已经在以后再说里了");
+        if (cell?.pauseReason === "parked") return projectResult("someday", true, "已经在以后再说里了");
         if (!open || record.lifecycle !== "active") return projectResult("not_applied", false, "只有进行中的项目可以移进以后再说");
         {
           const r = kernel.control(projectId,{action:"pause",pauseReason:"parked"},actorOf(as));
@@ -520,7 +509,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
         return projectResult("someday", true, `「${record.title}」已移进以后再说，后台任务已暂停，记录和报告都留着`);
       }
       case "activate": {
-        if (record.lifecycle !== "someday") return projectResult("not_applied", false, "这个项目不在以后再说里");
+        if (cell?.pauseReason !== "parked") return projectResult("not_applied", false, "这个项目不在以后再说里");
         if (!open) return projectResult("not_applied", false, "这个项目已结束");
         withTx(kernel.db, () => {
           if (cell.status === "paused") {
@@ -546,7 +535,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
    */
   async function addProjectAction(projectId: string, req: AddActionRequest & { owner?: "human" | "waiting" }, as: DeskActor): Promise<ProjectMutationResponse> {
     const actorPrincipal = principalOf(as);
-    const record = projectRecord(projectId);
+    projectRecord(projectId);
     const title = typeof req?.title === "string" ? req.title.trim() : "";
     if (!title) throw bad("下一步需要一个标题");
     if (req.effort !== undefined && !isEffort(req.effort)) throw bad(`未知的精力标签 ${String(req.effort)}`);
@@ -575,7 +564,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
           projectId,
           owner === "human"
             ? `${whoText(as)}在项目上补了一个自己来做的动作：${title}（${action.id}）${action.nextStep && action.nextStep !== title ? `\n下一步：${action.nextStep}` : ""}\n主人办完会勾掉它，你会收到通知。`
-            : `${whoText(as)}在项目上加了一个要等的事：${title}（${action.id}）${nextStep ? `\n说明：${nextStep}` : ""}\n需要的话派一个 watcher 盯住它，达成后用 track_action 关掉这个动作。`,
+            : `${whoText(as)}在项目上加了一个要等的事：${title}（${action.id}）${nextStep ? `\n说明：${nextStep}` : ""}\n需要的话派一个 checker 盯住它，达成后用 track_action 关掉这个动作。`,
           as,
         );
       }
@@ -615,8 +604,8 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
   function checkEntry(entry: unknown): string {
     if (typeof entry !== "string" || !entry.trim()) throw bad("需要脚本路径或检查名");
     const e = entry.trim();
-    if (e.startsWith(SCRIPT_PREFIX)) {
-      if (e.length === SCRIPT_PREFIX.length) throw bad("script: 后面需要脚本路径");
+    if (e.startsWith("script:")) {
+      if (!e.slice("script:".length).trim()) throw bad("script: 后面需要脚本路径");
       return e;
     }
     if (!kernel.registry.codeProcessors.has(e)) throw bad(`没有名为 ${e} 的检查`);
@@ -652,7 +641,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     });
     if (!r.restorable || r.restoredAt) return result("not_restorable", false, r.restoredAt ? "已经移回过了" : "这条记录不能移回");
     const restored = { ...r, restoredAt: now() };
-    const original = r.envelope ?? (r.actionId ? originalEnvelope(asClarifyCard(gate.getApprovalSync(r.actionId)?.card.data)?.source.envelopeId) : null);
+    const original = r.envelope ?? (r.actionId ? originalEnvelope(asDecisionCard(gate.getApprovalSync(r.actionId)?.card.data)?.source.envelopeId) : null);
     if (original) {
       const handback = createEnvelope<HandbackPayload>(
         {
@@ -793,13 +782,9 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     errors: { bad, missing },
   });
 
-  function projectRoot(cell: { preset: string | null }) {
-    return !!cell.preset && kernel.registry.presets.get(cell.preset)?.projectRoot === true;
-  }
-
   function decisionCells(cellId: string | null) {
     const issuer = cellId ? kernel.getCell(cellId) : undefined;
-    const pid = issuer && (projectRoot(issuer) ? issuer.id : projectCellIdOf(issuer.spec));
+    const pid = issuer && (isProjectRoot(kernel.registry, issuer) ? issuer.id : projectCellIdOf(issuer.spec));
     const project = pid ? kernel.getCell(pid) : undefined;
     const paused = project?.status === "paused" ? project : issuer?.status === "paused" ? issuer : undefined;
     return {project, paused};
@@ -807,7 +792,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
 
   function closureMembers(target: string) {
     const root = kernel.getCell(target);
-    if (!root || !projectRoot(root) || root.status==="closed") return [];
+    if (!root || !isProjectRoot(kernel.registry, root) || root.status==="closed") return [];
     const members = [root];
     for (const parent of members) members.push(...kernel.listCells({parentId:parent.id}).filter(c=>c.status!=="closed"));
     return members.map(c=>({id:c.id,title:c.title?.trim() || "未命名任务"})).sort((a,b)=>a.id.localeCompare(b.id));
@@ -834,7 +819,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     },
     cellControl: agents.control,
     cellTrigger: agents.trigger,
-    recentlyClosedProjects: () => kernel.listCells({status:["closed"]}).filter(projectRoot).sort((a,b)=>b.updatedAt-a.updatedAt)
+    recentlyClosedProjects: () => kernel.listCells({status:["closed"]}).filter(cell => isProjectRoot(kernel.registry, cell)).sort((a,b)=>b.updatedAt-a.updatedAt)
       .slice(0,30).map(c=>({id:c.id,title:c.title?.trim() || "未命名任务",reason:c.closeReason})),
     openArtifactIds: () => all<{artifact_id: string}>(kernel.db, `
       SELECT DISTINCT artifact_id FROM human_items

@@ -51,10 +51,10 @@ export const KEYS = {
 } as const;
 
 /**
- * `handback.reason` of an item the owner restored from the archive ("移回待确认"). Same text the app
- * sends (apps/gtd-desk/src/server/desk.ts RESTORE_REASON); such an item must get a card, never be archived again.
+ * `handback.reason` of an item the owner restored from the archive ("交回主台"). Same text the app
+ * sends; such an item must get a card, never be archived again.
  */
-export const RESTORE_REASON = "主人把这条从归档记录里移回了待确认：请为它准备一张待确认卡片，不要再静默归档。";
+export const RESTORE_REASON = "主人把这条归档记录交回了主台，请为它准备一张「待我处理」卡片。";
 
 export interface RegisterPresetsOptions {
   /** The desk cell id (default "desk"). Must match the kernel's `deskCellId`. */

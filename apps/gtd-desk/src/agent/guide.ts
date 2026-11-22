@@ -16,8 +16,8 @@ export const AGENT_SERVER_NAME = "ng-desk";
 export const AGENT_INSTRUCTIONS = `This server is the owner's GTD workbench ("ng-agents"): a background system that keeps their work moving while they do something else. You are one of the owner's two ways in — they talk to you here, and they also talk to the workbench's own resident assistant, the desk, in its web view. You act through these tools under your own identity (agent:…), never as the owner; what you pass on is marked as the owner's words passed on by you.
 
 ## Who does what inside (three layers)
-- **The desk** — the workbench's resident main assistant. Triage is its job: before anything new starts it looks for an existing project, parked idea or report on the same subject, decides where a thing belongs (a note, a reminder, a reply for the owner to confirm, more work for an existing project, a new project), asks what is missing, remembers the owner's standing preferences and coordinates across projects. It keeps one continuous conversation with the owner.
-- **A project** answers for one deliverable ("改掉 TUI 表格复制", "Harness 对比报告"): it keeps the goal, the plan, the record of who owes what, its own notes and the shared report, and hands the real work to workers in the directory it was given. It waits for outside events (an MR merging, a reply) with small watchers.
+- **The desk** — the workbench's resident main assistant. Triage is its job: before anything new starts it looks for an existing project, parked idea or report on the same subject, decides where a thing belongs (a note, a reminder, a decision for the owner, more work for an existing project, a new project), asks what is missing, remembers the owner's standing preferences and coordinates across projects. It keeps one continuous conversation with the owner.
+- **A project** answers for one deliverable ("改掉 TUI 表格复制", "Harness 对比报告"): it keeps the goal, the plan, the record of who owes what, its own notes and the shared report, and hands the real work to workers in the directory it was given. For a condition such as an MR merging, it can dispatch a checker that verifies the present state and closes after reporting.
 - **A worker** does one piece of work (reading or changing code, tests, research). When its turn is over it stays dormant on its record: a message wakes it with everything it knew. Its project is told each time a turn ends and reads what the worker did.
 - **Actions** are the open items of a project, owned by "agent" (a worker is on it), "human" (the owner must do something — their to-do list) or "waiting" (an outside event). **Cards** are decisions waiting for the owner (a plan to approve or a blocked worker). **Parked ("someday")** projects keep their research and cost nothing until activated.
 
@@ -65,7 +65,7 @@ export const AGENT_TOOLS: readonly AgentToolDoc[] = [
   {
     name: "capture",
     description:
-      "Drop something into the desk's inbox exactly as 随手记 does (a note or link to save, a reminder, a message that needs a reply) for silent triage, without a conversation. Prefer chat_with_desk when the owner expects an answer or the desk may need to ask something.",
+      "Drop something into the desk's inbox exactly as 随手记 does (a note, a link, a reminder, or an idea to triage) for silent triage, without a conversation. Prefer chat_with_desk when the owner expects an answer or the desk may need to ask something.",
     inputSchema: obj({ clientId:str("optional stable id for a retried capture"),text: str("the owner's words, unedited; add context after them only if it is needed to understand them") }, ["text"]),
   },
   {
@@ -87,7 +87,7 @@ export const AGENT_TOOLS: readonly AgentToolDoc[] = [
   {
     name: "get_project",
     description:
-      "One project in detail: its state and one-line summary, the directory it works in, its token use, every action (who has the ball, next step), all its cells — at work, waiting, dormant (wakeable) or archived — with what they are doing, what its workers did or were told that the project has not taken in yet (read live, including the owner's direct words to them), its reports (artifact ids and titles), pending cards, and whether it is stalled.",
+      "One project in detail: its state and one-line summary, the directory it works in, every action (who has the ball, next step), all its cells — at work, waiting, dormant (wakeable) or archived — with what they are doing, what its workers did or were told that the project has not taken in yet (read live, including the owner's direct words to them), its reports (artifact ids and titles), pending cards, and whether it is stalled.",
     inputSchema: obj({ id: str("project id from workbench_overview / create_project") }, ["id"]),
   },
   {
@@ -124,7 +124,7 @@ export const AGENT_TOOLS: readonly AgentToolDoc[] = [
     inputSchema: obj({
       id: str("待处理事项的 ID"), optionId: str("所选选项的 ID"),
       seenItemRevision: {type:"number", description:"列表中看到的事项修订号 itemRevision"},
-      seenVersion: {type:"number", description:"事项带草稿时，填写看到的草稿版本 artifactVersion"},
+      seenArtifactVersion: {type:"number", description:"事项带草稿时，填写看到的草稿版本 artifactVersion"},
       until: {type:"number", description:"推迟到的时间，使用 Unix 毫秒时间戳"}, note: str("选项要求的答复、修改意见或备注"),
       resumeProjectId: str("明确同意恢复的项目或分身 ID，见 resumeTarget.id"),
       confirmedTargets: {type:"array", items:{type:"string"}, description:"确认中止的目标项目 ID 列表"},

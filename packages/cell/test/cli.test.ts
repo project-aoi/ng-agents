@@ -19,7 +19,7 @@ const evidence = (h: Harness, cellId: string): StepOrExternalEvidence[] => h.ker
 const cliOpts = (fake: { bin: string; env: Record<string, string | undefined> }) => ({ bin: fake.bin, env: fake.env, pollMs: 30, killGraceMs: 500 });
 
 describe("kernel with CLI engines", () => {
-  it("runs a cell with engine set through its CLI loop while the desk runs through the API loop", async () => {
+  it("runs a cell with engine set through its CLI loop while the desk uses the scripted fixture", async () => {
     const fakes = tempDir("fake-cli");
     const claude = installFakeCli(fakes, "claude", [
       { actions: [{ text: "noting it" }, { mcp: "set_state", args: { patches: { seen: "yes" } } }] },
@@ -33,7 +33,7 @@ describe("kernel with CLI engines", () => {
     message(h, "clicell", "hello cli");
     await h.kernel.idle();
 
-    // desk: API loop (the scripted model saw its request); the CLI cell never reached the model client
+    // Only the desk called the scripted test model.
     expect(h.kernel.context.readStateSync("desk", "desk")).toBe("api");
     expect(h.script.requests.map((r) => r.cellId)).not.toContain("clicell");
     // CLI cell: kernel tool through the MCP bridge, transcript mirrored, session persisted

@@ -7,7 +7,7 @@ import { ErrorState, Loading } from "./states";
 
 /**
  * Reading a report or draft (research report, plan, review) without leaving the view: one side drawer shared by
- * Radar and Agents. Read-only — editing happens in the Engage workspace.
+ * Radar and Agents. Read-only — editing happens in the human inbox.
  */
 export function ReportDrawer({ report, onClose }: { report: ArtifactRefDTO | null; onClose(): void }) {
   const panel = useRef<HTMLDivElement>(null);

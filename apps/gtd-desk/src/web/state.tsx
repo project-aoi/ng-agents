@@ -360,7 +360,7 @@ export type ViewKey = "inbox" | "radar" | "agents";
 
 export interface Route {
   view: ViewKey;
-  /** Clarify: the card to show first. */
+  /** The human inbox card to show first. */
   cardId?: string;
   /** Agents: the selected node ("desk" stands for the desk whatever its id). */
   cellId?: string;
@@ -384,7 +384,7 @@ export function parseRoute(hash: string): Route {
   const path = q >= 0 ? raw.slice(0, q) : raw;
   const query = new URLSearchParams(q >= 0 ? raw.slice(q + 1) : "");
   const parts = path.split("/").filter(Boolean).map(decode);
-  const [view, a, b] = parts;
+  const [view, a] = parts;
   if (view === "radar") return { view: "radar" };
   if (view === "agents") {
     const project = query.get("project");

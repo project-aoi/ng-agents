@@ -1,5 +1,6 @@
 import type { Kernel } from "@ng/cell";
-import { CELL_DIRECT_CHAT_KEY, CELL_TURN_KEY, gtdKeys, type BusTopic, type BusTopics } from "@ng/protocol";
+import { gtdKeys } from "@ng/presets";
+import { CELL_DIRECT_CHAT_KEY, CELL_TURN_KEY,  type BusTopic, type BusTopics} from "@ng/protocol";
 import type { DeskEvent, NotificationDTO, ViewName } from "../shared/api";
 import { SENSOR_SUGGESTION_PREFIX, SKILL_SUGGESTION_PREFIX } from "./projections/common";
 

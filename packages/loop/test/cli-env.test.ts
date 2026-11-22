@@ -6,7 +6,6 @@ import type { AgentLoop, PromptSnapshot, RunOutcome, RunPorts } from "@ng/protoc
 import {
   cliEnvironment,
   cliModelsFromEnv,
-  CLI_SESSION_KEY,
   createRoutingLoop,
   detectCli,
   parseAgentBackend,
@@ -24,8 +23,8 @@ describe("CLI environment", () => {
       PATH: "/usr/bin",
       CLAUDE_CONFIG_DIR: "/home/u/.claude-alt",
       CODEX_HOME: "/home/u/.codex",
-      NG_SECRET_GITHUB: "ghp_x",
-      NG_OPENAI_API_KEY: "sk-x",
+      NG_AGENT_TOKEN: "ghp_x",
+      NG_DESK_TOKEN: "test-desk-token",
       NG_AGENT_BACKEND: "claude",
       ANTHROPIC_API_KEY: "sk-ant",
       CLAUDECODE: "1",
@@ -34,7 +33,7 @@ describe("CLI environment", () => {
       UNDEFINED: undefined,
     });
     expect(env).toEqual({ HOME: "/home/u", PATH: "/usr/bin", CLAUDE_CONFIG_DIR: "/home/u/.claude-alt", CODEX_HOME: "/home/u/.codex" });
-    expect(cliEnvironment({ ANTHROPIC_API_KEY: "k", NG_SECRET_X: "s" }, { keep: ["ANTHROPIC_API_KEY"], set: { A: "1" } })).toEqual({ ANTHROPIC_API_KEY: "k", A: "1" });
+    expect(cliEnvironment({ ANTHROPIC_API_KEY: "k", NG_DESK_TOKEN: "s" }, { keep: ["ANTHROPIC_API_KEY"], set: { A: "1" } })).toEqual({ ANTHROPIC_API_KEY: "k", A: "1" });
     expect(cliEnvironment({ GITHUB_TOKEN: "g" }, { drop: [/TOKEN$/] })).toEqual({});
   });
 });

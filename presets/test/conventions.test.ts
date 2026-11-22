@@ -8,7 +8,7 @@ import { boot, childrenOf, cleanupAll, lastToolResult, projects, tool, type Harn
 
 afterEach(cleanupAll);
 
-/** What the app sends for "移回待确认" (apps/gtd-desk restoreActivity). */
+/** What the app sends for "交回主台" (apps/gtd-desk restoreActivity). */
 function restore(h: Harness, original: Envelope, activityId: string): void {
   h.kernel.inbox.enqueueSync("desk", {
     id: `${original.id}#restore#${activityId}`,

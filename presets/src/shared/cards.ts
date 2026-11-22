@@ -1,6 +1,6 @@
 import type {
   CardPrep,
-  ClarifyCard,
+  DecisionCard,
   Deliverable,
   DraftRef,
   ItemSource,
@@ -10,7 +10,7 @@ import type {
 import type { RawInput } from "./records";
 
 // Builders for project proposals and escalations. A card is the `card` Deliverable of a deferred action;
-// its `data` is the ClarifyCard the UI renders block by block.
+// its `data` is the DecisionCard the UI renders block by block.
 
 export interface CardBase {
   subjectKey: string;
@@ -20,7 +20,7 @@ export interface CardBase {
   prep: CardPrep;
 }
 
-export function cardDeliverable(card: ClarifyCard, body: string): Deliverable {
+export function cardDeliverable(card: DecisionCard, body: string): Deliverable {
   return { format: "card", title: card.title, body: body ? `${card.title}\n\n${body}` : card.title, data: card };
 }
 

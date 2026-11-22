@@ -41,7 +41,7 @@ export function AgentsView({ cellId, projectId }: { cellId?: string | undefined;
 
   const select = useCallback((id: string) => navigate({ view: "agents", cellId: id, ...(projectId ? { projectId } : {}) }), [navigate, projectId]);
   const project = projectId
-    ? { id: projectId, title: topo.data?.nodes.find((n) => n.cellId === projectId || (n.preset === "project" && n.projectId === projectId))?.title ?? null }
+    ? { id: projectId, title: topo.data?.nodes.find((n) => n.cellId === projectId)?.title ?? null }
     : null;
 
   return (

@@ -10,10 +10,9 @@ import {
   type SensorSuggestion,
   type SkillSuggestion,
 } from "./common";
-import { button, channelLabel, enc, post, waitingDeadline, waitingDTO } from "./format";
+import { button, enc, post, waitingDeadline, waitingDTO } from "./format";
 import { dueText, nextWeekly, weekStart } from "./time";
 
-const WEEK = 7 * 24 * 3_600_000;
 /** An llm source that ran this often is worth a zero-token check (docs/04 §4.2). */
 export const SENSOR_SUGGEST_MIN_RUNS = 4;
 function isSkillSuggestion(v: unknown): v is SkillSuggestion {

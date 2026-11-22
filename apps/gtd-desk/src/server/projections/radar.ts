@@ -1,5 +1,5 @@
 import type { CellNode } from "@ng/cell";
-import { asClarifyCard, compareBallOwner, topBallOwner, type ActionRecord, type BallOwner, type CellRecord, type ProjectRecord } from "@ng/protocol";
+import { all, compareBallOwner, topBallOwner, type ActionRecord, type BallOwner, type CellRecord } from "@ng/protocol";
 import {
   BALL_LABEL,
   type ArtifactRefDTO,
@@ -11,7 +11,7 @@ import {
   type RadarDTO,
   type WaitingDTO,
 } from "../../shared/api";
-import { approvalProjectId, projectOfAction, readActions, readProjects, type DeskKernel, type Located, type ProjectionInput } from "./common";
+import { projectOfAction, readActions, readProjects, type DeskKernel, type Located, type ProjectionInput } from "./common";
 import { button, enc, ownerLabel, post, progressDTO, waitingDeadline, waitingDTO } from "./format";
 import { projectReview } from "./review";
 import { weekStart, whenText } from "./time";
@@ -77,7 +77,7 @@ function subtreeActivity(node: CellNode | undefined, activity: KernelActivity, n
   return a;
 }
 
-/** The live cells below a project (its workers and watchers, and theirs), excluding cells that are projects of their own. */
+/** The live cells below a project (its workers and checkers, and theirs), excluding cells that are projects of their own. */
 function workersOf(node: CellNode | undefined, activity: KernelActivity, projectCells: ReadonlySet<string>): ProjectWorkerDTO[] {
   const out: ProjectWorkerDTO[] = [];
   const walk = (n: CellNode) => {
@@ -146,10 +146,10 @@ function mergeWaiting(list: readonly WaitingDTO[]): WaitingDTO | null {
   return { ...list[0]!, parties, replied, total: parties.length, dueAt: due.length ? Math.min(...due) : null, text: `已回 ${replied}/${parties.length}` };
 }
 
-function projectButtons(id: string, record: ProjectRecord, paused: boolean, stalled: boolean, jobs:number): ButtonDTO[] {
+function projectButtons(id: string, parked: boolean, paused: boolean, stalled: boolean, jobs:number): ButtonDTO[] {
   const base = `/api/projects/${enc(id)}`;
   const cancel = button({ id: "cancel", label: "✕ 取消项目", endpoint: post(`${base}/cancel`), confirm: "取消后会立即停止这个项目的全部后台任务，确定吗？" });
-  if (record.lifecycle === "someday") {
+  if (parked) {
     return [button({ id: "activate", label: "↺ 重新启动", primary: true, endpoint: post(`${base}/activate`) }), cancel];
   }
   const out: ButtonDTO[] = [];
@@ -196,30 +196,23 @@ export function radarProjects(input: ProjectionInput): Omit<RadarDTO, "review"> 
     else actionsByProject.set(pid, [a]);
   }
   const visibleCards = new Map<string, { id: string; title: string }>();
-  for (const rec of kernel.gate.listPendingSync({ includeSnoozed: true })) {
-    const pid = approvalProjectId(kernel, rec);
-    if (!pid) continue;
-    if (rec.snoozedUntil === null || rec.snoozedUntil <= now) {
-      const card = asClarifyCard(rec.card.data);
-      if (!visibleCards.has(pid)) visibleCards.set(pid, { id: rec.actionId, title: card?.title ?? rec.card.title ?? rec.action.summary });
-    }
-  }
-
   for (const item of kernel.humanItems.list()) {
     if (item.category==="decision") for (const pid of item.relatedProjectIds) if (!visibleCards.has(pid)) visibleCards.set(pid,{id:item.id,title:item.title});
   }
+  const stalls = new Map(all<{ cell_id: string; since: number }>(kernel.db, "SELECT cell_id,since FROM cell_stalls").map(r => [r.cell_id, r.since]));
   const rows: ProjectRowDTO[] = [];
   for (const p of projects) {
     const r = p.record;
-    if (r.lifecycle !== "active" && r.lifecycle !== "someday") continue;
+    if (r.lifecycle !== "active") continue;
     const cell = cells.get(p.cellId);
     // BUG-011.3: a parked project is paused underneath, but "以后再说" is its state — not also "已暂停".
-    const paused = cell?.status === "paused" && r.lifecycle !== "someday";
+    const parked = cell?.pauseReason === "parked";
+    const paused = cell?.status === "paused" && !parked;
     // docs/05 guard 2: the kernel's five-anchor check (whole subtree, waits, cards, the owner's actions) stamps the
     // record; the app has no stall rule of its own. A stamp that a pause has not cleared yet does not count. A stalled
     // project has, by the kernel's account, nothing running and nothing it waits for — the pending stall notice itself
     // looks like a timer to the cell tree, so its activity is not counted.
-    const stalledSince = r.lifecycle === "active" && !paused && typeof r.stalledSince === "number" ? r.stalledSince : null;
+    const stalledSince = cell?.status === "active" ? stalls.get(p.cellId) ?? null : null;
     const stalled = stalledSince !== null;
     const act = stalled ? { running: 0, waiting: 0, busyLine: null, waitLine: null } : subtreeActivity(nodes.get(p.cellId), activity, now);
     const subtree = subtreeIds(p.cellId, byParent);
@@ -266,7 +259,7 @@ export function radarProjects(input: ProjectionInput): Omit<RadarDTO, "review"> 
       outcome: r.outcome ?? null,
       summary: typeof r.summary === "string" && r.summary ? r.summary : null,
       cwd: cell?.spec.cwd ?? null,
-      lifecycle: r.lifecycle,
+      lifecycle: parked ? "someday" : r.lifecycle,
       paused,
       ball,
       progress: sumProgress(openActions.filter((a) => a.owner === "agent" && a.progress).map((a) => a.progress!)),
@@ -283,7 +276,7 @@ export function radarProjects(input: ProjectionInput): Omit<RadarDTO, "review"> 
       agents: agentsEntry(p.cellId, subtree, cells, activity),
       createdAt: r.createdAt,
       updatedAt: r.updatedAt,
-      buttons: projectButtons(p.cellId, r, paused, stalled, kernel.workspace.listJobsSync({state:["running"]}).filter(j=>subtree.includes(j.cellId)).length),
+      buttons: projectButtons(p.cellId, parked, paused, stalled, kernel.workspace.listJobsSync({state:["running"]}).filter(j=>subtree.includes(j.cellId)).length),
     });
   }
 

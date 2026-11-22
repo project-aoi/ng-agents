@@ -455,7 +455,7 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
   const clearWait = defineTool({
     name: "clear_wait",
     kind: "kernel",
-    description: "Remove one obsolete wait and its timeout. Supply its waitId, or the party for a legacy wait.",
+    description: "Remove the open wait and its timeout by waitId.",
     input: z.object({ waitId: z.string().trim().min(1) }),
     async handler({ waitId }, ctx) {
       if (!ctx.ports.clearWait) return { output: "Cannot clear waits in this environment.", isError: true };

@@ -40,7 +40,7 @@ export interface CellSpec {
    *   announced, also the third one after the owner woke it twice) — and the cell stays `active` and dormant: no
    *   process, no timer, nothing that would wake it by itself. Any message wakes it again on its CLI session. It is
    *   closed with its parent (or by an explicit close).
-   * - `"one_shot"` (the `watcher` preset's default): a probe. When a Run ends `completed` (or `refused`) with the
+   * - `"one_shot"` (the `checker` preset's default): a probe. When a Run ends `completed` (or `refused`) with the
    *   inbox drained, the kernel delivers the cell's single final `cell.result` (id `${cellId}:${epoch}:cell.result`)
    *   and closes the cell — with its watches and timers — in the transaction that completes the claim.
    * - `"persistent"` (default): the cell lives until someone closes it (or it calls complete_self).

@@ -1,13 +1,11 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
   createEnvelope,
-  gtdKeys,
   get,
   run,
   PAYLOAD,
   type Envelope,
   type HandbackPayload,
-  type ProjectRecord,
   type UserMessagePayload,
 } from "@ng/protocol";
 import { boot, cleanupAll, HOUR, requestText, T0, tool, type Harness } from "./helpers";
@@ -16,11 +14,9 @@ afterEach(cleanupAll);
 
 const GRACE = 2_000;
 
-function project(h: Harness, id = "proj", lifecycle: ProjectRecord["lifecycle"] = "active"): void {
+function project(h: Harness, id = "proj", parked = false): void {
   h.kernel.spawnCell("desk", { id, preset: "project", title: "Harness 对比", meta: { role: id, projectCellId: id } });
-  if (lifecycle === "someday") h.kernel.control(id, {action: "pause", pauseReason: "parked"});
-  const now = h.clock.now();
-  h.kernel.context.commitSync(id, { statePatches: { [gtdKeys.project]: { title: "Harness 对比", lifecycle, createdAt: now, updatedAt: now } satisfies ProjectRecord } });
+  if (parked) h.kernel.control(id, {action: "pause", pauseReason: "parked"});
 }
 
 function addWait(h: Harness, from: string, to: string, id = to, registration = id): void {
@@ -102,7 +98,7 @@ describe("stall check", () => {
     project(h, "p-agent");
     project(h, "p-human");
     project(h, "p-wait");
-    project(h, "p-someday", "someday");
+    project(h, "p-someday", true);
     project(h, "p-paused");
     h.kernel.control("p-paused", { action: "pause" });
 

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { CELL_STATUS_KEY, gtdKeys, type ProjectRecord } from "@ng/protocol";
+import { gtdKeys } from "../src/shared/keys";
+import { CELL_STATUS_KEY,  type ProjectRecord} from "@ng/protocol";
 import { startProjectSync, type ProjectTaskInput } from "../src";
 import { boot, childrenOf, cleanupAll, continuesRun, gitRepo, lastToolResult, requestText, tool } from "./helpers";
 
@@ -34,7 +35,7 @@ describe("a project's books are kept before its model runs", () => {
         { title: "和市场部对齐风格", owner: "human", nextStep: "约市场部 15 分钟" },
         { title: "等设计稿", owner: "waiting" },
       ],
-      source: { label: "飞书转发", at: h.clock.now() },
+      source: { label: "工作台收件箱", at: h.clock.now() },
     });
     expect({ projectId, started }).toEqual({ projectId: "proj_site", started: true });
     expect(startProjectSync(h.kernel, { id: "proj_site", title: "官网改版", outcome: "x", brief: "x" })).toEqual({ projectId: "proj_site", started: false });
@@ -46,7 +47,8 @@ describe("a project's books are kept before its model runs", () => {
     await h.kernel.idle();
 
     expect(h.script.callsOf("project")).toHaveLength(2);
-    expect(h.project("proj_site")).toMatchObject({ title: "官网改版", outcome: "新版官网上线", lifecycle: "active", cwd: repo, source: { label: "飞书转发" }, proposal: { title: "官网改版" } });
+    expect(h.project("proj_site")).toMatchObject({ title: "官网改版", outcome: "新版官网上线", lifecycle: "active", source: { label: "工作台收件箱" }, proposal: { title: "官网改版" } });
+    expect(h.kernel.getCell("proj_site")?.spec.cwd).toBe(repo);
     expect(h.state(projectId, CELL_STATUS_KEY)).toMatchObject({ text: "目标：新版官网上线" });
     const acts = h.actions(projectId);
     expect(acts.map((a) => [a.title, a.owner, a.status, a.nextStep ?? null, a.phase ?? null, a.projectCellId])).toEqual(
@@ -128,7 +130,7 @@ describe("a project's books are kept before its model runs", () => {
     projectId = startProjectSync(h.kernel, { title: "报表", outcome: "报表上线", brief: "做报表" }).projectId;
     await h.kernel.idle();
     expect(h.kernel.getCell(projectId)?.status).toBe("paused");
-    expect(h.project(projectId)).toMatchObject({ lifecycle: "someday" });
+    expect(h.kernel.getCell(projectId)).toMatchObject({status:"paused",pauseReason:"parked"});
 
     expect(h.kernel.sendToCell(projectId, { text: "现在做导出" })).toMatchObject({ status: "delivered", targetStatus: "paused" });
     await h.kernel.idle();

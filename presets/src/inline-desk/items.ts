@@ -1,7 +1,7 @@
 import type { Kernel } from "@ng/cell";
+import { gtdKeys } from "../shared/keys";
 import {
-  asClarifyCard, cellPrincipal,
-  gtdKeys,
+  asDecisionCard, cellPrincipal,
   PAYLOAD,
   isEnvelopeOfType,
   isNgError,
@@ -46,7 +46,7 @@ export function currentItem(ctx: ToolContext): Envelope | undefined {
   return primaryItem(ctx.snapshot.batch.envelopes);
 }
 
-/** The owner moved this item back from the archive ("移回待确认"): it must get a card. */
+/** The owner moved this item back from the archive ("交回主台"): it must get a card. */
 export function isRestored(ctx: ToolContext): boolean {
   return ctx.snapshot.batch.envelopes.some((e) => isEnvelopeOfType(e, "handback") && e.payload.reason === RESTORE_REASON);
 }
@@ -79,7 +79,7 @@ export function approvedProjectInit(
   remembered: ProposalItem | null,
   clock: Clock,
 ): ProjectInit {
-  const card = asClarifyCard(action.card?.data);
+  const card = asDecisionCard(action.card?.data);
   const proposal = action.artifactId ? art?.content.data : action.proposal;
   if (!isProjectProposal(proposal)) throw new Error("立项方案的内容不完整，请修改方案后再确认");
   const brief = ["主人在立项卡上确认了这份方案（可能亲手改过），按它开始推进。", proposal.background ?? ""].filter(Boolean).join("\n");

@@ -1,6 +1,6 @@
 import type { NotificationDTO, StatusDTO } from "../../shared/api";
 import { get } from "@ng/protocol";
-import { readActivities, readProjects, type DeskKernel, type ProjectionInput } from "./common";
+import { readActivities, type DeskKernel, type ProjectionInput } from "./common";
 import { radarProjects } from "./radar";
 import { localMidnight, nextWeekly, whenText } from "./time";
 
@@ -20,7 +20,7 @@ export function notifications(input: ProjectionInput): NotificationDTO[] {
  * it), but that is its parked state, not a pause — it is counted in the Radar's someday list instead.
  */
 function pausedCount(kernel: DeskKernel): number {
-  const parked = new Set(readProjects(kernel).filter((p) => p.record.lifecycle === "someday").map((p) => p.cellId));
+  const parked = new Set(kernel.listCells({status:["paused"]}).filter(c => c.pauseReason === "parked").map(c => c.id));
   const cells = new Map(kernel.listCells({ status: ["active", "paused"] }).map((c) => [c.id, c]));
   let n = 0;
   for (const c of cells.values()) {

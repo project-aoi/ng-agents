@@ -6,17 +6,17 @@ import { join } from "node:path";
 import { MemoryChannel, UiChannel } from "@ng/channel";
 import { createKernel, type Kernel, type KernelOptions } from "@ng/cell";
 import { createScriptedLoop, ScriptedModelClient, type ModelRequest, type ScriptResponder, type ScriptTurn } from "@ng/loop/testing";
+import { gtdKeys } from "../src/shared/keys";
 import {
-  asClarifyCard,
+  asDecisionCard,
   createRegistry,
-  gtdKeys,
   ManualClock,
   type ActionRecord,
   type ActivityRecord,
   type ApprovalRecord,
   type BusTopic,
   type BusTopics,
-  type ClarifyCard,
+  type DecisionCard,
   type ProjectRecord,
   type Registry,
   type SourceRecord,
@@ -124,7 +124,7 @@ export interface Harness {
   /** Owner notifications, oldest first. */
   notices(): string[];
   /** Pending decision cards (snoozed included). */
-  cards(): Array<ApprovalRecord & { clarify: ClarifyCard }>;
+  cards(): Array<ApprovalRecord & { decision: DecisionCard }>;
   actions(cellId?: string): ActionRecord[];
   activities(): ActivityRecord[];
   project(rootId: string): ProjectRecord | null;
@@ -181,17 +181,13 @@ export async function boot(opts: BootOptions = {}): Promise<Harness> {
     notices: () => kernel.hub.listNotificationsSync().reverse().map((r) => r.content.body),
     cards: () =>
       kernel.gate.listPendingSync({ includeSnoozed: true }).map((a) => {
-        const clarify = asClarifyCard(a.card.data);
-        if (!clarify) throw new Error(`approval ${a.actionId} has no ClarifyCard`);
-        return { ...a, clarify };
+        const decision = asDecisionCard(a.card.data);
+        if (!decision) throw new Error(`approval ${a.actionId} has no DecisionCard`);
+        return { ...a, decision };
       }),
     actions: (cellId) => kernel.context.queryStateSync({ keyPrefix: gtdKeys.actionPrefix, ...(cellId ? { cellIds: [cellId] } : {}) }).map((e) => e.value as ActionRecord).concat(readHumanActionRecords(kernel.db, kernel.deskCellId, cellId).map(e=>e.record)),
     activities: () => kernel.context.queryStateSync({ keyPrefix: gtdKeys.activityPrefix, cellIds: ["desk"] }).map((e) => e.value as ActivityRecord),
-    project: (rootId) => {
-      const record = kernel.context.readStateSync<ProjectRecord>(rootId, gtdKeys.project);
-      const cell = kernel.getCell(rootId);
-      return record && cell ? { ...record, ...(cell.spec.cwd && { cwd: cell.spec.cwd }), ...(cell.pauseReason === "parked" && { lifecycle: "someday" }) } : null;
-    },
+    project: rootId => kernel.context.readStateSync<ProjectRecord>(rootId, gtdKeys.project),
     source: (cellId) => kernel.context.readStateSync<SourceRecord>(cellId, gtdKeys.source),
     state: (cellId, key) => kernel.context.readStateSync(cellId, key),
     deskRuns: () => events.filter((e) => e.topic === "run.started" && (e.data as { cellId: string }).cellId === "desk").length,

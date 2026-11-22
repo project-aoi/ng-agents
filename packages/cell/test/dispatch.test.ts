@@ -1,7 +1,7 @@
 import type { ModelRequest } from "@ng/loop/testing";
 import { afterEach, describe, expect, it } from "vitest";
 import {
-  asClarifyCard,
+  asDecisionCard,
   finalResultEnvelopeId,
   PAYLOAD,
   steerNoteText,
@@ -244,7 +244,7 @@ describe("escalations", () => {
 
     const cards = h.kernel.gate.listPendingSync();
     expect(cards).toHaveLength(1);
-    const card = asClarifyCard(cards[0]!.card.data)!;
+    const card = asDecisionCard(cards[0]!.card.data)!;
     expect(card).toMatchObject({ cardType: "escalation", subjectKey: "kernel:desk:retry_limit", escalation: { reason: "retry_limit" } });
     expect(card.rawInput).toEqual({ text: "需要你看一下这个", kind: "message" });
     expect(card.source.label).toBe("memory");

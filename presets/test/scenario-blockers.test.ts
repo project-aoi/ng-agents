@@ -6,8 +6,6 @@ import { boot, childrenOf, cleanupAll, continuesRun, gitRepo, lastToolResult, re
 
 afterEach(cleanupAll);
 
-const KEY = "ci-develop-lint";
-const TITLE = "develop 分支 lint 任务挂了";
 const FIXED = "ci已修复（MR !77），可以 rebase develop 然后继续推进";
 
 

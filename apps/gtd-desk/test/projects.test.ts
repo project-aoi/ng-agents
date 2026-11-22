@@ -1,9 +1,9 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { startProjectSync } from "@ng/presets";
-import { gtdKeys, type ProjectRecord } from "@ng/protocol";
-import type { ProjectMutationResponse, RadarDTO, SourcesDTO } from "../src/shared/api";
+import { gtdKeys, startProjectSync } from "@ng/presets";
+import {  type ProjectRecord} from "@ng/protocol";
+import type { ProjectMutationResponse } from "../src/shared/api";
 import { bootRealDesk, cellMessages, cleanupAll, requestsOf, tempDir, tool, type TestDesk } from "./helpers";
 
 afterEach(cleanupAll);
@@ -79,28 +79,5 @@ describe("closing and the directory", () => {
     expect(readFileSync(join(repo, "src", "a.ts"), "utf8")).toBe("export const a = 1;\n");
     // a finished project cannot be cancelled again
     expect((await d.post<ProjectMutationResponse>(`/api/projects/${projectId}/cancel`)).outcome).toBe("not_applied");
-  });
-});
-
-describe("hubs are sources", () => {
-  it("a hub is listed in the sources drawer through its source record, never as a project", async () => {
-    const d = await bootRealDesk();
-    d.script.add(
-      "desk",
-      tool("add_hub", {
-        title: "代码评审直通",
-        repos: [{ name: "backend", cwd: "/srv/code/backend" }],
-        rules: "评审群里 @我 的 MR 派只读 worker 评审",
-        watch: { thread: "memory:review" },
-      }),
-    );
-    await d.post("/api/capture", { text: "评审群 @我 的 MR 以后直接派人看" });
-    await d.kernel.idle();
-    const hub = d.kernel.listCells({ parentId: "desk" }).find((c) => c.spec.meta?.["role"] === "hub")!;
-    expect(hub).toBeDefined();
-    const sources = await d.get<SourcesDTO>("/api/sources");
-    expect(sources.sensors.map((s) => [s.id, s.title, s.kind])).toEqual([[hub.id, "代码评审直通", "watch"]]);
-    const radar = await d.get<RadarDTO>("/api/radar");
-    expect([...radar.projects, ...radar.someday]).toEqual([]);
   });
 });

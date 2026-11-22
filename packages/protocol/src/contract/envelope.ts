@@ -25,8 +25,8 @@ export interface Envelope<T = unknown> {
 }
 
 export interface PolicyBounds {         // one permission set; deriving a child Cell must strictly satisfy child ⊆ parent
-  tools: ReadonlySet<ToolKind>;         // upper bound of authorized tool kinds (the desk can still expose only read + spawn to its model via Loop.allowedTools)
-  canSendTo: readonly Address[];        // addresses this Cell may deliver to (worker default: only the parent inbox; a user ChannelAddr can be granted for 1:1 direct reporting)
+  tools: ReadonlySet<ToolKind>;         // upper bound of authorized workspace tool kinds
+  canSendTo: readonly Address[];        // permitted destinations for workbench notifications
   isolation: "none";
   maxConcurrentChildren: number;        // cap on simultaneously active children / child sandboxes (prevents unbounded fan-out)
   maxDepth: number;                     // remaining levels of spawnCell allowed (minus 1 per level; 0 forbids further spawning)

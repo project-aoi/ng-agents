@@ -78,7 +78,7 @@ function portOf(v: string | undefined): number {
 }
 
 /**
- * registry → presets → kernel (ui + configured channels) → desk root cell → start → HTTP app.
+ * registry → presets → kernel and workbench channel → desk root cell → start → HTTP app.
  * Fails before touching the data directory when the bind would be unsafe.
  */
 export async function createDeskServer(opts: DeskServerOptions = {}): Promise<DeskServer> {
@@ -149,7 +149,7 @@ export async function createDeskServer(opts: DeskServerOptions = {}): Promise<De
     const desk = createDesk({ kernel, ui, settings, onError });
     events = createEventHub(kernel);
     const webDir = opts.webDir === undefined ? resolve(APP_ROOT, "dist/web") : opts.webDir;
-    const agent = createAgentControlPlane({ kernel, desk, ui, settings });
+    const agent = createAgentControlPlane({ kernel, desk });
     const app = createDeskApp({ desk, events, security, agent, models: createModelSwitch(kernel), webDir, onError });
     const agentAccess =
       security.agentTokens.size > 0

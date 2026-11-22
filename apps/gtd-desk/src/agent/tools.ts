@@ -1,46 +1,37 @@
 import type { CellSpecInput, Kernel } from "@ng/cell";
-import type { UiChannel } from "@ng/channel";
-import { ownerOnlyApproval } from "@ng/gate";
-import { ROLES, startProjectSync, type ProjectInit, type ProjectMode } from "@ng/presets";
+
+import { type ProjectInit, type ProjectMode } from "@ng/presets";
 import {
   CELL_DIRECT_CHAT_KEY,
   CELL_STATUS_KEY,
   DEFAULT_RESOURCE_PAGE_CHARS,
   MAX_RESOURCE_PAGE_CHARS,
-  createEnvelope,
-  gtdKeys,
-  inboxAddr,
   isNgError,
   newId,
-  PAYLOAD,
   type ActionRecord,
-  type ApprovalRecord,
   type BallOwner,
   type CellDirectChatState,
   type CellRecord,
   type CellStatusLine,
   type ProjectRecord,
   type SendToCellResult,
-  type UserMessagePayload,
 } from "@ng/protocol";
 import type { ProjectRowDTO, SendCellMessageRequest, TimelineItemDTO } from "../shared/api";
 import type { Delivery } from "../server/agents";
 import { DeskError, type Desk, type DeskActor, type ProjectOp } from "../server/desk";
 import { isLeafCell, unpulledOf } from "../server/projections/agents";
-import { inputOf, projectOfAction, readActions, readProjects, type DeskSettings, type Located } from "../server/projections/common";
+import { projectOfAction, readActions, readProjects,  type Located } from "../server/projections/common";
 import { AGENT_TOOLS, type AgentToolDoc } from "./guide";
 import type { AgentControlPlane, AgentToolResult } from "./routes";
 
 // docs/05 §5.3 — the external main agent's control plane: every tool of guide.ts, run as the caller's `agent:<id>`
 // principal. Reads go through the same projections as the web client; changes go through the same Desk functions as
-// the Radar / Engage / Clarify buttons (parameterised by the principal) or straight to the kernel as that principal.
+// the workbench buttons (parameterised by the principal) or straight to the kernel as that principal.
 // The kernel and the Gate decide what an agent may do; this file only turns their answers into plain text.
 
 export interface AgentControlPlaneDeps {
   kernel: Kernel;
   desk: Desk;
-  ui: UiChannel;
-  settings: DeskSettings;
 }
 
 type Args = Record<string, unknown>;
@@ -88,7 +79,6 @@ const ARG_ALIASES: Readonly<Record<string, readonly string[]>> = {
   id: ["projectId", "project_id", "cellId", "cell_id", "cardId", "card_id", "artifactId", "artifact_id"],
   projectId: ["project_id", "project"],
   actionId: ["action_id", "action"],
-  seenVersion: ["seenArtifactVersion", "artifactVersion"],
   query: ["q", "text", "keywords"],
   state: ["op", "action", "status"],
   note: ["reason", "comment"],
@@ -154,8 +144,8 @@ export function validateArgs(doc: AgentToolDoc, args: Args): string | null {
 // ==================== the control plane ====================
 
 export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentControlPlane {
-  const { kernel, desk, settings } = deps;
-  const { context, gate, clock } = kernel;
+  const { kernel, desk } = deps;
+  const { context, clock } = kernel;
   const deskId = kernel.deskCellId;
   const docs = new Map(AGENT_TOOLS.map((t) => [t.name, t]));
   const now = () => clock.now();
@@ -190,14 +180,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
   function cardLine(item: ReturnType<typeof desk.listHumanItems>[number]) {
     const parts = [`rev=${item.itemRevision}`, item.artifactVersion !== null && `草稿 v${item.artifactVersion}`,
       item.project?.title, item.ownerOnly && "[ownerOnly]"].filter(Boolean);
-    return {data:item, line:`- ${item.id}「${item.title}」 ${parts.join(" · ")}`};
-  }
-
-  function cardQueue() {
-    const all = desk.listHumanItems(true);
-    const items = all.filter(item => !item.snoozedUntil || item.snoozedUntil <= now());
-    const cards = items.filter(i => i.category === "decision");
-    return {items, cards, snoozed: all.filter(i => i.category === "decision").length - cards.length};
+    return `- ${item.id}「${item.title}」 ${parts.join(" · ")}`;
   }
 
   function projectLine(p: ProjectRowDTO): string {
@@ -207,7 +190,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
     if (p.summary) parts.push(`摘要：${oneLine(p.summary, 120)}`);
     if (p.cwd) parts.push(`目录 ${p.cwd}`);
     if (p.workers.length) parts.push(`${p.workers.length} 个后台分身（${p.workers.filter((w) => w.state === "running").length} 个在跑）`);
-    if (p.pendingCardId) parts.push(`有卡 ${p.pendingCardId} 待确认`);
+    if (p.pendingCardId) parts.push(`有一项 ${p.pendingCardId} 等你决定`);
     if (p.paused && p.lifecycle === "active") parts.push("已暂停");
     if (p.stalled) parts.push(`⚠ 停滞（自 ${isoMin(p.stalledSince)}，没有任何推进锚点）`);
     return `- ${p.id}「${p.title}」— ${parts.join("；")}`;
@@ -301,7 +284,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         const reports = subtreeIds(id).flatMap((cid) => context.listArtifactsSync(cid));
         const named = reports.length ? ` Its reports: ${reports.map((a) => `${a.artifactId} v${a.version}${a.content.title ? `「${a.content.title}」` : ""}`).join(", ")}.` : "";
         return fail(
-          `Not delivered: project ${id} has already finished${r.closeReason ? ` (${r.closeReason})` : ""}. To continue the same subject, create_project with a brief that names what the old project delivered (read_artifact the reports first) so nothing is redone.${named}`,
+          `Not delivered: project ${id} has already finished${r.closeReason ? ` (${r.closeReason})` : ""}. Use reopen_project to continue this project with its existing record.${named}`,
           { status: "closed", closeReason: r.closeReason, artifacts: reports.map((a) => a.artifactId) },
         );
       }
@@ -314,8 +297,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
 
   function deliveredText(id: string, r: Extract<SendToCellResult, { status: "delivered" }>, isProject: boolean): string {
     if (r.targetStatus === "paused") {
-      const rec = isProject ? projectRecordOf(id) : null;
-      return rec?.lifecycle === "someday"
+      return isProject && kernel.getCell(id)?.pauseReason === "parked"
         ? `Delivered to ${id}, but it is parked ("someday"): it reads this when it is activated. To have it act now, set_project_state ${id} activate (with the owner's words as note).`
         : `Delivered to ${id}, but it is paused: it reads this when it is resumed (set_project_state / control_cell resume).`;
     }
@@ -326,17 +308,15 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
 
   const handlers: Record<string, Handler> = {
     workbench_overview(args) {
-      const queue = cardQueue();
+      const all = desk.listHumanItems(true);
+      const items = all.filter((item) => item.snoozedUntil == null || item.snoozedUntil <= now());
+      const actions = items.filter((item) => item.category === "action");
+      const cards = items.filter((item) => item.category === "decision");
       const radar = desk.radar();
-      const human = queue.items.filter(i=>i.category === "action").map(i=>({
-        line:cardLine(i).line, data:{...i, nextStep:i.description, projectId:i.project?.id ?? null, overdue:i.dueAt != null && i.dueAt<now()}
-      }));
-      const cards = queue.cards.map(cardLine);
       const running = runningLines();
       const ws = workspaceLines();
       const parts = [
-        section("需要主人处理", human.map((h) => h.line)),
-        section("待确认卡片", cards.map((c) => c.line)),
+        section("待我处理", items.map(cardLine)),
         section("进行中的项目", radar.projects.map(projectLine)),
         section("已停靠", radar.someday.map((p) => `- ${p.id}「${p.title}」— 以后再说${p.summary ? `；摘要：${oneLine(p.summary, 120)}` : ""}${p.cwd ? `；目录 ${p.cwd}` : ""}`)),
         section("正在运行", running.lines),
@@ -356,16 +336,17 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         );
         finished = recent.map((p) => ({ id: p.cellId, title: p.record.title, lifecycle: p.record.lifecycle, at: p.record.completedAt ?? p.record.updatedAt, summary: p.record.summary ?? null }));
       }
-      if (queue.snoozed > 0) parts.push(`另有 ${queue.snoozed} 张卡被推迟，到点会回到待确认。`);
+      const snoozed = all.length - items.length;
+      if (snoozed > 0) parts.push(`另有 ${snoozed} 项已推迟，到点会回到「待我处理」。`);
       return ok(`工作台概览（${isoMin(now())}）\n\n${parts.join("\n\n")}`, {
         generatedAt: now(),
-        humanActions: human.map((h) => h.data),
-        cards: cards.map((c) => c.data),
+        humanActions: actions.map((item) => ({ ...item, nextStep: item.description, projectId: item.project?.id ?? null, overdue: item.dueAt != null && item.dueAt < now() })),
+        cards,
         projects: radar.projects.map(projectData),
         parked: radar.someday.map(projectData),
         running: running.data,
         workspaces: ws.data,
-        snoozedCards: queue.snoozed,
+        snoozedCards: snoozed,
         ...(finished ? { finished } : {}),
       });
     },
@@ -373,7 +354,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
     async capture(args,principalId) {
       const clientId=str(args["clientId"]);
       const receipt=await desk.ingest({text:str(args["text"])!,...(clientId ? {clientId} : {})},{principalId});
-      return ok(`Captured message ${receipt.id}. The workbench routes it to the matching watcher or the desk.`,{envelopeId:receipt.id});
+      return ok(`Captured message ${receipt.id}. The workbench routes it to the matching subscriber or the desk.`,{envelopeId:receipt.id});
     },
 
     chat_with_desk(args, principalId) {
@@ -505,7 +486,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const anchors = cell && cell.status !== "closed" ? kernel.anchorsOf(id) : null;
       // BUG-011.3: a parked project is paused underneath, but it is brought back with activate — never resume.
       const state =
-        record.lifecycle === "someday"
+        cell?.pauseReason === "parked"
           ? "以后再说（停靠中，什么都不运行；要它继续：set_project_state activate，不是 resume）"
           : cell?.status === "closed"
             ? `${record.lifecycle}（cell closed: ${cell.closeReason ?? "?"}）`
@@ -531,7 +512,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const ownWaits = waits.filter((w) => w.cellId === id).map((w) => `${w.waitingFor}（${oneLine(w.reason, 80)}）`);
       const head = [
         `项目 ${id}「${record.title}」`,
-        `状态：${state}${row?.stalled || record.stalledSince ? `；⚠ 停滞（自 ${isoMin(record.stalledSince)}）` : ""}`,
+        `状态：${state}${row?.stalled ? `；⚠ 停滞（自 ${isoMin(row.stalledSince)}）` : ""}`,
         `目标：${record.outcome ?? "—"}`,
         `摘要：${record.summary ?? "—"}`,
         `目录：${cell?.spec.cwd ?? "—"}`,
@@ -547,7 +528,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         section("它的分身（运行中 / 等待中 / 待命可唤醒 / 已归档）", cellLines),
         ...(unpulled.length ? [section("尚未汇总至项目的 Worker 最新动态", unpulled.map((u) => `- ${u.cellId}：${u.count} 条新记录\n${u.text.split("\n").map((l) => `  ${l}`).join("\n")}`))] : []),
         section("报告与草稿", artifacts.map((a) => `- ${a.artifactId} v${a.version}${a.content.title ? `「${a.content.title}」` : ""}（${a.content.format}，${a.updatedBy} 更新于 ${isoMin(a.updatedAt)}）`)),
-        section("待确认卡片", cards.map(r => cardLine(r).line)),
+        section("等你决定", cards.map(cardLine)),
       ].join("\n\n");
       return ok(text, {
         id,
@@ -558,7 +539,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         summary: record.summary ?? null,
         cwd: cell?.spec.cwd ?? null,
         stalled: Boolean(row?.stalled),
-        stalledSince: record.stalledSince ?? null,
+        stalledSince: row?.stalledSince ?? null,
         ball: row?.ball ? { owner: row.ball.owner, text: row.ball.text } : null,
         actions: actions.map(({ record, cellId }) => {
           const item = record.owner === "human" ? kernel.humanItems.get(record.id) : undefined;
@@ -615,7 +596,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
     async decide_human_item(args,principalId) {
       const result = await desk.decideHumanItem(str(args.id)!,{
         optionId:str(args.optionId)!, seenItemRevision:args.seenItemRevision as number,
-        ...(typeof args.seenVersion==="number" ? {seenArtifactVersion:args.seenVersion} : {}),
+        ...(typeof args.seenArtifactVersion==="number" ? {seenArtifactVersion:args.seenArtifactVersion} : {}),
         ...(typeof args.until==="number" ? {until:args.until} : {}), ...(typeof args.note==="string" ? {note:args.note} : {}),
         ...(typeof args.resumeProjectId==="string" ? {resumeProjectId:args.resumeProjectId} : {}),
         ...(Array.isArray(args.confirmedClosure) ? {confirmedClosure:args.confirmedClosure as string[]} : {}),
@@ -754,7 +735,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         `状态行：${statusLineOf(id) ?? "—"}`,
         `在等：${waits.length ? waits.map((w) => `${w.waitingFor}（${oneLine(w.reason, 80)}${w.timeoutAt ? `，${isoMin(w.timeoutAt)} 超时` : ""}）`).join("；") : "—"}`,
         ...(project ? [`持有项目记录：${project.lifecycle}「${project.title}」`] : []),
-        ...(cards.length ? [`待确认卡片：${cards.map(r => cardLine(r).line).join(", ")}`] : []),
+        ...(cards.length ? [`等你决定：${cards.map(cardLine).join(", ")}`] : []),
         `子节点：${children.length ? children.map((x) => `${x.id}（${x.preset ?? "cell"}，${x.status}）`).join("、") : "—"}`,
       ];
       return ok(`${head.join("\n")}\n\n${section("最近记录", tail.map((t) => `- ${t.line}`))}`, {
@@ -790,7 +771,6 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         } else {
           const spec: CellSpecInput = { preset: preset as NonNullable<CellSpecInput["preset"]>, title };
           if (cwd) spec.cwd = cwd;
-          if (preset === "hub") spec.meta = { role: ROLES.hub, gtd: { source: { title, description: instruction, kind: "channel", mode: "active", processor: "llm" } } };
           const addr = desk.spawnCell(parentId, spec, { instruction, title }, { principalId });
           cellId = addr.slice("inbox:".length);
         }

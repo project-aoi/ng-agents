@@ -6,10 +6,9 @@ export interface DeliverableAttachment {
 }
 
 /**
- * Anything shown to a human or sent outward: reply drafts, proposals, approval cards, notifications.
- * - `body` is always a human-readable rendering (markdown for "markdown", JSON text for "json",
- *   a plain-text fallback for "card"), so a channel that only speaks text can always send `body`.
- * - `data` carries the structured value: the parsed JSON for "json", a `ClarifyCard` (see gtd.ts) for "card".
+ * A draft, proposal, decision card or notification shown on the workbench.
+ * - `body` is the human-readable representation of the content.
+ * - `data` carries the structured value: the parsed JSON for "json", a `DecisionCard` (see gtd.ts) for "card".
  */
 export interface Deliverable {
   format: "text" | "markdown" | "json" | "card";

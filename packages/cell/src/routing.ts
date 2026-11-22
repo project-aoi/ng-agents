@@ -50,7 +50,7 @@ export function matchWatches(core: KernelCore, env: Omit<Envelope, "to">): Watch
 /**
  * The hub's ingress sink. A message on a watched thread (or matching a watch filter) goes straight to the watching
  * cells (订阅直通), bypassing the desk; everything else goes to the desk. Durably enqueued before it resolves, so an
- * HTTP adapter answers 200 only for what is stored — and what is stored stays queryable (a watcher that starts later
+ * HTTP adapter answers 200 only for what is stored — and what is stored stays queryable (a subscriber that starts later
  * checks the record instead of hoping to catch the edge, docs/05 principle 5).
  * A watch with `coalesceMs` delivers into a fixed batching window keyed by that watch (`coalesce:<watchId>`).
  */

@@ -7,7 +7,7 @@ import { projectLaunch } from "../project/launch";
 export function deskPreset(books: DeskBooks): PresetDef {
   return {
     name: "inline",
-    description: "The main desk: the owner's standing assistant — conversation, triage, quick personal items, starting projects, arbitration. Read-only in its directory; delegates everything slow.",
+    description: "The main desk: the owner's standing assistant — conversation, triage, quick personal items, starting projects, arbitration. Delegates long-running work to projects.",
     defaults: { processor: DESK_PROCESSOR, lifetime: "persistent", meta: { role: ROLES.desk } },
     // The desk's books (reminders due, decided cards, finished projects) are kept before the model runs, so they never
     // depend on the model calling a tool; a wake-up with nothing else in it does not reach the model at all.

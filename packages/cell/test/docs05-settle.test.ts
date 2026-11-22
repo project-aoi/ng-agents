@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
-  asClarifyCard,
+  asDecisionCard,
   CELL_RESULT_CANDIDATE_KEY,
   finalResultEnvelopeId,
   PAYLOAD,
@@ -232,7 +232,7 @@ describe("step limit and refusal are never 'completed'", () => {
     // The third stop raised a card instead of a third continuation.
     const [card] = h.kernel.gate.listPendingSync();
     expect(isKernelEscalation(card!.action) && card!.action.args).toMatchObject({ reason: "retry_limit", cellId: "w1", stepLimit: true });
-    expect(asClarifyCard(card!.card.data)).toMatchObject({ cardType: "escalation" });
+    expect(asDecisionCard(card!.card.data)).toMatchObject({ cardType: "escalation" });
 
     const item = h.kernel.humanItems.get(card!.actionId)!;
     expect(item.subjectKey).toBe("kernel:w1:step_limit");

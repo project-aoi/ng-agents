@@ -36,7 +36,7 @@ interface ActionBase {
   summary: string;                      // one human-readable line (card title fallback, audit log)
   subjectKey: string;                   // the item this action belongs to; at most one pending approval per subjectKey
   sideEffect: SideEffect;
-  card?: Deliverable;                   // the approval card to show if deferred (format "card", data: ClarifyCard); Gate builds a plain one from `summary` if absent
+  card?: Deliverable;                   // the approval card to show if deferred (format "card", data: DecisionCard); Gate builds a plain one from `summary` if absent
   artifactId?: string;
 }
 

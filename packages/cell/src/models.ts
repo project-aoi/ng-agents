@@ -127,7 +127,7 @@ export function createModelSettings(opts: ModelSettingsOptions): ModelSettings {
   const info = (id: string): CliModelInfo | undefined => catalog?.models.find((m) => m.id === id);
 
   function choiceOf(tier: ModelTier, sel: ModelSelection): CliModelChoice | null {
-    // Auto for fast work must not inherit the flagship at its highest effort: watchers and sources are quick checks.
+    // Auto for fast work must not inherit the flagship at its highest effort: checkers and sources are quick checks.
     if (sel.mode === "auto") return catalog ? (tier === "fast" ? fastRecommendation(catalog) : catalog.recommended) : null;
     const effort = sel.effort ?? preferredEffort(info(sel.model)?.efforts ?? []);
     return effort ? { model: sel.model, effort } : { model: sel.model };

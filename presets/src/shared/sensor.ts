@@ -2,9 +2,9 @@ import type {CellSpec,ProcessorSpec} from "@ng/protocol";
 import {SENSOR_LLM_PROCESSOR} from "./processors";
 import { z } from "zod";
 import { scriptCommand } from "./script-command";
+import { gtdKeys } from "./keys";
 import {
   defineTool,
-  gtdKeys,
   PAYLOAD,
   type CommitTx,
   type CodeProcessor,

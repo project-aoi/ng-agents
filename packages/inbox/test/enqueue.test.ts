@@ -5,7 +5,7 @@ import { msg, setup, timer } from "./helpers";
 describe("enqueue", () => {
   it("is idempotent on (cellId, envelope id) and stores `to`", () => {
     const t = setup({ cells: [{ id: "desk" }, { id: "w1", parentId: "desk" }] });
-    const env = msg({ id: "webhook-123" });
+    const env = msg({ id: "input-123" });
     expect(t.inbox.enqueueSync("desk", env)).toBe("accepted");
     expect(t.inbox.enqueueSync("desk", { ...env, payload: { text: "changed" } })).toBe("deduped");
     // the same transport id for a different cell is a different message
@@ -13,7 +13,7 @@ describe("enqueue", () => {
 
     const rows = t.inbox.listMessagesSync({ cellId: "desk" });
     expect(rows).toHaveLength(1);
-    expect(rows[0]!.envelope).toMatchObject({ id: "webhook-123", to: "inbox:desk", payload: { text: env.payload && (env.payload as { text: string }).text } });
+    expect(rows[0]!.envelope).toMatchObject({ id: "input-123", to: "inbox:desk", payload: { text: env.payload && (env.payload as { text: string }).text } });
     expect(rows[0]!.status).toBe("pending");
     expect(t.takeWakes()).toEqual(["desk:enqueued", "w1:enqueued"]);
   });

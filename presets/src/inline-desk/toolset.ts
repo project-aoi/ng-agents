@@ -1,8 +1,8 @@
 import {createSensorSpec,sensorProcessor} from "../shared/sensor";
 import { z } from "zod";
+import { gtdKeys } from "../shared/keys";
 import {
   defineTool,
-  gtdKeys,
   isNgError,
   newId,
   subjectKeys,
@@ -129,7 +129,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
   const remindMe = tool({
     name: "remind_me",
     description:
-      "Set a personal reminder for the owner. Done at once with a light notice — no card. When it fires, call apply_updates: it becomes a quick to-do in the owner's focus list and the owner is notified.",
+      "Set a personal reminder for the owner. Done at once with a light notice — no card. When it fires, the workbench adds the action to 待我处理 and notifies the owner.",
     input: z.object({
       text: z.string().min(1).describe('what to remind, in Chinese, e.g. "给牙医打电话约时间"'),
       at: z.string().optional().describe(`ISO 8601 with offset; times the owner names are in their time zone, ${cfg.timeZone} (message times you see are UTC)`),
@@ -499,14 +499,13 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
       const id = newId("hub", ctx.clock);
       const coalesceMs = Math.round((args.coalesceMinutes ?? 2) * 60_000);
       const repos = args.repos.map((r) => ({ name: r.name, cwd: r.cwd, ...(r.defaultBranch ? { defaultBranch: r.defaultBranch } : {}) }));
-      const source: SourceInit = { title: args.title, description: args.rules, kind: "watch", mode: "active", processor: "llm" };
       const spec: CellSpec = {
         id,
         preset: "hub",
         title: args.title,
         processor: HUB_PROCESSOR,
         watches: [{ threadOrFilter: { ...(args.watch.filter ?? {}), ...(args.watch.thread ? { thread: args.watch.thread } : {}) }, ...(coalesceMs > 0 ? { coalesceMs } : {}) }],
-        meta: { role: ROLES.hub, gtd: { source } },
+        meta: { role: ROLES.hub },
       };
       const instruction = [
         `你是「${args.title}」的直通入口。`,

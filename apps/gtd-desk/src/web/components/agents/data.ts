@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { CellJobDTO, CellTimelineDTO, TimelineItemDTO, TopologyNodeDTO } from "../../../shared/api";
 import { api, type ApiFailure } from "../../api";
-import { serverNow, syncServerClock, toFailure, useCellLive, useDebouncedRefresh } from "../../state";
+import { syncServerClock, toFailure, useCellLive, useDebouncedRefresh } from "../../state";
 import { itemEnd, mergeItems } from "./model";
 
 // One cell's timeline as the right pane shows it. The first page is the newest one; after that nothing is refetched

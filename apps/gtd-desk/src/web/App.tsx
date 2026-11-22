@@ -20,7 +20,6 @@ import {
   parseRoute,
   routeHash,
   syncServerClock,
-  toFailure,
   useRefresh,
   useResource,
   useToast,

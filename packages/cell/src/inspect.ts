@@ -16,7 +16,7 @@ import type { KernelCore } from "./core";
 
 // The parent pulls; the worker is not asked to push. A worker that the owner talked to directly answers the owner
 // and stops — nothing makes it summarise three rounds of changes for a parent it has half forgotten. What it did is
-// on record anyway: every engine (API loop, Claude Code, Codex, Antigravity) mirrors inbound messages, assistant
+// on record anyway: each local CLI mirrors inbound messages, assistant
 // text, tool calls and results into evidence in one shape, so one reader serves all four.
 
 const SUMMARY_CHARS = 12_000;

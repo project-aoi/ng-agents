@@ -1,10 +1,8 @@
-import { readHumanActionRecords } from "@ng/presets";
-import type { Kernel } from "@ng/cell";
+import { gtdKeys, readHumanActionRecords } from "@ng/presets";
+import { isProjectRoot, type Kernel } from "@ng/cell";
 import {
-  get, gtdKeys,
   type ActionRecord,
   type ActivityRecord,
-  type ApprovalRecord,
   type BallOwner,
   type ProjectRecord,
   type SourceRecord,
@@ -85,7 +83,7 @@ export interface SensorSuggestion {
 
 const OWNERS = new Set<BallOwner>(["agent", "waiting"]);
 const ACTION_STATUSES = new Set(["open", "done", "cancelled"]);
-const LIFECYCLES = new Set(["active", "completed", "cancelled", "someday"]);
+const LIFECYCLES = new Set(["active", "completed", "cancelled"]);
 const ACTIVITY_KINDS = new Set(["notification_archived", "note_saved", "reminder_set", "card_withdrawn", "action_completed"]);
 
 function isObj(v: unknown): v is Record<string, unknown> {
@@ -160,14 +158,7 @@ export function readProjects(kernel: DeskKernel): Array<Located<ProjectRecord>> 
     const record = asProject(e.value, e.updatedAt);
     if (!record) continue;
     const cell = kernel.getCell(e.cellId);
-    if (!cell) continue;
-    const stall = get<{since:number;notified_at:number|null}>(kernel.db, "SELECT since,notified_at FROM cell_stalls WHERE cell_id=?", [cell.id]);
-    if (cell.spec.cwd) record.cwd = cell.spec.cwd;
-    if (cell.pauseReason === "parked") record.lifecycle = "someday";
-    if (stall) {
-      record.stalledSince = stall.since;
-      if (stall.notified_at !== null) record.stalledNotifiedAt = stall.notified_at;
-    }
+    if (!isProjectRoot(kernel.registry, cell)) continue;
     out.push({ cellId: e.cellId, key: e.key, record, updatedAt: e.updatedAt });
   }
   return out;
@@ -208,18 +199,6 @@ export function projectOfAction(kernel: DeskKernel, a: Located<ActionRecord>, pr
   const meta = kernel.getCell(a.cellId)?.spec.meta?.["projectCellId"];
   if (typeof meta === "string" && meta) return meta;
   return projectCells.has(a.cellId) ? a.cellId : null;
-}
-
-/** Project subject keys look like `project:<cellId>` (gtd.ts subjectKeys.project). */
-export function projectIdOfSubject(subjectKey: string): string | null {
-  return subjectKey.startsWith("project:") ? subjectKey.slice("project:".length) || null : null;
-}
-
-export function approvalProjectId(kernel: DeskKernel, rec: ApprovalRecord): string | null {
-  const fromSubject = projectIdOfSubject(rec.subjectKey);
-  if (fromSubject) return fromSubject;
-  const meta = kernel.getCell(rec.cellId)?.spec.meta?.["projectCellId"];
-  return typeof meta === "string" && meta ? meta : null;
 }
 
 /** Cells that hold a project record (`gtd:project`): one Radar row each. */

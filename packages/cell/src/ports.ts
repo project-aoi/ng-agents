@@ -2,7 +2,7 @@ import { renderEnvelope } from "@ng/context";
 import { CLI_SESSION_KEY, type CliSessionRecord } from "@ng/loop";
 import { deliveryAllowed } from "@ng/gate";
 import {
-  get, asClarifyCard, CELL_RESULT_CANDIDATE_KEY,
+  get, asDecisionCard, CELL_RESULT_CANDIDATE_KEY,
   cellPrincipal,
   createEnvelope,
   inboxAddr,
@@ -313,7 +313,7 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
     },
     listOwnDecisions() {
       return core.gate.listApprovalsSync({cellIds:[cellId]}).map(record => {
-        const source = asClarifyCard(record.card.data)?.source.envelopeId;
+        const source = asDecisionCard(record.card.data)?.source.envelopeId;
         const row = source && get<{envelope:string}>(core.db, "SELECT envelope FROM inbox_messages WHERE envelope_id=? ORDER BY (cell_id=?) DESC, seq LIMIT 1", [source,cellId]);
         return {record, ...(row ? {envelope:JSON.parse(row.envelope) as Envelope} : {})};
       });

@@ -86,7 +86,7 @@ describe("control: authorization and refusal", () => {
     expect(t.inbox.controlSync("w1", { action: "resume", principalId: "cell:desk" }).applied).toBe(true);
     expect(t.inbox.controlSync("proj", { action: "pause", principalId: "cell:proj" })).toMatchObject({ applied: false });
     expect(t.inbox.controlSync("proj", { action: "pause", principalId: "cell:w1" })).toMatchObject({ applied: false });
-    expect(t.inbox.controlSync("other", { action: "cancel", principalId: "slack:U123" })).toMatchObject({ applied: false });
+    expect(t.inbox.controlSync("other", { action: "cancel", principalId: "member:bob" })).toMatchObject({ applied: false });
     expect(t.inbox.controlSync("desk", { action: "pause", principalId: "owner" })).toMatchObject({ applied: false });
     expect(t.inbox.controlSync("desk", { action: "cancel", principalId: "owner" })).toMatchObject({ applied: false });
     expect(t.inbox.controlSync("other", { action: "pause", principalId: "owner" }).applied).toBe(true);

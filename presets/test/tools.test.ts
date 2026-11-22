@@ -3,7 +3,8 @@ import { writeActionRecordSync } from "../src";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { run, withTx, gtdKeys, PAYLOAD, type ActionRecord, type ProjectRecord } from "@ng/protocol";
+import { gtdKeys } from "../src/shared/keys";
+import { run,  PAYLOAD, type ActionRecord, type ProjectRecord } from "@ng/protocol";
 import { BUILTIN_SKILLS, seedBuiltinSkills, startApprovedProjectSync, startProjectSync } from "../src";
 import { boot, childrenOf, cleanupAll, gitRepo, lastToolResult, projects, systemOf, tool } from "./helpers";
 
@@ -294,7 +295,8 @@ describe("project tools", () => {
     );
     const { projectId } = startProjectSync(h.kernel, { title: "旧标题", outcome: "o", brief: "b" });
     await h.kernel.idle();
-    expect(h.project(projectId)).toMatchObject({ title: "新标题", summary: "方案已定", cwd: repo });
+    expect(h.project(projectId)).toMatchObject({ title: "新标题", summary: "方案已定" });
+    expect(h.kernel.getCell(projectId)?.spec.cwd).toBe(repo);
     expect(h.kernel.getCell(projectId)?.title).toBe("新标题");
     expect(h.state(projectId, "cell:status")).toMatchObject({ text: "方案已定" });
     const a = h.actions(projectId).find(record => record.id === id)!;
@@ -365,7 +367,7 @@ describe("desk tools for projects in flight", () => {
     await h.ui.capture({ text: "官网该改版了" });
     await h.kernel.idle();
     const [card] = h.cards();
-    expect(card?.clarify.cardType).toBe("project_proposal");
+    expect(card?.decision.cardType).toBe("project_proposal");
     const deskCalls = h.script.callsOf("desk").length;
     // Root cell cannot be paused (BUG-020); approve and synchronously start before the desk's microtask runs, then verify idempotency + desk wakeup.
     expect(h.kernel.control("desk", { action: "pause" })).toMatchObject({ applied: false });
@@ -403,7 +405,8 @@ describe("built-in skills", () => {
     const { projectId } = startProjectSync(h.kernel, { title: "p", outcome: "o", brief: "b" });
     await h.kernel.idle();
     expect(systemOf(h, projectId)).toContain("# Skill: project-relay");
-    expect(systemOf(h, projectId)).toContain("A project is a relay race");
+    const relay = BUILTIN_SKILLS.find((skill) => skill.name === "project-relay")!;
+    expect(systemOf(h, projectId)).toContain(relay.body.trim());
     h.script.add("desk", tool("wait", { reason: "ok" }));
     await h.ui.capture({ text: "hi" });
     await h.kernel.idle();

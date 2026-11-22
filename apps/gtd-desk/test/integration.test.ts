@@ -3,7 +3,8 @@
 // a persistent `project` cell that dispatches one-shot workers and decides itself what happens next.
 
 import { afterEach, describe, expect, it } from "vitest";
-import { gtdKeys, type ProjectRecord } from "@ng/protocol";
+import { gtdKeys } from "@ng/presets";
+import {  type ProjectRecord} from "@ng/protocol";
 import type { HumanItemDTO, ProjectMutationResponse, RadarDTO } from "../src/shared/api";
 import { bootRealDesk, cellMessages, cleanupAll, requestsOf, tool, type TestDesk } from "./helpers";
 

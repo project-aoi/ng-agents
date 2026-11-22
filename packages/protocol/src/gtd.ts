@@ -6,19 +6,6 @@ import type { Envelope } from "./contract/envelope";
 
 // ==================== keys ====================
 
-export const gtdKeys = {
-  /** In a project root cell → ProjectRecord. */
-  project: "gtd:project",
-  /** In a sensor cell → SourceRecord. */
-  source: "gtd:source",
-  /** In the cell that owns the action → ActionRecord. */
-  action: (id: string) => `gtd:action:${id}`,
-  actionPrefix: "gtd:action:",
-  /** In the desk cell → ActivityRecord. */
-  activity: (id: string) => `gtd:activity:${id}`,
-  activityPrefix: "gtd:activity:",
-} as const;
-
 /**
  * Gate keeps at most one pending card per subjectKey ("同一事项至多一张卡"). Everything inside a project shares the
  * project's subject, so a project never shows two cards at once; a one-off inbound item uses its envelope id.
@@ -72,7 +59,7 @@ export function topBallOwner(actions: Iterable<Pick<ActionRecord, "owner" | "sta
 
 // ==================== records ====================
 
-export type ProjectLifecycle = "active" | "completed" | "cancelled" | "someday";
+export type ProjectLifecycle = "active" | "completed" | "cancelled";
 export type Effort = "15m" | "45m" | "low_energy";
 
 export interface Progress {
@@ -97,7 +84,7 @@ export interface ReferenceLink {
   detail?: string;
 }
 
-/** `gtd:project` in a project root cell. */
+/** In a project root cell. */
 export interface ProjectRecord {
   title: string;
   outcome?: string;                     // what "done" looks like
@@ -106,12 +93,6 @@ export interface ProjectRecord {
   createdAt: number;
   updatedAt: number;
   completedAt?: number;
-  /** Set by the stall check when the project has none of the five anchors left (docs/05 guard 2); cleared when one returns. */
-  stalledSince?: number;
-  /** When the single `kernel.stalled_check` wake-up for this stall was sent; while set, no second one goes out. */
-  stalledNotifiedAt?: number;
-  /** [docs/05] Where the project's work happens (shown in Radar; children inherit the cell's cwd). */
-  cwd?: string;
   /** [docs/05] One line on where things stand, kept by the project cell. */
   summary?: string;
   /** [docs/05] The approved plan the project was started from (kept so a someday project can be reactivated as is). */
@@ -137,7 +118,7 @@ export interface WaitingSet {
 
 export type ActionStatus = "open" | "done" | "cancelled";
 
-/** `gtd:action:<id>` in the cell that owns the action. */
+/** In the cell that owns the action. */
 export interface ActionRecord {
   id: string;
   title: string;
@@ -155,7 +136,7 @@ export interface ActionRecord {
   createdAt: number;
   updatedAt: number;
   completedAt?: number;
-  /** [docs/05] The child cell (worker / watcher) carrying this action while its owner is "agent" or "waiting". */
+  /** [docs/05] The child cell (worker / checker) carrying this action while its owner is "agent" or "waiting". */
   cellId?: string;
   /** [docs/05] Phase of a staged project this action belongs to (1-based); later phases start after the owner's go-ahead. */
   phase?: number;
@@ -168,7 +149,7 @@ export type ActivityKind =
   | "card_withdrawn"                    // e.g. someone already answered in the group
   | "action_completed";
 
-/** `gtd:activity:<id>` in the desk cell — the "后台已静默归档 N 条通知" drawer; records the original item for restoration. */
+/** In the desk cell — the "后台已静默归档 N 条通知" drawer; records the original item for restoration. */
 export interface ActivityRecord {
   id: string;
   kind: ActivityKind;
@@ -177,14 +158,14 @@ export interface ActivityRecord {
   at: number;
   source?: ItemSource;
   rawInput?: string;
-  envelope?: Envelope;                  // original inbound envelope, re-enqueued to the desk on "移回待确认"
+  envelope?: Envelope;                  // original inbound envelope, re-enqueued to the desk on "交回主台"
   actionId?: string;                    // the withdrawn approval, for card_withdrawn
   remindAt?: number;                    // for reminder_set
   restorable: boolean;
   restoredAt?: number;
 }
 
-/** `gtd:source` in a sensor cell — shown in the 信源 drawer, never in the project list. */
+/** In a sensor cell — shown in the 信源 drawer, never in the project list. */
 export interface SourceRecord {
   title: string;
   description?: string;
@@ -205,7 +186,7 @@ export interface SourceRecord {
 
 // ==================== Project proposals and escalations ====================
 
-export type ClarifyCardType = "project_proposal" | "escalation";
+export type DecisionCardType = "project_proposal" | "escalation";
 
 export interface DraftRef {
   artifactId: string;
@@ -218,8 +199,8 @@ export interface CardPrep {
   checked: ReferenceLink[];             // code, docs, data, history it looked at
 }
 
-interface ClarifyCardBase {
-  cardType: ClarifyCardType;
+interface DecisionCardBase {
+  cardType: DecisionCardType;
   subjectKey: string;
   title: string;
   /** Block 1: source & status bar. The status/version text is derived by the UI from the approval + artifact. */
@@ -262,7 +243,7 @@ export function isProjectProposal(value: unknown): value is ProjectProposal {
     (p.repos===undefined || Array.isArray(p.repos) && p.repos.every(r=>r && text(r.name) && text(r.cwd) && (r.defaultBranch===undefined || text(r.defaultBranch))));
 }
 
-export interface ProjectProposalCard extends ClarifyCardBase {
+export interface ProjectProposalCard extends DecisionCardBase {
   cardType: "project_proposal";
   proposal: ProjectProposal;
   /** The proposal is also kept as an artifact (format json) so "手动改一下安排" saves with version protection. */
@@ -272,7 +253,7 @@ export interface ProjectProposalCard extends ClarifyCardBase {
 export type EscalationReason = "waiting_timeout" | "retry_limit" | "blocked";
 
 /** C. Waiting timeout / blocked escalation. */
-export interface EscalationCard extends ClarifyCardBase {
+export interface EscalationCard extends DecisionCardBase {
   cardType: "escalation";
   escalation: {
     reason: EscalationReason;
@@ -281,11 +262,11 @@ export interface EscalationCard extends ClarifyCardBase {
   };
 }
 
-export type ClarifyCard = ProjectProposalCard | EscalationCard;
+export type DecisionCard = ProjectProposalCard | EscalationCard;
 
-/** `approvalCard.data` → ClarifyCard, or null if the card is not a GTD card. */
-export function asClarifyCard(data: unknown): ClarifyCard | null {
+/** `approvalCard.data` → DecisionCard, or null if the card is not a GTD card. */
+export function asDecisionCard(data: unknown): DecisionCard | null {
   if (!data || typeof data !== "object") return null;
   const t = (data as { cardType?: unknown }).cardType;
-  return t === "project_proposal" || t === "escalation" ? (data as ClarifyCard) : null;
+  return t === "project_proposal" || t === "escalation" ? (data as DecisionCard) : null;
 }

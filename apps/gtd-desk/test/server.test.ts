@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { projectIdForApproval } from "@ng/presets";
-import { gtdKeys, type ActionRecord, type ProjectProposalCard, type ProjectRecord, type SourceRecord } from "@ng/protocol";
+import { gtdKeys, projectIdForApproval } from "@ng/presets";
+import { type ProjectProposalCard, type ProjectRecord, type SourceRecord } from "@ng/protocol";
 import type { Kernel } from "@ng/cell";
 import type {
   PlanSaveResponse,
@@ -16,7 +16,7 @@ import { viewsForBusEvent } from "../src/server/events";
 import { SecurityConfigError, isLoopbackHost } from "../src/server/security";
 import { SKILL_SUGGESTION_PREFIX } from "../src/server/projections";
 import { BUILTIN_SKILLS } from "@ng/presets";
-import { bootDesk, bootRealDesk, cellMessages, cleanupAll, DAY, makeProject, makeReviewCard, requestText, tempDir, writeAction } from "./helpers";
+import { bootDesk, bootRealDesk, cellMessages, cleanupAll, makeProject, makeReviewCard, requestText, tempDir } from "./helpers";
 
 afterEach(cleanupAll);
 

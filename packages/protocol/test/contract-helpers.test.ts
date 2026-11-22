@@ -19,7 +19,6 @@ import {
   selectRunTools,
   stableStringify,
   topBallOwner,
-  type ProposedAction,
   type ToolContext,
 } from "../src";
 

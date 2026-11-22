@@ -1,7 +1,8 @@
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { gtdKeys, type ActionRecord } from "@ng/protocol";
+
+
 import { notifyProjectOfOwnerChangeSync } from "../src";
 import { boot, cleanupAll, gitRepo, lastToolResult, projects, requestText, tempDir, tool } from "./helpers";
 
@@ -49,7 +50,7 @@ describe("docs/05 scenario 1 — part of the work waits for the owner; the repor
       },
     );
     h.script.add("project", tool("update_project", { summary: "trae 部分已完成，等 Doubao work 的代码" }));
-    await h.ui.capture({ text: "/todo Harness 对比，会议纪要见飞书" });
+    await h.ui.capture({ text: "/todo Harness 对比，会议纪要见共享文档" });
     await h.kernel.idle();
 
     const [project] = projects(h);

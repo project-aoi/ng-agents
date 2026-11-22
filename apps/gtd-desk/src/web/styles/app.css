@@ -635,9 +635,6 @@ code {
   color: var(--text-2);
 }
 
-/* limits switched off: a quiet reminder that stays while it is so */
-
-
 /* ==================== bottom bar ==================== */
 
 .bottombar {
@@ -824,7 +821,6 @@ code {
 }
 
 .link-btn,
-.link-like,
 .back-link {
   padding: 0;
   border: 0;
@@ -844,7 +840,6 @@ code {
 }
 
 .link-btn:hover,
-.link-like:hover,
 .back-link:hover {
   color: var(--text);
   text-decoration-color: currentColor;
@@ -1607,15 +1602,7 @@ textarea:focus-visible {
   display: flex;
   gap: var(--sp-2);
   width: min(420px, 100%);
-}
-
-/* ==================== Clarify ==================== */
-
-
-.remaining strong {
-  color: var(--text);
-  font-variant-numeric: tabular-nums;
-}
+}/* ==================== card details ==================== */
 
 .position {
   margin-left: var(--sp-2);
@@ -1637,15 +1624,6 @@ textarea:focus-visible {
     opacity: 0;
     transform: translateY(6px);
   }
-}
-
-.card-bar {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--sp-2) var(--sp-4);
-  font-size: var(--fs-sm);
 }
 
 .status-pill {
@@ -1671,14 +1649,6 @@ textarea:focus-visible {
   color: var(--danger);
 }
 
-.card-title {
-  margin: var(--sp-3) 0 var(--sp-2);
-  font-size: var(--fs-xl);
-  font-weight: var(--fw-bold);
-  line-height: var(--lh-tight);
-  letter-spacing: 0.005em;
-}
-
 .block {
   margin-top: var(--sp-6);
 }
@@ -1700,33 +1670,6 @@ textarea:focus-visible {
   margin-bottom: -4px;
 }
 
-.prep-summary {
-  color: var(--text);
-}
-
-.escalation {
-  display: grid;
-  gap: var(--sp-2);
-  padding: var(--sp-3) var(--sp-4);
-  border-left: 2px solid var(--border-strong);
-}
-
-.usage {
-  font-size: var(--fs-sm);
-  font-variant-numeric: tabular-nums;
-}
-
-.card-actions {
-  margin-top: var(--sp-6);
-  padding-top: var(--sp-5);
-  border-top: 1px solid var(--border);
-}
-
-.state-send_unknown .card-actions,
-.state-send_failed .card-actions {
-  border-top-color: color-mix(in srgb, var(--waiting) 40%, var(--border));
-}
-
 /* plan */
 .plan,
 .plan-editor {
@@ -1746,51 +1689,6 @@ textarea:focus-visible {
 
 .plan-head .block-label {
   margin: 0;
-}
-
-.plan-facts {
-  display: grid;
-  gap: var(--sp-2);
-}
-
-.plan-facts > div {
-  display: grid;
-  grid-template-columns: 6.5em 1fr;
-  gap: var(--sp-3);
-}
-
-.plan-facts dt {
-  color: var(--text-3);
-  font-size: var(--fs-sm);
-  padding-top: 1px;
-}
-
-.plan-sub {
-  color: var(--text-3);
-  font-size: var(--fs-xs);
-  font-weight: var(--fw-medium);
-  letter-spacing: 0.06em;
-  margin-top: var(--sp-2);
-}
-
-.plan-actions {
-  display: grid;
-  gap: var(--sp-2);
-}
-
-.plan-actions li {
-  display: flex;
-  gap: var(--sp-3);
-  align-items: flex-start;
-}
-
-.plan-action-body {
-  display: grid;
-  min-width: 0;
-}
-
-.plan-action-body .muted {
-  font-size: var(--fs-sm);
 }
 
 .field {
@@ -1858,58 +1756,7 @@ textarea:focus-visible {
 .theirs-plan .plan {
   margin-top: var(--sp-2);
   background: var(--surface);
-}
-
-/* inbox zero */
-.inbox-zero {
-  display: grid;
-  justify-items: center;
-  gap: var(--sp-3);
-  padding: var(--sp-9) var(--sp-6);
-  text-align: center;
-  animation: rise 320ms var(--ease);
-}
-
-.zero-mark {
-  color: var(--agent);
-  margin-bottom: var(--sp-2);
-}
-
-.inbox-zero h2 {
-  font-size: var(--fs-2xl);
-  font-weight: var(--fw-bold);
-  letter-spacing: 0.01em;
-}
-
-.zero-facts {
-  display: grid;
-  gap: var(--sp-2);
-  min-width: min(380px, 100%);
-  margin: var(--sp-5) 0 var(--sp-3);
-  padding: var(--sp-4) var(--sp-5);
-  border: 1px solid var(--border);
-  border-radius: var(--r-md);
-  background: var(--surface);
-  text-align: left;
-}
-
-.zero-facts > div {
-  display: grid;
-  grid-template-columns: 4.5em 1fr;
-  gap: var(--sp-3);
-  font-size: var(--fs-sm);
-}
-
-.zero-facts dt {
-  color: var(--text-3);
-}
-
-.zero-actions {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: center;
-  gap: var(--sp-2);
-}
+}/* inbox zero */
 
 /* ==================== drafts ==================== */
 
@@ -1932,11 +1779,6 @@ textarea:focus-visible {
   align-items: center;
   gap: 4px var(--sp-3);
   min-width: 0;
-}
-
-.draft-kind {
-  font-weight: var(--fw-medium);
-  font-size: var(--fs-sm);
 }
 
 .draft-version {
@@ -2075,18 +1917,7 @@ textarea:focus-visible {
 .draft.roomy .hl-backdrop .dl {
   margin: 0 -24px;
   padding: 0 24px;
-}
-
-/* ==================== Engage ==================== */
-
-.view-head {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--sp-3);
-  margin-bottom: var(--sp-6);
-}
+}/* ==================== editing and lists ==================== */
 
 .segmented {
   display: inline-flex;
@@ -2125,22 +1956,6 @@ textarea:focus-visible {
   margin-left: 6px;
 }
 
-.dnd-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  color: var(--text-2);
-  font-size: var(--fs-sm);
-}
-
-.dnd-badge::before {
-  content: "";
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--human);
-}
-
 .items {
   display: grid;
   gap: var(--sp-3);
@@ -2158,35 +1973,6 @@ textarea:focus-visible {
   box-shadow: var(--shadow-1);
 }
 
-.item-main {
-  display: grid;
-  gap: 4px;
-  min-width: 0;
-}
-
-.item-title {
-  font-size: var(--fs-md);
-  font-weight: var(--fw-medium);
-  overflow-wrap: anywhere;
-}
-
-.link-like.item-title {
-  text-decoration-color: transparent;
-}
-
-.link-like.item-title:hover {
-  text-decoration-color: currentColor;
-}
-
-.item-next {
-  color: var(--text-2);
-  font-size: var(--fs-sm);
-}
-
-.item-buttons {
-  flex: none;
-}
-
 /* A list of rows each with a filled button is loud; in lists the primary action is outlined in ink. */
 .items .btn.primary,
 .projects .btn.primary,
@@ -2201,25 +1987,7 @@ textarea:focus-visible {
 .src-list .btn.primary:hover {
   background: var(--ink);
   color: var(--on-ink);
-}
-
-.item-buttons .button-row {
-  justify-content: flex-end;
-}
-
-/* workspace */
-.ws-head {
-  display: grid;
-  justify-items: start;
-  gap: 6px;
-  margin-bottom: var(--sp-6);
-}
-
-.ws-title {
-  font-size: var(--fs-xl);
-  font-weight: var(--fw-bold);
-  line-height: var(--lh-tight);
-}
+}/* workspace */
 
 .split {
   display: grid;
@@ -2247,23 +2015,6 @@ textarea:focus-visible {
   min-width: 0;
   position: sticky;
   top: 0;
-}
-
-.ws-actions {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--sp-3);
-  padding-top: var(--sp-2);
-}
-
-.no-draft {
-  padding: var(--sp-6);
-  border: 1px dashed var(--border-strong);
-  border-radius: var(--r-lg);
-  display: grid;
-  gap: var(--sp-2);
 }
 
 .side-block {
@@ -2325,35 +2076,6 @@ textarea:focus-visible {
   flex-wrap: wrap;
   justify-content: flex-end;
   gap: var(--sp-2);
-}
-
-.cp-part {
-  display: grid;
-  gap: 6px;
-}
-
-.cp-part h4 {
-  font-size: var(--fs-sm);
-  font-weight: var(--fw-bold);
-}
-
-.cp-part p {
-  font-size: var(--fs-sm);
-}
-
-.skills {
-  display: grid;
-  gap: 6px;
-}
-
-.skills li {
-  display: grid;
-  font-size: var(--fs-sm);
-}
-
-.skill-name {
-  font-family: var(--font-mono);
-  font-size: var(--fs-xs);
 }
 
 /* ==================== Radar ==================== */
@@ -3167,16 +2889,6 @@ textarea:focus-visible {
 .ag-fact {
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
-}
-
-.ag-tokens {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.ag-tokens .progress {
-  width: 56px;
 }
 
 .ag-detail {
@@ -4155,15 +3867,9 @@ textarea:focus-visible {
     padding: var(--sp-5) var(--sp-4) var(--sp-4);
     border-radius: var(--r-md);
   }
-  .card-title {
-    font-size: var(--fs-lg);
-  }
   .item {
     flex-direction: column;
     align-items: stretch;
-  }
-  .item-buttons .button-row {
-    justify-content: flex-start;
   }
   .plan-edit-row {
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
@@ -4178,11 +3884,6 @@ textarea:focus-visible {
     grid-column: auto;
     grid-row: auto;
     justify-self: start;
-  }
-  .plan-facts > div,
-  .zero-facts > div {
-    grid-template-columns: 1fr;
-    gap: 0;
   }
   .bottombar {
     padding: var(--sp-2) var(--sp-3) calc(var(--sp-2) + env(safe-area-inset-bottom));

@@ -41,7 +41,7 @@ const scheduleInput = z.object({
 
 const boundsInput = z.object({
   tools: z.array(z.enum(TOOL_KINDS)).optional(),
-  canSendTo: z.array(z.string()).optional().describe("channel addresses the child may send to (inboxes are always reachable)"),
+  canSendTo: z.array(z.string()).optional().describe("addresses the child can notify (channel:ui:owner for the owner; internal inboxes are always reachable)"),
   isolation: z.enum(ISOLATION_LEVELS).optional(),
   maxConcurrentChildren: z.number().int().min(0).optional(),
   maxDepth: z.number().int().min(0).optional(),
@@ -91,7 +91,7 @@ const canSpawn = ({ bounds }: { bounds: PolicyBounds }) => bounds.maxDepth > 0;
 
 /**
  * `kernel.cells`: spawn_cell, inspect_cell, update_cell, control_cell, close_cell. All but update_cell (own
- * watches/schedules) need `bounds.maxDepth > 0` — a leaf (worker, watcher) has none of them.
+ * watches/schedules) need `bounds.maxDepth > 0` — a leaf (worker, checker) has none of them.
  * The kernel attenuates the requested bounds (child ⊆ parent) and enforces maxConcurrentChildren; control is limited to
  * descendants by Gate.
  */

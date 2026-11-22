@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  asClarifyCard,
+  asDecisionCard,
   CELL_RESULT_CANDIDATE_KEY,
   CELL_STATUS_KEY,
   createEnvelope,
@@ -20,7 +20,7 @@ import { createFakeRun, fakeInspection, type FakeRun, type FakeRunOptions } from
 import { clock, makeRegistry } from "./helpers";
 
 const registry = makeRegistry();
-registry.reserveState(["example:ledger"], ["example:ledger:"]);
+registry.reserveState(["example:summary"], ["example:summary:"]);
 
 function tool(name: string): ToolDef {
   for (const ts of registry.toolsets.list()) {
@@ -123,7 +123,7 @@ describe("kernel.comms request_approval / report_to_parent / handback / wait", (
     expect(r.endRun).toBe("deferred_for_approval");
     const { action, opts } = run.ports.log.authorizations[0]!;
     expect(action).toMatchObject({ type: "project.start", sideEffect: "external", proposal: { title: "支付报错排查", actions: [{ owner: "agent" }, { owner: "human" }] } });
-    const card = asClarifyCard(action.card?.data);
+    const card = asDecisionCard(action.card?.data);
     expect(card?.cardType).toBe("project_proposal");
     const draftId = card?.cardType === "project_proposal" ? card.draft?.artifactId : undefined;
     expect(run.ports.artifacts.get(draftId!)!.content.format).toBe("json");
@@ -137,7 +137,7 @@ describe("kernel.comms request_approval / report_to_parent / handback / wait", (
     await invoke(run, "request_approval", { kind: "escalation", title: "CI 连续失败", summary: "CI 卡住", escalation: { reason: "retry_limit", explanation: "已修 3 轮仍失败" } });
     const action = run.ports.log.authorizations[0]!.action as Extract<ProposedAction, { type: "custom" }>;
     expect(action.name).toBe("escalation.retry_limit");
-    expect(asClarifyCard(action.card?.data)).toMatchObject({ cardType: "escalation", escalation: { reason: "retry_limit" } });
+    expect(asDecisionCard(action.card?.data)).toMatchObject({ cardType: "escalation", escalation: { reason: "retry_limit" } });
   });
 
   it("reports results and silent progress to the parent and updates the roster status line", async () => {
@@ -198,13 +198,13 @@ describe("kernel.comms request_approval / report_to_parent / handback / wait", (
     const done = await invoke(run, "complete_self", { summary: "官网改版已上线" });
     expect(done).toMatchObject({ output: "Closing after this run. Stop here.", endRun: "completed", data: { action: "complete" } });
     await invoke(run, "complete_self", { summary: "放弃了", cancelled: true });
-    await invoke(run, "pause_self", { reason: "等明年预算" });
+    await invoke(run, "pause_self", { reason: "等明年排期" });
     expect(run.ports.log.settled).toEqual([
       { action: "complete", summary: "官网改版已上线" },
       { action: "cancel", summary: "放弃了" },
-      { action: "pause", summary: "等明年预算" },
+      { action: "pause", summary: "等明年排期" },
     ]);
-    expect(run.ports.state.get(CELL_STATUS_KEY)).toMatchObject({ text: "已停靠：等明年预算" });
+    expect(run.ports.state.get(CELL_STATUS_KEY)).toMatchObject({ text: "已停靠：等明年排期" });
   });
 
   it("hands back through the kernel port when present, else commits the handback envelope to the desk", async () => {
@@ -315,12 +315,12 @@ describe("kernel.comms request_approval / report_to_parent / handback / wait", (
     const run = fakeRun({ cellId: "p1" });
     await invoke(run, "complete_self", { summary: "收尾，子任务不要了", closeChildren: true });
     await invoke(run, "complete_self", { summary: "放弃", cancelled: true, closeChildren: true });
-    await invoke(run, "pause_self", { reason: "等预算", closeChildren: true });
+    await invoke(run, "pause_self", { reason: "等排期", closeChildren: true });
     await invoke(run, "complete_self", { summary: "正常收尾", closeChildren: false });
     expect(run.ports.log.settled).toEqual([
       { action: "complete", summary: "收尾，子任务不要了", force: true },
       { action: "cancel", summary: "放弃", force: true },
-      { action: "pause", summary: "等预算", force: true },
+      { action: "pause", summary: "等排期", force: true },
       { action: "complete", summary: "正常收尾" },
     ]);
 
@@ -406,7 +406,7 @@ describe("kernel.context", () => {
 
   it("protects registered keys and prefixes without writing part of a rejected patch", async () => {
     const run = fakeRun();
-    for (const key of ["example:ledger", "example:ledger:open"]) {
+    for (const key of ["example:summary", "example:summary:open"]) {
       const result = await invoke(run, "set_state", { patches: { normal: 1, [key]: 2 } });
       expect(result).toMatchObject({ isError: true, output: expect.stringContaining(key) });
       expect(run.ports.state.size).toBe(0);
@@ -625,7 +625,6 @@ describe("kernel.cells", () => {
       ],
       schedules: [{ deliverAt: Date.parse("2026-11-18T01:00:00Z") }],
     });
-    // docs/05: no `workspace` argument any more (no automatic worktree); nothing ends up in meta
     expect(spec.meta).toBeUndefined();
     expect([...spec.bounds!.tools!]).toEqual(["read", "edit", "bash"]);
 
@@ -637,7 +636,6 @@ describe("kernel.cells", () => {
       initialPayload: { instruction: "每天 9 点查", input: { metric: "pay_success" } },
     });
     expect(run.ports.log.spawned[1]!.spec).not.toHaveProperty("cwd");
-    expect((await invoke(run, "spawn_cell", { preset: "watcher", title: "t", instruction: "i" })).isError).toBe(true);
     // thrown errors become isError results inside the loop
     await expect(invoke(run, "spawn_cell", { preset: "worker", title: "t", instruction: "i", bounds: { canSendTo: ["nope"] } })).rejects.toThrow(
       "not addresses: nope",

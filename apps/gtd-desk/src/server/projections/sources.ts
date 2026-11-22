@@ -1,7 +1,7 @@
 import type { SourceRecord } from "@ng/protocol";
 import type { SensorSourceDTO, SourcesDTO } from "../../shared/api";
 import { readSources, type ProjectionInput } from "./common";
-import { button, channelLabel, enc, post } from "./format";
+import { button, enc, post } from "./format";
 
 const WEEKDAYS = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
 

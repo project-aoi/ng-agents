@@ -1,12 +1,13 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { gtdKeys, subjectKeys, type EscalationCard, type ProjectProposalCard, type ProjectRecord } from "@ng/protocol";
+import { gtdKeys } from "@ng/presets";
+import { subjectKeys } from "@ng/protocol";
 import { DEFAULT_SETTINGS, inputOf, projectActivity, projectRadar, projectReview, projectSources, projectStatus, SENSOR_SUGGESTION_PREFIX, SKILL_SUGGESTION_PREFIX } from "../src/server/projections";
 import { cronText } from "../src/server/projections/sources";
 import { parseDecisions, waitingDTO } from "../src/server/projections/format";
 import { dueText, nextWeekly, weekStart } from "../src/server/projections/time";
 import { relativeTimeZh } from "../src/shared/api";
 import type { Kernel } from "@ng/cell";
-import { agentRedraft, bootDesk, cleanupAll, DAY, HOUR, makeProject, makeReviewCard, MIN, writeAction, writeActivity, writeProject, writeSource } from "./helpers";
+import { bootDesk, cleanupAll, DAY, HOUR, makeProject, makeReviewCard, MIN, writeAction, writeActivity, writeProject, writeSource } from "./helpers";
 
 afterEach(cleanupAll);
 
@@ -88,11 +89,11 @@ describe("Radar projection — docs/05", () => {
     // a timer in the subtree is an anchor: the kernel clears the stamp
     kernel.spawnCell(p, { id: "t1", preset: "checker", title: "明天再看", schedules: [{ deliverAt: clock.now() + DAY }] });
     kernel.checkStalls();
-    expect(kernel.context.readStateSync<ProjectRecord>(p, gtdKeys.project)!.stalledSince).toBeUndefined();
+    expect(kernel.db.prepare("SELECT 1 FROM cell_stalls WHERE cell_id=?").get(p)).toBeUndefined();
     expect(projectRadar(view(kernel)).projects[0]).toMatchObject({ stalled: false, waitingOn: 1, ball: { owner: "waiting" } });
   });
 
-  it("a project's workers and watchers are detail of its row, never rows of their own; summary and directory come from the record", async () => {
+  it("a project's workers and checkers are detail of its row, never rows of their own; summary and directory come from the record", async () => {
     const { kernel } = await bootDesk();
     const p = makeProject(kernel, "竞品调研", { summary: "A、B 两家已整理完", cwd: process.cwd() });
     kernel.updateCell(p,{cwd:process.cwd()});

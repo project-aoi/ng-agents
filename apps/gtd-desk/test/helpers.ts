@@ -1,4 +1,4 @@
-import {createScriptSensor} from "@ng/presets";
+import { gtdKeys, createScriptSensor} from "@ng/presets";
 import {gtdLifecycle, writeActionRecordSync} from "@ng/presets";
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -7,14 +7,12 @@ import { MemoryChannel } from "@ng/channel";
 import { STANDARD_TOOLSETS } from "@ng/loop";
 import { createScriptedLoop, type ModelRequest, ScriptedModelClient, type ScriptResponder, type ScriptTurn } from "@ng/loop/testing";
 import {
-  gtdKeys,
   ManualClock,
   newId,
   PAYLOAD,
   subjectKeys,
   type ActionRecord,
   type ActivityRecord,
-  type ChannelAddr,
   type Envelope,
   createRegistry,
   type ProjectRecord,
@@ -188,7 +186,9 @@ export function writeAction(kernel: Kernel, cellId: string, a: Partial<ActionRec
   return record;
 }
 
-export function writeProject(kernel: Kernel, cellId: string, p: Partial<ProjectRecord> & Pick<ProjectRecord, "title">): ProjectRecord {
+type ProjectSetup = Partial<Omit<ProjectRecord, "lifecycle">> & {cwd?: string; lifecycle?: ProjectRecord["lifecycle"] | "someday"};
+
+export function writeProject(kernel: Kernel, cellId: string, p: ProjectSetup & Pick<ProjectRecord, "title">): ProjectRecord {
   const t = kernel.clock.now();
   const { cwd, lifecycle = "active", ...fields } = p;
   if (cwd) kernel.updateCell(cellId, { cwd });
@@ -212,7 +212,7 @@ export function writeSource(kernel: Kernel, cellId: string, s: Partial<SourceRec
 }
 
 /** A project root cell under the desk holding `gtd:project`. */
-export function makeProject(kernel: Kernel, title: string, p: Partial<ProjectRecord> = {}): string {
+export function makeProject(kernel: Kernel, title: string, p: ProjectSetup = {}): string {
   const id = newId("proj", kernel.clock);
   kernel.spawnCell("desk", { id, preset: "project", title, meta: { projectCellId: id }, stallPolicy: "monitor" });
   writeProject(kernel, id, { title, ...p });

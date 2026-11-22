@@ -1,10 +1,10 @@
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
-import { existsSync, fstatSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { groupAlive, isNgError, run, validatePayload, type JobResultPayload } from "@ng/protocol";
-import { defaultCommandRunner, JOB_MARKER, type CommandRunner } from "../src";
+import { JOB_MARKER } from "../src";
 import { markedAlive, processHasMarker, processInspection, psEnvironment } from "../src/util";
 import { cleanupAll, harness, pidGone, waitFor } from "./helpers";
 

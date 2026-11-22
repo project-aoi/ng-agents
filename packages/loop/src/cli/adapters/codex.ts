@@ -1,5 +1,5 @@
 import type { CliAdapter, CliCapabilities, CliDriver, CliEvent, LaunchRequest } from "../types";
-import { asRecord, contentText, HOST_UNSANDBOXED, num, str, tomlInlineTable, tomlValue } from "./util";
+import { asRecord, contentText, HOST_UNSANDBOXED, str, tomlInlineTable, tomlValue } from "./util";
 
 /**
  * OpenAI Codex CLI (`codex exec --json`), prompt on stdin.

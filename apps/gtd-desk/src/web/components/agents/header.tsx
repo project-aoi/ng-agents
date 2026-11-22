@@ -4,7 +4,7 @@ import { callButton, request } from "../../api";
 import { toFailure, useNavigate, useOpenReport, useStatus, useToast } from "../../state";
 import { ButtonRow, Chevron } from "../controls";
 import { Markdown } from "../markdown";
-import { engineText, isCoordinator } from "./model";
+import { engineText } from "./model";
 
 const CONTROL_ACTIONS = new Set<CellControlRequest["action"]>(["pause", "resume", "cancel"]);
 
@@ -18,7 +18,7 @@ export function NodeHeader(props: { head: CellTimelineDTO; onSelect(cellId: stri
   const toast = useToast();
   const [boardOpen, setBoardOpen] = useState(false);
   const engine = engineText(n);
-  const board = isCoordinator(n) || head.notes !== null || head.unpulled.length > 0;
+  const board = n.layer === 1 || head.notes !== null || head.unpulled.length > 0;
   const unpulledTotal = head.unpulled.reduce((s, u) => s + u.count, 0);
 
   const runControl = async (b: ButtonDTO) => {

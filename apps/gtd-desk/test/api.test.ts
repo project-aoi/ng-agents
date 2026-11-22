@@ -1,6 +1,7 @@
-import { join } from "node:path";
+
 import { afterEach, describe, expect, it } from "vitest";
-import { gtdKeys, PAYLOAD, type ActionRecord, type HandbackPayload, type ProjectRecord } from "@ng/protocol";
+import { gtdKeys, RESTORE_REASON } from "@ng/presets";
+import { PAYLOAD, type ActionRecord, type ProjectRecord } from "@ng/protocol";
 import type {
   ActivityMutationResponse,
   ArtifactSaveResponse,
@@ -9,17 +10,16 @@ import type {
   ProjectMutationResponse,
   RadarDTO,
 } from "../src/shared/api";
-import { RESTORE_REASON } from "../src/server/desk";
 import {
   agentRedraft,
   bootDesk,
+  bootRealDesk,
   cleanupAll,
   HOUR,
   inboundEnvelope,
   makeProject,
   makeReviewCard,
   requestText,
-  tempDir,
   tool,
   writeAction,
   writeActivity,
@@ -139,8 +139,9 @@ describe("review options", () => {
     expect((await d.req("POST", "/api/human-items/absent/decide", {optionId:"system.someday", seenItemRevision:1})).status).toBe(404);
   });
 
-  it("cancels a personal action and restores it through its activity entry", async () => {
-    const d = await bootDesk();
+  it("restores a cancelled personal action through HTTP and rejects a second undo", async () => {
+    const d = await bootDesk({port:0});
+    const {url} = await d.server.listen();
     const original = d.kernel.humanItems.create({
       title: "核对周会议程", subjectKey: "meeting:agenda", category: "action",
       options: [{ id: "done", label: "已办完", effect: "complete" }],
@@ -150,7 +151,13 @@ describe("review options", () => {
     });
     expect(result.status).toBe("cancelled");
     expect((await d.get<{ items: HumanItemDTO[] }>("/api/human-items")).items).toHaveLength(0);
-    await d.post(`/api/human-activity/${result.activityId}/undo`);
+    const undo = () => fetch(`${url}/api/human-activity/${result.activityId}/undo`, {
+      method:"POST", headers:{"content-type":"application/json"}, body:"{}",
+    });
+    const first = await undo();
+    expect(first.status).toBe(200);
+    expect(await first.json()).toMatchObject({status:"undone", deskStatus:{generatedAt:d.clock.now()}});
+    expect((await undo()).status).toBe(409);
     const restored = (await d.get<{ items: HumanItemDTO[] }>("/api/human-items")).items;
     expect(restored).toMatchObject([{ id: original.id, title: original.title, status: "pending" }]);
     expect(restored[0]!.itemRevision).toBeGreaterThan(original.itemRevision);
@@ -207,6 +214,64 @@ describe("human actions", () => {
     expect(stale.json.artifact).toMatchObject({ version: 3, body: "my merged edit", parked: [{ body: "agent addition" }] });
     const dismissed = await d.post<{ parked: unknown[] }>(`/api/artifacts/art_x/parked/${stale.json.artifact.parked[0]!.id}/dismiss`);
     expect(dismissed.parked).toEqual([]);
+  });
+});
+
+describe("project HTTP routes", () => {
+  it("lists closed projects, restores them once, and returns 403 for a revoked project", async () => {
+    const d = await bootDesk({port:0});
+    const {url} = await d.server.listen();
+    const project = makeProject(d.kernel,"发布计划");
+    const revoked = makeProject(d.kernel,"临时验证");
+    d.kernel.gate.revokeSync(revoked);
+    await d.kernel.closeCell(project, "completed");
+    await d.kernel.closeCell(revoked, "cancelled");
+
+    const closed = async () => {
+      const response = await fetch(url + "/api/projects/closed");
+      expect(response.status).toBe(200);
+      return (await response.json() as {projects: {id:string; title:string}[]}).projects;
+    };
+    const reopen = (id:string) => fetch(`${url}/api/projects/${id}/reopen`, {
+      method:"POST", headers:{"content-type":"application/json"}, body:"{}",
+    });
+    expect(await closed()).toEqual(expect.arrayContaining([
+      expect.objectContaining({id:project,title:"发布计划"}), expect.objectContaining({id:revoked,title:"临时验证"}),
+    ]));
+    const restored = await reopen(project);
+    expect(restored.status).toBe(200);
+    expect(await restored.json()).toMatchObject({restored:[project],deskStatus:{generatedAt:d.clock.now()}});
+    expect((await closed()).map(p => p.id)).not.toContain(project);
+    expect((await reopen(project)).status).toBe(409);
+    const forbidden = await reopen(revoked);
+    expect(forbidden.status).toBe(403);
+    expect(await forbidden.json()).toMatchObject({error:{code:"bounds_violation"}});
+    expect(d.kernel.getCell(revoked)?.status).toBe("closed");
+  });
+
+  it("saves a proposal and returns the current plan on a stale HTTP write", async () => {
+    const d = await bootRealDesk({port:0});
+    const {url} = await d.server.listen();
+    d.script.add("desk", tool("propose_project", {title:"验收发布", outcome:"发布完成", actions:[{title:"核对清单",owner:"human"}]}));
+    await d.post("/api/capture", {text:"为这次发布制定计划"});
+    await d.kernel.idle();
+    const list = await fetch(url + "/api/human-items");
+    const {items} = await list.json() as {items:HumanItemDTO[]};
+    const proposal = items.find(i => i.proposal)!;
+    const save = (outcome: string) => fetch(`${url}/api/human-items/${proposal.id}/plan`, {
+      method:"PUT", headers:{"content-type":"application/json"},
+      body:JSON.stringify({expectedVersion:proposal.artifactVersion, proposal:{...proposal.proposal,outcome}}),
+    });
+    const saved = await save("交付日志并获得验收签字");
+    expect(saved.status).toBe(200);
+    expect(await saved.json()).toMatchObject({ok:true,outcome:"saved",deskStatus:{generatedAt:d.clock.now()}});
+    const stale = await save("覆盖新稿");
+    expect(stale.status).toBe(409);
+    const conflict = await stale.json();
+    expect(conflict).toMatchObject({ok:false,outcome:"conflict",current:{version:proposal.artifactVersion! + 1}});
+    expect(JSON.parse(conflict.current.body).outcome).toBe("交付日志并获得验收签字");
+    const refreshed = await d.get<{items:HumanItemDTO[]}>("/api/human-items");
+    expect(refreshed.items.find(i => i.id === proposal.id)?.proposal?.outcome).toBe("交付日志并获得验收签字");
   });
 });
 

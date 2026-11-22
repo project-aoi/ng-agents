@@ -1,5 +1,6 @@
-import type { Kernel } from "@ng/cell";
-import { createEnvelope, gtdKeys, inboxAddr, newId, PAYLOAD, type TimerFiredPayload } from "@ng/protocol";
+import { isProjectRoot, type Kernel } from "@ng/cell";
+import { gtdKeys } from "@ng/presets";
+import { createEnvelope,  inboxAddr, newId, PAYLOAD, type TimerFiredPayload} from "@ng/protocol";
 import type {
   CellControlRequest,
   CellControlResponse,
@@ -188,7 +189,7 @@ export function createAgentsApi({ commands,kernel, settings, status, projectOp, 
     if (cell.parentId === null && action !== "resume") {
       return controlResult("not_applied", false, "总助理是整个工作台的根，不能暂停或叫停：停下它，所有后台工作都会停", cellId);
     }
-    if (kernel.context.readStateSync(cellId, gtdKeys.project) !== null) {
+    if (isProjectRoot(kernel.registry, cell)) {
       const r = await projectOp(cellId, action, actor);
       const outcome = r.outcome === "paused" || r.outcome === "resumed" || r.outcome === "cancelled" ? r.outcome : "not_applied";
       return controlResult(outcome, r.ok, r.message, cellId);
@@ -205,7 +206,7 @@ export function createAgentsApi({ commands,kernel, settings, status, projectOp, 
         return r.applied ? controlResult("resumed", true, `「${name}」继续`, cellId) : controlResult("not_applied", false, "继续没有生效（它的上级可能还在暂停）", cellId);
       }
       case "cancel": {
-        if (cell.preset === "sensor") return controlResult("not_applied", false, "信源请在信源抽屉里删除", cellId);
+        if (kernel.context.readStateSync(cellId, gtdKeys.source) !== null) return controlResult("not_applied", false, "信源请在信源抽屉里删除", cellId);
         // Its parent hears that it was stopped (the kernel tells it), and decides what comes next.
         const r = await commands.close(cellId,actor);
         const others = Math.max(0, r.closed.length - 1);

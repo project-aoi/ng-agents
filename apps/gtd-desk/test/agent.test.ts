@@ -6,7 +6,8 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { isNgError, gtdKeys, type ActionRecord, type ProjectRecord, type UserMessagePayload } from "@ng/protocol";
+import { gtdKeys } from "@ng/presets";
+import { type ProjectRecord, type UserMessagePayload } from "@ng/protocol";
 import { AGENT_INSTRUCTIONS, AGENT_SERVER_NAME, AGENT_TOOLS } from "../src/agent/guide";
 import type { AgentToolResult } from "../src/agent/routes";
 import { bootDesk, bootRealDesk, cellMessages, cleanupAll, requestText, requestsOf, tempDir, tool, writeAction, type TestDesk } from "./helpers";
@@ -190,7 +191,7 @@ describe("tools", () => {
     expect(d.kernel.getCell(projectId)).toMatchObject({ status: "closed", closeReason: "cancelled" });
     const closed = await refused(d, "message_project", { id: projectId, text: "再补一个录屏" });
     expect(closed.text).toContain("has already finished");
-    expect(closed.text).toContain("create_project");
+    expect(closed.text).toContain("reopen_project");
     expect(closed.text).toContain("art_r");
     expect((await refused(d, "message_project", { id: "proj_nope", text: "x" })).text).toContain('There is no project "proj_nope"');
     expect((await refused(d, "set_project_state", { id: projectId, state: "complete" })).text).toContain("已经取消");
@@ -246,7 +247,7 @@ describe("tools", () => {
     const listed = (await ok(d, "list_human_items")).data as { items: import("../src/shared/api").HumanItemDTO[] };
     const proposal = listed.items.find(i => i.proposal?.title === "官网改版")!;
     expect(proposal).toMatchObject({ ownerOnly: true, artifactVersion: 1, humanEdited: false });
-    expect((await refused(d, "decide_human_item", { id: proposal.id, optionId: "system.execute", seenVersion: 1, note: "主人说可以", seenItemRevision: proposal.itemRevision })).text).toMatch(/主人/);
+    expect((await refused(d, "decide_human_item", { id: proposal.id, optionId: "system.execute", seenArtifactVersion: 1, note: "主人说可以", seenItemRevision: proposal.itemRevision })).text).toMatch(/主人/);
     expect(d.kernel.gate.getApprovalSync(proposal.id)!.status).toBe("pending");
     await expect(d.kernel.humanItems.decide(proposal.id, {optionId:"system.someday",
       seenArtifactVersion:1, seenItemRevision:proposal.itemRevision}, "owner")).rejects.toThrow(/以后再说/);
@@ -258,7 +259,7 @@ describe("tools", () => {
     expect((await refused(d, "decide_human_item", { id: proposal.id, optionId: "system.execute", seenItemRevision: 1 })).isError).toBe(true);
     expect((await refused(d, "decide_human_item", { id: "missing", optionId: "done", seenItemRevision: 1 })).text).toContain("找不到");
 
-    // An ordinary non-ownerOnly card with a draft: MCP must forward caller-held seenVersion (never live DB read).
+    // An ordinary non-ownerOnly card with a draft: MCP must forward caller-held seenArtifactVersion (never live DB read).
     const artId = "art_merge_1";
     const art = d.kernel.context.commitSync("desk", { artifact: { artifactId: artId, content: { format: "text", body: "方案 v1" }, updatedBy: "agent" } });
     if (!art.ok) throw new Error("artifact commit failed");
@@ -277,9 +278,9 @@ describe("tools", () => {
     expect(current).toMatchObject({ artifactVersion: 2, humanEdited: true });
     const choice = { id: current.id, optionId: "system.reply", seenItemRevision: current.itemRevision };
     await refused(d, "decide_human_item", choice);
-    await refused(d, "decide_human_item", { ...choice, seenVersion: 1 });
+    await refused(d, "decide_human_item", { ...choice, seenArtifactVersion: 1 });
     expect(d.kernel.humanItems.get(current.id)?.status).toBe("pending");
-    expect((await ok(d, "decide_human_item", { ...choice, seenVersion: 2 })).data).toMatchObject({status:"resolved"});
+    expect((await ok(d, "decide_human_item", { ...choice, seenArtifactVersion: 2 })).data).toMatchObject({status:"resolved"});
     expect(d.kernel.gate.getApprovalSync(current.id)).toMatchObject({ approverId: "agent:main" });
 
 
@@ -295,7 +296,7 @@ describe("tools", () => {
     expect((m!.envelope.payload as UserMessagePayload).sender).toMatchObject({ id: "agent:main" });
     await d.kernel.idle();
     expect(requestText(d.script.requests.find((x) => x.role === "desk")!.req)).toContain("rust-async 这篇存一下");
-    expect((await ok(d, "workbench_overview")).text).toContain("需要主人处理");
+    expect((await ok(d, "workbench_overview")).text).toContain("待我处理");
   });
 
   it("routes authenticated capture through watches, and retries the same client id once", async () => {
@@ -326,7 +327,7 @@ describe("tools", () => {
     await new Promise((r) => setTimeout(r, 200));
     await ok(d, "set_project_state", { id: parked, state: "someday" });
     const o = await ok(d, "workbench_overview");
-    for (const head of ["需要主人处理", "待确认卡片", "进行中的项目", "已停靠", "正在运行", "工作目录占用"]) expect(o.text).toContain(head);
+    for (const head of ["待我处理", "进行中的项目", "已停靠", "正在运行", "工作目录占用"]) expect(o.text).toContain(head);
     expect(o.text).toContain("给牙医回电话");
     expect(o.text).toContain(`${proposal.id}「立项发布计划」`);
     expect(o.text).toContain(`${projectId}「改 a」`);
@@ -424,8 +425,8 @@ describe("tools", () => {
     // spawn_cell takes any registered preset (no enum in its schema); the kernel answers for one that is not registered
     const presetSchema = (AGENT_TOOLS.find((t) => t.name === "spawn_cell")!.inputSchema as { properties: Record<string, { enum?: unknown }> }).properties["preset"]!;
     expect(presetSchema.enum).toBeUndefined();
-    const watcher = await ok(d, "spawn_cell", { preset: "checker", title: "盯 CI", instruction: "CI 绿了告诉我" });
-    expect(d.kernel.getCell((watcher.data as { cellId: string }).cellId)).toMatchObject({ preset: "checker", parentId: "desk" });
+    const checker = await ok(d, "spawn_cell", { preset: "checker", title: "盯 CI", instruction: "CI 绿了告诉我" });
+    expect(d.kernel.getCell((checker.data as { cellId: string }).cellId)).toMatchObject({ preset: "checker", parentId: "desk" });
     expect(await refused(d, "spawn_cell", { preset: "nope", title: "x", instruction: "y" })).toMatchObject({ text: 'Not done: unknown preset "nope"', data: { code: "invalid_argument" } });
   });
 });

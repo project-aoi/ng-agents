@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { gtdKeys, PAYLOAD, type ProjectProposal } from "@ng/protocol";
+import { gtdKeys } from "../src/shared/keys";
+import {  PAYLOAD, type ProjectProposal} from "@ng/protocol";
 import { defineSensorCheck, OBSERVATION_NOTE, type SensorHit } from "../src";
 import { boot, cleanupAll, DAY, projects, T0, tool, type Harness } from "./helpers";
 
@@ -63,7 +64,7 @@ describe("docs/03 §四 row 1 — a sensor is a source, not a task", () => {
     expect(cards).toHaveLength(1);
     const card = cards[0]!;
     expect(card.cellId).toBe("desk");
-    expect(card.clarify).toMatchObject({
+    expect(card.decision).toMatchObject({
       cardType: "project_proposal",
       title: "排查注册转化率下跌",
       source: { label: "信源 · 注册转化率下跌" },
@@ -75,7 +76,7 @@ describe("docs/03 §四 row 1 — a sensor is a source, not a task", () => {
     expect(card.boundVersion).toBe(1);
 
     // "✎ 手动改一下安排": the owner edits the plan (v2); approving the v1 they no longer see is refused.
-    const proposal = (card.clarify as { proposal: ProjectProposal }).proposal;
+    const proposal = (card.decision as { proposal: ProjectProposal }).proposal;
     const edited: ProjectProposal = { ...proposal, actions: [...proposal.actions, { title: "确认埋点没有漏报", owner: "agent" }] };
     expect(h.kernel.context.commitSync("desk", { artifact: { artifactId: card.artifactId!, content: { format: "json", body: JSON.stringify(edited), data: edited }, updatedBy: "human", expectedVersion: 1 } })).toMatchObject({ ok: true });
     await expect(h.kernel.humanItems.decide(card.actionId, { optionId: "system.execute", seenItemRevision: h.kernel.humanItems.get(card.actionId)!.itemRevision, seenArtifactVersion: 1 }, "owner")).rejects.toMatchObject({code: "conflict"});

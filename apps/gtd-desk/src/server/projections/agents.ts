@@ -1,7 +1,8 @@
+import { gtdKeys } from "@ng/presets";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
-import { workTreeKey, type WaitRecord } from "@ng/cell";
+import { isProjectRoot, workTreeKey, type WaitRecord } from "@ng/cell";
 import {
   all,
   CELL_DIRECT_CHAT_KEY,
@@ -48,7 +49,7 @@ import type {
   TopologyDTO,
   TopologyNodeDTO,
 } from "../../shared/api";
-import { approvalProjectId, projectOfAction, readActions, readProjects, type DeskKernel, type ProjectionInput } from "./common";
+import { projectOfAction, readActions, readProjects, type DeskKernel, type ProjectionInput } from "./common";
 import { button, channelLabelOfAddress, enc, post } from "./format";
 import { whenText } from "./time";
 
@@ -171,21 +172,15 @@ export function agentsView(input: ProjectionInput, focus?: readonly string[]): A
   const cards = new Map<string, Ref>();
   const snoozedCards = new Set<string>();
   const projectCards = new Map<string, Ref>();
-  for (const rec of kernel.gate.listPendingSync({ includeSnoozed: true })) {
-    const ref = { id: rec.actionId, title: rec.card.title ?? rec.action.summary };
-    if (rec.snoozedUntil !== null && rec.snoozedUntil > now) {
-      snoozedCards.add(rec.cellId);
+  for (const item of kernel.humanItems.list(true)) {
+    if (item.category !== "decision") continue;
+    if (item.snoozedUntil !== null && item.snoozedUntil > now) {
+      if (item.cellId) snoozedCards.add(item.cellId);
       continue;
     }
-    if (!cards.has(rec.cellId)) cards.set(rec.cellId, ref);
-    const pid = approvalProjectId(kernel, rec);
-    if (pid && !projectCards.has(pid)) projectCards.set(pid, ref);
-  }
-  for (const item of kernel.humanItems.list()) {
-    if (item.category !== "decision") continue;
-    const ref = {id:item.id,title:item.title};
-    if (item.cellId && !cards.has(item.cellId)) cards.set(item.cellId,ref);
-    for (const pid of item.relatedProjectIds) if (!projectCards.has(pid)) projectCards.set(pid,ref);
+    const ref = { id: item.id, title: item.title };
+    if (item.cellId && !cards.has(item.cellId)) cards.set(item.cellId, ref);
+    for (const id of item.relatedProjectIds) if (!projectCards.has(id)) projectCards.set(id, ref);
   }
   for (const id of cards.keys()) snoozedCards.delete(id);
 
@@ -211,11 +206,11 @@ export function isLeafCell(c: Pick<CellRecord, "spec" | "preset">): boolean {
 
 function roleOf(v: AgentsView, c: CellRecord): { roleLabel: string; layer: 0 | 1 | 2 } {
   const role = typeof c.spec.meta?.["role"] === "string" ? (c.spec.meta["role"] as string) : null;
-  if (isRoot(c) || role === "desk") return { roleLabel: "总助理", layer: 0 };
-  if (v.projects.has(c.id) || c.preset === "project") return { roleLabel: "项目协调", layer: 1 };
-  if (c.preset === "hub" || role === "hub") return { roleLabel: "领域中枢", layer: 1 };
-  if (c.preset === "sensor" || role === "sensor") return { roleLabel: "信源巡检", layer: 0 };
-  if (c.preset === "checker" || role === "checker") return { roleLabel: "外部盯梢", layer: 2 };
+  if (isRoot(c)) return { roleLabel: "总助理", layer: 0 };
+  if (isProjectRoot(v.input.kernel.registry, c)) return { roleLabel: "项目协调", layer: 1 };
+  if (role === "hub") return { roleLabel: "领域中枢", layer: 1 };
+  if (role === "sensor") return { roleLabel: "信源巡检", layer: 0 };
+  if (role === "checker") return { roleLabel: "外部盯梢", layer: 2 };
   if (isLeafCell(c)) return { roleLabel: "执行分身", layer: 2 };
   return { roleLabel: "分身", layer: 1 };
 }
@@ -252,7 +247,7 @@ function crumbLabel(v: AgentsView, c: CellRecord): string {
 
 /** The project a cell works for (itself for a project); null for the desk, sources and hubs. */
 function projectIdOf(v: AgentsView, c: CellRecord): string | null {
-  if (v.projects.has(c.id)) return c.id;
+  if (isProjectRoot(v.input.kernel.registry, c)) return c.id;
   const pid = c.spec.meta?.["projectCellId"];
   return typeof pid === "string" && v.projects.has(pid) ? pid : null;
 }
@@ -358,7 +353,7 @@ function stateOf(v: AgentsView, c: CellRecord): { state: AgentVisualState; state
     return { state: "running", stateLabel: "运行中", stateDetail: detail };
   }
   if (act.state === "paused") {
-    const parked = v.projects.get(projectIdOf(v, c) ?? "")?.lifecycle === "someday";
+    const parked = v.cells.get(projectIdOf(v, c) ?? "")?.pauseReason === "parked";
     return { state: "paused", stateLabel: "已暂停", stateDetail: parked ? "放在以后再说里" : null };
   }
   const card = v.cards.get(c.id) ?? (v.projects.has(c.id) ? v.projectCards.get(c.id) : undefined);
@@ -1063,11 +1058,11 @@ function controlsOf(v: AgentsView, c: CellRecord): ButtonDTO[] {
     endpoint: post(path, { action: "cancel" }),
     confirm: "立即停止它和它下面的全部后台工作？正在跑的命令会被中断，文件和分支都留在原处。",
   });
-  const parked = v.projects.get(c.id)?.lifecycle === "someday";
+  const parked = c.pauseReason === "parked";
   // The desk is the root of everything: pausing or stopping it would stop the whole workbench.
   if (isRoot(c)) return c.status === "paused" ? [resume] : [];
   // A source is removed in the sources drawer; here it is only paused and resumed.
-  const isSource = c.preset === "sensor";
+  const isSource = v.input.kernel.context.readStateSync(c.id, gtdKeys.source) !== null;
   if (c.status === "paused") return parked ? [cancel] : isSource ? [resume] : [resume, cancel];
   return isSource ? [pause] : [pause, cancel];
 }

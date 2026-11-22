@@ -7,9 +7,7 @@ export type AgentBackendSetting = "auto" | AgentEngine;
 export const DEFAULT_CLI_BINS: Readonly<Record<CliEngine, string>> = { claude: "claude", codex: "codex", agy: "agy" };
 
 /**
- * Variables never handed to a CLI agent: the kernel's own configuration and secrets (`NG_*`, incl. `NG_SECRET_*` and
- * `NG_OPENAI_API_KEY`), the kernel's API credentials (the CLI uses the owner's own CLI login instead), and the session
- * markers of an agent the kernel itself may be running under (a nested CLI would otherwise think it is a sub-session).
+ * The local CLI receives its own login environment, with workbench settings and parent session markers removed.
  */
 export const CLI_ENV_DROP: readonly (string | RegExp)[] = [
   /^NG_/,

@@ -257,7 +257,7 @@ export function DraftEditor(props: {
   readOnlyNote?: string;
   textareaRef?: RefObject<HTMLTextAreaElement | null>;
   minRows?: number;
-  /** Larger editor (Engage workspace). */
+  /** Full-width editor. */
   roomy?: boolean;
 }) {
   const { draft } = props;

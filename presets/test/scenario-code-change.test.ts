@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { gtdKeys, PAYLOAD, type ProjectRecord } from "@ng/protocol";
+import { gtdKeys } from "../src/shared/keys";
+import {  PAYLOAD, type ProjectRecord} from "@ng/protocol";
 import { startProjectSync } from "../src";
 import { boot, childrenOf, cleanupAll, gitRepo, lastToolResult, projects, requestText, systemOf, tool } from "./helpers";
 
@@ -54,7 +55,8 @@ describe("docs/05 scenario 2 — a small code change, follow-ups in the same dir
 
     const [project] = projects(h);
     expect(h.kernel.getCell(project!)).toMatchObject({ preset: "project", status: "active", spec: { cwd: repo, lifetime: "persistent" } });
-    expect(h.project(project!)).toMatchObject({ title: "表格复制改为 Markdown 源码", lifecycle: "active", cwd: repo, summary: "代码已改好（分支 feat/md-copy），还没提 MR", source: { label: "随手记" } });
+    expect(h.project(project!)).toMatchObject({ title: "表格复制改为 Markdown 源码", lifecycle: "active", summary: "代码已改好（分支 feat/md-copy），还没提 MR", source: { label: "随手记" } });
+    expect(h.kernel.getCell(project!)?.spec.cwd).toBe(repo);
     // The worker is not closed: it rests, with everything it knows about the change.
     expect(h.kernel.getCell(writer1)).toMatchObject({ preset: "worker", status: "active", parentId: project, spec: { cwd: repo, lifetime: "wakeable" } });
     expect(h.kernel.activityOf([writer1]).get(writer1)!.state).toBe("dormant");

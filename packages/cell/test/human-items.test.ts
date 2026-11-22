@@ -142,37 +142,41 @@ it("reopens only worker generations that closed with the project", async () => {
 it("finishes old epoch cleanup without killing a job started after reopening, then sends a second closure notice", async () => {
   const { kernel, dataDir } = await boot({ start: false });
   kernel.spawnCell("desk", { id: "project", preset: "project", cwd: dataDir });
-  let unblock!: () => void;
-  let reached!: () => void;
-  const entered = new Promise<void>((r) => {
-    reached = r;
-  });
-  const gate = new Promise<void>((r) => {
-    unblock = r;
-  });
-  const stop = kernel.workspace.cancelJobsForCell.bind(kernel.workspace);
-  kernel.workspace.cancelJobsForCell = async (id) => {
-    reached();
-    await gate;
-    return stop(id);
+  const priorEpoch = kernel.getCell("project")!.epoch;
+  const priorWorkspace = await kernel.workspace.acquire("project", { cwd: dataDir });
+  const oldJob = await priorWorkspace.startJob({ command: "sleep 30" });
+  let release!: () => void;
+  let enter!: () => void;
+  const entered = new Promise<void>(r => { enter = r; });
+  const hold = new Promise<void>(r => { release = r; });
+  const cancelJobs = kernel.workspace.cancelJobsForCell.bind(kernel.workspace);
+  const order: string[] = [];
+  kernel.workspace.cancelJobsForCell = async id => {
+    enter();
+    await hold;
+    const result = await cancelJobs(id);
+    order.push("old jobs stopped");
+    return result;
   };
   const closing = kernel.closeCell("project", "completed");
   await entered;
-  const opening = kernel.reopenProject("project", "owner");
+  const opening = kernel.reopenProject("project", "owner").then(() => { order.push("project reopened"); });
   try {
-    await Promise.resolve();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(order).toEqual([]);
     expect(kernel.getCell("project")?.status).toBe("closed");
-    unblock();
-    await opening;
-    const port = await kernel.workspace.acquire("project", { cwd: dataDir });
-    const job = await port.startJob({ command: "sleep 15" });
-    unblock();
-    await closing;
-    expect(kernel.workspace.getJobSync(job.jobId)?.state).toBe("running");
+    expect(kernel.workspace.getJobSync(oldJob.jobId)?.state).toBe("running");
   } finally {
-    unblock();
-    kernel.workspace.cancelJobsForCell = stop;
+    release();
+    await Promise.all([closing, opening]);
+    kernel.workspace.cancelJobsForCell = cancelJobs;
   }
+  expect(order).toEqual(["old jobs stopped", "project reopened"]);
+  expect(kernel.getCell("project")!.epoch).toBeGreaterThan(priorEpoch);
+  expect(kernel.workspace.getJobSync(oldJob.jobId)?.state).toBe("cancelled");
+  const reopenedWorkspace = await kernel.workspace.acquire("project", {cwd:dataDir});
+  const newJob = await reopenedWorkspace.startJob({command:"sleep 30"});
+  expect(kernel.workspace.getJobSync(newJob.jobId)?.state).toBe("running");
   await kernel.closeCell("project", "cancelled");
   const ids = kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.cellResult }).map((m) => m.envelope.id);
   expect(new Set(ids).size).toBe(2);

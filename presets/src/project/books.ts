@@ -1,6 +1,6 @@
+import { gtdKeys } from "../shared/keys";
 import {
   CELL_STATUS_KEY,
-  gtdKeys,
   isEnvelopeOfType,
   newId, sha256Hex,
   PAYLOAD,

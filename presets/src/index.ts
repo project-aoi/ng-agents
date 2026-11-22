@@ -1,3 +1,4 @@
+export { gtdKeys } from "./shared/keys";
 import {gtdLifecycle} from "./shared/lifecycle";
 export {gtdLifecycle} from "./shared/lifecycle";
 // @ng/presets — the workbench's cell templates (docs/05): the desk (triage + arbitration), persistent projects that keep

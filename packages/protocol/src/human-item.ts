@@ -24,7 +24,7 @@ export interface HumanItemDraft {
   description?: string;
   prep?: import("./gtd").CardPrep;
   source?: import("./gtd").ItemSource;
-  rawInput?: import("./gtd").ClarifyCard["rawInput"];
+  rawInput?: import("./gtd").DecisionCard["rawInput"];
   relatedProjectIds?: string[];
   options: CardOption[];
   category?: "action" | "decision";

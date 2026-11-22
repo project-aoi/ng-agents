@@ -14,7 +14,7 @@
 //   messages / control / trigger (always 200, the outcome — not_found included — is in the body), and the two
 //   version-protected saves (409 with ArtifactSaveResponse / PlanSaveResponse).
 
-import type { HumanItem, ProjectProposal, ClarifyCard } from "@ng/protocol";
+import type { HumanItem, ProjectProposal } from "@ng/protocol";
 
 export interface HumanItemDTO extends HumanItem {
   resumeTarget: {id:string; title:string} | null;
@@ -312,7 +312,7 @@ export interface ProjectActionDTO {
   dueAt: number | null;
 }
 
-/** A cell working for a project right now (a worker, a watcher): detail of the project's row, never a row itself. */
+/** A cell working for a project right now (a worker, a checker): detail of the project's row, never a row itself. */
 export interface ProjectWorkerDTO {
   cellId: string;
   title: string;
@@ -415,7 +415,7 @@ export interface TopologyNodeDTO {
   /** "总助理" | "项目协调" | "执行分身" | "外部盯梢" | "信源巡检" | "领域中枢" */
   roleLabel: string;
   title: string;
-  /** Column of the three-layer canvas: 0 = sources and the desk, 1 = projects and hubs, 2 = workers and watchers. */
+  /** Column of the three-layer canvas: 0 = sources and the desk, 1 = projects and hubs, 2 = workers and checkers. */
   layer: 0 | 1 | 2;
   state: AgentVisualState;
   /** "运行中" | "等待外部" | "等你拍板" | "已待命 · 发消息即唤醒" | "已暂停" | "已归档" */
@@ -499,7 +499,7 @@ export type TimelineItemDTO =
   | (TimelineItemBase & { kind: "artifact_event"; verb: "created" | "revised"; artifact: ArtifactRefDTO })
   /** A turn ended and the project was told; a project was started / finished; a card was raised. */
   | (TimelineItemBase & { kind: "milestone"; text: string; tone: "ok" | "warn" | "info" })
-  /** Everything else worth a grey line ("系统巡检唤醒", "额度用完，已暂停推进"). */
+  /** Everything else worth a grey line ("系统巡检唤醒"). */
   | (TimelineItemBase & { kind: "system_event"; text: string });
 
 /** What the box under the timeline does for the selected node (proposal part 4 §3.3). */

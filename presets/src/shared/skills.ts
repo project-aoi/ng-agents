@@ -18,11 +18,11 @@ export const SKILL_HABIT_DISCOVERY = "habit-and-routine-discovery";
 const projectRelay: BuiltinSkill = {
   name: SKILL_PROJECT_RELAY,
   description:
-    "For a project cell: how to run a multi-step outcome as a relay of workers — what to put in each hand-off, reading what a worker did when its turn is over, sending the next step to the worker that already knows the work or to a new one, waiting for outside events and for the owner, staged work, and finishing with preferences saved.",
+    "For a project cell: how to run a multi-step outcome as a relay of workers — what to put in each hand-off, reading what a worker did when its turn is over, sending the next step to the worker that already knows the work or to a new one, waiting for outside events and for the owner, staged work, and reporting the owner's reusable preferences to the desk.",
   tags: ["project", "builtin"],
   body: `# Project relay
 
-A project is a relay race: you hold the baton — the goal, the plan, the records, the shared report and your "board" note — and each worker runs a leg. A worker that has run its leg does not leave the track: you are told that its turn is over, and it rests (dormant), remembering everything about its leg, until a message sends it out again. So the next leg goes either to the worker that already knows the ground (send_message) or to a new runner (dispatch). That choice, and the baton, are yours.
+The project keeps the goal, plan, action records, shared report and its local working_note named board. Workers each own a concrete deliverable. After each worker's turn you receive its result. Sending it a follow-up wakes it with its existing context.
 
 ## The hand-off: what a dispatch instruction contains
 A new worker knows only what you write. Use this shape and leave nothing implicit:
@@ -81,14 +81,14 @@ const domainHub: BuiltinSkill = {
   tags: ["hub", "builtin"],
   body: `# Domain hub
 
-## The ledger (state key "hub:topics")
+## Topic records (state key "hub:topics")
 \`\`\`json
 {
   "mr-41": { "about": "Review MR !41 限流阈值", "repo": "gateway", "worker": "cell_…", "state": "reviewing", "thread": "ui:reviews", "updatedAt": "…" },
   "inc-order-5xx": { "about": "order-service 线上 5xx", "repo": "order", "worker": null, "state": "done" }
 }
 \`\`\`
-Pick the key from what identifies the topic outside (MR number, incident id, a short slug). Write the ledger with set_state after every change; read it with read_state at the start of a wake-up if you do not have it.
+Pick the key from what identifies the topic outside (MR number, incident id, a short slug). Write the topic list with set_state after every change; read it with read_state at the start of a wake-up if you do not have it.
 
 ## One batch, start to finish
 Messages in the batch:
@@ -96,13 +96,13 @@ Messages in the batch:
 
 - 1 + 2 are one topic, mr-41, new → spawn_cell preset "worker", cwd = the repository's directory, instruction: "评审 MR !41（<链接>），仓库 <目录>，默认分支 <分支>。张三特别提到：重点看并发。只做查阅，不要改文件、不要切分支。交付：评审意见（阻塞项/建议项），写成 artifact 并报告 id。"
 - 3 is not yours → handback with its id, reason "不是代码评审的事".
-- 4 is mr-38; the ledger says worker cell_abc is on it → send_message to "inbox:cell_abc": "王五说 !38 改好了，请再看一眼（<原话>）".
+- 4 is mr-38; the topic list says worker cell_abc is on it → send_message to "inbox:cell_abc": "王五说 !38 改好了，请再看一眼（<原话>）".
   - "Delivered" → done. A worker still reviewing takes it before its turn ends; one whose review turn is over is resting, and the message wakes it — it re-checks with its first review and everything it learned in mind.
-  - "NOT DELIVERED … closed" → that worker is gone (someone stopped it). spawn_cell a new worker: "继续评审 MR !38：上一轮结论见 artifact <id>（ledger 里记着）；作者王五称已修改，请复核上一轮的阻塞项是否解决。只做查阅，不要改文件、不要切分支。"
-- Update the ledger for mr-41 and mr-38, end the turn.
+  - "NOT DELIVERED … closed" → that worker is gone (someone stopped it). spawn_cell a new worker: "继续评审 MR !38：上一轮结论见 artifact <id>（主题记录里可查）；作者王五称已修改，请复核上一轮的阻塞项是否解决。只做查阅，不要改文件、不要切分支。"
+- Update the topic list for mr-41 and mr-38, end the turn.
 
 ## When a worker's turn is over
-You are told (\`cell.result\`, with its summary). The summary is its own account; before you pass an outcome on, or when the summary leaves doubt, inspect_cell shows what it actually did. Update the topic in the ledger: done — or, for a review with blocking issues, "waiting for the author", with the worker left as it is, resting and ready for the next round.
+You are told (\`cell.result\`, with its summary). The summary is its own account; before you pass an outcome on, or when the summary leaves doubt, inspect_cell shows what it actually did. Update the topic in the topic list: done — or, for a review with blocking issues, "waiting for the author", with the worker left as it is, resting and ready for the next round.
 
 ## Rules of thumb
 - Nothing queues for a repository and nothing locks it: every worker starts the moment you spawn it. Reviewing and investigating only read — say "只做查阅，不要改文件、不要切分支" in the instruction — so they can run beside anyone.
@@ -173,10 +173,10 @@ The same deliverable, produced at least three times, at a regular rhythm, from t
 ## Turning it into something that runs
 1. Write the recipe down as a skill (suggest_skill): when it applies, the data sources with exactly how each is queried, the structure of the deliverable, what the owner always rewrites by hand.
 2. Propose the schedule to the owner — never switch it on silently: present_to_owner or propose_project, e.g. "每周四 17:00（周会前）按以往做法整理周报草稿并推送给你，要开启吗？".
-3. Once agreed: add_source with the cron in the owner's time zone and a description that names the skill; each run produces a draft artifact and a hit, which reaches the owner as a card they can edit before it goes anywhere.
+3. Once agreed: add_source with the cron in the owner's time zone and a description that names the skill; each run produces a draft artifact and a hit, which reaches the owner as a workbench item for the owner to review.
 
 ## Smaller habits
-A correction the owner makes twice ("报告先写结论", "提 MR 后贴录屏") is a preference: save_note kind "preference", scope "global", with when it applies. Check existing preferences first so you refine one instead of adding a near-duplicate.
+Record a lasting rule only when the owner confirms it and explains when it applies. The desk checks for an existing preference and writes the confirmed rule with save_note, kind "preference", scope "global". If you are a project or worker, pass the wording and source to the desk. Keep observations in a cell-scoped working_note or reference until the owner confirms them.
 `,
 };
 

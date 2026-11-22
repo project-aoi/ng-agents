@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { gtdKeys, PAYLOAD, type SourceRecord } from "@ng/protocol";
+import { gtdKeys } from "../src/shared/keys";
+import { PAYLOAD } from "@ng/protocol";
 import { boot, childrenOf, cleanupAll, continuesRun, gitRepo, lastToolResult, MIN, requestText, tool, type Harness } from "./helpers";
 
 afterEach(cleanupAll);
@@ -78,7 +79,6 @@ describe("docs/05 scenario 6 — a hub for direct review requests: batched, rout
       status: "active",
       spec: { lifetime: "persistent", absorbInbound: true, watches: [{ threadOrFilter: { "payload.text": { $contains: "@bot" } }, coalesceMs: 2 * MIN }] },
     });
-    expect(h.source(hub())).toMatchObject({ title: "代码评审直通", kind: "watch", processor: "llm", runCount: 0 } satisfies Partial<SourceRecord>);
     expect(h.notices()).toContain("已添加直通入口：代码评审直通");
     const deskRuns = h.deskRuns();
     const hubRuns = () => h.of("run.started").filter((e) => e.cellId === hub()).length;
@@ -103,7 +103,6 @@ describe("docs/05 scenario 6 — a hub for direct review requests: batched, rout
     expect(h.kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.handback })).toHaveLength(1);
     expect(h.deskRuns()).toBe(deskRuns + 1);
     expect(h.state(hub(), "hub:topics")).toMatchObject({ "mr-41": { state: "reviewing" } });
-    expect(h.source(hub())).toMatchObject({ runCount: 1 });
     const review41 = hubChild("评审 MR !41");
     const review38 = hubChild("评审 MR !38");
     expect(h.kernel.getCell(review41)).toMatchObject({ status: "active", spec: { cwd: repo, lifetime: "wakeable" } });
@@ -126,6 +125,6 @@ describe("docs/05 scenario 6 — a hub for direct review requests: batched, rout
     const results = h.kernel.inbox.listMessagesSync({ cellId: hub(), type: PAYLOAD.cellResult }).map((m) => m.envelope.payload as { childCellId: string; summary: string });
     expect(results.map((r) => r.summary)).toEqual(expect.arrayContaining(["!38 评审完成：2 个阻塞项", "!41：并发与锁粒度均已评审，1 个建议项", "!38 阻塞项已解决"]));
     expect(results.filter((r) => r.childCellId === review38)).toHaveLength(2);
-    expect(h.kernel.context.readStateSync(hub(), gtdKeys.project)).toBeNull(); // a hub is a source, never a project row
+    expect(h.kernel.context.readStateSync(hub(), gtdKeys.project)).toBeNull();
   });
 });

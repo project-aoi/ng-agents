@@ -1,6 +1,7 @@
 // @ng/cell — ⑦ the kernel: wires the six primitives into one runtime (supervision tree, epochs, dispatcher, ingress
 // routing, approval execution, escalations, close cascade). Presets and the app build on `createKernel`.
 
+export { isProjectRoot } from "./core";
 export { createKernel } from "./kernel";
 export type {
   ActorOptions,

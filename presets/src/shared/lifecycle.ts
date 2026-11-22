@@ -1,4 +1,5 @@
-import { gtdKeys, type ActionRecord, type PresetDef, type ProjectRecord } from "@ng/protocol";
+import { gtdKeys } from "./keys";
+import {  type ActionRecord, type PresetDef, type ProjectRecord} from "@ng/protocol";
 
 export const gtdLifecycle: Pick<PresetDef, "onCellClosed" | "onCellReopened"> = {
   onCellClosed(cell, reason, context, clock) {

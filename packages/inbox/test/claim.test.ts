@@ -185,7 +185,7 @@ describe("leases, release and dead letters", () => {
 
 describe("handback", () => {
   it("re-enqueues the off-topic envelope to the desk with the original sender and reason, and marks it handed_back", () => {
-    const t = setup({ cells: [{ id: "desk" }, { id: "proj", parentId: "desk" }, { id: "watcher", parentId: "proj" }] });
+    const t = setup({ cells: [{ id: "desk" }, { id: "proj", parentId: "desk" }, { id: "subscriber", parentId: "proj" }] });
     const original = msg({
       id: "memory-evt-9",
       from: "channel:memory:oc_123",
@@ -193,16 +193,16 @@ describe("handback", () => {
       threads: ["memory:oc_123"],
       payload: { text: "顺便问下，下周团建去哪？" },
     });
-    t.inbox.enqueueSync("watcher", original);
-    t.inbox.enqueueSync("watcher", msg({ id: "on-topic" }));
-    const batch = t.inbox.claimNextRunSync("watcher", "k")!;
+    t.inbox.enqueueSync("subscriber", original);
+    t.inbox.enqueueSync("subscriber", msg({ id: "on-topic" }));
+    const batch = t.inbox.claimNextRunSync("subscriber", "k")!;
     t.takeWakes();
 
     t.inbox.handbackSync(batch.claimId, "memory-evt-9", "unrelated to the quote follow-up");
     expect(t.takeWakes()).toEqual(["desk:enqueued"]);
     const [handed] = t.inbox.listMessagesSync({ cellId: "desk" });
     expect(handed!.envelope).toMatchObject({
-      id: "memory-evt-9#handback#watcher",
+      id: "memory-evt-9#handback#subscriber",
       from: "kernel:handback",
       to: "inbox:desk",
       principalId: "memory:ou_alice",
@@ -210,12 +210,12 @@ describe("handback", () => {
       threads: ["memory:oc_123"],
     });
     const payload = handed!.envelope.payload as HandbackPayload;
-    expect(payload).toMatchObject({ fromCellId: "watcher", reason: "unrelated to the quote follow-up" });
+    expect(payload).toMatchObject({ fromCellId: "subscriber", reason: "unrelated to the quote follow-up" });
     expect(payload.original).toMatchObject({ id: "memory-evt-9", from: "channel:memory:oc_123", principalId: "memory:ou_alice" });
     expect(handed!.status).toBe("pending");
 
     t.inbox.completeSync(batch.claimId);
-    const statuses = Object.fromEntries(t.inbox.listMessagesSync({ cellId: "watcher" }).map((r) => [r.envelope.id, r.status]));
+    const statuses = Object.fromEntries(t.inbox.listMessagesSync({ cellId: "subscriber" }).map((r) => [r.envelope.id, r.status]));
     expect(statuses).toEqual({ "memory-evt-9": "handed_back", "on-topic": "done" });
   });
 

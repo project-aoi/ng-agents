@@ -4,7 +4,6 @@ import {
   makeBounds,
   steerNoteText,
   textMessage,
-  type Address,
   type ToolResultBlock,
 } from "@ng/protocol";
 import { call, createFakeRun, createScriptedLoop, TRUNCATED_CALL_OUTPUT, say, ScriptedModelClient } from "../src/testing";

@@ -1,5 +1,5 @@
 import type { CliAdapter, CliCapabilities, CliDriver, CliEvent, DriverIO, LaunchRequest } from "../types";
-import { asRecord, contentText, HOST_UNSANDBOXED, num, str } from "./util";
+import { asRecord, contentText, HOST_UNSANDBOXED, str } from "./util";
 
 /**
  * Google Antigravity CLI through its Agent Client Protocol server (`agy acp`, JSON-RPC over stdio). Print mode has no

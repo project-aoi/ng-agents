@@ -66,7 +66,7 @@ export const PAYLOAD = {
   waitTimeout: "kernel.wait_timeout",
 } as const;
 
-/** A human (owner or external sender) said something through a Channel, or typed into 随手记. */
+/** An input captured by the workbench, with its author and source. */
 export interface UserMessagePayload {
   text: string;
   replyTo?: ChannelAddr;                // where an answer would go (Gate still decides)

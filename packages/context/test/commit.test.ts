@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createEnvelope, gtdKeys, markdownDeliverable, textDeliverable, withTx } from "@ng/protocol";
+import { createEnvelope, markdownDeliverable, textDeliverable, withTx } from "@ng/protocol";
 import { setup } from "./helpers";
 
 const env = (h: ReturnType<typeof setup>, id: string) =>
@@ -9,21 +9,21 @@ describe("state", () => {
   it("reads, lists by prefix, deletes with null/undefined, and queries across cells", () => {
     const h = setup({ cells: [{ id: "desk" }, { id: "p1", parentId: "desk" }, { id: "p2", parentId: "desk" }] });
     const s = h.store;
-    s.commitSync("p1", { statePatches: { [gtdKeys.action("a")]: { title: "A" }, [gtdKeys.action("b")]: { title: "B" }, "gtd:project": { title: "P1" } } });
-    s.commitSync("p2", { statePatches: { [gtdKeys.action("c")]: { title: "C" }, other: 1 } });
-    expect(s.readStateSync("p1", gtdKeys.action("a"))).toEqual({ title: "A" });
+    s.commitSync("p1", { statePatches: { ["task:a"]: { title: "A" }, ["task:b"]: { title: "B" }, "profile": { title: "P1" } } });
+    s.commitSync("p2", { statePatches: { ["task:c"]: { title: "C" }, other: 1 } });
+    expect(s.readStateSync("p1", "task:a")).toEqual({ title: "A" });
     expect(s.readStateSync("p1", "missing")).toBeNull();
-    expect(s.listStateSync("p1", gtdKeys.actionPrefix).map((e) => e.key)).toEqual(["gtd:action:a", "gtd:action:b"]);
+    expect(s.listStateSync("p1", "task:").map((e) => e.key)).toEqual(["task:a", "task:b"]);
 
-    const all = s.queryStateSync({ keyPrefix: gtdKeys.actionPrefix });
-    expect(all.map((e) => `${e.cellId}/${e.key}`)).toEqual(["p1/gtd:action:a", "p1/gtd:action:b", "p2/gtd:action:c"]);
-    expect(s.queryStateSync({ keyPrefix: "gtd:", cellIds: ["p2"] }).map((e) => e.key)).toEqual(["gtd:action:c"]);
-    expect(s.queryStateSync({ keyPrefix: "gtd:", cellIds: [] })).toEqual([]);
+    const all = s.queryStateSync({ keyPrefix: "task:" });
+    expect(all.map((e) => `${e.cellId}/${e.key}`)).toEqual(["p1/task:a", "p1/task:b", "p2/task:c"]);
+    expect(s.queryStateSync({ keyPrefix: "task:", cellIds: ["p2"] }).map((e) => e.key)).toEqual(["task:c"]);
+    expect(s.queryStateSync({ keyPrefix: "task:", cellIds: [] })).toEqual([]);
 
-    s.commitSync("p1", { statePatches: { [gtdKeys.action("a")]: null, [gtdKeys.action("b")]: undefined } });
-    expect(s.listStateSync("p1", gtdKeys.actionPrefix)).toEqual([]);
+    s.commitSync("p1", { statePatches: { ["task:a"]: null, ["task:b"]: undefined } });
+    expect(s.listStateSync("p1", "task:")).toEqual([]);
     const changed = h.events.filter((e) => e.topic === "state.changed").map((e) => e.data);
-    expect(changed.at(-1)).toEqual({ cellId: "p1", keys: ["gtd:action:a", "gtd:action:b"] });
+    expect(changed.at(-1)).toEqual({ cellId: "p1", keys: ["task:a", "task:b"] });
   });
 
   it("async twins delegate to the sync core", async () => {

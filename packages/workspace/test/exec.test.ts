@@ -4,7 +4,7 @@ import { isNgError } from "@ng/protocol";
 import { cleanupAll, harness, initRepo } from "./helpers";
 
 afterEach(() => {
-  delete process.env.NG_SECRET_TEST_TOKEN;
+  delete process.env.NG_DESK_TOKEN;
   cleanupAll();
 });
 
@@ -20,13 +20,13 @@ describe("bash", () => {
   });
 
   it("isolation none is the owner's own environment (real HOME, PATH, git identity) minus the kernel's NG_* configuration and secrets", async () => {
-    process.env.NG_SECRET_TEST_TOKEN = "s3cr3t-value-123";
+    process.env.NG_DESK_TOKEN = "s3cr3t-value-123";
     process.env.NGWS_TEST_OWNER_VAR = "owner-setting";
     const h = harness();
     const port = await h.mgr.acquire("w1");
     const r = await port.exec("bash", { command: "env" });
     expect(r.output).not.toContain("s3cr3t-value-123");
-    expect(r.output).not.toContain("NG_SECRET_TEST_TOKEN");
+    expect(r.output).not.toContain("NG_DESK_TOKEN");
     const vars = Object.fromEntries(
       r.output
         .trim()

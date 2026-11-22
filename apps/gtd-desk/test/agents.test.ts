@@ -4,9 +4,9 @@
 import { execFileSync } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
 import { forgetWorkTreeKeys, type CellSpecInput } from "@ng/cell";
+import { gtdKeys } from "@ng/presets";
 import {
   createBus,
-  gtdKeys,
   KERNEL_FROM,
   PAYLOAD,
   pullCursorKey,
@@ -33,7 +33,7 @@ import type {
   TopologyNodeDTO,
 } from "../src/shared/api";
 import type { AgentToolResult } from "../src/agent/routes";
-import { AGENT_TOOLS } from "../src/agent/guide";
+
 import { createEventHub } from "../src/server/events";
 import { projectReview } from "../src/server/projections/review";
 import { DEFAULT_SETTINGS, inputOf } from "../src/server/projections/common";
@@ -65,7 +65,7 @@ function gitRepo(): string {
 
 /** A coordinating cell holding a project record (scripted as role "project"; it may inspect_cell its workers). */
 function project(d: TestDesk, id: string, title: string, extra: Partial<CellSpecInput> = {}): void {
-  d.kernel.spawnCell("desk", { id, preset: "inline", title, ...extra, meta: { role: "project", projectCellId: id } });
+  d.kernel.spawnCell("desk", { id, preset: "project", title, ...extra, meta: { role: "project", projectCellId: id } });
   writeProject(d.kernel, id, { title, ...(extra.cwd ? { cwd: extra.cwd } : {}) });
 }
 

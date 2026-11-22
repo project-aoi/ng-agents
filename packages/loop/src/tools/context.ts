@@ -373,7 +373,7 @@ const saveNote = defineTool({
     roles: z
       .array(z.string().min(1))
       .optional()
-      .describe('preference only: only cells of these roles see it — "worker", "project", "checker", "desk", "hub", "sensor" (a cell matches by its role or its preset name)'),
+      .describe('preference only: visible to cells matching one of these roles or registered preset names'),
   }),
   async handler(args, ctx) {
     const kind = args.kind ?? "working_note";

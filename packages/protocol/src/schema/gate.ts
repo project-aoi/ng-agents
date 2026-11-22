@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS human_items (
   action_type    TEXT NOT NULL,
   action         TEXT NOT NULL,                -- JSON ProposedAction
   action_hash    TEXT NOT NULL,                -- hashAction(action)
-  card           TEXT NOT NULL,                -- JSON Deliverable (format "card", data: ClarifyCard)
+  card           TEXT NOT NULL,                -- JSON Deliverable (format "card", data: DecisionCard)
   artifact_id    TEXT,                         -- draft bound to this approval (artifacts.artifact_id, owned by @ng/context)
   bound_version  INTEGER,
   proposed_version INTEGER,                    -- version the agent proposed; human-written versions after it = human_edited

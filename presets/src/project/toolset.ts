@@ -1,10 +1,10 @@
 import { z } from "zod";
 import { normalizeCwd } from "@ng/cell";
+import { gtdKeys } from "../shared/keys";
 import {
   CELL_STATUS_KEY,
   cellIdOf,
   defineTool,
-  gtdKeys,
   isNgError,
   newId,
   type ActionRecord,
@@ -114,7 +114,7 @@ export function projectToolset(): Toolset {
       phase: z.number().int().min(1).optional().describe("phase of a staged project"),
       modelTier: z.enum(["fast", "strong"]).optional(),
       check: checkInput.optional(),
-      watches: z.array(watchInput).optional().describe("checker: messages to route to it (e.g. the MR's thread); each one makes it look at once"),
+      watches: z.array(watchInput).optional().describe("checker: optional workbench message filters that wake it to check the current condition"),
       schedules: z
         .array(scheduleInput)
         .optional()
@@ -275,12 +275,12 @@ export function projectToolset(): Toolset {
     description: [
       "Record the project's end on the owner's board and close (or park) the project cell in one step.",
       '"completed": done and accepted. "someday": parked with everything kept, to be brought back later. "cancelled": stopped; what is still running under the project is stopped with it.',
-      "Nothing is checked for you: whether the owner has accepted, whether every piece of accepted work has reported, and whether a habit the owner taught you should be saved first are yours to judge (the result lists the actions that were still open). Child cells still open are named instead of closed, unless closeChildren is true.",
+      "Check owner acceptance and results for every promised step. Active children and jobs can block settlement. Use closeChildren only when the owner intends to stop outstanding work. The result lists open actions.",
     ].join(" "),
     input: z.object({
       outcome: z.enum(["completed", "cancelled", "someday"]),
       summary: z.string().min(1).describe("what was delivered and where it is (artifact, MR link), or why it stops — plain Chinese"),
-      retro: z.string().optional().describe("the reusable habits of the owner you saved as preferences during this project, by name — kept on the record"),
+      retro: z.string().optional().describe("names of confirmed owner preferences you reported to the desk for reuse"),
       closeChildren: z.boolean().optional().describe("true: also stop child cells that are still open (always the case for cancelled)"),
     }),
     async run(args, ctx) {
@@ -313,7 +313,7 @@ export function projectToolset(): Toolset {
 
   return {
     name: TOOLSETS.project,
-    description: "A project's own books: dispatch work, track who has the ball, wait for a reply, keep the record current, finish.",
+    description: "Dispatch workers or checkers, record the next action and its owner, update the project, and settle it.",
     tools: [dispatch, trackAction, updateProject, finishProject],
   };
 }

@@ -36,7 +36,7 @@ const LEAD: Readonly<Record<string, string>> = {
   "cell.direct_chat":
     "The owner said this directly to one of your cells (named below), not to you. It is already with that cell — do not forward it. Take it into your own picture of the work: the plan, your notes, what you tell the next cell.",
   "kernel.stalled_check":
-    "Nothing is moving this project forward any more. Look at where it stands and do exactly one of these now: start the next step; record what it waits for (a card or an action for the owner, a watcher for an outside event, a wait on a cell that will answer); park it (pause_self); or finish it (complete_self). You get this notice once per stall — if you end this run without doing one of them, the project just stays stalled.",
+    "Nothing is moving this project forward any more. Look at where it stands and do exactly one of these now: start the next step; record what it waits for (a card or an action for the owner, a subscription or timer for an outside event, a wait on a cell that will answer); park it (pause_self); or finish it (complete_self). You get this notice once per stall — if you end this run without doing one of them, the project just stays stalled.",
   "kernel.continue":
     "Your previous run stopped at its step limit before the work was finished. Continue from where you stopped — do not start over, and do not repeat what is already done.",
   "kernel.wait_timeout":

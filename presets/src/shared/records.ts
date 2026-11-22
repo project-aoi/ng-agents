@@ -1,11 +1,11 @@
+import { gtdKeys } from "./keys";
 import {
   CELL_STATUS_KEY,
-  gtdKeys,
   isEnvelopeOfType,
   type ActionRecord,
   type ActivityRecord,
   type CellStatusLine,
-  type ClarifyCard,
+  type DecisionCard,
   type Envelope,
   type Progress,
   type ProjectRecord,
@@ -15,7 +15,7 @@ import {
 // GTD record helpers. Records are plain Context state (gtd.ts); everything here writes through the running cell's
 // own ports, so a record always lives in the cell that owns it.
 
-export type RawInput = ClarifyCard["rawInput"];
+export type RawInput = DecisionCard["rawInput"];
 
 /** Envelope types that are "an item" (something that came in and may deserve a card). */
 const ITEM_TYPES = new Set(["user.message", "source.hit", "handback"]);

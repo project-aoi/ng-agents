@@ -35,7 +35,7 @@ export interface ContextStore {
 
   // ---------- [ext] additional reads (also exposed to Loops through CellPorts.context) ----------
   listState(cellId: string, keyPrefix: string): Promise<StateEntry[]>;
-  /** Cross-cell read for UI projections, e.g. every `gtd:action:` key in the system. */
+  /** Cross-cell read for UI projections. */
   queryState(q: StateQuery): Promise<StateEntry[]>;
   getArtifact(artifactId: string): Promise<VersionedArtifact | null>;
   getArtifactVersion(artifactId: string, version: number): Promise<ArtifactVersionRecord | null>;
@@ -337,13 +337,13 @@ export type KnowledgeKind = "skill" | "working_note" | "reference" | "preference
 export type KnowledgeScope = "global" | "cell";
 
 /**
- * [ext] BUG-007 — which cells a preference is shown to (in their frozen system prefix). Both filters must hold when
- * both are set; with neither, the preference applies to every cell (the default, and every row written before this).
+ * Controls which cells see a preference in their frozen system prefix. A cell must match all supplied filters.
+ * A preference without filters applies to every cell.
  * - `cwdPrefix`: an absolute directory (`~/…` expands to the owner's home); matches cells whose `spec.cwd` is that
  *   directory or below it, compared on path-segment boundaries (`/a/b` covers `/a/b/c`, not `/a/bc`). A cell without
  *   `spec.cwd` never matches. Stored normalized (expanded, resolved, no trailing slash).
- * - `roles`: matches a cell whose `spec.meta.role` or preset name is one of them (e.g. "worker", "project", "checker",
- *   "desk", "hub", "sensor", "checker", "inline"); stored trimmed and lowercased, an empty list is no limit.
+ * - `roles`: matches the cell's `spec.meta.role` or preset name. Entries are trimmed and lowercased.
+ *   An empty list permits every role.
  */
 export interface KnowledgeApplies {
   cwdPrefix?: string;
