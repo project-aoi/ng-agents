@@ -1,3 +1,4 @@
+import {gtdLifecycle,humanActionDomain} from "../../../presets/src";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -123,37 +124,37 @@ export const TOOLSETS = STANDARD_TOOLSETS;
  */
 export function registerTestPresets(registry: Registry): void {
   const all = [TOOLSETS.context, TOOLSETS.comms, TOOLSETS.schedule, TOOLSETS.cells, TOOLSETS.workspace];
-  registry.presets.register({
-    name: "inline",
+  registry.presets.register({...gtdLifecycle,
+    name: "inline", stateDomain:humanActionDomain,
     description: "test desk",
     defaults: { processor: { kind: "llm", toolsets: all }, lifetime: "persistent", meta: { role: "desk" } },
   });
-  registry.presets.register({
+  registry.presets.register({...gtdLifecycle,
     name: "project",
     description: "test project coordinator",
-    defaults: { processor: { kind: "llm", toolsets: all }, lifetime: "persistent", meta: { role: "project" } },
+    defaults: { stallPolicy:"monitor",processor: { kind: "llm", toolsets: all }, lifetime: "persistent", meta: { role: "project" } },
   });
-  registry.presets.register({
+  registry.presets.register({...gtdLifecycle,
     name: "hub",
     description: "test domain hub",
     defaults: { processor: { kind: "llm", toolsets: all }, lifetime: "persistent", absorbInbound: true, meta: { role: "hub" } },
   });
-  registry.presets.register({
+  registry.presets.register({...gtdLifecycle,
     name: "worker",
     description: "test worker",
     defaults: {
       processor: { kind: "llm", toolsets: [TOOLSETS.workspace, TOOLSETS.context, TOOLSETS.comms, TOOLSETS.cells] },
-      lifetime: "wakeable",
+      ccParent:true,lifetime: "wakeable",
       meta: { role: "worker" },
     },
     requestBounds: () => ({ maxDepth: 0 }),
   });
-  registry.presets.register({
+  registry.presets.register({...gtdLifecycle,
     name: "watcher",
     description: "test watcher",
     defaults: {
       processor: { kind: "llm", modelTier: "fast", toolsets: [TOOLSETS.context, TOOLSETS.comms, TOOLSETS.schedule] },
-      lifetime: "one_shot",
+      ccParent:true,lifetime: "one_shot",
       meta: { role: "watcher" },
     },
     requestBounds: () => ({ maxDepth: 0 }),

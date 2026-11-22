@@ -6,7 +6,10 @@ const TOOL_TEXT_CAP = 4_000;
 export const FORK_NOTE_PREFIX = "[fork] Everything above is the context of cell";
 
 function clip(text: string, max: number): string {
-  return text.length > max ? `${text.slice(0, max)}…[${text.length - max} more chars]` : text;
+  if (text.length <= max) return text;
+  const head = text.slice(0,2000), tail = text.slice(-1500);
+  const refs = [...new Set(text.match(/res:\/\/[^\s\]>)"'\x60]+/g) ?? [])].filter(uri=>!head.includes(uri) && !tail.includes(uri));
+  return [head, `…[${text.length-head.length-tail.length} more chars]`, ...refs, tail].join("\n");
 }
 
 /** A provider-neutral message list as a plain transcript, for priming a fresh CLI session with the cell's history. */

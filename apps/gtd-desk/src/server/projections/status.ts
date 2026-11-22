@@ -81,7 +81,7 @@ export function projectStatus(input: ProjectionInput): StatusDTO {
   }
   const radar = radarProjects(input);
   const nextReviewAt = nextWeekly(now, settings.weeklyReview.weekday, settings.weeklyReview.hour);
-  const focus = { on: stats.focus, buffered: stats.bufferedNotifications };
+  const focus = { ...kernel.hub.focusInfoSync(), on: stats.focus, buffered: stats.bufferedNotifications };
 
   const clarifyLine: string[] = [];
   if (today.archivedNotifications > 0) clarifyLine.push(`后台已静默归档 ${today.archivedNotifications} 条通知`);
@@ -93,6 +93,7 @@ export function projectStatus(input: ProjectionInput): StatusDTO {
   radarLine.push(`下次周回顾 ${whenText(nextReviewAt, now)}`);
 
   return {
+    humanPending:kernel.humanItems.list().length,
     generatedAt: now,
     demo: settings.demo,
     backend: settings.backend,

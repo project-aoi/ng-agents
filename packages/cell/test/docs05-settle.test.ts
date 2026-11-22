@@ -40,6 +40,16 @@ function gate(): { wait: Promise<void>; open(): void } {
 }
 
 describe("leaf settlement", () => {
+  it("delivers a one-shot probe's explicit result even when it arranged a wakeup earlier in this run", async () => {
+    const h = await boot();
+    probe(h, "probe");
+    h.script.add("probe", tool("set_reminder", { label: "check later", inSeconds: 3600 }), tool("report_to_parent", { kind: "result", text: "all clear" }));
+    await h.kernel.idle();
+    expect(h.of("run.finished").filter(e => e.cellId === "probe")).toMatchObject([{ outcome: "yielded_waiting" }]);
+    expect(results(h)).toMatchObject([{ childCellId: "probe", summary: "all clear" }]);
+    expect(h.kernel.getCell("probe")?.status).toBe("closed");
+  });
+
   it("two sibling workers report: one notice each under its own turn's id, both stay, nothing synthetic", async () => {
     const h = await boot();
     worker(h, "w1");
@@ -161,7 +171,7 @@ describe("leaf settlement", () => {
   it("a one-shot cell with a child still at work is not closed by its own report; it closes once the child's turn is over", async () => {
     const h = await boot();
     // a one-shot worker given spawn depth
-    worker(h, "w1", "do it", { lifetime: "one_shot", bounds: { maxDepth: 1 } });
+    worker(h, "w1", "do it", {preset:"inline", lifetime: "one_shot", bounds: { maxDepth: 1 } });
     const g = gate();
     h.script.add("w1", tool("spawn_cell", { preset: "worker", title: "helper", instruction: "help", meta: { role: "helper" } }));
     h.script.add("w1", tool("report_to_parent", { kind: "result", text: "premature" }));
@@ -206,7 +216,10 @@ describe("step limit and refusal are never 'completed'", () => {
     expect(isKernelEscalation(card!.action) && card!.action.args).toMatchObject({ reason: "retry_limit", cellId: "w1", stepLimit: true });
     expect(asClarifyCard(card!.card.data)).toMatchObject({ cardType: "escalation" });
 
-    expect(await h.kernel.resolveApproval(card!.actionId, { decision: "continue" })).toMatchObject({ status: "continued" });
+    const item = h.kernel.humanItems.get(card!.actionId)!;
+    expect(item.subjectKey).toBe("kernel:w1:step_limit");
+    expect(item.options[0]?.effect).toBe("execute");
+    expect(await h.kernel.humanItems.decide(item.id, {optionId:item.options[0]!.id, seenItemRevision:item.itemRevision}, "owner")).toMatchObject({status:"continued"});
     await h.kernel.idle();
     // The owner's go-ahead is itself continuation #1, so one more follows before the next card.
     expect(outcomes().slice(3)).toEqual(["step_limit", "step_limit"]);
@@ -362,7 +375,7 @@ describe("complete_self / pause_self (persistent cells)", () => {
     h.script.add("w1", tool("request_approval", { kind: "escalation", title: "需要你确认", summary: "blocked", escalation: { reason: "blocked", explanation: "目录里有未提交改动" } }));
     await h.kernel.idle();
     const [card] = h.kernel.gate.listPendingSync();
-    expect(await h.kernel.resolveApproval(card!.actionId, { decision: "snooze", until: h.clock.now() + 60_000 })).toMatchObject({ status: "snoozed" });
+    expect(await h.kernel.resolveApproval(card!.actionId, { decision: "snooze", approverId: "owner", until: h.clock.now() + 60_000 })).toMatchObject({ status: "snoozed" });
     h.clock.advance(60_000);
     await h.kernel.idle();
     // The card is back; the probe still waits behind it, unreported.

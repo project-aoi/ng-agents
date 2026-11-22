@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { normalizeCwd } from "@ng/cell";
 import {
   CELL_STATUS_KEY,
   cellIdOf,
@@ -21,7 +22,6 @@ import {
 } from "@ng/protocol";
 import { TOOLSETS, type PresetsConfig } from "../shared/config";
 import { errorText, isCwdError, parseIso, scheduleInput, toSchedule, toWatch, watchInput } from "../shared/inputs";
-import { notifyOwner } from "../shared/notify";
 import { PROBE, probeProcessor } from "../shared/probe";
 import { CHECKER_PROCESSOR, WORKER_PROCESSOR } from "../shared/processors";
 import { clip, newAction, newProject, patchAction, patchProject, statusLine } from "../shared/records";
@@ -102,7 +102,7 @@ export function projectToolset(cfg: PresetsConfig): Toolset {
     name: "dispatch",
     description: [
       "Hand one piece of work to a new child and put it on the books in the same step.",
-      'preset "worker" (default): reads or changes code, runs tests, researches. You are woken when its turn is over; it then rests and a send_message to it continues it with everything it knows. preset "watcher": a light checker of one outside condition (an MR merged, CI green, a path exists); it looks now, keeps checking, reports when the condition holds and is then closed — with check, a command does the checking and no model runs until it reports.',
+      'preset "worker" (default): reads or changes code, runs tests, researches. You are woken when its turn is over; it then rests and a send_message to it continues it with everything it knows. preset "checker": a light checker of one outside condition (an MR merged, CI green, a path exists); it looks now, keeps checking, reports when the condition holds and is then closed — with check, a command does the checking and no model runs until it reports.',
       "The child sees nothing of your conversation: the instruction carries everything. It starts at once — nothing queues or locks a directory, so if someone is already changing that repository (the note \"active workspaces\"), say in the instruction how to share it. The action it carries is closed for you when its turn ends well.",
     ].join(" "),
     input: z.object({
@@ -111,7 +111,7 @@ export function projectToolset(cfg: PresetsConfig): Toolset {
         .string()
         .min(1)
         .describe("the goal; the directory; what the previous step left (branch, commits, uncommitted changes); material (paths, links, artifact id and version); the owner's preferences; how to verify; what to report"),
-      preset: z.enum(["worker", "watcher"]).optional().describe('default "worker" ("watcher" when check is given)'),
+      preset: z.enum(["worker", "checker","watcher"]).optional().describe('default "worker" ("checker" when check is given)'),
       cwd: z.string().optional().describe("absolute path of the directory it works in. Default: the project's (for a second writer in the same repository, give the path of a git worktree, or tell it in the instruction to create one)"),
       actionId: z.string().optional().describe("an action already on the books that this carries out (e.g. a planned step); default: a new action"),
       phase: z.number().int().min(1).optional().describe("phase of a staged project"),
@@ -127,12 +127,12 @@ export function projectToolset(cfg: PresetsConfig): Toolset {
     }),
     async run(args, ctx) {
       const check = args.check;
-      const preset = args.preset ?? (check ? "watcher" : "worker");
+      const preset = args.preset==="watcher" ? "checker" : args.preset ?? (check ? "checker" : "worker");
       // One timer source per watcher (BUG-005): a check keeps its own, a model watcher either gets a fixed cron
       // rhythm (and is told so) or sets its own reminders; an idle schedule would not repeat for it.
-      if (check && preset !== "watcher") return { output: 'Not started: check is for a watcher — give preset "watcher" (or leave preset out).', isError: true };
+      if (check && preset !== "checker") return { output: 'Not started: check is for a watcher — give preset "checker" (or leave preset out).', isError: true };
       if (check && args.schedules?.length) return { output: "Not started: a watcher with check keeps its own timer (check.everySec); leave schedules out.", isError: true };
-      if (preset === "watcher" && args.schedules?.some((r) => r.idleSec !== undefined)) {
+      if (preset === "checker" && args.schedules?.some((r) => r.idleSec !== undefined)) {
         return {
           output:
             'Not started: idleSec does not repeat for a watcher — it fires once after the watcher has gone quiet. For a fixed rhythm use cron (e.g. "*/10 * * * *"), give a check command, or leave schedules out and let the watcher set its own reminders.',
@@ -142,7 +142,7 @@ export function projectToolset(cfg: PresetsConfig): Toolset {
       const project = await readProject(ctx.ports);
       const actions = await readActions(ctx.ports);
       const existing = args.actionId !== undefined ? actions.find((a) => a.id === args.actionId) : undefined;
-      const base: ProcessorSpec = preset === "watcher" ? CHECKER_PROCESSOR : WORKER_PROCESSOR;
+      const base: ProcessorSpec = preset === "checker" ? CHECKER_PROCESSOR : WORKER_PROCESSOR;
       const actionId = existing?.id ?? newId("act", ctx.clock);
       const now = ctx.clock.now();
       const everySec = check?.everySec ?? PROBE.everySec;
@@ -167,14 +167,14 @@ export function projectToolset(cfg: PresetsConfig): Toolset {
       try {
         if (args.watches?.length) spec.watches = args.watches.map((w) => toWatch(w));
         if (args.schedules?.length) spec.schedules = args.schedules.map(toSchedule);
-        const note = preset === "watcher" && !check && spec.schedules ? scheduleNote(spec.schedules) : "";
+        const note = preset === "checker" && !check && spec.schedules ? scheduleNote(spec.schedules) : "";
         if (note) instruction = `${instruction}\n\n${note}`;
         addr = await ctx.ports.spawnCell(spec, instruction);
       } catch (err) {
         return spawnRefusal(err);
       }
       const childId = cellIdOf(addr);
-      const owner: BallOwner = preset === "watcher" ? "waiting" : "agent";
+      const owner: BallOwner = preset === "checker" ? "waiting" : "agent";
       const action = existing
         ? patchAction(existing, { title: args.title, owner, cellId: childId, nextStep: null, ...(existing.status !== "open" ? { status: "open" as const, completedAt: null } : {}), ...(args.phase ? { phase: args.phase } : {}), ...(owner === "waiting" ? { waiting: waitingFor(args.title) } : {}) }, now)
         : newAction(
@@ -217,7 +217,7 @@ export function projectToolset(cfg: PresetsConfig): Toolset {
       const now = ctx.clock.now();
       const due = args.dueAt !== undefined ? parseIso(args.dueAt, "dueAt") : undefined;
       if (typeof due === "string") return { output: due, isError: true };
-      if (args.cellId !== undefined && !ctx.snapshot.tail.roster.some((c) => c.cellId === args.cellId && c.parentId === self(ctx))) {
+      if (args.cellId !== undefined && !ctx.ports.isDirectChild(args.cellId)) {
         return { output: `${args.cellId} is not one of your cells (see the list at the end of your wake-up message).`, isError: true };
       }
       const fields = {
@@ -336,18 +336,19 @@ export function projectToolset(cfg: PresetsConfig): Toolset {
       cwd: z.string().optional().describe("absolute path where the project's work happens now"),
     }),
     async run(args, ctx) {
-      if (args.cwd !== undefined && !args.cwd.startsWith("/")) return { output: "cwd must be an absolute path; ask the owner if you do not know it.", isError: true };
+      const cwd = args.cwd !== undefined ? normalizeCwd(args.cwd) : undefined;
       const now = ctx.clock.now();
       const patch: Partial<ProjectRecord> = {
         ...(args.summary ? { summary: args.summary } : {}),
         ...(args.outcome ? { outcome: args.outcome } : {}),
         ...(args.title ? { title: args.title } : {}),
-        ...(args.cwd ? { cwd: args.cwd } : {}),
+        ...(cwd ? { cwd } : {}),
       };
       if (Object.keys(patch).length === 0) return { output: "Nothing to update.", isError: true };
+      if (args.title || args.cwd) await ctx.ports.updateCell(self(ctx),{...(args.title ? {title:args.title} : {}),...(cwd ? {cwd} : {})});
       const next = patchProject(await projectOf(ctx), patch, now);
       await save(ctx, { [gtdKeys.project]: next, ...(args.summary ? { [CELL_STATUS_KEY]: statusLine(clip(args.summary, 200), now) } : {}) });
-      if (args.title) await ctx.ports.updateCell(self(ctx), { title: args.title });
+
       return `Project record updated${args.summary ? "; the owner's board shows the new summary" : ""}.`;
     },
   });
@@ -371,12 +372,6 @@ export function projectToolset(cfg: PresetsConfig): Toolset {
       const project = await projectOf(ctx);
       const open = (await readActions(ports)).filter((a) => a.status === "open");
       const force = args.outcome === "cancelled" || args.closeChildren === true;
-      try {
-        await ports.settleSelf?.({ action: args.outcome === "completed" ? "complete" : args.outcome === "cancelled" ? "cancel" : "pause", summary: args.summary, ...(force ? { force: true } : {}) });
-      } catch (err) {
-        if (isNgError(err, "conflict")) return { output: `Nothing was recorded or closed: ${errorText(err)} Call again with closeChildren: true if stopping them is what you mean.`, isError: true };
-        throw err;
-      }
       const patches: Record<string, unknown> = {};
       // The books follow what happened: a cancelled project's open actions are cancelled with it. For the other
       // outcomes they are left as the project left them and only reported back.
@@ -386,14 +381,14 @@ export function projectToolset(cfg: PresetsConfig): Toolset {
       patches[gtdKeys.project] = record;
       const label = args.outcome === "completed" ? "已完成" : args.outcome === "cancelled" ? "已停止" : "已放进以后再说";
       patches[CELL_STATUS_KEY] = statusLine(`${label}：${clip(args.summary.split("\n")[0]!, 150)}`, now);
-      await save(ctx, patches);
-      if (args.outcome === "completed") await notifyOwner(ports, cfg.ownerAddress, `「${project.title}」已完成：${clip(args.summary.split("\n")[0]!, 120)}`, `finished:${self(ctx)}`);
-      const what =
-        args.outcome === "completed"
-          ? "Recorded as completed and the owner's board shows it; the project closes when this turn ends"
-          : args.outcome === "cancelled"
-            ? "Recorded as cancelled; everything still running was stopped and the project closes when this turn ends"
-            : "Recorded as someday; the project is parked with everything kept when this turn ends and wakes when the owner brings it back";
+      try {
+        if (!ports.settleSelf) return { output: "Project settlement is unavailable.", isError: true };
+        await ports.settleSelf({ action: args.outcome === "completed" ? "complete" : args.outcome === "cancelled" ? "cancel" : "pause", summary: args.summary, ...(args.outcome==="someday" ? {pauseReason:"parked" as const} : {}), statePatches: patches, ...(force ? { force: true } : {}) });
+      } catch (err) {
+        if (isNgError(err, "conflict")) return { output: `Nothing was recorded or closed: ${errorText(err)} Call again with closeChildren: true if stopping them is what you mean.`, isError: true };
+        throw err;
+      }
+      const what = "Requested project settlement after this run drains";
       const left = args.outcome !== "cancelled" && open.length > 0 ? ` Note: these actions were still open on the books — ${open.map(describe).join("; ")}.` : "";
       return { output: `${what}; stop here.${left}`, endRun: "completed" };
     },

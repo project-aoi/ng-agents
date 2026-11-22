@@ -25,11 +25,11 @@
 | **`Envelope`** | 通信契约 | 统一异步消息信封（幂等 `id`、验签身份 `principalId`、目标纪元 `expectedEpoch`、唤醒/静默投递模式） | 不夹带可变内存引用，跨进程/跨重启完全可序列化重放 |
 | **① `Channel`** | 数据面原语 | 外部协议（IM / Webhook / UI）验签入站、渠道能力如实声明、幂等外发与专注期免打扰缓冲（`buffered_dnd`） | 只管对人/对外部系统的进出通道；**跨 `Cell` 内部协作直走同库 `Inbox`，绝不绕外部 `Channel`** |
 | **② `Inbox`** | 数据面原语 | SQLite WAL 队列、原生 `deliverAt / cron / idleSec` 定时唤醒、按订阅窗口攒批（`coalesceMs`）、单 `Cell` 串行租约锁、跑题退回（`handback`）与实时控制旁路（`cancel / pause / resume / steer`） | 不解析业务语义，只保证投递不丢、认领不重、控制指令绕开普通排队锁秒级生效 |
-| **③ `Context`** | 数据面原语 | 物理分三层：① 业务状态（`cell_state`）与带 `expectedVersion` 乐观锁的交付物 `Artifact`（支持创建与局部 `patch`）；② 只追加 `evidence`（含溢出 `resources`、冻结前缀 `hydrate` 与全域 `FTS5` 检索）；③ `SKILL.md` 与带作用域的长期偏好。协调器自记的笔记（`save_note` 的 `kind: "note"`、`scope: "cell"`）随每次唤醒挂入动态尾部 | 不允许上下文压缩误删结构化状态或 `Artifact`；已内联进系统提示词的技能不再重复挂入待读索引；笔记、花名册、活跃目录只进动态尾部，绝不进冻结前缀 |
+| **③ `Context`** | 数据面原语 | 物理分三层：① 业务状态（`cell_state`）与带 `expectedVersion` 乐观锁的交付物 `Artifact`（支持创建与局部 `patch`）；② 只追加 `evidence`（含溢出 `resources`、冻结前缀 `hydrate` 与全域 `FTS5` 检索）；③ `SKILL.md` 与带作用域的长期偏好。协调器自记的笔记（`save_note` 的 `kind: "working_note"`、`scope: "cell"`）随每次唤醒挂入动态尾部 | 不允许上下文压缩误删结构化状态或 `Artifact`；已内联进系统提示词的技能不再重复挂入待读索引；笔记、花名册、活跃目录只进动态尾部，绝不进冻结前缀 |
 | **④ `Loop`** | 数据面原语 | 单次有界执行（`Run`）：统一支持 **`llm` 大模型推理**（API 或持久化复用会话的本地 CLI Agent，严格区分 `strong / fast` 档位）与 **`code` 零 Token 确定性处理器**；四套引擎（`api / claude / codex / agy`）把入站消息、助手文本、工具调用与结果以同一形状镜像进 `evidence`；步数触顶与模型拒答显式返回 `step_limit / refused` | 平时休眠零开销（Sleep-by-Default）；绝不将步数截断或拒答伪装成正常 `completed` |
 | **⑤ `Workspace`** | 数据面原语 | 执行目录句柄（`cwd` 沿监督树继承，`git rev-parse --show-toplevel` 解析所属工作树）与跨轮次存活的异步长进程句柄（`startJob` + `cancelling` 退净确认） | 不暗建假仓库、不篡改宿主 `$HOME`、关闭 `Cell` 时只回收运行态进程/容器，绝不删宿主机目录；**不为目录排队或加锁** |
 | **⑥ `Gate`** | 数据面原语 | 单调权限收紧（`child ⊆ parent`）、密钥白名单代理、绑定 `epoch` 与草稿 `version` 的挂起审批卡（`defer`）、监督树增量 + 缓存加权双账本预算护栏（规则见 `P-SAFE-7`） | 普通内部协作免打扰放行；对外向他人发消息与超预算续费强制锁死人类 `owner` |
-| **⑦ `Cell`** | 控制面容器 | 将 6 个原语拼装为带单调递增 `epoch` 与 `parentId` 监督树的运行单元：承载 6 套角色预设（`inline / project / worker / watcher / sensor / hub`）、叶节点回合结算、直连发话抄送、活跃目录事实、认领前预算挂起与级联回收 | 不做运行期“半路热搬家（沙箱过户）”；常驻协调器、停靠项目与待命 `worker` 都不挤占活跃执行并发配额 |
+| **⑦ `Cell`** | 控制面容器 | 将 6 个原语拼装为带单调递增 `epoch` 与 `parentId` 监督树的运行单元：承载 七种角色预设（`inline / project / worker / checker / reply_watcher / sensor / hub`）、叶节点回合结算、直连发话抄送、活跃目录事实、认领前预算挂起与级联回收 | 不做运行期“半路热搬家（沙箱过户）”；常驻协调器、停靠项目与待命 `worker` 都不挤占活跃执行并发配额 |
 
 ---
 
@@ -38,10 +38,10 @@
 ### `P-KERN-1`：上下文上浮归持久 `Project`，执行下沉归纯叶节点 `Worker`（回合结束即待命，父节点主动 Pull）
 1. **禁止把跨阶段长任务闷在单个超长 CLI 会话里跑到底**：否则外界对中间进展彻底失明，中途插入并行需求无法拆分，且超长上下文必然导致注意力退化与自我审查偏见。
 2. **`Project` 握住接力棒与账本**：`project` `Cell` 持久存活，只做轻量规划与质检，把目标、动作球权账本、分支/链接等环境事实与版本化 `Artifact` 透明保存在项目层，并维护一块自由格式的项目白板笔记（每次唤醒自动摆在动态尾部，会话压缩或重建都不失忆）。
-3. **`worker / watcher` 是纯叶节点**：两个预设都把派生深度收口为 `maxDepth: 0`，`spawn_cell / control_cell / close_cell / inspect_cell` 不提供给它们，监督树深度因此有界。底层 CLI 自带的 sub-agent 是该 CLI 自己的事，内核放行不干预，开销计入该叶节点账本；唯一禁区是 CLI 的问用户/计划审批交互（后台无人看终端，问主人走内核工具或直接在回复里说）。
+3. **`worker / checker` 是纯叶节点**：两个预设都把派生深度收口为 `maxDepth: 0`，`spawn_cell / control_cell / close_cell / inspect_cell` 不提供给它们，监督树深度因此有界。底层 CLI 自带的 sub-agent 是该 CLI 自己的事，内核放行不干预，开销计入该叶节点账本；唯一禁区是 CLI 的问用户/计划审批交互（后台无人看终端，问主人走内核工具或直接在回复里说）。
 4. **`worker`（`lifetime: "wakeable"`）回合结束即待命，从不因干完一轮而关闭**：本轮排空结算时，内核在同一事务内向父节点投递确定性退场通知（携带 `turn` 与 `childState: "dormant"` 的 `cell.result`，每轮恰好一次），`worker` 保持 `active` 进入**待命（Dormant）**——零进程、零定时、系统绝不主动唤醒、不占并发配额、不构成项目锚点、不拦项目结项；此后任何消息（项目追加的指令、主人的直连发话）都沿原 CLI 会话 `--resume` 唤醒它续跑，它随所属项目关闭而归档。结算条件与通知内容见 [00-system-mechanics §2.2](../02-workflows/00-system-mechanics.md)。
 5. **不依赖子节点自觉汇报，父节点主动 Pull**：被主人直连多轮后，`worker` 常常回答完就自然结束回合；因此 `report_to_parent` 只是可选补充（结构化摘要、`artifactId`、失败原因），没人等它被调用。协调器收到退场通知后用 `inspect_cell` 拉取该叶节点自上次检视以来收到的消息（主人直连单独标出）、说过的话、改过的文件与跑过的命令——四套引擎同形，依据是客观记录而非子节点的自述。
-6. **`watcher`（`lifetime: "one_shot"`）仍是一次性探针**：条件达成或终态失败时，经单事务排空检查投递唯一结果 `${cellId}:${epoch}:cell.result` 并连同其定时与监听一并关闭——带定时器的探针绝不滞留待命（见 [00-system-mechanics §2.3](../02-workflows/00-system-mechanics.md)）。
+6. **`checker`（`lifetime: "one_shot"`）仍是一次性探针**：条件达成或终态失败时，经单事务排空检查投递唯一结果 `${cellId}:${epoch}:cell.result` 并连同其定时与监听一并关闭——带定时器的探针绝不滞留待命（见 [00-system-mechanics §2.3](../02-workflows/00-system-mechanics.md)）。
 
 ### `P-KERN-2`：异步事件走队列，UI 简单交互直走同步事务
 - 外部入站消息、定时触发、后台 `Job` 完结与跨 `Cell` 汇报一律走 `Inbox` 异步信封队列；
@@ -50,7 +50,7 @@
 
 ### `P-KERN-3`：外部监听看“当前事实与持久历史”（Level-Triggered 优于 Edge-Triggered）
 - 等待 MR 合入、CI 全绿、目录就绪或同事回信时，绝不依赖“恰好在事件发生前那一毫秒挂上了内存回调”的边沿巧合；
-- 入站渠道消息先持久化落库可查；`watcher / sensor` 每次唤醒**第一步永远是直接核查当前真实状态或持久历史记录**——无论目标事件发生在监听启动前 3 秒还是启动后 3 小时，行为完全一致、零漏检。
+- 入站渠道消息先持久化落库可查；`checker / sensor` 每次唤醒**第一步永远是直接核查当前真实状态或持久历史记录**——无论目标事件发生在监听启动前 3 秒还是启动后 3 小时，行为完全一致、零漏检。
 
 ### `P-KERN-4`：严格保持前缀不变保缓存，执行算力按 `0-Token / fast / strong` 三级分流
 1. **Prefix-Invariant Context**：系统提示词不塞随时间跳变的动态噪音；长期偏好在立项前落库，使持久 `Cell` 会话生命周期内系统前缀稳定不变，保持 **95%+ Prompt Cache 命中率**；多轮状态变化（子节点花名册与未读区间、自己的未决等待、活跃目录、协调器自记笔记）仅作为尾部动态注记追加，绝不触碰冻结前缀，因此 CLI `--resume` 会话持续命中。
@@ -66,3 +66,9 @@
 ### `P-KERN-6`：生成与终审上下文物理隔离（Clean-Room Verification）
 - 涉及重要代码合入、复杂重构或高风险方案交付时，协调器应派生一个**全新的终审 `worker`**（指令写明只做查阅），对照硬性检查清单独立核验真实 `git diff` 与门禁回执——绝不把终审交给编写者那个待命 `worker` 的原会话；
 - 终审分身不继承编写者的思维包袱，发现边界缺陷如实签发分级问题单（拒绝橡皮图章式盲签 `PASS`）。
+
+### 状态归属与领域命令
+
+人类事项的选项、版本与生命周期归 `human_items`。授权、预算与信任规则归 Gate。外发的每次尝试及其送达证据归 Outbox。宿主工作目录、存活状态与暂停原因归 `cells`。关闭项目时，预设的事务钩子更新领域账本。
+
+`lifetime` 决定回合如何结算，`maxDepth` 决定能否派生，`ccParent` 决定直连抄送。一次性核查使用 `checker`，等外部回信使用持久的 `reply_watcher`。工作笔记 `working_note` 进入唤醒尾部，个人收藏与信源观察归 `reference`，按需检索。技能提议经周回顾确认后安装。

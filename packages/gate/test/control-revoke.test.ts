@@ -12,9 +12,13 @@ function tree() {
 }
 
 describe("authorizeControlSync (the Inbox control bypass)", () => {
-  it("owner may control any cell; a cell only its strict descendants", () => {
+  it("owner may control any non-root cell (and steer/resume root, never pause/cancel root); a cell only its strict descendants", () => {
     const f = tree();
-    for (const id of ["desk", "proj", "leaf", "sib"]) expect(f.gate.authorizeControlSync(id, "owner", "cancel")).toEqual({ ok: true });
+    for (const id of ["proj", "leaf", "sib"]) expect(f.gate.authorizeControlSync(id, "owner", "cancel")).toEqual({ ok: true });
+    expect(f.gate.authorizeControlSync("desk", "owner", "cancel")).toMatchObject({ ok: false, reason: /root cell/ });
+    expect(f.gate.authorizeControlSync("desk", "owner", "pause")).toMatchObject({ ok: false, reason: /root cell/ });
+    expect(f.gate.authorizeControlSync("desk", "owner", "resume")).toEqual({ ok: true });
+    expect(f.gate.authorizeControlSync("desk", "owner", "steer")).toEqual({ ok: true });
     expect(f.gate.authorizeControlSync("leaf", "cell:desk", "steer")).toEqual({ ok: true });
     expect(f.gate.authorizeControlSync("leaf", "cell:proj", "pause")).toEqual({ ok: true });
     for (const [target, actor] of [
@@ -27,13 +31,17 @@ describe("authorizeControlSync (the Inbox control bypass)", () => {
     }
   });
 
-  it("an agent on the control plane may pause/resume/steer/cancel any cell, like the owner (docs/05 §5.3)", () => {
+  it("an agent on the control plane may control any non-root cell, and only steer/resume root (BUG-020)", () => {
     const f = tree();
-    for (const id of ["desk", "proj", "leaf", "sib"]) {
+    for (const id of ["proj", "leaf", "sib"]) {
       for (const action of ["pause", "resume", "steer", "cancel"] as const) {
         expect(f.gate.authorizeControlSync(id, "agent:ops", action), `${action} ${id}`).toEqual({ ok: true });
       }
     }
+    expect(f.gate.authorizeControlSync("desk", "agent:ops", "pause")).toMatchObject({ ok: false, reason: /root cell/ });
+    expect(f.gate.authorizeControlSync("desk", "agent:ops", "cancel")).toMatchObject({ ok: false, reason: /root cell/ });
+    expect(f.gate.authorizeControlSync("desk", "agent:ops", "resume")).toEqual({ ok: true });
+    expect(f.gate.authorizeControlSync("desk", "agent:ops", "steer")).toEqual({ ok: true });
     f.gate.revokeSync("proj");
     expect(f.gate.authorizeControlSync("leaf", "agent:ops", "cancel")).toEqual({ ok: true });
     expect(f.gate.authorizeControlSync("ghost", "agent:ops", "pause")).toMatchObject({ ok: false, reason: /unknown cell "ghost"/ });

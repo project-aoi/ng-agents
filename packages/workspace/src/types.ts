@@ -117,6 +117,9 @@ export interface WorkspaceLimits {
   storedLogMaxChars: number;            // log text handed to `resources.writeResourceSync` (tail kept)
   killGraceMs: number;                  // SIGTERM → SIGKILL delay
   maxJobsPerCell: number;               // concurrently running jobs per cell
+  jobTimeoutMs: number;                 // default max runtime of a background job (spec.timeoutMs overrides, clamped to maxJobTimeoutMs)
+  maxJobTimeoutMs: number;              // hard ceiling for background job runtime
+  jobQuietWarningMs: number;            // one warning per job after this long without output; 0 disables
   jobPollMs: number;                    // liveness poll for jobs re-attached after a restart
   previewPollMs: number;                // log poll for streamPreview jobs
 }

@@ -15,10 +15,14 @@ export type FakeCliAction =
   /** codex only: a raw item emitted as `item.completed` (e.g. a code-mode `custom_tool_call`). */
   | { item: Record<string, unknown> }
   | { sleep: number }
-  | { fail: string };
+  | { fail: string }
+  | { exit: number };
 
 export interface FakeCliTurn {
   actions: FakeCliAction[];
+  /** Claude can report a successful result while acknowledging an interrupt. */
+  acknowledgeInterrupt?: boolean;
+  omitQueuedTurnCount?: boolean;
 }
 
 export interface FakeCliLogEntry {

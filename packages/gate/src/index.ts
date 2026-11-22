@@ -21,6 +21,7 @@ export {
   effectiveSideEffect,
   maxSideEffect,
   ownerOnlyApproval,
+  isBudgetEscalation,
   parseActionClass,
   pickRule,
   ruleApplies,

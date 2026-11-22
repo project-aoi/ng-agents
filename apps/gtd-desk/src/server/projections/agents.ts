@@ -57,7 +57,7 @@ import { whenText } from "./time";
 // What a person reads is plain Chinese — a state is "待命可唤醒", never the machinery behind it — while what a cell
 // touched (paths, commands, outputs, branch names) passes through verbatim.
 
-type Activity = { state: "working" | "waiting" | "dormant" | "idle" | "paused" | "closed"; why: string };
+type Activity = { state: "working" | "waiting" | "dormant" | "idle" | "paused" | "budget_paused" | "closed"; why: string };
 
 interface Facts {
   statusLine: string | null;
@@ -182,6 +182,12 @@ export function agentsView(input: ProjectionInput, focus?: readonly string[]): A
     const pid = approvalProjectId(kernel, rec);
     if (pid && !projectCards.has(pid)) projectCards.set(pid, ref);
   }
+  for (const item of kernel.humanItems.list()) {
+    if (item.category !== "decision") continue;
+    const ref = {id:item.id,title:item.title};
+    if (item.cellId && !cards.has(item.cellId)) cards.set(item.cellId,ref);
+    for (const pid of item.relatedProjectIds) if (!projectCards.has(pid)) projectCards.set(pid,ref);
+  }
   for (const id of cards.keys()) snoozedCards.delete(id);
 
   const human = new Map<string, { cellId: string; actionId: string; title: string }>();
@@ -202,7 +208,7 @@ const isRoot = (c: CellRecord) => c.parentId === null;
 
 /** A worker or a probe: the third column, and the cells a project pulls from. */
 export function isLeafCell(c: Pick<CellRecord, "spec" | "preset">): boolean {
-  return isLeafLifetime(c.spec.lifetime) || c.preset === "worker" || c.preset === "watcher";
+  return isLeafLifetime(c.spec.lifetime);
 }
 
 function roleOf(v: AgentsView, c: CellRecord): { roleLabel: string; layer: 0 | 1 | 2 } {
@@ -211,7 +217,7 @@ function roleOf(v: AgentsView, c: CellRecord): { roleLabel: string; layer: 0 | 1
   if (v.projects.has(c.id) || c.preset === "project") return { roleLabel: "项目协调", layer: 1 };
   if (c.preset === "hub" || role === "hub") return { roleLabel: "领域中枢", layer: 1 };
   if (c.preset === "sensor" || role === "sensor") return { roleLabel: "信源巡检", layer: 0 };
-  if (c.preset === "watcher" || role === "watcher" || role === "checker") return { roleLabel: "外部盯梢", layer: 2 };
+  if (c.preset === "checker" || c.preset === "reply_watcher" || c.preset === "watcher" || role === "watcher" || role === "checker") return { roleLabel: "外部盯梢", layer: 2 };
   if (isLeafCell(c)) return { roleLabel: "执行分身", layer: 2 };
   return { roleLabel: "分身", layer: 1 };
 }
@@ -365,6 +371,7 @@ function stateOf(v: AgentsView, c: CellRecord): { state: AgentVisualState; state
     const detail = job ? `后台命令：${oneLine(job.command, 120)}` : act.why.startsWith("a message is waiting") ? "收到新消息，马上开始处理" : runningStep(kernel, c.id);
     return { state: "running", stateLabel: "运行中", stateDetail: detail };
   }
+  if (act.state === "budget_paused") return {state:"paused",stateLabel:"等待追加额度",stateDetail:"后续任务已保留"};
   if (act.state === "paused") {
     const parked = v.projects.get(projectIdOf(v, c) ?? "")?.lifecycle === "someday";
     return { state: "paused", stateLabel: "已暂停", stateDetail: parked ? "放在以后再说里" : null };
@@ -409,7 +416,7 @@ export function nodeOf(v: AgentsView, c: CellRecord): TopologyNodeDTO {
     cellId: c.id,
     parentId: c.parentId,
     projectId: projectIdOf(v, c),
-    preset: c.preset,
+    preset: c.preset==="watcher" ? (c.spec.lifetime==="persistent" ? "reply_watcher" : "checker") : c.preset,
     roleLabel,
     title: titleOf(v, c),
     layer,
@@ -940,7 +947,7 @@ function buildItems(ctx: BuildCtx, records: readonly EvidenceEntry[]): Built[] {
 function buildCtx(v: AgentsView, cell: CellRecord): BuildCtx {
   const { kernel } = v.input;
   const parent = cell.parentId ? v.cells.get(cell.parentId) : undefined;
-  const syncedTo = isLeafCell(cell) && parent && parent.status !== "closed" ? titleOf(v, parent) : null;
+  const syncedTo = cell.spec.ccParent && parent && parent.status !== "closed" ? titleOf(v, parent) : null;
   const steers = kernel.inbox
     .listMessagesSync({ cellId: cell.id, type: PAYLOAD.controlSteer })
     .sort((a, b) => a.seq - b.seq)
@@ -1047,7 +1054,7 @@ function artifactsOf(v: AgentsView, cell: CellRecord): ArtifactRefDTO[] {
 
 /** A coordinator's own notes (save_note, scope "cell"), as the kernel puts them in front of it at every wake-up. */
 export function notesOf(kernel: DeskKernel, cellId: string): string | null {
-  const notes = kernel.context.listKnowledgeSync({ kind: "note", cellId, includeGlobal: false }).filter((n) => n.scope === "cell" && n.cellId === cellId && n.body.trim());
+  const notes = kernel.context.listKnowledgeSync({ kind: "working_note", cellId, includeGlobal: false }).filter((n) => n.scope === "cell" && n.cellId === cellId && n.body.trim());
   if (notes.length === 0) return null;
   notes.sort((a, b) => a.name.localeCompare(b.name));
   return notes.map((n) => `## ${n.name}\n${n.body.trim()}`).join("\n\n");
@@ -1068,7 +1075,10 @@ function lastSaid(kernel: DeskKernel, cellId: string, afterSeq: number): string 
 function controlsOf(v: AgentsView, c: CellRecord): ButtonDTO[] {
   if (c.status === "closed") return [];
   const path = `/api/cells/${enc(c.id)}/control`;
-  const pause = button({ id: "pause", label: "⏸ 暂停", endpoint: post(path, { action: "pause" }) });
+  const treeIds = new Set([c.id]);
+  for (const id of treeIds) for (const child of v.children.get(id) ?? []) treeIds.add(child.id);
+  const jobs = v.input.kernel.workspace.listJobsSync({state:["running"]}).filter(j=>treeIds.has(j.cellId));
+  const pause = button({ ...(jobs.length ? {confirm:`还有 ${jobs.length} 个后台命令正在运行。确认暂停？`} : {}), id: "pause", label: "⏸ 暂停", endpoint: post(path, { action: "pause" }) });
   const resume = button({ id: "resume", label: "▶ 继续", primary: true, endpoint: post(path, { action: "resume" }) });
   const cancel = button({
     id: "cancel",
@@ -1099,7 +1109,7 @@ function composerOf(v: AgentsView, c: CellRecord, node: TopologyNodeDTO): Compos
         ? []
         : [
             button({ id: "trigger", label: "立即触发一次检查", primary: true, endpoint: post(`${path}/trigger`) }),
-            c.status === "paused" ? button({ id: "resume", label: "▶ 继续", endpoint: post(`${path}/control`, { action: "resume" }) }) : button({ id: "pause", label: "⏸ 暂停", endpoint: post(`${path}/control`, { action: "pause" }) }),
+            c.status === "paused" ? button({ id: "resume", label: "▶ 继续", endpoint: post(`${path}/control`, { action: "resume" }) }) : controlsOf(v,c).find(b=>b.id==="pause")!,
           ];
     return { ...base, syncTo: null, enabled: false, mode: "script", hint: "这是零算力确定性脚本探针，不接受自然语言对话", placeholder: "", quick };
   }

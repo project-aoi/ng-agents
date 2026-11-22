@@ -9,7 +9,7 @@ import type { Kernel } from "@ng/cell";
 import type { MemoryChannel } from "@ng/channel";
 import { defineSensorCheck } from "@ng/presets";
 import type { ScriptTurn } from "@ng/loop";
-import { subjectKeys, type Clock } from "@ng/protocol";
+import { asClarifyCard, subjectKeys, type Clock } from "@ng/protocol";
 import type { Desk } from "./desk";
 import { zonedParts, zonedTime, type DemoBrain } from "./demo-model";
 
@@ -238,7 +238,7 @@ export async function seedDemo(d: DemoSeedDeps): Promise<void> {
   async function owner(t: number, text: string, ...turns: ScriptTurn[]): Promise<string> {
     await step(t);
     brain.queueDesk(...turns);
-    const r = await desk.capture({ text });
+    const r = await desk.ingest({ text },{principalId:desk.ownerPrincipal});
     await idle();
     drained(text.slice(0, 12));
     return r.id;
@@ -253,14 +253,17 @@ export async function seedDemo(d: DemoSeedDeps): Promise<void> {
   }
   const t = (name: string, input: unknown = {}): ScriptTurn => ({ toolCalls: [{ name, input }] });
   const card = (subjectKey: string) => {
-    const rec = kernel.gate.findPendingBySubjectSync(subjectKey);
+    const rec = kernel.gate.findPendingBySubjectSync(subjectKey) ?? (subjectKey.startsWith("msg:")
+      ? kernel.gate.listPendingSync().find(r => asClarifyCard(r.card.data)?.source.envelopeId === subjectKey.slice(4))
+      : undefined);
     if (!rec) throw new Error(`demo seed: no pending card for ${subjectKey}`);
     return rec;
   };
   const version = (artifactId: string | null) => (artifactId ? (kernel.context.getArtifactSync(artifactId)?.version ?? null) : null);
+  const ownerActor = { principalId: desk.ownerPrincipal };
   const approve = async (subjectKey: string) => {
     const rec = card(subjectKey);
-    const r = await desk.approve(rec.actionId, { seenVersion: version(rec.artifactId) });
+    const r = await desk.approve(rec.actionId, { seenVersion: version(rec.artifactId), seenItemRevision: rec.itemRevision }, ownerActor);
     if (!r.ok) log(`demo seed: approving "${rec.action.summary}" → ${r.outcome}`);
     await idle();
   };
@@ -375,10 +378,8 @@ export async function seedDemo(d: DemoSeedDeps): Promise<void> {
   );
   {
     const rec = card(subjectKeys.inbound(cto));
-    const r = await desk.toHuman(rec.actionId, {});
-    if (!r.ok) log(`demo seed: 转给我来处理 → ${r.outcome}`);
     const art = kernel.context.getArtifactSync(rec.artifactId!)!;
-    desk.saveArtifact(art.artifactId, { expectedVersion: art.version, body: art.content.body.replace("我倾向 B，", "我倾向 B（DBA 也建议双写），") });
+    desk.saveArtifact(art.artifactId, { expectedVersion: art.version, body: art.content.body.replace("我倾向 B，", "我倾向 B（DBA 也建议双写），") },{principalId:desk.ownerPrincipal});
   }
   await says(at(-1, 10, 30), "lizong", "补充一下：下周六有大促，停机窗口必须避开", { thread: "demo:dm-lizong" },
     t("draft_reply", {
@@ -431,7 +432,7 @@ export async function seedDemo(d: DemoSeedDeps): Promise<void> {
     desk.saveArtifact(rec.artifactId!, {
       expectedVersion: version(rec.artifactId)!,
       body: "在 Wiki「认证服务 / 登录错误码」这一页：https://wiki.example.com/auth/error-codes 。提示文案以第 3 列为准，40103 和 40104 这两个上周刚改过，注意一下。",
-    });
+    },{principalId:desk.ownerPrincipal});
     await approve(subjectKeys.inbound(zl));
   }
   await step(at(0, 9, 10));
@@ -459,7 +460,7 @@ export async function seedDemo(d: DemoSeedDeps): Promise<void> {
   brain.queueDesk(
     project("排查支付回调偶发 500", "主人的原话：支付回调偶发 500，看日志像是幂等键冲突。帮我查一下原因并修掉，修好给我看改动。", { outcome: "回调不再报 500，改动等主人看过后合入" }),
   );
-  await desk.capture({ text: "支付回调偶发 500，看日志像是幂等键冲突。帮我查一下原因并修掉，修好给我看改动" });
+  await desk.ingest({ text: "支付回调偶发 500，看日志像是幂等键冲突。帮我查一下原因并修掉，修好给我看改动" },{principalId:desk.ownerPrincipal});
   const bug = await until(() => projectTitled("排查支付回调偶发 500"), "the bug-fix project");
   await until(() => !kernel.activeRuns().some((r) => r.cellId === kernel.deskCellId) || null, "the desk");
   drained("start_project");

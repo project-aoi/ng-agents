@@ -1,8 +1,9 @@
+import type { HumanItemDraft } from "../human-item";
 import type { Clock } from "../clock";
 import type { Channel } from "./channel";
-import type { ContextStore, PromptSnapshot } from "./context";
+import type { ContextStore, EvidenceEntry, PromptSnapshot } from "./context";
 import type { Envelope, EnvelopeDraft, EnvelopeKind, InboxAddr, IsolationLevel, PolicyBounds, Delivery, ToolKind } from "./envelope";
-import type { AuthorizeResult, MeterResult, ProposedAction, Usage } from "./gate";
+import type { AuthorizeResult, ChannelSendAction, MeterResult, ProposedAction, Usage } from "./gate";
 import type { ControlAction, ControlResult, EnqueueResult, Inbox, ScheduleRule } from "./inbox";
 import type { ProcessorSpec } from "./loop";
 import type { WorkspacePort } from "./workspace";
@@ -11,9 +12,10 @@ import type { WorkspacePort } from "./workspace";
 
 // ==================== ⑦ Cell: preset templates and the dynamic assembly container ====================
 export interface CellSpec {
+  stallPolicy?: "monitor";
   id?: string;
   parentId?: string;                    // forms the supervision tree; closing/cancelling the parent recursively reclaims the subtree
-  preset?: "inline" | "worker" | "watcher" | "sensor" | "project" | "hub"; // [ext] project, hub (docs/05)
+  preset?: "inline" | "worker" | "checker" | "reply_watcher" | "watcher" | "sensor" | "project" | "hub"; // [ext] project, hub (docs/05)
   watches?: Array<{ threadOrFilter: Record<string, unknown>; cancelGroup?: string; coalesceMs?: number /* [ext] */ }>;
   schedules?: ScheduleRule[];
   contextMode?: "isolated" | "fork_prefix";
@@ -56,6 +58,7 @@ export interface CellSpec {
    *   and closes the cell — with its watches and timers — in the transaction that completes the claim.
    * - `"persistent"` (default): the cell lives until someone closes it (or it calls complete_self).
    */
+  ccParent?: boolean;
   lifetime?: "one_shot" | "wakeable" | "persistent";
   /**
    * [ext] docs/05 §3.3 — the running Loop takes messages that arrive mid-Run into the same Run (`RunPorts.drainInbound`)
@@ -70,7 +73,7 @@ export interface CellPorts {            // the controlled capability surface a L
   notifyChannel: Channel["send"];       // [ext] here `target` is a full ChannelAddr; the kernel routes via ChannelHub
   streamPreview: NonNullable<Channel["streamPreview"]>;
   context: Pick<ContextStore, "readState" | "commit" | "appendEvidence" | "readResource" | "searchHistory" | "upsertSkillOrNote"
-    | "listState" | "getArtifact" | "listArtifacts">; // [ext] listState/getArtifact/listArtifacts
+    | "listState" | "getArtifact" | "getArtifactVersion" | "listArtifacts">; // [ext] listState/getArtifact/listArtifacts
   cancelScheduled: Inbox["cancelScheduled"];
   spawnCell(spec: SpawnSpec /* [ext] the processor may come from the preset */, initialPayload?: unknown): Promise<InboxAddr>;
   updateCell(cellId: string, patch: Partial<CellSpec>): Promise<void>; // [ext] own id allowed for watches/schedules/title/meta
@@ -103,7 +106,7 @@ export type SpawnSpec = Omit<CellSpec, "processor"> & { processor?: ProcessorSpe
 // - [docs/05] cwd is inherited from the parent when absent; lifetime comes from the preset's defaults.
 
 export type PresetName = NonNullable<CellSpec["preset"]>;
-export const PRESET_NAMES = ["inline", "worker", "watcher", "sensor", "project", "hub"] as const satisfies readonly PresetName[];
+export const PRESET_NAMES = ["inline", "worker", "checker", "reply_watcher", "watcher", "sensor", "project", "hub"] as const satisfies readonly PresetName[];
 export type CwdMode = NonNullable<CellSpec["cwdMode"]>;
 export type CellLifetime = NonNullable<CellSpec["lifetime"]>;
 /** A leaf executor (wakeable worker or one-shot probe), as opposed to a persistent coordinator. */
@@ -126,6 +129,9 @@ export interface RunSelf {
   spec: CellSpec;
 }
 
+export type ReplyDecision = Exclude<AuthorizeResult, { type: "allow" }> |
+  { type: "delivery"; actionId: string; receipt: "sent" | "unknown" | "failed" | "pending" | "cancelled" };
+
 /**
  * What the kernel actually hands a Loop for one Run. Every port is already bound to this cell, epoch and
  * principal; the kernel enforces bounds on workspace exec (tool ∈ bounds.tools), sends (target ∈ canSendTo, valid
@@ -133,13 +139,32 @@ export interface RunSelf {
  * effect so Gate can defer it.
  */
 export interface RunPorts extends CellPorts {
+  isDirectChild(id: string): boolean;
+  createHumanItem?(draft: HumanItemDraft): { id: string; itemRevision: number };
+
   readonly self: RunSelf;
   /** Gate.authorize bound to self (cellId, epoch, principal). */
   authorize(action: ProposedAction, opts?: { artifactVersion?: number }): Promise<AuthorizeResult>;
   /** Gate.meter for this cell; the Loop calls it after every model call and stops with budget_stopped on hard_stop. */
   meter(usage: Usage): MeterResult;
   /** Steer messages that arrived since the Run started; the Loop checks between model steps and appends them as user text. */
-  drainSteer(): string[];
+  drainSteer(): DrainedSteerItem[];
+  /**
+   * [ext] Return unconfirmed envelopes belonging to this Run's claim back to `pending` (e.g. a CLI exited before
+   * confirming a live-written steer or follow-up). Optional in the type only so hand-written fakes stay valid.
+   */
+  requeueEnvelopes?(envelopeIds: readonly string[], reason: string): number;
+  /**
+   * [ext] Read this cell's append-only SQLite evidence (e.g. when a CLI session falls back to a fresh rebuild and needs
+   * the exact SQLite-recorded inbound/turn evidence). Optional in the type only so hand-written fakes stay valid.
+   */
+  confirmCliInput?(sessionId: string, throughSeq: number): void;
+  listEvidence?(opts?: { afterSeq?: number; limit?: number; runId?: string }): EvidenceEntry[];
+  /** Authorize a reply, recording a standing-rule send and its outbox intent together before transport. */
+  /** Confirm the native parent session still represents exactly the creation-time evidence. */
+  canForkSession(parentId:string, uptoSeq:number, sessionId:string, delivered:number): boolean;
+  listOwnDecisions(): Array<{ record: import("./gate").ApprovalRecord; envelope?: Envelope }>;
+  submitReply(action: ChannelSendAction, artifactVersion: number, sourceId: string): Promise<ReplyDecision>;
   /**
    * Commit with inboxOut to `inbox:<parentId>` (envelope from `inbox:<selfId>`, expectedEpoch = parent's epoch). Throws
    * for root cells. [docs/05] A `cell.result` from a leaf (`one_shot` / `wakeable`) cell is not sent from here: it is
@@ -192,7 +217,7 @@ export interface RunPorts extends CellPorts {
    * cell's own arranged events (a timer, a job result, a child's result). A wait on a live cell is one of the five
    * anchors of the stall check.
    */
-  registerWait?(wait: { waitingFor: string; reason: string; timeoutAt?: number }): Promise<void>;
+  registerWait?(wait: { waitingFor: string; reason: string; waitId?: string; refId?: string; timeoutAt?: number }): Promise<void>;
   clearWait?(waitingFor: string): Promise<boolean>;
   /**
    * What the kernel does with this cell when the Run has settled (after it left the run table, in the claim's
@@ -228,8 +253,10 @@ export interface CellInspection {
   /** Records covered: `fromSeq`..`toSeq` (both 0 when nothing is new). */
   fromSeq: number;
   toSeq: number;
-  /** More records exist after `toSeq` (the text limit was reached): call again with `afterSeq: toSeq`. */
+  /** More records exist after `toSeq` (or a middle stretch was omitted): call again with `afterSeq: resumeAfterSeq ?? toSeq`. */
   more: boolean;
+  /** When `more` is true due to head+tail truncation, pass this cursor as `afterSeq` to read the omitted middle. */
+  resumeAfterSeq?: number;
   directChats: number;
   artifactIds: string[];
   text: string;
@@ -250,6 +277,12 @@ export type SendToCellResult =
   | { status: "not_found" }
   | { status: "refused"; reason: string };
 
+export interface DrainedSteerItem {
+  envelopeId: string;
+  message: string;
+  envelope?: Envelope;
+}
+
 export interface DrainedInbound {
   envelope: Envelope;
   /** The envelope rendered exactly as the next hydrate will show it. */
@@ -257,6 +290,9 @@ export interface DrainedInbound {
 }
 
 export interface SelfSettleRequest {
+  /** Preset-owned changes committed only if the requested transition actually happens. */
+  statePatches?: Record<string, unknown>;
+  pauseReason?: "parked";
   action: "complete" | "cancel" | "pause";
   /** Final text for the parent's `cell.result` when the cell closes without a stashed candidate. */
   summary?: string;
@@ -362,6 +398,17 @@ export interface EmitOptions {
  * request goes through Gate.attenuate, so nothing a preset or caller asks for can exceed the parent.
  */
 export interface PresetDef {
+  onCellClosed?(cell:CellRecord, reason:CloseReason, store:ContextStore, clock:Clock):void;
+  onCellReopened?(cell:CellRecord, store:ContextStore, clock:Clock):void;
+  stateDomain?(db: import("../db/sqlite").Db, clock: Clock): import("./context").StateDomain;
+
+  /** Synchronous preset plan applied in the same transaction as a confirmed action. */
+  approvedSpawn?(record: import("./gate").ApprovalRecord, store: Pick<ContextStore, "getArtifactVersionSync" | "readStateSync">, clock: Clock):
+    { spec: CellSpec; task: unknown } | undefined;
+
+  /** Decode only this preset's own scheduled personal reminders. The kernel settles them before any budget check. */
+  personalReminder?(envelope: Envelope): { id: string; draft: HumanItemDraft; notify: import("./envelope").ChannelAddr } | undefined;
+
   name: PresetName;
   description: string;
   defaults: Partial<Omit<CellSpec, "id" | "parentId" | "preset" | "fork">>;
@@ -402,6 +449,7 @@ export interface CellRecord {
   epoch: number;
   status: CellStatus;
   closeReason: CloseReason | null;
+  pauseReason: "manual" | "parked" | "budget_declined" | null;
   principalId: string;                  // principal that created the cell
   createdAt: number;
   updatedAt: number;

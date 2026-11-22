@@ -366,7 +366,7 @@ export class DemoBrain {
     for (const b of envelopes(sinceLastAssistant(req))) {
       if (b.type === "cell.task") st.queue.push(...plan.first);
       else if (b.type === "cell.result") st.queue.push(...(plan.afterResult?.[st.results++] ?? []));
-      else if (b.type === "cell.message" && /principal (owner|agent:|cell:desk)/.test(b.head)) st.queue.push(...(plan.afterOwner?.[st.owner++] ?? []));
+      else if ((b.type === "cell.message" || b.type === "approval.resolved") && /principal (owner|agent:|cell:desk)/.test(b.head)) st.queue.push(...(plan.afterOwner?.[st.owner++] ?? []));
     }
     return next();
   }

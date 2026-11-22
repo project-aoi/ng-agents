@@ -39,6 +39,9 @@ export const DEFAULT_LIMITS: WorkspaceLimits = {
   storedLogMaxChars: 1_000_000,
   killGraceMs: 3000,
   maxJobsPerCell: 8,
+  jobTimeoutMs: 30 * 60_000,
+  maxJobTimeoutMs: 4 * 60 * 60_000,
+  jobQuietWarningMs: 5 * 60_000,
   jobPollMs: 1000,
   previewPollMs: 250,
 };
@@ -238,10 +241,12 @@ export function createWorkspaceManager(opts: WorkspaceManagerOptions): Workspace
       });
     },
 
-    async stopRuntime(cellId: string) {
+    async stopRuntime(cellId: string, stillClosed = () => true) {
       await cellLock.run(cellId, async () => {
+        if (!stillClosed()) return;
         // Resolves when every job's process group is confirmed gone (see JobManager.cancel).
         await jobs.cancelForCell(cellId, "cancelled with the cell");
+        if (!stillClosed()) return;
         const ws = store.getWorkspace(cellId);
         if (!ws || !ws.containerId) return;
         // Only a container is the kernel's to stop. Directories, branches and worktrees — the owner's or ones a cell

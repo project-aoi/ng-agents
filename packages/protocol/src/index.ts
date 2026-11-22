@@ -24,8 +24,12 @@ export * from "./clock";
 export * from "./ids";
 export * from "./errors";
 export * from "./json";
+export * from "./process";
 
 // ---- SQLite ----
 export * from "./db/sqlite";
 export * from "./db/repos";
 export * from "./schema";
+export * from "./human-item";
+
+export {CHANNEL_LABELS,describeEnvelopeSource} from "./source";

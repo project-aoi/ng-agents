@@ -22,8 +22,8 @@ export interface Gate {
     | { type: "defer"; actionId: string; boundArtifactVersion?: number; approvalCard: Deliverable }
   >;
   // synchronous UI confirmation: checks the draft version seen at click time; if the background just refreshed it, returns version_mismatch (no blind send)
-  approve(actionId: string, approverId: string, seenArtifactVersion?: number): Promise<
-    "approved" | "version_mismatch" | "already_cancelled" | "not_found" /* [ext] not_found */
+  approve(actionId: string, approverId: string, seenArtifactVersion?: number, opts?: { seenItemRevision?: number }): Promise<
+    ApproveResult
   >;
   revoke(cellId: string): Promise<void>;
   meter(cellId: string, usage: Usage /* [ext] cachedTokens */, opts?: LedgerViewOptions /* [ext] */): "ok" | "warn" | "hard_stop";
@@ -66,7 +66,7 @@ export interface Gate {
 
   // ---------- [ext] sync twins (the async methods delegate to these) ----------
   authorizeSync(action: ProposedAction, meta: AuthorizeMeta): AuthorizeResult;
-  approveSync(actionId: string, approverId: string, seenArtifactVersion?: number): ApproveResult;
+  approveSync(actionId: string, approverId: string, seenArtifactVersion?: number, opts?: { seenItemRevision?: number }): ApproveResult;
   /** Invalidate the cell's unused tokens and cancel its pending approvals (cancel/close). */
   revokeSync(cellId: string): void;
   /**
@@ -78,16 +78,25 @@ export interface Gate {
   // ---------- [ext] approvals administration (sync-only; the UI's synchronous transaction API) ----------
   listPendingSync(filter?: PendingFilter): ApprovalRecord[];
   getApprovalSync(actionId: string): ApprovalRecord | undefined;
-  findPendingBySubjectSync(subjectKey: string): ApprovalRecord | undefined;
+  findPendingBySubjectSync(subjectKey: string, cellId?: string): ApprovalRecord | undefined;
   /** Card leaves the Clarify stack until `until` (status stays pending). */
-  snoozeSync(actionId: string, until: number): "snoozed" | "not_pending";
-  denySync(actionId: string, approverId: string, reason?: string): "denied" | "not_pending";
+  snoozeSync(actionId: string, until: number, opts?: { seenItemRevision?: number }): "snoozed" | "not_pending" | "revision_mismatch";
+  denySync(actionId: string, approverId: string, reason?: string, opts?: { seenItemRevision?: number }): "denied" | "not_pending" | "revision_mismatch";
+  /** Record an accepted revise instruction against a pending card: checks & increments itemRevision in the same tx. */
+  reviseSync(
+    actionId: string,
+    approverId: string,
+    opts?: { seenItemRevision?: number; seenArtifactVersion?: number },
+  ): "revised" | "not_pending" | "version_mismatch" | "revision_mismatch";
   /** Auto-withdraw (e.g. someone already answered in the group): pending → cancelled with a reason. */
-  withdrawSync(actionId: string, reason: string): "cancelled" | "not_pending";
+  withdrawSync(actionId: string, reason: string, opts?: { seenItemRevision?: number }): "cancelled" | "not_pending" | "revision_mismatch";
+  setSendAbandonedSync(actionId: string, activityId: string, abandoned: boolean, seenItemRevision: number): boolean;
   /** Cancel every pending approval of a cell; returns the count. */
   cancelForCellSync(cellId: string, reason: string): number;
   /** Kernel records the result of executing an approved action. */
   recordOutcomeSync(actionId: string, status: "executed" | "failed" | "unknown", outcome: ApprovalOutcome): void;
+  /** Persist an already-authorized standing-rule send, in the outbox preparation transaction. */
+  recordStandingSendSync(actionId: string, action: ChannelSendAction, meta: AuthorizeMeta): ApprovalRecord;
   /** [ext] Re-bind a pending card to another existing version of its draft (the draft was revised). */
   rebindSync(actionId: string, version: number): "rebound" | "not_pending";
   /** [ext] Any approvals by status/cell, newest first (e.g. `unknown` sends that must stay visible). */
@@ -111,6 +120,9 @@ export interface Gate {
 
   // ---------- [ext] dual ledger ----------
   usageSync(cellId: string, opts?: LedgerViewOptions): LedgerUsage;
+  declineBudgetSync(cellId: string, approverId: string): void;
+  budgetDeclinedSync(cellId: string): boolean;
+  clearBudgetDeclinesSync(approverId:string, cellId?:string):string[];
   /** Human-granted extra allowance for one cell ("追加额度继续"). Owner principal only. */
   raiseBudgetSync(cellId: string, add: { tokens?: number; cents?: number }, approverId: string): LedgerUsage;
   /**
@@ -135,6 +147,9 @@ export interface Gate {
 export type SideEffect = "none" | "internal" | "notify_owner" | "external";
 
 interface ActionBase {
+  cardOptions?: import("../human-item").CardOption[];
+  relatedProjectIds?: string[];
+
   summary: string;                      // one human-readable line (card title fallback, audit log)
   subjectKey: string;                   // the item this action belongs to; at most one pending approval per subjectKey
   /**
@@ -154,26 +169,6 @@ export interface ChannelSendAction extends ActionBase {
   target: ChannelAddr;
   content?: Deliverable;                // required to obtain a token; for a draft send it is the bound artifact version's content
 }
-export interface WorkspaceExecAction extends ActionBase {
-  type: "workspace.exec";
-  tool: ToolKind;
-  args: unknown;
-}
-export interface JobStartAction extends ActionBase {
-  type: "job.start";
-  command: string;
-}
-export interface CellSpawnAction extends ActionBase {
-  type: "cell.spawn";
-  spec: CellSpec;
-  initialPayload?: unknown;
-}
-export interface CellControlAction extends ActionBase {
-  type: "cell.control";
-  targetCellId: string;
-  action: ControlAction;
-  steerMessage?: string;
-}
 export interface SecretUseAction extends ActionBase {
   type: "secret.use";
   secretRef: string;
@@ -192,10 +187,6 @@ export interface CustomAction extends ActionBase {
 
 export type ProposedAction =
   | ChannelSendAction
-  | WorkspaceExecAction
-  | JobStartAction
-  | CellSpawnAction
-  | CellControlAction
   | SecretUseAction
   | ProjectStartAction
   | CustomAction;
@@ -227,7 +218,7 @@ export type AuthorizeResult =
  *   exists, or the action is no longer within the cell's current bounds. The mismatch re-binds the row to the current
  *   version, so the next click on the refreshed card can pass. A paused cell can still be approved.
  */
-export type ApproveResult = "approved" | "version_mismatch" | "already_cancelled" | "not_found";
+export type ApproveResult = "approved" | "version_mismatch" | "revision_mismatch" | "already_cancelled" | "not_found";
 
 export type ApprovalStatus = "pending" | "approved" | "denied" | "cancelled" | "superseded" | "executed" | "failed" | "unknown";
 
@@ -256,6 +247,8 @@ export interface ApprovalRecord {
   card: Deliverable;
   artifactId: string | null;
   boundVersion: number | null;
+  proposedVersion: number | null;       // [ext] version proposed by the agent (used to compute human edit diff)
+  itemRevision: number;                 // [ext] card-level optimistic lock; bumped on every accepted decision/update
   status: ApprovalStatus;
   statusReason: string | null;          // [ext] why it was denied / cancelled / superseded (e.g. "someone already answered")
   snoozedUntil: number | null;
@@ -381,7 +374,7 @@ export interface ApprovalStat {
 
 // ==================== [ext] pure helpers ====================
 
-const PRESENTATIONAL_KEYS = new Set(["summary", "subjectKey", "sideEffect", "urgent", "card", "artifactId"]);
+const PRESENTATIONAL_KEYS = new Set(["summary", "subjectKey", "sideEffect", "urgent", "card", "artifactId", "cardOptions", "relatedProjectIds"]);
 
 /** The fields that determine what an action *does*; tokens are bound to these. */
 export function operativeAction(action: ProposedAction): Record<string, unknown> {
@@ -402,12 +395,8 @@ export function actionClassOf(action: ProposedAction): string {
       const [, channelId] = action.target.split(":");
       return `channel.send|channel:${channelId}:*`;
     }
-    case "workspace.exec":
-      return `workspace.exec|${action.tool}`;
     case "secret.use":
       return `secret.use|${action.secretRef}`;
-    case "cell.control":
-      return `cell.control|${action.action}`;
     case "custom":
       return `custom|${action.name}`;
     default:
@@ -420,16 +409,10 @@ export function actionTargetOf(action: ProposedAction): string | null {
   switch (action.type) {
     case "channel.send":
       return action.target;
-    case "workspace.exec":
-      return action.tool;
     case "secret.use":
       return action.secretRef;
-    case "cell.control":
-      return action.targetCellId;
     case "custom":
       return action.name;
-    case "job.start":
-      return action.command;
     default:
       return null;
   }

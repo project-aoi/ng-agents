@@ -1,6 +1,6 @@
 import type { Kernel } from "@ng/cell";
 import {
-  gtdKeys,
+  get, gtdKeys,
   type ActionRecord,
   type ActivityRecord,
   type ApprovalRecord,
@@ -12,6 +12,7 @@ import {
 /** What the projections read: the kernel's stores and read models, never its mutating methods. */
 export type DeskKernel = Pick<
   Kernel,
+  | "humanItems"
   | "context"
   | "gate"
   | "hub"
@@ -154,6 +155,15 @@ export function readActions(kernel: DeskKernel): Array<Located<ActionRecord>> {
     const record = asAction(e.key, e.value, e.updatedAt);
     if (record) out.push({ cellId: e.cellId, key: e.key, record, updatedAt: e.updatedAt });
   }
+  for (const item of kernel.humanItems.list()) {
+    if (item.cellId !== null || !item.subjectKey.startsWith("reminder:")) continue;
+    const at = item.dueAt ?? 0;
+    out.push({ cellId: kernel.deskCellId, key: item.subjectKey, updatedAt: at, record: {
+      id: item.id, title: item.title, nextStep: item.description ?? item.title, owner: "human", status: "open",
+      ...(item.effort === "45m" || item.effort === "15m" || item.effort === "low_energy" ? { effort: item.effort } : {}),
+      ...(item.dueAt !== undefined ? { dueAt: item.dueAt } : {}), createdAt: at, updatedAt: at, source: { label: "定时提醒", at },
+    } });
+  }
   return out;
 }
 
@@ -234,6 +244,12 @@ export function cardBackedActions(kernel: DeskKernel, actions: ReadonlyArray<Loc
 /** Cells that hold a project record (`gtd:project`): one Radar row each. */
 export function projectCellIds(kernel: DeskKernel): Set<string> {
   return new Set(readProjects(kernel).map((p) => p.cellId));
+}
+
+export function humanItemForAction(kernel:DeskKernel, cellId:string, actionId:string) {
+  const origin = get<{item_id:string}>(kernel.db,"SELECT item_id FROM human_item_origins WHERE cell_id=? AND key=?",
+    [cellId,gtdKeys.action(actionId)]);
+  return kernel.humanItems.get(origin?.item_id ?? actionId);
 }
 
 export const actionKey = (a: Located<ActionRecord>) => `${a.cellId}\u0000${a.record.id}`;

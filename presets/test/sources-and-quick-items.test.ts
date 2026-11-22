@@ -78,11 +78,11 @@ describe("docs/03 §四 row 1 — a sensor is a source, not a task", () => {
     const proposal = (card.clarify as { proposal: ProjectProposal }).proposal;
     const edited: ProjectProposal = { ...proposal, actions: [...proposal.actions, { title: "确认埋点没有漏报", owner: "agent" }] };
     expect(h.kernel.context.commitSync("desk", { artifact: { artifactId: card.artifactId!, content: { format: "json", body: JSON.stringify(edited), data: edited }, updatedBy: "human", expectedVersion: 1 } })).toMatchObject({ ok: true });
-    expect(await h.kernel.resolveApproval(card.actionId, { decision: "approve", seenArtifactVersion: 1 })).toMatchObject({ status: "version_mismatch", currentVersion: 2 });
+    expect(await h.kernel.resolveApproval(card.actionId, { decision: "approve", approverId: "owner", seenArtifactVersion: 1 })).toMatchObject({ status: "version_mismatch", currentVersion: 2 });
 
     // Approve v2 → the project starts with the edited plan, before (and without) any model call of the desk.
     const deskCalls = h.script.callsOf("desk").length;
-    expect(await h.kernel.resolveApproval(card.actionId, { decision: "approve", seenArtifactVersion: 2 })).toEqual({ status: "approved", actionId: card.actionId });
+    expect(await h.kernel.resolveApproval(card.actionId, { decision: "approve", approverId: "owner", seenArtifactVersion: 2 })).toEqual({ status: "approved", actionId: card.actionId });
     await h.kernel.idle();
     expect(h.script.callsOf("desk")).toHaveLength(deskCalls);
 
@@ -100,7 +100,6 @@ describe("docs/03 §四 row 1 — a sensor is a source, not a task", () => {
     const acts = h.actions(project);
     expect(acts.map((a) => [a.title, a.owner, a.status, a.nextStep ?? null])).toEqual([
       ["拉取近两周注册漏斗数据，定位下跌环节", "agent", "open", null],
-      ["和增长组同步结论", "human", "open", "约增长组开 15 分钟短会"],
       ["确认埋点没有漏报", "agent", "open", null],
     ]);
     expect(acts.every((a) => a.projectCellId === project)).toBe(true);
@@ -125,7 +124,7 @@ describe("docs/03 §四 row 1 — a sensor is a source, not a task", () => {
     expect(h.deskRuns()).toBe(deskRuns);
     expect(h.kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.sourceHit })).toEqual([]);
     expect(h.cards()).toEqual([]);
-    const note = h.kernel.context.getKnowledgeSync({ kind: "note", name: OBSERVATION_NOTE, scope: "cell", cellId: sensor! });
+    const note = h.kernel.context.getKnowledgeSync({ kind: "reference", name: OBSERVATION_NOTE, scope: "cell", cellId: sensor! });
     expect(note?.body).toContain("有人说付款页面白屏");
     expect(h.notices()).toEqual(["已添加信源：研发群反馈（观察模式，只记笔记不出卡）"]);
   });
@@ -173,7 +172,7 @@ describe("docs/03 §四 row 2 — personal zero-side-effect items: done at once,
       envelope: { id: env.id },
     });
     expect(h.notices()).toEqual(["已存入阅读清单：Agent 架构长文"]);
-    const note = h.kernel.context.getKnowledgeSync({ kind: "note", name: "阅读清单", scope: "cell", cellId: "desk" });
+    const note = h.kernel.context.getKnowledgeSync({ kind: "reference", name: "阅读清单", scope: "cell", cellId: "desk" });
     expect(note?.body).toContain("Agent 架构长文 https://example.com/post");
   });
 
@@ -196,14 +195,14 @@ describe("docs/03 §四 row 2 — personal zero-side-effect items: done at once,
     h.clock.set(remindAt);
     await h.kernel.idle();
     expect(h.script.callsOf("desk")).toHaveLength(deskCalls);
-    const acts = h.actions("desk");
+    const acts = h.kernel.humanItems.list();
     expect(acts).toHaveLength(1);
-    expect(acts[0]).toMatchObject({ title: "给牙医打电话约时间", owner: "human", status: "open", effort: "15m", nextStep: "给牙医打电话约时间", source: { label: "定时提醒" }, dueAt: remindAt });
+    expect(acts[0]).toMatchObject({ title: "给牙医打电话约时间", cellId: null, status: "pending", effort: "15m", dueAt: remindAt });
     expect(h.notices().at(-1)).toBe("⏰ 提醒：给牙医打电话约时间");
     expect(h.cards()).toEqual([]);
 
     // Applying the same wake-up twice changes nothing (any desk tool settles it first).
-    expect(h.kernel.context.listStateSync("desk", gtdKeys.actionPrefix)).toHaveLength(1);
+    expect(h.kernel.context.listStateSync("desk", gtdKeys.actionPrefix)).toHaveLength(0);
   });
 
   it("a reminder becomes a to-do when it fires even if the model ignores the wake-up it shares with a new item", async () => {
@@ -230,7 +229,7 @@ describe("docs/03 §四 row 2 — personal zero-side-effect items: done at once,
     release();
     await h.kernel.idle();
     expect(h.script.callsOf("desk")).toHaveLength(4);
-    expect(h.actions("desk")).toEqual([expect.objectContaining({ title: "交房租", owner: "human", status: "open", dueAt: T0 + 60 * 60_000 })]);
+    expect(h.kernel.humanItems.list()).toEqual([expect.objectContaining({ title: "交房租", cellId: null, status: "pending", dueAt: T0 + 60 * 60_000 })]);
     expect(h.notices()).toContain("⏰ 提醒：交房租");
     expect(h.kernel.context.listStateSync("desk", "desk:reminder:")).toEqual([]);
   });

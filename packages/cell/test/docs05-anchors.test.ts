@@ -3,6 +3,7 @@ import {
   createEnvelope,
   gtdKeys,
   isNgError,
+  run,
   PAYLOAD,
   type ActionRecord,
   type Envelope,
@@ -20,6 +21,11 @@ function project(h: Harness, id = "proj", lifecycle: ProjectRecord["lifecycle"] 
   h.kernel.spawnCell("desk", { id, preset: "project", title: "Harness 对比", meta: { role: id, projectCellId: id } });
   const now = h.clock.now();
   h.kernel.context.commitSync(id, { statePatches: { [gtdKeys.project]: { title: "Harness 对比", lifecycle, createdAt: now, updatedAt: now } satisfies ProjectRecord } });
+}
+
+function addWait(h: Harness, from: string, to: string, id = to, registration = id): void {
+  run(h.kernel.db, `INSERT INTO cell_waits(cell_id, wait_id, registration_id, waiting_for, reason, epoch, created_at)
+    VALUES (?,?,?,?,?,?,?)`, [from, id, registration, `inbox:${to}`, "await reply", h.kernel.getCell(from)!.epoch, h.clock.now()]);
 }
 
 const record = (h: Harness, id = "proj") => h.kernel.context.readStateSync<ProjectRecord>(id, gtdKeys.project)!;
@@ -52,19 +58,20 @@ describe("stall check", () => {
     h.clock.advance(GRACE);
     await h.kernel.idle();
     expect(h.script.callsOf("proj")).toHaveLength(1);
-    // Still stalled, still stamped — and that is all: the check's own Run and message were never an anchor, and the
-    // notice is not repeated however much time passes or however often the check runs.
-    expect(h.kernel.anchorsOf("proj").stalled).toBe(true);
+    const escalation = h.kernel.humanItems.list().find(item => item.subjectKey.startsWith("kernel:stalled:"))!;
+    expect(escalation.relatedProjectIds).toEqual(["proj"]);
+    expect(h.kernel.anchorsOf("proj")).toMatchObject({ human: true, stalled: false });
     h.clock.advance(6 * HOUR);
     h.kernel.checkStalls();
     await h.ui.capture({ text: "无关的一条随手记" });
     await h.kernel.idle();
     expect(checks(h)).toHaveLength(1);
     expect(h.script.callsOf("proj")).toHaveLength(1);
-    expect(record(h)).toMatchObject({ stalledSince: T0, stalledNotifiedAt: T0 });
+    expect(h.kernel.humanItems.list().filter(item => item.subjectKey.startsWith("kernel:stalled:"))).toHaveLength(1);
 
     // A real anchor (the owner now has an open action) lifts the stall and re-arms the notice…
     action(h, "proj", "a1", {});
+    await h.kernel.humanItems.decide(escalation.id, {optionId:"reply", seenItemRevision:escalation.itemRevision}, "owner");
     await h.kernel.idle();
     expect(h.kernel.anchorsOf("proj")).toMatchObject({ human: true, stalled: false });
     expect(record(h).stalledSince).toBeUndefined();
@@ -115,7 +122,7 @@ describe("stall check", () => {
     await h.kernel.idle();
 
     expect(h.kernel.anchorsOf("p-human")).toMatchObject({ human: true, stalled: false });
-    expect(h.kernel.anchorsOf("p-wait")).toMatchObject({ internal: true, stalled: false });
+    expect(h.kernel.anchorsOf("p-wait")).toMatchObject({ internal: false, stalled: true });
     expect(h.kernel.anchorsOf("p-someday")).toMatchObject({ parked: true, stalled: false });
     expect(h.kernel.anchorsOf("p-paused")).toMatchObject({ parked: true, stalled: false });
     // The worker ended its turn with a bare wait: nothing will ever wake it, so its project has no anchor left.
@@ -123,7 +130,7 @@ describe("stall check", () => {
     expect(Object.fromEntries(["p-agent", "p-human", "p-wait", "p-someday", "p-paused"].map((id) => [id, checks(h, id).length]))).toEqual({
       "p-agent": 1,
       "p-human": 0,
-      "p-wait": 0,
+      "p-wait": 1,
       "p-someday": 0,
       "p-paused": 0,
     });
@@ -179,7 +186,7 @@ describe("waits (the internal anchor)", () => {
     h.script.add("proj", tool("wait", { reason: "等 w1 交卷", waitingFor: "inbox:w1" }));
     h.kernel.sendToCell("proj", { text: "go" });
     await h.kernel.idle();
-    expect(h.kernel.anchorsOf("proj")).toMatchObject({ internal: true, stalled: false });
+    expect(h.kernel.anchorsOf("proj")).toMatchObject({ internal: false, stalled: true });
 
     await h.kernel.closeCell("w1", "cancelled");
     expect(h.kernel.listWaits(["w1"])).toEqual([]);
@@ -314,7 +321,7 @@ describe("agent principal on the control plane", () => {
     expect(h.kernel.gate.usageSync("w").limitTokens).toBe(1_000);
     expect(h.kernel.gate.getApprovalSync(budget.actionId)!.status).toBe("pending");
     // The owner can.
-    expect(await h.kernel.resolveApproval(budget.actionId, { decision: "continue" })).toMatchObject({ status: "continued" });
+    expect(await h.kernel.resolveApproval(budget.actionId, { decision: "continue", approverId: "owner" })).toMatchObject({ status: "continued" });
 
     // An ordinary blocked card is the agent's to answer on the owner's behalf.
     h.kernel.spawnCell("desk", { id: "p", preset: "project", meta: { role: "p" } }, "go");
@@ -340,4 +347,122 @@ describe("preferences reach cells that are already alive", () => {
     await h.kernel.idle();
     expect(h.script.callsOf("desk")[1]!.system).toContain("/ship-mr");
   });
+});
+
+it("rechecks an orphaned worker wait outside projects", async () => {
+  const h = await boot();
+  h.kernel.spawnCell("desk", {id:"detached",preset:"worker",meta:{role:"detached"}});
+  h.script.add("detached",tool("wait",{waitingFor:"inbox:desk",waitId:"missing-reply",reason:"waiting for an answer"}));
+  h.kernel.sendToCell("detached",{text:"wait for instructions"});
+  await h.kernel.idle();
+  expect(checks(h,"detached").filter(m=>m.status==="pending")).toHaveLength(1);
+});
+
+it("requires a real source beyond an internal wait chain and rejects cycles of three cells", async () => {
+  const h = await boot({ start: false });
+  project(h);
+  for (const id of ["a","b","c"]) h.kernel.spawnCell("proj", { id, preset: "worker" });
+  addWait(h, "a", "proj");
+  expect(h.kernel.anchorsOf("proj").internal).toBe(false);
+  addWait(h, "a", "b");
+  addWait(h, "b", "c");
+  expect(h.kernel.anchorsOf("proj").internal).toBe(false);
+  h.kernel.updateCell("c", { watches: [{ threadOrFilter: { thread: "memory:result" } }] });
+  expect(h.kernel.anchorsOf("proj").internal).toBe(true);
+  addWait(h, "c", "a");
+  expect(h.kernel.anchorsOf("proj").internal).toBe(false);
+});
+
+it("ignores a budget-held target's queued work and excludes waits below a budget-declined project", async () => {
+  const h = await boot();
+  project(h);
+  h.kernel.spawnCell("desk", { id: "held", preset: "worker", bounds: { maxTokens: 100 } });
+  h.kernel.gate.meter("held", { tokens: 101, billedCents: 0 });
+  h.kernel.sendToCell("held", { text: "run when funded" });
+  await h.kernel.idle();
+  expect(h.kernel.activityOf(["held"]).get("held")?.state).toBe("budget_paused");
+  addWait(h,"proj","held");
+  expect(h.kernel.anchorsOf("proj").internal).toBe(false);
+
+  h.kernel.spawnCell("proj", { id: "nested", preset: "project" });
+  h.kernel.checkStalls();
+  expect(checks(h,"nested")).toMatchObject([{status:"pending"}]);
+  h.kernel.gate.declineBudgetSync("proj", "owner");
+  expect(h.kernel.getCell("nested")?.status).toBe("active");
+  h.kernel.checkStalls();
+  expect(checks(h,"nested")).toMatchObject([{status:"cancelled"}]);
+  h.clock.advance(GRACE);
+  await h.kernel.idle();
+  expect(h.script.callsOf("nested")).toHaveLength(0);
+});
+
+it("arbitrates each affected project separately and re-arms a resolved incident for a new wait registration", async () => {
+  const h = await boot();
+  for (const id of ["a", "b", "c"]) {
+    project(h,id);
+    addWait(h,id,"desk","answer");
+  }
+  const decision = (subjectKey: string, projects: string[]) => h.kernel.humanItems.create({
+    title: "需要裁决", subjectKey, relatedProjectIds: projects, options: [{ id: "ok", label: "答复", effect: "reply" }],
+  }, "desk");
+  const accept = async (item: { id: string; itemRevision: number }, optionId: string) => {
+    await h.kernel.humanItems.decide(item.id, { optionId, seenItemRevision: item.itemRevision }, "owner");
+    await h.kernel.idle();
+  };
+  decision("arb:a", ["a"]);
+  h.kernel.spawnCell("desk", { id: "fixer", preset: "worker", meta: {relatedProjectIds:["c"]},
+    watches: [{ threadOrFilter: {thread:"memory:fixer"} }] });
+  h.kernel.humanItems.create({category:"action", title:"普通待办", subjectKey:"action:b", relatedProjectIds:["b"],
+    options:[{id:"done",label:"完成",effect:"reply"}]}, "b");
+  const cause = "arb:shared";
+  const escalations = () => h.kernel.humanItems.list().filter(i => i.subjectKey === `kernel:stalled:${cause}`);
+  await accept(decision(cause, ["a", "b", "c"]), "ok");
+  expect(escalations()).toMatchObject([{relatedProjectIds:["b"]}]);
+  await accept(escalations()[0]!, "reply");
+  expect(escalations()).toEqual([]);
+  h.kernel.directMessage("b", {text:"这一轮结束"}, {principalId:"owner"});
+  await h.kernel.idle();
+  expect(h.kernel.listWaits(["b"])).toEqual([]);
+  addWait(h,"b","desk","answer","second");
+  await accept(decision(cause,["a","b","c"]), "ok");
+  expect(escalations()).toMatchObject([{relatedProjectIds:["b"]}]);
+  expect(h.kernel.inbox.listMessagesSync({cellId:"desk",type:PAYLOAD.arbitrationUnanswered})).toHaveLength(2);
+});
+
+it("settles multiple waits on an owner's direct answer even when the new run defers for approval", async () => {
+  const h = await boot();
+  project(h);
+  addWait(h, "proj", "desk", "first");
+  addWait(h, "proj", "desk", "second");
+  h.script.add("proj", tool("request_approval", {kind:"escalation", title:"请确认", summary:"需要决定",
+    escalation:{reason:"blocked",explanation:"请主人给出处理决定"}}));
+  h.kernel.directMessage("proj", {text:"两项都确认"}, {principalId:"agent:main"});
+  await h.kernel.idle();
+  expect(h.of("run.finished").filter(e => e.cellId === "proj")).toMatchObject([{outcome:"deferred_for_approval"}]);
+  expect(h.kernel.listWaits(["proj"])).toEqual([]);
+
+  addWait(h,"proj","desk","named");
+  h.kernel.inbox.enqueueSync("proj", {id:"answer", from:"inbox:desk", principalId:"cell:desk", kind:"event",
+    type:PAYLOAD.cellMessage, payload:{ fromCellId:"desk", text:"answered", replyToId:"transport-message" }, createdAt:h.clock.now()});
+  await h.kernel.idle();
+  expect(h.kernel.listWaits(["proj"])).toEqual([]);
+});
+
+
+it("shows a coordinator the budget hold and a human edit on a descendant's shared artifact", async () => {
+  const h = await boot();
+  project(h);
+  h.kernel.spawnCell("proj", {id:"worker",preset:"worker",bounds:{maxTokens:100}});
+  h.kernel.gate.meter("worker", {tokens:101,billedCents:0});
+  h.kernel.sendToCell("worker",{text:"continue"});
+  await h.kernel.idle();
+  const draft = (body: string) => ({format:"text" as const, body});
+  h.kernel.context.commitSync("worker",{artifact:{artifactId:"art_report",content:draft("draft"),updatedBy:"agent"}});
+  h.kernel.context.commitSync("worker",{artifact:{artifactId:"art_report",expectedVersion:1,content:draft("reviewed"),updatedBy:"human"}});
+  h.kernel.sendToCell("proj",{text:"查看共享文档"});
+  await h.kernel.idle();
+  const prompt = requestText(h.script.callsOf("proj").at(-1)!);
+  expect(prompt).toContain("budget exhausted");
+  expect(prompt).toContain("[human-edited artifacts]");
+  expect(prompt).toContain("art_report v2");
 });

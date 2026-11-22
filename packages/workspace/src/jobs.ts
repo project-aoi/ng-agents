@@ -1,5 +1,5 @@
 import type { ChildProcess } from "node:child_process";
-import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, rmSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, rmSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import {
@@ -25,34 +25,42 @@ import {
 import type { IsolationDriver } from "./drivers/types";
 import type { WorkspaceStore } from "./store";
 import type { CommandRunner, JobObservation, WorkspaceLimits, WorkspaceManagerOptions } from "./types";
-import { errorMessage, groupAlive, killGroup, markedAlive, processHasMarker, sleep } from "./util";
+import { processIdentity, processInspection } from "@ng/protocol";
+import { errorMessage, groupAlive, killGroup, pidAlive, processHasMarker, sleep } from "./util";
 
 export const JOB_MARKER = "NG_JOB_ID";
 
-/** Consecutive polls on which a re-attached job's process was alive but unidentifiable before it counts as gone. */
-const UNREADABLE_POLLS = 3;
+/** Prefix on `jobs.error` when cancel_requested_at was set by #onTimeout so restart recovery preserves exitCode 124. */
+const TIMEOUT_REASON_PREFIX = "job timed out after ";
 
 /**
  * POSIX sh wrapper every job runs under: `sh -c WRAPPER ng-job <exitFile> <shell> -c <command>`. It records the
  * command's exit status atomically next to the log, so a job that finishes while no kernel is watching (crash,
  * restart) still reports its real outcome to `recover()`.
  */
-export const JOB_WRAPPER = 'exitf="$1"; shift; "$@"; s=$?; printf "%s\\n" "$s" > "$exitf.tmp" && mv -f "$exitf.tmp" "$exitf"; exit "$s"';
+// A caught TERM keeps the supervising shell alive and gives the command its normal TERM disposition.
+export const JOB_WRAPPER = 'trap ":" TERM; exitf="$1"; shift; "$@"; s=$?; printf "%s\\n" "$s" > "$exitf.tmp" && mv -f "$exitf.tmp" "$exitf"; exit "$s"';
 
 /** `silent`: the cell cancelled the job itself, so its result rides along with the next batch instead of waking it. */
 type Outcome = { state: Exclude<JobState, "running">; exitCode: number | null; error: string | null; silent?: boolean };
 
 interface LiveJob {
+  unknownSince?:number;
   jobId: string;
   cellId: string;
   pid: number;
   logPath: string;
   child: ChildProcess | null;           // null when re-attached after a restart (not our child)
   poller: NodeJS.Timeout | null;
+  timeoutTimer: NodeJS.Timeout | null;
+  quietTimer: NodeJS.Timeout | null;
+  terminationRetry: NodeJS.Timeout | null;
+  warned: Set<string>;
   preview: { timer: NodeJS.Timeout; offset: number; decoder: StringDecoder } | null;
   done: Promise<void>;
   markDone: () => void;
   isDone: boolean;
+  timedOut: boolean;
   cancelReason: string | null;
   cancelSilent: boolean;
   /** The cancel in flight (request written, signals sent, waiting for the group to go). */
@@ -112,10 +120,18 @@ export class JobManager {
 
   // ---------- start ----------
 
-  async start(ws: WorkspaceRecord, driver: IsolationDriver, spec: { command: string; streamPreview?: boolean | undefined }): Promise<{ jobId: string }> {
+  async start(
+    ws: WorkspaceRecord,
+    driver: IsolationDriver,
+    spec: { command: string; streamPreview?: boolean | undefined; timeoutMs?: number | undefined },
+  ): Promise<{ jobId: string }> {
     if (this.#closed) throw new NgError("conflict", "the workspace manager is closed");
     if (driver.readOnly) throw new NgError("bounds_violation", `jobs are not allowed in a ${driver.level} workspace`);
     if (typeof spec?.command !== "string" || !spec.command.trim()) throw new NgError("invalid_argument", "startJob: command must be a non-empty string");
+    if (spec.timeoutMs !== undefined && (!Number.isFinite(spec.timeoutMs) || spec.timeoutMs <= 0)) {
+      throw new NgError("invalid_argument", "startJob: timeoutMs must be a positive number");
+    }
+    const timeoutMs = Math.min(Math.max(1, Math.floor(spec.timeoutMs ?? this.d.limits.jobTimeoutMs)), this.d.limits.maxJobTimeoutMs);
     const { db, store, clock, bus } = this.d;
     const cellId = ws.cellId;
     const root = ws.path!;
@@ -135,7 +151,7 @@ export class JobManager {
           throw new NgError("conflict", `cell "${cellId}" already has ${this.d.limits.maxJobsPerCell} running jobs; wait for one or cancel one`);
         }
         // The epoch is read in the same transaction that records the job: it becomes the result's expectedEpoch.
-        store.insertJob({ jobId, cellId, epoch: cell.epoch, command: spec.command, cwd: root, logPath, streamPreview: spec.streamPreview === true });
+        store.insertJob({ jobId, cellId, epoch: cell.epoch, command: spec.command, cwd: root, logPath, streamPreview: spec.streamPreview === true, timeoutMs });
         afterCommit(db, () => bus.emit("job.changed", { jobId, cellId, state: "running" }));
       });
     } catch (err) {
@@ -147,7 +163,9 @@ export class JobManager {
     let child: ChildProcess;
     try {
       const plan = driver.plan(ws, {
-        argv: ["/bin/sh", "-c", JOB_WRAPPER, "ng-job", driver.toSandboxPath(ws, exitPath), driver.shell(), "-c", spec.command],
+        // Carry `${JOB_MARKER}=${jobId}` as sh's $0 in addition to the env marker: on macOS with SIP, `/bin/sh` is an
+        // Apple platform binary whose environment is stripped from `ps -E`, while its argv ($0) remains visible.
+        argv: ["/bin/sh", "-c", JOB_WRAPPER, `${JOB_MARKER}=${jobId}`, driver.toSandboxPath(ws, exitPath), driver.shell(), "-c", spec.command],
         cwd: root,
         env: this.d.sandboxEnv(cellId),
         marker: { name: JOB_MARKER, value: jobId },
@@ -165,9 +183,10 @@ export class JobManager {
     }
     closeSync(fd);
     const pid = child.pid!;
-    store.setJobPid(jobId, pid);
+    store.setJobPid(jobId, pid, process.platform === "darwin" ? processIdentity(pid) : null);
 
     const live = this.#register(jobId, cellId, pid, logPath, child);
+    this.#armTimeout(live, timeoutMs, timeoutMs);
     child.stdin?.on("error", () => {
       // EPIPE when the job exits without reading its input; nothing to report.
     });
@@ -210,10 +229,15 @@ export class JobManager {
       logPath,
       child,
       poller: null,
+      timeoutTimer: null,
+      quietTimer: null,
+      terminationRetry: null,
+      warned: new Set(),
       preview: null,
       done,
       markDone,
       isDone: false,
+      timedOut: false,
       cancelReason: null,
       cancelSilent: false,
       cancelling: null,
@@ -222,7 +246,67 @@ export class JobManager {
       attempts: 0,
     };
     this.#live.set(jobId, live);
+    this.#watchOutput(live);
     return live;
+  }
+
+  #warn(job: JobRecord, reason: "quiet" | "identity_unknown" | "termination_pending", message: string): boolean {
+    const live = this.#live.get(job.jobId);
+    if (!live || live.warned.has(reason)) return true;
+    try {
+      this.d.inbox.enqueueSync(job.cellId, createEnvelope({
+        id: `${job.jobId}:warning:${reason}`, from: KERNEL_FROM.workspace, principalId: cellPrincipal(job.cellId),
+        kind: "event", type: PAYLOAD.jobWarning, to: inboxAddr(job.cellId), expectedEpoch: job.epoch,
+        payload: { jobId: job.jobId, reason, message }, delivery: "wakeup",
+      }, this.d.clock));
+      live.warned.add(reason);
+      return true;
+    } catch (err) {
+      console.error(`[workspace] warning for job ${job.jobId}:`, err);
+      return false;
+    }
+  }
+
+  #watchOutput(live: LiveJob): void {
+    const threshold = this.d.limits.jobQuietWarningMs;
+    if (!live.logPath || threshold <= 0) return;
+    const check = () => {
+      const job = this.d.store.getJob(live.jobId);
+      if (!job || job.state !== "running" || live.cancelReason !== null) return;
+      // Log timestamps are filesystem wall time, independent of the scheduler clock.
+      const modified = statSync(live.logPath, { throwIfNoEntry: false })?.mtimeMs;
+      const remaining = modified === undefined ? 0 : threshold - (Date.now() - modified);
+      if (remaining > 0) arm(remaining);
+      else if (!this.#warn(job, "quiet", `Job has produced no output for ${threshold} ms: ${job.command}`)) arm(threshold);
+    };
+    const arm = (ms: number) => {
+      live.quietTimer = setTimeout(() => {
+        live.quietTimer = null;
+        try { check(); } catch (err) { console.error("[workspace] job warning:", err); arm(threshold); }
+      }, Math.min(threshold, Math.max(1, ms)));
+      live.quietTimer.unref();
+    };
+    arm(Math.min(threshold, this.d.limits.jobPollMs));
+  }
+
+  #armTimeout(live: LiveJob, remainingMs: number, totalTimeoutMs: number): void {
+    if (live.timeoutTimer) clearTimeout(live.timeoutTimer);
+    live.timeoutTimer = setTimeout(() => {
+      live.timeoutTimer = null;
+      void this.#onTimeout(live, totalTimeoutMs);
+    }, Math.max(0, remainingMs));
+    live.timeoutTimer.unref();
+  }
+
+  async #onTimeout(live: LiveJob, totalTimeoutMs: number): Promise<void> {
+    if (this.#closed || live.isDone || live.cancelReason !== null || live.timedOut) return;
+    const job = this.d.store.getJob(live.jobId);
+    if (!job || job.state !== "running") return;
+    live.timedOut = true;
+    const reason = `job timed out after ${totalTimeoutMs}ms`;
+    this.d.store.requestJobCancel(live.jobId, reason);
+    live.cancelReason = reason;
+    await this.#finishCancellation(job, live);
   }
 
   // ---------- completion ----------
@@ -249,6 +333,7 @@ export class JobManager {
         exitCode: outcome.exitCode,
         tail: readTail(job.logPath, limits.jobResultTailChars),
         durationMs: Math.max(0, now - job.startedAt),
+        ...(outcome.error ? { error: outcome.error } : {}),
       };
       if (this.d.resources && job.logPath && existsSync(job.logPath)) {
         payload.logUri = this.d.resources.writeResourceSync(job.cellId, readTail(job.logPath, limits.storedLogMaxChars), {
@@ -289,6 +374,10 @@ export class JobManager {
     this.#markExited(live);
     if (live.poller) clearInterval(live.poller);
     live.poller = null;
+    if (live.quietTimer) clearTimeout(live.quietTimer);
+    if (live.terminationRetry) clearTimeout(live.terminationRetry);
+    if (live.timeoutTimer) clearTimeout(live.timeoutTimer);
+    live.timeoutTimer = null;
     if (live.preview) {
       this.#pumpPreview(live);
       clearInterval(live.preview.timer);
@@ -404,31 +493,37 @@ export class JobManager {
   async cancel(jobId: string, reason = "cancelled", opts: { silent?: boolean } = {}): Promise<boolean> {
     const job = this.d.store.getJob(jobId);
     if (!job || job.state !== "running") return false;
-    const live = this.#live.get(jobId);
-    if (live?.cancelling) {
-      await live.cancelling;
-      return true;
-    }
+    const live = this.#live.get(jobId) ?? this.#register(jobId, job.cellId, job.pid ?? 0, job.logPath ?? "", null);
     const first = this.d.store.requestJobCancel(jobId, reason);
-    const silent = opts.silent === true;
-    const work = (async () => {
-      if (live) {
-        live.cancelReason ??= reason;
-        live.cancelSilent = silent;
-      }
-      const gone = await this.#terminate(job, live);
-      const outcome: Outcome = {
-        state: "cancelled",
-        exitCode: null,
-        error: gone ? reason : `${reason} (the process did not exit after SIGKILL; pid ${job.pid ?? "?"})`,
-        silent,
-      };
-      if (live) this.#settle(live, outcome);
-      else this.finalizeSync(jobId, outcome);
-    })();
-    if (live) live.cancelling = work.finally(() => (live.cancelling = null));
-    await work;
+    live.cancelReason ??= job.error ?? reason;
+    if (first) live.cancelSilent = opts.silent === true;
+    await this.#finishCancellation(job, live);
+    if (this.d.store.getJob(jobId)?.state === "running") {
+      throw new NgError("conflict", `job ${jobId} is still stopping; its workspace is still active`);
+    }
     return first;
+  }
+
+  async #finishCancellation(job: JobRecord, live: LiveJob): Promise<void> {
+    if (live.cancelling) return live.cancelling;
+    const attempt = async () => {
+      if (!await this.#terminate(job, live)) {
+        if (this.#closed || live.terminationRetry) return;
+        if (this.#aliveState(job,live) === null && this.#lostIdentity(job,live)) return;
+        live.terminationRetry = setTimeout(() => {
+          live.terminationRetry = null;
+          void this.#finishCancellation(job, live);
+        }, this.d.limits.jobPollMs);
+        live.terminationRetry.unref();
+        this.#warn(job, "termination_pending", "Waiting for confirmation that the job process has exited.");
+        return;
+      }
+      const reason = live.cancelReason ?? "cancelled";
+      const timeout = live.timedOut || reason.startsWith(TIMEOUT_REASON_PREFIX);
+      this.#settle(live, { state: timeout ? "failed" : "cancelled", exitCode: timeout ? 124 : null, error: reason, silent: live.cancelSilent });
+    };
+    live.cancelling = attempt().finally(() => { live.cancelling = null; });
+    return live.cancelling;
   }
 
   async cancelForCell(cellId: string, reason: string): Promise<number> {
@@ -437,12 +532,16 @@ export class JobManager {
     return results.filter(Boolean).length;
   }
 
-  /** True when nothing of the job is alive afterwards. */
+  /** True when nothing of the job is confirmed alive afterwards (`false` if still alive or identity unreadable). */
   async #terminate(job: JobRecord, live: LiveJob | undefined): Promise<boolean> {
     const pid = job.pid;
     if (!pid) return true;
     const ours = !!live?.child;
-    if (!ours && !markedAlive(pid, JOB_MARKER, job.jobId)) return true; // gone, or the pid now belongs to someone else
+    if (!ours) {
+      const state = this.#processState(job);
+      if (state === false) return true; // confirmed gone or PID belongs to another process
+      if (state === null) return false; // unreadable identity: never signal, never falsely claim terminated
+    }
     const target = this.d.workspaceOf(job.cellId);
     const marker = { name: JOB_MARKER, value: job.jobId };
     const signalAll = (sig: "TERM" | "KILL") => {
@@ -451,27 +550,41 @@ export class JobManager {
     };
     signalAll("TERM");
     if (await this.#waitGone(job, live, this.d.limits.killGraceMs)) return true;
+    if (!ours && pidAlive(pid)) {
+      const state = this.#processState(job);
+      if (state !== true) return state === false && !groupAlive(pid);
+    }
     signalAll("KILL");
     return this.#waitGone(job, live, 2000);
   }
 
   /**
-   * Our own child: done when the leader was reaped and no group member is left (a TERM-ignoring grandchild must
-   * still get the KILL). A re-attached job: only the marker-verified leader is trusted, since its group id could
-   * in principle be reused once the original group is gone.
+   * Three-state liveness check:
+   * - `true`:  confirmed alive
+   * - `false`: confirmed gone (or PID recycled)
+   * - `null`:  re-attached process appears alive, but its identity could not be read
    */
-  #anyAlive(job: JobRecord, live: LiveJob | undefined): boolean {
+  #processState(job:JobRecord) {
+    const state = processHasMarker(job.pid!, JOB_MARKER, job.jobId, job.processIdentity);
+    if (state !== null || job.processIdentity) return state;
+    // Legacy rows have no persisted PID identity. Only the host clock is comparable to ps lstart.
+    const identity = processInspection.readIdentity(job.pid!);
+    const logTime = job.logPath && statSync(job.logPath, { throwIfNoEntry: false })?.mtimeMs;
+    return identity && logTime && Date.parse(identity.slice(0,24)) > logTime + 1000 ? false : null;
+  }
+
+  #aliveState(job: JobRecord, live: LiveJob | undefined): boolean | null {
     if (live?.child) return !live.isDone || groupAlive(job.pid!);
-    return markedAlive(job.pid!, JOB_MARKER, job.jobId);
+    return this.#processState(job);
   }
 
   async #waitGone(job: JobRecord, live: LiveJob | undefined, ms: number): Promise<boolean> {
-    const step = 25;
-    for (let waited = 0; waited < ms; waited += step) {
-      if (!this.#anyAlive(job, live)) return true;
-      await sleep(step);
+    const gone = () => !groupAlive(job.pid!) && (live?.child ? live.isDone : this.#processState(job) === false);
+    for (let waited = 0; waited < ms; waited += 25) {
+      if (gone()) return true;
+      await sleep(25);
     }
-    return !this.#anyAlive(job, live);
+    return gone();
   }
 
   // ---------- restart ----------
@@ -501,19 +614,18 @@ export class JobManager {
           continue;
         }
         if (job.cancelRequestedAt !== null) {
-          // The previous kernel asked for this cancel and died before it could confirm the exit: finish the kill here.
-          // Awaited, so recover() returns only when no cancelled job can still be writing to its directory.
-          const reason = job.error ?? "cancelled";
-          const gone = await this.#terminate(job, undefined);
-          this.finalizeSync(job.jobId, {
-            state: "cancelled",
-            exitCode: null,
-            error: gone ? reason : `${reason} (the process did not exit after SIGKILL; pid ${job.pid})`,
-          });
+          // The previous kernel asked for this cancel (or timeout termination) and died before it could confirm the
+          // exit. An unreadable process stays registered and the pending request is retried.
+          const cancel = this.#register(job.jobId, job.cellId, job.pid, job.logPath ?? "", null);
+          cancel.cancelReason = job.error ?? "cancelled";
+          await this.#finishCancellation(job, cancel);
           continue;
         }
-        if (markedAlive(job.pid, JOB_MARKER, job.jobId)) {
-          this.#reattach(job);
+        const marked = this.#processState(job);
+        // Three-state handling (BUG-027): confirmed alive (`true`) OR identity unreadable (`null`, e.g. transient `ps`
+        // error on macOS) goes to `#reattach` for multi-poll verification instead of falsely declaring the job dead.
+        if (marked === true || marked === null) {
+          this.#reattach(job, marked === true);
           continue;
         }
         this.finalizeSync(
@@ -531,25 +643,45 @@ export class JobManager {
     if (errors.length) throw new NgError("conflict", `recover: ${errors.length} job(s) could not be completed: ${errors.map(errorMessage).join("; ")}`);
   }
 
-  #reattach(job: JobRecord): void {
+  #lostIdentity(job: JobRecord, live: LiveJob): boolean {
+    live.unknownSince ??= Date.now();
+    if (Date.now() - live.unknownSince < 30_000) return false;
+    this.#settle(live, this.#outcomeFromExitFile(job) ?? {state:"failed", exitCode:null, error:"Job process identity could not be verified; tracking stopped without signalling it."});
+    return true;
+  }
+
+  #reattach(job: JobRecord, confirmedAlive: boolean): void {
     const pid = job.pid!;
     const live = this.#register(job.jobId, job.cellId, pid, job.logPath ?? "", null);
-    let unreadable = 0;
+    const timeoutMs = job.timeoutMs ?? this.d.limits.jobTimeoutMs;
+    const armIfTimeout = () => {
+      if (timeoutMs > 0 && !live.timeoutTimer) {
+        const elapsed = Math.max(0, this.d.clock.now() - job.startedAt);
+        this.#armTimeout(live, Math.max(0, timeoutMs - elapsed), timeoutMs);
+      }
+    };
+    // Only arm timeout termination once the process identity has been confirmed (`true`); an unverified `null` pid
+    // waits for multi-poll confirmation first so we never misreport an unreadable process as a timeout (exit 124).
+    let identityConfirmed = confirmedAlive;
+    if (identityConfirmed) armIfTimeout();
     live.poller = setInterval(() => {
-      const marked = processHasMarker(pid, JOB_MARKER, job.jobId);
+      const marked = this.#processState(job);
       if (marked === true) {
-        unreadable = 0;
+        delete live.unknownSince;
+        if (!identityConfirmed) {
+          identityConfirmed = true;
+          armIfTimeout();
+        }
         return;
       }
-      // Alive but not readable just now (no /proc and `ps` failed): a passing failure must not end a job that may still
-      // be writing, so look again on the next polls before treating it as gone.
-      if (marked === null && ++unreadable < UNREADABLE_POLLS) return;
-      if (live.cancelReason !== null) {
-        // cancel() is waiting on the same condition and records the outcome.
-        this.#markExited(live);
+      if (live.cancelReason !== null) return; // the termination request owns its final result
+      const exit = this.#outcomeFromExitFile(job);
+      if (marked === null && !exit) {
+        if (this.#lostIdentity(job,live)) return;
+        this.#warn(job, "identity_unknown", "The job process is still present but its identity cannot be confirmed.");
         return;
       }
-      this.#settle(live, this.#outcomeFromExitFile(job) ?? { state: "failed", exitCode: null, error: "the job process ended without recording an exit status" });
+      this.#settle(live, exit ?? { state: "failed", exitCode: null, error: "the job process ended without recording an exit status" });
     }, this.d.limits.jobPollMs);
     live.poller.unref();
     if (job.streamPreview && job.logPath) this.#startPreview(live);
@@ -559,7 +691,10 @@ export class JobManager {
   close(): void {
     this.#closed = true;
     for (const live of this.#live.values()) {
+      if (live.quietTimer) clearTimeout(live.quietTimer);
+      if (live.terminationRetry) clearTimeout(live.terminationRetry);
       if (live.poller) clearInterval(live.poller);
+      if (live.timeoutTimer) clearTimeout(live.timeoutTimer);
       if (live.preview) clearInterval(live.preview.timer);
       if (live.retry) clearTimeout(live.retry);
       live.child?.stdin?.destroy();

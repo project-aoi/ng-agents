@@ -23,7 +23,7 @@ describe("docs/03 §四 — five granularities through the real primitives", () 
     const activity: ActivityRecord = { id: "a1", kind: "note_saved", title: "阅读清单：https://example.com/post", at: T0, restorable: true };
     h.script.add(
       "desk",
-      tool("set_state", { patches: { [gtdKeys.activity("a1")]: activity } }),
+      tool("set_state", { patches: { "memo:a1": activity } }),
       tool("send_message", { to: "channel:ui:owner", text: "已存入阅读清单", summary: "note saved" }),
       { text: "done" },
     );
@@ -31,7 +31,7 @@ describe("docs/03 §四 — five granularities through the real primitives", () 
     await h.kernel.idle();
 
     expect(h.kernel.gate.listPendingSync({ includeSnoozed: true })).toEqual([]);
-    expect(h.kernel.context.readStateSync("desk", gtdKeys.activity("a1"))).toMatchObject({ kind: "note_saved" });
+    expect(h.kernel.context.readStateSync("desk", "memo:a1")).toMatchObject({ kind: "note_saved" });
     const notices = h.kernel.hub.listOutboxSync({ channelId: "ui" });
     expect(notices.map((n) => [n.status, n.content.body])).toEqual([["sent", "已存入阅读清单"]]);
     expect(h.of("run.finished").map((e) => e.outcome)).toEqual(["completed"]);
@@ -54,7 +54,7 @@ describe("docs/03 §四 — five granularities through the real primitives", () 
     // The owner edits the draft (Engage editor) → v2; a click carrying the old version must not send anything.
     const artifactId = card!.artifactId!;
     expect(h.kernel.context.commitSync("desk", { artifact: { artifactId, content: { format: "text", body: "议程 v2（我改过）" }, updatedBy: "human", expectedVersion: 1 } })).toEqual({ ok: true, artifactVersion: 2 });
-    expect(await h.kernel.resolveApproval(card!.actionId, { decision: "approve", seenArtifactVersion: 1 })).toEqual({
+    expect(await h.kernel.resolveApproval(card!.actionId, { decision: "approve", approverId: "owner", seenArtifactVersion: 1 })).toEqual({
       status: "version_mismatch",
       actionId: card!.actionId,
       currentVersion: 2,
@@ -62,7 +62,7 @@ describe("docs/03 §四 — five granularities through the real primitives", () 
     expect(h.memory.deliveries).toEqual([]);
 
     h.script.add("desk", { text: "noted" });
-    const r = await h.kernel.resolveApproval(card!.actionId, { decision: "approve", seenArtifactVersion: 2 });
+    const r = await h.kernel.resolveApproval(card!.actionId, { decision: "approve", approverId: "owner", seenArtifactVersion: 2 });
     expect(r).toEqual({ status: "sent", actionId: card!.actionId, artifactVersion: 2 });
     expect(h.memory.sent.map((d) => [d.target, d.content.body])).toEqual([["alice", "议程 v2（我改过）"]]);
     expect(h.kernel.gate.getApprovalSync(card!.actionId)).toMatchObject({ status: "executed", humanEdited: true, outcome: { receipt: "sent" } });
@@ -73,7 +73,7 @@ describe("docs/03 §四 — five granularities through the real primitives", () 
     expect(resolved.map((m) => [m.status, (m.envelope.payload as { status: string }).status])).toEqual([["done", "executed"]]);
 
     // A second click is idempotent: same receipt, nothing re-sent.
-    expect(await h.kernel.resolveApproval(card!.actionId, { decision: "approve", seenArtifactVersion: 2 })).toMatchObject({ status: "sent" });
+    expect(await h.kernel.resolveApproval(card!.actionId, { decision: "approve", approverId: "owner", seenArtifactVersion: 2 })).toMatchObject({ status: "sent" });
     expect(h.memory.deliveries).toHaveLength(1);
   });
 

@@ -1,3 +1,4 @@
+import type { createHumanItems } from "./human-items";
 import type { ChannelHubImpl } from "@ng/channel";
 import type { GateService } from "@ng/gate";
 import type { InboxService } from "@ng/inbox";
@@ -13,6 +14,7 @@ import type { Waits } from "./waits";
 
 /** Everything the kernel's modules share. Built once by createKernel; modules are attached after construction. */
 export interface KernelCore {
+  defaultEngine: import("@ng/protocol").AgentEngine | null;
   db: Db;
   bus: Bus;
   clock: Clock;
@@ -26,6 +28,7 @@ export interface KernelCore {
   loop: AgentLoop;
 
   dataDir: string;
+  cliProcDir: string;
   deskCellId: string;
   ownerPrincipal: string;
   ownerAddresses: readonly string[];
@@ -48,6 +51,7 @@ export interface KernelCore {
   dispatcher: Dispatcher;
   escalations: Escalations;
   approvals: Approvals;
+  humanItems: ReturnType<typeof createHumanItems>;
   readModel: ReadModel;
   waits: Waits;
   stall: StallMonitor;

@@ -5,7 +5,7 @@ import { memDb, seedCells } from "./helpers";
 function insertApproval(db: Db, actionId: string, subjectKey: string, status = "pending") {
   run(
     db,
-    `INSERT INTO approvals (action_id, cell_id, epoch, principal_id, subject_key, action_type, action, action_hash, card, status, created_at, updated_at)
+    `INSERT INTO human_items (action_id, cell_id, epoch, principal_id, subject_key, action_type, action, action_hash, card, disposition, created_at, updated_at)
      VALUES (?, 'desk', 0, 'cell:desk', ?, 'channel.send', '{}', 'h', '{}', ?, 1, 1)`,
     [actionId, subjectKey, status],
   );
@@ -25,7 +25,7 @@ describe("approvals: at most one pending card per subjectKey", () => {
     insertApproval(db, "a1", "project:p1");
     insertApproval(db, "a0", "project:p1", "executed");
     insertApproval(db, "a00", "project:p1", "cancelled");
-    run(db, "UPDATE approvals SET status = 'superseded' WHERE action_id = 'a1'");
+    run(db, "UPDATE human_items SET disposition = 'superseded' WHERE action_id = 'a1'");
     expect(() => insertApproval(db, "a2", "project:p1")).not.toThrow();
     expect(() => insertApproval(db, "b1", "project:p2")).not.toThrow();
   });

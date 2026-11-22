@@ -37,6 +37,7 @@ interface JobRow {
   cwd: string | null;
   state: string;
   pid: number | null;
+  process_identity:string | null;
   log_path: string | null;
   exit_code: number | null;
   stream_preview: number;
@@ -46,6 +47,7 @@ interface JobRow {
   finished_at: number | null;
   updated_at: number;
   cancel_requested_at: number | null;
+  timeout_ms: number | null;
 }
 
 function toWorkspace(r: WorkspaceRow): WorkspaceRecord {
@@ -74,6 +76,7 @@ function toJob(r: JobRow): JobRecord {
     cwd: r.cwd,
     state: r.state as JobState,
     pid: r.pid,
+    processIdentity:r.process_identity,
     logPath: r.log_path,
     exitCode: r.exit_code,
     streamPreview: toBool(r.stream_preview),
@@ -83,6 +86,7 @@ function toJob(r: JobRow): JobRecord {
     finishedAt: r.finished_at,
     updatedAt: r.updated_at,
     cancelRequestedAt: r.cancel_requested_at ?? null,
+    timeoutMs: r.timeout_ms ?? null,
   };
 }
 
@@ -181,18 +185,18 @@ export class WorkspaceStore {
     return get<{ n: number }>(this.db, "SELECT COUNT(*) AS n FROM jobs WHERE cell_id = ? AND state = 'running'", [cellId])?.n ?? 0;
   }
 
-  insertJob(j: { jobId: string; cellId: string; epoch: number; command: string; cwd: string; logPath: string; streamPreview: boolean }): void {
+  insertJob(j: { jobId: string; cellId: string; epoch: number; command: string; cwd: string; logPath: string; streamPreview: boolean; timeoutMs?: number | null }): void {
     const now = this.clock.now();
     run(
       this.db,
-      `INSERT INTO jobs (job_id, cell_id, epoch, command, cwd, state, pid, log_path, exit_code, stream_preview, result_envelope_id, error, started_at, finished_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, 'running', NULL, ?, NULL, ?, NULL, NULL, ?, NULL, ?)`,
-      [j.jobId, j.cellId, j.epoch, j.command, j.cwd, j.logPath, fromBool(j.streamPreview), now, now],
+      `INSERT INTO jobs (job_id, cell_id, epoch, command, cwd, state, pid, log_path, exit_code, stream_preview, result_envelope_id, error, started_at, finished_at, updated_at, timeout_ms)
+       VALUES (?, ?, ?, ?, ?, 'running', NULL, ?, NULL, ?, NULL, NULL, ?, NULL, ?, ?)`,
+      [j.jobId, j.cellId, j.epoch, j.command, j.cwd, j.logPath, fromBool(j.streamPreview), now, now, j.timeoutMs ?? null],
     );
   }
 
-  setJobPid(jobId: string, pid: number): void {
-    run(this.db, "UPDATE jobs SET pid = ?, updated_at = ? WHERE job_id = ?", [pid, this.clock.now(), jobId]);
+  setJobPid(jobId: string, pid: number, identity:string | null): void {
+    run(this.db, "UPDATE jobs SET pid = ?, process_identity=?, updated_at = ? WHERE job_id = ?", [pid, identity, this.clock.now(), jobId]);
   }
 
   /**

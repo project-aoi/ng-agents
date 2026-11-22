@@ -1,6 +1,6 @@
 import type { Kernel } from "@ng/cell";
 import {
-  cellPrincipal,
+  asClarifyCard, cellPrincipal,
   gtdKeys,
   PAYLOAD,
   isChannelAddr,
@@ -15,7 +15,7 @@ import {
   type Envelope,
   type ItemSource,
   type PrepareRunInput,
-  type ProjectProposal,
+  isProjectProposal,
   type ProjectRecord,
   type ProjectStartAction,
   type RunPorts,
@@ -109,12 +109,6 @@ export function replyAddressOf(env: Envelope | undefined): ChannelAddr | undefin
 /** The project an approval starts: derived from the approval id, so every path that starts it starts the same cell once. */
 export const projectIdForApproval = (approvalId: string) => `proj_${approvalId.replace(/^act_/, "")}`;
 
-function proposalOf(data: unknown, fallback: ProjectProposal): ProjectProposal {
-  const p = data as Partial<ProjectProposal> | undefined;
-  if (p && typeof p.title === "string" && typeof p.outcome === "string" && Array.isArray(p.actions) && p.actions.length > 0) return p as ProjectProposal;
-  return fallback;
-}
-
 /** `custom` action of present_to_owner cards: confirming only files the item as seen. */
 export const ACKNOWLEDGE_ACTION = "gtd.acknowledge";
 
@@ -129,7 +123,9 @@ export function approvedProjectInit(
   remembered: ProposalItem | null,
   clock: Clock,
 ): ProjectInit {
-  const proposal = proposalOf(art?.content.data, action.proposal);
+  const card = asClarifyCard(action.card?.data);
+  const proposal = action.artifactId ? art?.content.data : action.proposal;
+  if (!isProjectProposal(proposal)) throw new Error("立项方案的内容不完整，请修改方案后再确认");
   const brief = ["主人在立项卡上确认了这份方案（可能亲手改过），按它开始推进。", proposal.background ?? ""].filter(Boolean).join("\n");
   return {
     id: projectIdForApproval(approvalId),
@@ -138,11 +134,11 @@ export function approvedProjectInit(
     brief,
     proposal,
     plan: proposal.actions.map((a) => ({ title: a.title, owner: a.owner, ...(a.nextStep ? { nextStep: a.nextStep } : {}), ...(a.effort ? { effort: a.effort } : {}) })),
-    source: remembered?.source ?? { label: "立项", at: clock.now() },
-    ...(remembered?.rawInput.text ? { rawInput: remembered.rawInput.text } : {}),
-    ...(remembered?.cwd ? { cwd: remembered.cwd } : {}),
-    ...(remembered?.repos?.length ? { repos: remembered.repos } : {}),
-    ...(remembered?.phases?.length ? { phases: remembered.phases } : {}),
+    source: card?.source ?? remembered?.source ?? { label: "立项", at: clock.now() },
+    ...((card?.rawInput.text ?? remembered?.rawInput.text) ? {rawInput:(card?.rawInput.text ?? remembered?.rawInput.text)!} : {}),
+    ...((proposal.cwd ?? remembered?.cwd) ? { cwd: (proposal.cwd ?? remembered?.cwd)! } : {}),
+    ...((proposal.repos ?? remembered?.repos) ? { repos: (proposal.repos ?? remembered?.repos)! } : {}),
+    ...((proposal.phases ?? remembered?.phases) ? { phases: (proposal.phases ?? remembered?.phases)! } : {}),
   };
 }
 
@@ -159,10 +155,9 @@ export function startApprovedProjectSync(
   if (!rec || rec.action.type !== "project.start" || rec.status !== "approved") return null;
   const holder = kernel.getCell(rec.cellId);
   if (!holder || holder.status === "closed" || holder.spec.meta?.["role"] !== ROLES.desk) return null;
-  const action = rec.action as ProjectStartAction;
-  const art = action.artifactId ? kernel.context.getArtifactSync(action.artifactId) : null;
-  const remembered = action.artifactId ? kernel.context.readStateSync<ProposalItem>(rec.cellId, KEYS.proposal(action.artifactId)) : null;
-  const init = approvedProjectInit(approvalId, action, art, remembered, kernel.clock);
+  const action = {...rec.action,card:rec.card} as ProjectStartAction;
+  const art = action.artifactId && rec.boundVersion ? kernel.context.getArtifactVersionSync(action.artifactId,rec.boundVersion) : null;
+  const init = approvedProjectInit(approvalId, action, art, null, kernel.clock);
   return startProjectSync(kernel, init, { parentId: rec.cellId, principalId: cellPrincipal(rec.cellId) });
 }
 
@@ -187,6 +182,18 @@ export async function launchProject(ports: RunPorts, init: ProjectInit, clock: C
 export function createDeskBooks(cfg: PresetsConfig) {
   const applied = new Map<string, string[]>();
   return {
+    personalReminder(env: Envelope) {
+      if (!isEnvelopeOfType(env, "timer.fired")) return;
+      const data = (env.payload.data as { gtd?: ReminderData } | undefined)?.gtd;
+      if (data?.kind !== "reminder" || !data.id || !data.text || env.id !== `gtd-reminder:${data.id}`) return;
+      return {
+        id: data.id, notify: cfg.ownerAddress, draft: {
+          title: data.text, subjectKey: `reminder:${data.id}`, category: "action" as const, effort: data.effort ?? "15m",
+          ...(data.remindAt !== undefined ? { dueAt: data.remindAt } : {}),
+          options: [{ id: "done", label: "已办完", effect: "complete" as const, input: { mode: "optional" as const } }],
+        },
+      };
+    },
     async prepareRun({ snapshot, ports, signal, clock }: PrepareRunInput): Promise<"handled" | void> {
       // Other cells on the inline preset (light helpers) have no books.
       if (ports.self.spec.meta?.["role"] !== ROLES.desk) return;
@@ -233,15 +240,12 @@ export async function settleDeskBatch(cfg: PresetsConfig, ctx: ToolContext): Pro
   /** A reminder came due: a quick to-do for the owner and the reminder itself. Once per reminder. */
   async function reminderDue(data: ReminderData, envelopeId?: string): Promise<void> {
     const key = gtdKeys.action(data.id);
-    if (await ports.context.readState(self, key)) {
-      await ports.context.commit(self, { statePatches: { [KEYS.reminder(data.id)]: null } });
-      return;
-    }
+    if (await ports.context.readState(self, key)) return;
     const action = newAction(
       { id: data.id, title: data.text, owner: "human", nextStep: data.text, effort: data.effort ?? "15m", dueAt: data.remindAt ?? now, source: { label: "定时提醒", ...(envelopeId ? { envelopeId } : {}), at: now } },
       now,
     );
-    await ports.context.commit(self, { statePatches: { [key]: action, [KEYS.reminder(data.id)]: null } });
+    await ports.context.commit(self, { statePatches: { [key]: action } });
     await notifyOwner(ports, cfg.ownerAddress, `⏰ 提醒：${data.text}`, `reminder:${data.id}`);
     out.push(`提醒已到：${data.text}（已放进专注工作区，主人已收到提醒）`);
   }
@@ -253,6 +257,7 @@ export async function settleDeskBatch(cfg: PresetsConfig, ctx: ToolContext): Pro
     if (!project || project.lifecycle !== "completed") return;
     const id = `done-${p.childCellId}`;
     if (await ports.context.readState(self, gtdKeys.activity(id))) return;
+    await notifyOwner(ports, cfg.ownerAddress, `「${project.title}」已完成：${p.summary.split("\n")[0]!.slice(0, 120)}`, `finished:${p.childCellId}:${id}`);
     const a: ActivityRecord = newActivity({ id, kind: "action_completed", title: `已完成：${project.title}`, detail: p.summary, ...(project.source ? { source: project.source } : {}), restorable: false }, now);
     await ports.context.commit(self, { statePatches: { [gtdKeys.activity(id)]: a } });
     out.push(`项目已完成：${project.title}`);
@@ -269,12 +274,13 @@ export async function settleDeskBatch(cfg: PresetsConfig, ctx: ToolContext): Pro
       const p = env.payload as ApprovalResolvedPayload;
       if (p.action.type === "project.start") {
         if (p.status !== "approved") return true;
-        const action = p.action as ProjectStartAction;
-        const art = action.artifactId ? await ports.context.getArtifact(action.artifactId) : null;
-        const remembered = action.artifactId ? await ports.context.readState<ProposalItem>(self, KEYS.proposal(action.artifactId)) : null;
-        const init = approvedProjectInit(p.actionId, action, art, remembered, clock);
+        const decision = ports.listOwnDecisions().find(d=>d.record.actionId===p.actionId);
+        const action = {...p.action,...(decision ? {card:decision.record.card} : {})} as ProjectStartAction;
+        const version = p.artifactVersion ?? decision?.record.boundVersion;
+        const art = action.artifactId && version ? await ports.context.getArtifactVersion(action.artifactId,version) : null;
+        const init = approvedProjectInit(p.actionId, action, art, null, clock);
         const r = await launchProject(ports, init, clock);
-        if (r.started) {
+        {
           await notifyOwner(ports, cfg.ownerAddress, `已立项：${init.title}，后台开始推进`, `project:${p.actionId}`);
           out.push(`项目「${init.title}」已按确认的安排启动（${r.projectId}）`);
         }
@@ -282,22 +288,24 @@ export async function settleDeskBatch(cfg: PresetsConfig, ctx: ToolContext): Pro
       } else if (p.action.type === "custom") {
         return p.action.name === ACKNOWLEDGE_ACTION;
       } else if (p.action.type === "channel.send") {
-        const key = KEYS.reply(p.action.subjectKey);
-        const item = await ports.context.readState<ReplyItem>(self, key);
-        if (!item || item.actionId !== p.actionId) return false;
-        if (item.status !== "pending") return true;
+        if (p.status === "unknown" || p.status === "failed") return false;
+        const item = (await readReplyItems(ports)).find(i => i.actionId === p.actionId);
+        if (!item) return false;
         if (p.status === "executed") {
+          if (await ports.context.readState(self,gtdKeys.activity(`sent-${p.actionId}`))) return true;
           const done: ActivityRecord = newActivity(
             { id: `sent-${p.actionId}`, kind: "action_completed", title: `已回复${item.targetLabel}：${item.title}`, source: item.source, rawInput: item.rawInput.text, actionId: p.actionId, restorable: false },
             now,
           );
           const linked = await closeLinkedActions(ports, p.actionId, "done", now);
-          await ports.context.commit(self, { statePatches: { [key]: { ...item, status: "sent", updatedAt: now }, [gtdKeys.activity(done.id)]: done, ...linked } });
+          await ports.context.commit(self, { statePatches: { [gtdKeys.activity(done.id)]: done, ...linked } });
           out.push(`回复已发出：${item.title}`);
+          return true;
         } else if (p.status === "denied" || p.status === "cancelled") {
-          await ports.context.commit(self, { statePatches: { [key]: { ...item, status: "closed", updatedAt: now } } });
+          return !p.action.relatedProjectIds?.length;
         }
-        return true;
+        // failed / unknown: never swallow at 0-Token (BUG-032) — hand to the desk model so the failure/unknown is surfaced.
+        return false;
       }
       return false;
     } else if (isEnvelopeOfType(env, "cell.result")) {
@@ -318,20 +326,16 @@ export async function settleDeskBatch(cfg: PresetsConfig, ctx: ToolContext): Pro
       out.push(`${SETTLE_ERROR}${err instanceof Error ? err.message : String(err)}`);
     }
   }
-  // Reminders whose wake-up passed without a desk tool call are applied now.
-  for (const e of await ports.context.listState(self, KEYS.reminderPrefix)) {
-    const data = e.value as ReminderData;
-    if (data.remindAt !== undefined && data.remindAt <= now) {
-      try {
-        await reminderDue(data);
-      } catch (err) {
-        out.push(`${SETTLE_ERROR}${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
-  }
   return { lines: out, consumedAll: consumedAll && !out.some((l) => l.startsWith(SETTLE_ERROR)) };
 }
 
 export async function readReplyItems(ports: RunPorts): Promise<ReplyItem[]> {
-  return (await ports.context.listState(ports.self.cellId, KEYS.replyPrefix)).map((e) => e.value as ReplyItem);
+  return ports.listOwnDecisions().flatMap(({record, envelope}) => {
+    const card = asClarifyCard(record.card.data);
+    if (record.action.type !== "channel.send" || card?.cardType !== "response" || !record.artifactId) return [];
+    const status: ReplyItem["status"] = record.status === "executed" ? "sent" : record.status === "cancelled" ? "withdrawn" : record.status === "denied" ? "closed" : "pending";
+    return [{subjectKey:record.subjectKey, title:card.title, target:record.action.target, targetLabel:card.reply.targetLabel,
+      status, artifactId:record.artifactId, actionId:record.actionId, source:card.source, rawInput:card.rawInput,
+      ...(envelope ? {envelope, ...(envelope.threads ? {threads:envelope.threads} : {})} : {}),createdAt:record.createdAt,updatedAt:record.updatedAt}];
+  });
 }

@@ -40,10 +40,16 @@ export interface AgentsErrors {
 
 export interface AgentsDeps {
   kernel: Kernel;
+  commands:{
+    message(id:string, req:Parameters<Kernel["directMessage"]>[1], as:{principalId:string}):ReturnType<Kernel["directMessage"]>;
+    control(id:string, req:Parameters<Kernel["control"]>[1], as:{principalId:string}):ReturnType<Kernel["control"]>;
+    close(id:string,as:{principalId:string}): ReturnType<Kernel["closeCell"]>;
+    trigger(id:string,epoch:number,as:{principalId:string}): unknown;
+  };
   settings: DeskSettings;
   status(): StatusDTO;
   /** Radar's project buttons: pause / resume / cancel of a cell that holds a project go through them. */
-  projectOp(projectId: string, op: "pause" | "resume" | "cancel", as: { principalId?: string }): Promise<ProjectMutationResponse>;
+  projectOp(projectId: string, op: "pause" | "resume" | "cancel", as: { principalId: string }): Promise<ProjectMutationResponse>;
   errors: AgentsErrors;
 }
 
@@ -68,9 +74,14 @@ export interface Delivery {
   ccTitle: string | null;
 }
 
-export function createAgentsApi({ kernel, settings, status, projectOp, errors }: AgentsDeps) {
+export function createAgentsApi({ commands,kernel, settings, status, projectOp, errors }: AgentsDeps) {
   const input = () => inputOf(kernel, settings);
-  const owner = kernel.ownerPrincipal;
+  const requireActor = (as: { principalId: string }): { principalId: string } => {
+    if (!as || typeof as.principalId !== "string" || !as.principalId.trim()) {
+      throw errors.bad("缺少操作者身份（principalId）");
+    }
+    return { principalId: as.principalId.trim() };
+  };
 
   function topology(q: { includeArchived?: boolean; projectId?: string | null } = {}): TopologyDTO {
     if (q.projectId && !kernel.getCell(q.projectId)) throw errors.missing("找不到这个项目");
@@ -95,10 +106,11 @@ export function createAgentsApi({ kernel, settings, status, projectOp, errors }:
   // ---------- a person speaks to a cell ----------
 
   /**
-   * Validate and hand a person's message to the kernel (directMessage, as `as.principalId`, default the owner), and
-   * say in plain words what happened. Shared by the chat box and the control plane (which words it for an agent).
+   * Validate and hand a person's message to the kernel (directMessage, strictly as `as.principalId` — never falling
+   * back to the owner), and say in plain words what happened. Shared by the chat box and the control plane.
    */
-  function deliver(cellId: string, req: SendCellMessageRequest & { conversationId?: string }, as: { principalId?: string } = {}): Delivery {
+  function deliver(cellId: string, req: SendCellMessageRequest & { conversationId?: string }, as: { principalId: string }): Delivery {
+    const actor = requireActor(as);
     const text = typeof req?.text === "string" ? req.text.trim() : "";
     if (!text) throw errors.bad("消息不能为空");
     if (typeof req.clientId !== "string" || !CLIENT_ID.test(req.clientId)) throw errors.bad("clientId 格式不对（字母、数字、_ . : -，最多 80 个字符）");
@@ -112,7 +124,7 @@ export function createAgentsApi({ kernel, settings, status, projectOp, errors }:
     const before = projectNode(input(), cellId)!;
     const replyToText = req.replyToId ? timelineItemText(input(), cellId, req.replyToId) : null;
     const mode = req.mode ?? "enqueue";
-    const r = kernel.directMessage(
+    const r = commands.message(
       cellId,
       {
         text,
@@ -123,7 +135,7 @@ export function createAgentsApi({ kernel, settings, status, projectOp, errors }:
         ...(replyToText ? { replyToText } : {}),
         conversationId: req.conversationId ?? WEB_CONVERSATION,
       },
-      { principalId: as.principalId ?? owner },
+      actor,
     );
     const no = { id: null, before, ccTo: null, ccTitle: null };
     switch (r.status) {
@@ -153,7 +165,7 @@ export function createAgentsApi({ kernel, settings, status, projectOp, errors }:
   }
 
   /** POST /api/cells/:cellId/messages. Always answers (not_found included) with the outcome in the body. */
-  function sendMessage(cellId: string, req: SendCellMessageRequest, as: { principalId?: string } = {}): SendCellMessageResponse {
+  function sendMessage(cellId: string, req: SendCellMessageRequest, as: { principalId: string }): SendCellMessageResponse {
     const d = deliver(cellId, req, as);
     return { ok: d.ok, outcome: d.outcome, message: d.message, id: d.id, timeline: d.outcome === "not_found" ? null : projectTimeline(input(), cellId), status: status() };
   }
@@ -165,14 +177,14 @@ export function createAgentsApi({ kernel, settings, status, projectOp, errors }:
   }
 
   /** POST /api/cells/:cellId/control. A project goes through Radar's own buttons (its books and cards follow). */
-  async function control(cellId: string, req: CellControlRequest, as: { principalId?: string } = {}): Promise<CellControlResponse> {
+  async function control(cellId: string, req: CellControlRequest, as: { principalId: string }): Promise<CellControlResponse> {
+    const actor = requireActor(as);
     const action = req?.action;
     if (action !== "pause" && action !== "resume" && action !== "cancel") throw errors.bad("action 只能是 pause / resume / cancel");
     const cell = kernel.getCell(cellId);
     if (!cell) return controlResult("not_found", false, "找不到这个分身", null);
     const name = projectNode(input(), cellId)!.title;
     if (cell.status === "closed") return controlResult("not_applied", false, `「${name}」已经结束了`, cellId);
-    const actor = as.principalId ? { principalId: as.principalId } : {};
     if (cell.parentId === null && action !== "resume") {
       return controlResult("not_applied", false, "总助理是整个工作台的根，不能暂停或叫停：停下它，所有后台工作都会停", cellId);
     }
@@ -184,18 +196,18 @@ export function createAgentsApi({ kernel, settings, status, projectOp, errors }:
     switch (action) {
       case "pause": {
         if (cell.status === "paused") return controlResult("paused", true, `「${name}」已经暂停了`, cellId);
-        const r = kernel.control(cellId, { action: "pause" }, actor);
+        const r = commands.control(cellId, { action: "pause" }, actor);
         return r.applied ? controlResult("paused", true, `已暂停「${name}」`, cellId) : controlResult("not_applied", false, "暂停没有生效", cellId);
       }
       case "resume": {
         if (cell.status === "active") return controlResult("resumed", true, `「${name}」没有暂停`, cellId);
-        const r = kernel.control(cellId, { action: "resume" }, actor);
+        const r = commands.control(cellId, { action: "resume" }, actor);
         return r.applied ? controlResult("resumed", true, `「${name}」继续`, cellId) : controlResult("not_applied", false, "继续没有生效（它的上级可能还在暂停）", cellId);
       }
       case "cancel": {
         if (cell.preset === "sensor") return controlResult("not_applied", false, "信源请在信源抽屉里删除", cellId);
         // Its parent hears that it was stopped (the kernel tells it), and decides what comes next.
-        const r = await kernel.closeCell(cellId, "cancelled", actor);
+        const r = await commands.close(cellId,actor);
         const others = Math.max(0, r.closed.length - 1);
         return controlResult("cancelled", true, `已叫停「${name}」${others ? `和它下面的 ${others} 个分身` : ""}（文件和分支都留在原处）`, cellId);
       }
@@ -203,7 +215,8 @@ export function createAgentsApi({ kernel, settings, status, projectOp, errors }:
   }
 
   /** POST /api/cells/:cellId/trigger — "立即触发一次检查": a script probe runs its check now. */
-  function trigger(cellId: string, as: { principalId?: string } = {}): CellTriggerResponse {
+  function trigger(cellId: string, as: { principalId: string }): CellTriggerResponse {
+    const actor = requireActor(as);
     const cell = kernel.getCell(cellId);
     const result = (outcome: CellTriggerResponse["outcome"], ok: boolean, message: string): CellTriggerResponse => ({
       ok,
@@ -215,22 +228,7 @@ export function createAgentsApi({ kernel, settings, status, projectOp, errors }:
     if (!cell) return result("not_found", false, "找不到这个分身");
     if (cell.spec.processor.kind !== "code") return result("not_applied", false, "只有脚本探针可以手动触发检查；和它说话就好");
     if (cell.status !== "active") return result("not_applied", false, cell.status === "paused" ? "它暂停中，先继续再触发" : "它已经结束了");
-    kernel.inbox.enqueueSync(
-      cellId,
-      createEnvelope<TimerFiredPayload>(
-        {
-          id: newId("trig", kernel.clock),
-          from: "timer:manual",
-          to: inboxAddr(cellId),
-          principalId: as.principalId ?? owner,
-          kind: "event",
-          type: PAYLOAD.timerFired,
-          payload: { label: "主人手动触发了一次检查" },
-          expectedEpoch: cell.epoch,
-        },
-        kernel.clock,
-      ),
-    );
+    commands.trigger(cellId,cell.epoch,actor);
     return result("triggered", true, "已触发一次检查");
   }
 

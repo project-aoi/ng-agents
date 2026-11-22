@@ -1,8 +1,7 @@
 import {
+  afterCommit, hashAction, run, withTx, projectCellIdOf,
   isEnvelopeOfType,
   parseAddress,
-  projectCellIdOf,
-  subjectKeys,
   type ApprovalRecord,
   type BusTopics,
   type CellRecord,
@@ -91,22 +90,51 @@ export function createEscalations(core: KernelCore): Escalations {
     return cell.parentId === null ? "主台" : "一项后台任务";
   }
 
-  /** Same rule as the Loop's default subject: the project, else the inbound item (at a root), else the cell. */
-  function subjectOf(cell: CellRecord, envs: Envelope[]): string {
-    const project = projectCellIdOf(cell.spec);
-    if (project) return subjectKeys.project(project);
-    if (cell.parentId === null) {
-      const item = envs.find((e) => ITEM_TYPES.has(e.type));
-      if (item) return subjectKeys.inbound(itemOf(item).id);
-    }
-    return subjectKeys.cell(cell.id);
+  // Older databases used retry_limit for both stops. Move the open step card before looking up either kind.
+  function separateLegacyStepLimit(cellId: string): void {
+    withTx(core.db, () => {
+      const legacy = gate.findPendingBySubjectSync(`kernel:${cellId}:retry_limit`);
+      if (!legacy || !isKernelEscalation(legacy.action) || !legacy.action.args.stepLimit) return;
+      const key = `kernel:${cellId}:step_limit`;
+      const subject = gate.findPendingBySubjectSync(key) ? `${key}:${legacy.actionId}` : key;
+      run(core.db, `UPDATE human_items SET subject_key=?, action=json_set(action,'$.subjectKey',?),
+        card=json_set(card,'$.data.subjectKey',?), item_revision=item_revision+1, updated_at=? WHERE action_id=?`,
+        [subject, subject, subject, clock.now(), legacy.actionId]);
+      afterCommit(core.db, () => core.bus.emit("approval.changed", {
+        actionId:legacy.actionId, cellId:legacy.cellId, subjectKey:subject, status:legacy.status,
+      }));
+    });
   }
 
   function raise(cell: CellRecord, args: KernelEscalationArgs, title: string, explanation: string, envs: Envelope[], usage?: EscalationCard["escalation"]["usage"]): ApprovalRecord | null {
-    const subjectKey = subjectOf(cell, envs);
+    if (args.reason === "retry_limit") separateLegacyStepLimit(cell.id);
+    const subjectKey = args.reason === "budget_exhausted" ? `kernel:budget:${args.limitedBy ?? cell.id}` : `kernel:${cell.id}:${args.stepLimit ? "step_limit" : args.reason}`;
     // One card per item: an item that already waits on the owner is not given a second one.
     const existing = gate.findPendingBySubjectSync(subjectKey);
-    if (existing) return existing;
+    const projectId = cell.preset === "project" ? cell.id : projectCellIdOf(cell.spec);
+    function associate(rec: ApprovalRecord) {
+      if (projectId && run(core.db, `UPDATE human_items SET related_project_ids=json_insert(related_project_ids,'$[#]',?),
+        item_revision=item_revision+1 WHERE action_id=? AND NOT EXISTS (SELECT 1 FROM json_each(related_project_ids) WHERE value=?)`,
+        [projectId,rec.actionId,projectId]).changes) afterCommit(core.db, () => core.bus.emit("approval.changed", {
+          actionId:rec.actionId, cellId:rec.cellId, subjectKey:rec.subjectKey, status:rec.status,
+        }));
+      return gate.getApprovalSync(rec.actionId) ?? rec;
+    }
+    if (existing) {
+      if (args.envelopeIds && isKernelEscalation(existing.action)) {
+        const previous = existing.action.args.envelopeIds ?? [];
+        const envelopeIds = [...new Set([...previous, ...args.envelopeIds])];
+        if (envelopeIds.length !== previous.length) {
+          const action = { ...existing.action, args: { ...existing.action.args, envelopeIds } };
+          run(core.db, "UPDATE human_items SET action=?, action_hash=?, updated_at=?, item_revision=item_revision+1 WHERE action_id=?",
+            [JSON.stringify(action), hashAction(action), clock.now(), existing.actionId]);
+          afterCommit(core.db, () => core.bus.emit("approval.changed", {
+            actionId: existing.actionId, cellId: existing.cellId, subjectKey, status: existing.status,
+          }));
+        }
+      }
+      return associate(existing);
+    }
     const primary = envs.find((e) => ITEM_TYPES.has(e.type)) ?? envs[0];
     const card: EscalationCard = {
       cardType: "escalation",
@@ -128,10 +156,11 @@ export function createEscalations(core: KernelCore): Escalations {
     };
     // The affected cell holds the card (so closing it withdraws the card); if it cannot (paused, revoked), the nearest
     // ancestor that can.
-    for (const holder of [cell, ...cells.ancestors(cell.id)]) {
+    const origin = args.reason === "budget_exhausted" && args.limitedBy ? (cells.get(args.limitedBy) ?? cell) : cell;
+    for (const holder of [origin, ...cells.ancestors(origin.id)]) {
       if (holder.status === "closed") continue;
       const r = gate.authorizeSync(action, { cellId: holder.id, principalId: KERNEL_ESCALATION_PRINCIPAL, epoch: holder.epoch });
-      if (r.type === "defer") return gate.getApprovalSync(r.actionId) ?? null;
+      if (r.type === "defer") return associate(gate.getApprovalSync(r.actionId)!);
     }
     core.onError(new Error(`could not raise a ${args.reason} escalation card for cell "${cell.id}"`), "escalation");
     return null;
@@ -168,6 +197,7 @@ export function createEscalations(core: KernelCore): Escalations {
       const cell = cells.get(cellId);
       if (!cell || cell.status === "closed") return null;
       const usage = gate.usageSync(cellId);
+      if (gate.budgetDeclinedSync(usage.limitedBy ?? cellId)) return null;
       const limiter = usage.limitedBy && usage.limitedBy !== cellId ? cells.get(usage.limitedBy) : undefined;
       const lim = limiter ? gate.usageSync(limiter.id) : usage;
       const title = `${label(cell)}的预算已用完`;

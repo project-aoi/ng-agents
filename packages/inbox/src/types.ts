@@ -24,6 +24,7 @@ export interface InboxOptions {
   bus: Bus;
   clock: Clock;
   /** Wire to `Gate.authorizeControlSync`. Default: the owner may control any cell; `cell:<id>` only its strict descendants. */
+  cancelCellSync?: (cellId:string,principalId:string)=>void;
   authorizeControl?: ControlAuthorizer;
   /** Where `handback` re-enqueues. Default: the `desk` cell if it exists (and is not the caller), else the root of the cell's tree. */
   resolveDesk?: (cellId: string) => string;

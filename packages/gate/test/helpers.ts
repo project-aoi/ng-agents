@@ -94,7 +94,7 @@ export function send(target: string, over: Record<string, unknown> = {}): Propos
 }
 
 export function exec(tool: string, over: Record<string, unknown> = {}): ProposedAction {
-  return { type: "workspace.exec", summary: `run ${tool}`, subjectKey: "cell:w1", sideEffect: "internal", tool, args: {}, ...over } as ProposedAction;
+  return { type: "custom", name:tool, summary: `run ${tool}`, subjectKey: "cell:w1", sideEffect: "internal", tool, args: {}, ...over } as ProposedAction;
 }
 
 export function secretUse(secretRef: string, over: Record<string, unknown> = {}): ProposedAction {

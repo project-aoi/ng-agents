@@ -3,8 +3,12 @@ import type { SchemaModule } from "./types";
 // Owner: @ng/workspace.
 export const workspaceSchema: SchemaModule = {
   owner: "@ng/workspace",
-  version: 2,
-  migrations: [{ version: 2, up: /* sql */ `ALTER TABLE jobs ADD COLUMN cancel_requested_at INTEGER;` }],
+  version: 4,
+  migrations: [
+    { version: 2, up: /* sql */ `ALTER TABLE jobs ADD COLUMN cancel_requested_at INTEGER;` },
+    { version: 3, up: /* sql */ `ALTER TABLE jobs ADD COLUMN timeout_ms INTEGER;` },
+    {version:4, up:"ALTER TABLE jobs ADD COLUMN process_identity TEXT;"},
+  ],
   ddl: /* sql */ `
 CREATE TABLE IF NOT EXISTS workspaces (
   cell_id       TEXT PRIMARY KEY REFERENCES cells(id),
@@ -29,6 +33,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   cwd                 TEXT,
   state               TEXT NOT NULL CHECK (state IN ('running','succeeded','failed','cancelled')),
   pid                 INTEGER,
+  process_identity    TEXT,
   log_path            TEXT,
   exit_code           INTEGER,
   stream_preview      INTEGER NOT NULL DEFAULT 0,
@@ -37,7 +42,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   started_at          INTEGER NOT NULL,
   finished_at         INTEGER,
   updated_at          INTEGER NOT NULL,
-  cancel_requested_at INTEGER                  -- "cancelling": requested, process group not yet confirmed gone
+  cancel_requested_at INTEGER,                 -- "cancelling": requested, process group not yet confirmed gone
+  timeout_ms          INTEGER                  -- v3: max runtime budget (ms); enforced across restarts
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_cell ON jobs(cell_id, state);
 CREATE INDEX IF NOT EXISTS idx_jobs_running ON jobs(state) WHERE state = 'running';

@@ -2,6 +2,7 @@ import {
   CELL_STATUS_KEY,
   gtdKeys,
   isEnvelopeOfType,
+  KERNEL_FROM,
   parseAddress,
   type ActionRecord,
   type ActivityRecord,
@@ -22,18 +23,6 @@ export type RawInput = ClarifyCard["rawInput"];
 /** Envelope types that are "an item" (something that came in and may deserve a card). */
 const ITEM_TYPES = new Set(["user.message", "source.hit", "handback"]);
 
-const CHANNEL_LABELS: Readonly<Record<string, string>> = {
-  ui: "随手记",
-  cli: "命令行",
-  feishu: "飞书",
-  slack: "Slack",
-  github: "GitHub",
-  webhook: "Webhook",
-  email: "邮件",
-  memory: "测试通道",
-  demo: "演示 IM",
-};
-
 /** A handback carries the original item. */
 export function unwrapItem(env: Envelope): Envelope {
   return isEnvelopeOfType(env, "handback") ? env.payload.original : env;
@@ -45,18 +34,7 @@ export function primaryItem(envelopes: readonly Envelope[]): Envelope | undefine
   return env ? unwrapItem(env) : undefined;
 }
 
-export function itemSource(env: Envelope | undefined, now: number): ItemSource {
-  if (!env) return { label: "系统", at: now };
-  const base = { principalId: env.principalId, envelopeId: env.id, at: env.createdAt };
-  if (isEnvelopeOfType(env, "source.hit")) {
-    return { ...base, label: `信源 · ${env.payload.title}`, ...(env.payload.uri ? { uri: env.payload.uri } : {}) };
-  }
-  const from = parseAddress(env.from);
-  if (from?.kind === "channel") return { ...base, label: CHANNEL_LABELS[from.channelId] ?? from.channelId, channelId: from.channelId };
-  if (env.from.startsWith("timer:")) return { ...base, label: "定时提醒" };
-  return { ...base, label: "系统" };
-}
-
+export {describeEnvelopeSource as itemSource} from "@ng/protocol";
 export function itemRawInput(env: Envelope | undefined): RawInput {
   if (!env) return { text: "", kind: "system" };
   if (isEnvelopeOfType(env, "user.message")) return { text: env.payload.text, kind: env.payload.voice ? "voice_transcript" : "message" };

@@ -77,6 +77,7 @@ function reconcile(s: DraftInner, incoming: ArtifactDTO): DraftInner {
 export function useDraft(artifact: ArtifactDTO | null): DraftApi | null {
   const [inner, setInner] = useState<DraftInner | null>(() => (artifact ? restore(artifact) : null));
   const [saving, setSaving] = useState(false);
+  const saveInFlight = useRef(false);
   const [message, setMessage] = useState<DraftApi["message"]>(null);
   const innerRef = useRef(inner);
   innerRef.current = inner;
@@ -98,7 +99,8 @@ export function useDraft(artifact: ArtifactDTO | null): DraftApi | null {
 
   const doSave = useCallback(async (expectedVersion: number): Promise<ArtifactDTO | null> => {
     const s = innerRef.current;
-    if (!s) return null;
+    if (!s || saveInFlight.current) return null;
+    saveInFlight.current = true;
     setSaving(true);
     setMessage(null);
     try {
@@ -115,6 +117,7 @@ export function useDraft(artifact: ArtifactDTO | null): DraftApi | null {
       setMessage({ tone: "error", text: `没有保存：${toFailure(err).message}` });
       return null;
     } finally {
+      saveInFlight.current = false;
       setSaving(false);
     }
   }, []);
@@ -236,6 +239,14 @@ export function HighlightedTextarea(props: {
 
 // ==================== the editor block ====================
 
+export function DraftRefreshNotice({draft}: {draft: DraftApi}) {
+  if (draft.refreshedTo === null || draft.conflict) return null;
+  return <div className="banner warn" role="status">
+    <span>草稿已更新到 v{draft.refreshedTo}，请核对后再确认。</span>
+    <button type="button" className="btn sm ghost" onClick={draft.acknowledgeRefresh}>已核对新版</button>
+  </div>;
+}
+
 export function DraftEditor(props: {
   draft: DraftApi;
   label?: ReactNode;
@@ -299,14 +310,7 @@ export function DraftEditor(props: {
         )}
       </header>
 
-      {draft.refreshedTo !== null && !c && (
-        <div className="banner warn" role="status">
-          <span>草稿已更新到 v{draft.refreshedTo}，请重看一遍再确认。</span>
-          <button type="button" className="btn sm ghost" onClick={draft.acknowledgeRefresh}>
-            知道了
-          </button>
-        </div>
-      )}
+      <DraftRefreshNotice draft={draft} />
 
       {c && (
         <div className="banner conflict" role="alert">

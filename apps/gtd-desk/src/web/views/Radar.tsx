@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import type { ButtonDTO, ProjectMutationResponse, ProjectRowDTO, RadarDTO, ReviewMutationResponse, WeeklyReviewDTO } from "../../shared/api";
-import { api, callButton } from "../api";
+import { api, callButton, request } from "../api";
 import { BallChip, ButtonRow, Chevron, ProgressBar } from "../components/controls";
 import { Empty, ErrorState, Loading } from "../components/states";
 import { parseRoute, syncServerClock, toFailure, useNavigate, useNow, useOpenReport, useResource, useStatus, useToast } from "../state";
@@ -9,6 +9,11 @@ import { dueText, whenText } from "../text";
 export function RadarView() {
   // The weekly review rides along in /api/radar, so a review-only change refetches the same view.
   const res = useResource<RadarDTO>("radar", api.radar, ["radar", "review"]);
+  const ended=useResource("recently-closed",()=>request<{projects:{id:string;title:string}[]}>("GET","/api/projects/closed"),["radar"]);
+  const reopen=async (id:string)=>{
+    try {await request("POST",`/api/projects/${encodeURIComponent(id)}/reopen`);res.reload();ended.reload();toast({tone:"success",text:"项目已重新打开"});}
+    catch(err){toast({tone:"error",text:toFailure(err).message});}
+  };
   const { setStatus } = useStatus();
   const toast = useToast();
   const now = useNow();
@@ -23,7 +28,9 @@ export function RadarView() {
       const r = await callButton<ProjectMutationResponse>(b, input);
       res.set(r.view);
       setStatus(r.status);
-      toast({ tone: r.ok ? "success" : "warn", text: r.message });
+      const target=b.endpoint?.path.match(/\/projects\/([^/]+)\/(?:complete|cancel)$/)?.[1];
+      if (target && r.ok) ended.reload();
+      toast({ tone: r.ok ? "success" : "warn", text: r.message,...(r.ok && target ? {action:{label:"重新打开",run:()=>void reopen(decodeURIComponent(target))}} : {}) });
     } catch (err) {
       toast({ tone: "error", text: toFailure(err).message });
       res.reload();
@@ -48,6 +55,7 @@ export function RadarView() {
 
   return (
     <div className="stage-wide radar">
+      {!!ended.data?.projects.length && <details><summary>最近结束的项目</summary>{ended.data.projects.map(p=><p key={p.id}>{p.title} <button className="btn sm" onClick={()=>void reopen(p.id)}>重新打开</button></p>)}</details>}
       <div className="split split-7-5">
         <section className="split-main" aria-labelledby="radar-projects">
           <div className="section-head">
@@ -337,8 +345,8 @@ function WeeklyReview({ review, now, completedProjects, onRun }: { review: Weekl
 
       <p className="muted small review-foot">
         周回顾在 {whenText(review.nextReviewAt, now)} 自动准备好。
-        <button type="button" className="link-btn" onClick={() => navigate({ view: "engage" })}>
-          去专注工作区 →
+        <button type="button" className="link-btn" onClick={() => navigate({ view: "clarify" })}>
+          去待我处理 →
         </button>
       </p>
     </section>

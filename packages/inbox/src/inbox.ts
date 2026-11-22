@@ -30,6 +30,7 @@ import {
   type ControlCommand,
   type ControlResult,
   type ControlSteerPayload,
+  type DrainedSteer,
   type EnqueueResult,
   type Envelope,
   type HandbackPayload,
@@ -416,7 +417,11 @@ export function createInbox(opts: InboxOptions): InboxService {
     if (!inTransaction(db)) {
       const now = clock.now();
       if (cells.getEpoch(cellId) === undefined) throw new NgError("not_found", `cell "${cellId}" not found`);
-      if (get(db, SQL_MAYBE_CLAIMABLE, [cellId, now, cellId, now]) === undefined) return null;
+      if (get(db, SQL_MAYBE_CLAIMABLE, [cellId, now, cellId, now]) === undefined) {
+        // The wall clock can fall back between the enqueue announcement and this claim. An immediate row now needs a timer.
+        if (started && !manualClock && timer === undefined) rearmTimer();
+        return null;
+      }
     }
 
     return withTx(db, () => {
@@ -495,7 +500,7 @@ export function createInbox(opts: InboxOptions): InboxService {
       const now = clock.now();
       const res = finishClaim(c, "released", reason || "released", retryAt, now, ropts.countAttempt !== false);
       if (isClaimable(c.cell_id, now)) announce(c.cell_id, "released");
-      if (retryAt !== undefined && retryAt > now) scheduleChanged();
+      if (res.requeued && get(db, "SELECT 1 FROM inbox_messages WHERE cell_id=? AND status='pending' AND delivery='wakeup' AND deliver_at>? LIMIT 1", [c.cell_id, now])) scheduleChanged();
       return res;
     });
   }
@@ -544,27 +549,91 @@ export function createInbox(opts: InboxOptions): InboxService {
     });
   }
 
-  function drainSteerSync(cellId: string): string[] {
+  function drainSteerSync(cellId: string, claimId: string): DrainedSteer[] {
     return withTx(db, () => {
       const cell = requireCell(cellId);
-      const claim = get<{ claim_id: string; epoch: number }>(
-        db,
-        "SELECT claim_id, epoch FROM inbox_claims WHERE cell_id = ? AND status = 'active' ORDER BY claimed_at, claim_id LIMIT 1",
-        [cellId],
-      );
-      // A Run from before a cancel is being aborted; a newer steer belongs to the next Run.
-      if (!claim || claim.epoch !== cell.epoch) return [];
+      const claim = get<ClaimRow>(db, "SELECT * FROM inbox_claims WHERE claim_id = ?", [claimId]);
+      // Only an active claim of an active cell at the current epoch may drain mid-run steers.
+      // Steers move to `claimed` (attached to this claim) — never `done` before delivery is confirmed — so a crash
+      // or an unconfirmed CLI write can return them to `pending`.
+      if (!claim || claim.cell_id !== cellId || claim.status !== "active") return [];
+      if (cell.status !== "active" || claim.epoch !== cell.epoch) return [];
       const now = clock.now();
       const rows = all<{ seq: number; envelope: string }>(
         db,
-        `UPDATE inbox_messages SET status = 'done', claim_id = ?, status_reason = 'drained mid-run', updated_at = ?
+        `UPDATE inbox_messages SET status = 'claimed', claim_id = ?, status_reason = 'drained mid-run', updated_at = ?
          WHERE cell_id = ? AND status = 'pending' AND type = ? AND deliver_at <= ?
            AND (expected_epoch IS NULL OR expected_epoch = ?)
          RETURNING seq, envelope`,
         [claim.claim_id, now, cellId, PAYLOAD.controlSteer, now, cell.epoch],
       );
       rows.sort((a, b) => a.seq - b.seq);
-      return rows.map((r) => fromJson<Envelope<ControlSteerPayload>>(r.envelope).payload.message);
+      return rows.map((r) => {
+        const envelope = fromJson<Envelope<ControlSteerPayload>>(r.envelope);
+        return { envelope, seq: r.seq, message: envelope.payload.message };
+      });
+    });
+  }
+
+  function requeueClaimedSync(
+    claimId: string,
+    envelopeIds: readonly string[],
+    reason: string,
+    ropts: { countAttempt?: boolean } = {},
+  ): number {
+    const ids = [...new Set(envelopeIds.filter((id) => typeof id === "string" && id.length > 0))];
+    if (ids.length === 0) return 0;
+    return withTx(db, () => {
+      const c = requireClaim(claimId);
+      if (c.status !== "active") return 0;
+      const cell = cells.get(c.cell_id);
+      const now = clock.now();
+      const ph = ids.map(() => "?").join(", ");
+      const why = reason || "requeued unconfirmed mid-run input";
+      if (!cell || cell.status === "closed" || cell.epoch !== c.epoch) {
+        return run(
+          db,
+          `UPDATE inbox_messages SET status = 'cancelled', status_reason = ?, updated_at = ?
+           WHERE claim_id = ? AND status = 'claimed' AND envelope_id IN (${ph})`,
+          [why, now, claimId, ...ids],
+        ).changes;
+      }
+      if (ropts.countAttempt === true) {
+        const dead = all<{ seq: number; envelope_id: string }>(
+          db,
+          `UPDATE inbox_messages SET status = 'dead', attempts = attempts + 1, status_reason = ?, updated_at = ?
+           WHERE claim_id = ? AND status = 'claimed' AND envelope_id IN (${ph}) AND attempts + 1 >= ?
+           RETURNING seq, envelope_id`,
+          [why, now, claimId, ...ids, maxAttempts],
+        );
+        const requeued = run(
+          db,
+          `UPDATE inbox_messages SET status = 'pending', claim_id = NULL, attempts = attempts + 1, status_reason = ?, updated_at = ?
+           WHERE claim_id = ? AND status = 'claimed' AND envelope_id IN (${ph})`,
+          [why, now, claimId, ...ids],
+        ).changes;
+        if (dead.length > 0) {
+          dead.sort((a, b) => a.seq - b.seq);
+          const payload = {
+            cellId: c.cell_id,
+            claimId: c.claim_id,
+            seqs: dead.map((d) => d.seq),
+            envelopeIds: dead.map((d) => d.envelope_id),
+            reason: why,
+          };
+          afterCommit(db, () => bus.emit("inbox.dead", payload));
+        }
+        if (requeued > 0 && isClaimable(c.cell_id, now)) announce(c.cell_id, "released");
+        return dead.length + requeued;
+      }
+      const n = run(
+        db,
+        `UPDATE inbox_messages SET status = 'pending', claim_id = NULL, status_reason = ?, updated_at = ?
+         WHERE claim_id = ? AND status = 'claimed' AND envelope_id IN (${ph})`,
+        [why, now, claimId, ...ids],
+      ).changes;
+      if (n > 0 && isClaimable(c.cell_id, now)) announce(c.cell_id, "released");
+      return n;
     });
   }
 
@@ -733,6 +802,10 @@ export function createInbox(opts: InboxOptions): InboxService {
       if (!cell) return { applied: false, epoch: -1, reason: "not_found" };
       const auth = authorizeControl(cellId, cmd.principalId, cmd.action);
       if (!auth.ok) return { applied: false, epoch: cell.epoch, reason: auth.reason };
+      // Physical guardrail (BUG-020): a root cell (e.g. desk) can never be paused or cancelled regardless of authorizer.
+      if (cell.parentId === null && (cmd.action === "pause" || cmd.action === "cancel")) {
+        return { applied: false, epoch: cell.epoch, reason: "cannot pause or cancel a root cell" };
+      }
       if (cell.status === "closed") return { applied: false, epoch: cell.epoch, reason: "closed" };
 
       const now = clock.now();
@@ -742,6 +815,12 @@ export function createInbox(opts: InboxOptions): InboxService {
 
       switch (cmd.action) {
         case "cancel": {
+          if (opts.cancelCellSync) {
+            const ids=[cell,...cells.descendants(cellId,{status:["active","paused"]})].map(c=>c.id);
+            opts.cancelCellSync(cellId,cmd.principalId);
+            for (const id of ids) affected.push({cellId:id,epoch:cells.require(id).epoch});
+            break;
+          }
           const why = `control.cancel by ${cmd.principalId}`;
           for (const t of [cell, ...cells.descendants(cellId, { status: ["active", "paused"] })]) {
             const epoch = cells.bumpEpoch(t.id);
@@ -756,14 +835,14 @@ export function createInbox(opts: InboxOptions): InboxService {
           break;
         }
         case "pause": {
-          for (const t of [cell, ...cells.descendants(cellId, { status: ["active", "paused"] })]) {
-            if (t.status === "active") cells.setStatus(t.id, "paused");
+          for (const t of cmd.pauseReason === "budget_declined" ? [cell] : [cell, ...cells.descendants(cellId, { status: ["active", "paused"] })]) {
+            if (t.status === "active") cells.setStatus(t.id, "paused",undefined,cmd.pauseReason);
             affected.push({ cellId: t.id, epoch: t.epoch });
           }
           break;
         }
         case "resume": {
-          for (const t of [cell, ...cells.descendants(cellId, { status: ["paused"] })]) {
+          for (const t of cmd.pauseReason === "budget_declined" ? [cell] : [cell, ...cells.descendants(cellId, { status: ["paused"] })]) {
             if (t.status === "paused") cells.setStatus(t.id, "active");
             affected.push({ cellId: t.id, epoch: t.epoch });
             if (isClaimable(t.id, now)) wake.push(t.id);
@@ -867,6 +946,7 @@ export function createInbox(opts: InboxOptions): InboxService {
   function tickSync(): TickReport {
     // `at` before the query: a delayed row inserted after it has deliver_at > created_at >= at, so it stays above the watermark.
     const at = clock.now();
+    if (at < watermark) watermark = at - 1;
     const next = nextWakeAtSync();
     const suspend = measureSuspend(at);
     if ((next === null || next > at) && !suspend?.sleptMs) {
@@ -907,7 +987,7 @@ export function createInbox(opts: InboxOptions): InboxService {
         for (const r of all<{ cell_id: string }>(
           db,
           `SELECT DISTINCT cell_id FROM inbox_messages
-           WHERE status = 'pending' AND delivery = 'wakeup' AND deliver_at > ? AND deliver_at <= ? AND deliver_at > created_at`,
+           WHERE status = 'pending' AND delivery = 'wakeup' AND deliver_at > ? AND deliver_at <= ?`,
           [watermark, now],
         )) {
           touched.set(r.cell_id, "due");
@@ -931,11 +1011,12 @@ export function createInbox(opts: InboxOptions): InboxService {
   }
 
   function nextWakeAtSync(): number | null {
+    if (clock.now() < watermark) watermark = clock.now() - 1;
     const r = get<{ t: number | null }>(
       db,
       `SELECT MIN(t) AS t FROM (
          SELECT MIN(deliver_at) AS t FROM inbox_messages
-           WHERE status = 'pending' AND delivery = 'wakeup' AND deliver_at > ? AND deliver_at > created_at
+           WHERE status = 'pending' AND delivery = 'wakeup' AND deliver_at > ?
          UNION ALL SELECT MIN(next_fire_at) FROM inbox_schedules WHERE active = 1
          UNION ALL SELECT MIN(lease_expires_at) FROM inbox_claims WHERE status = 'active'
        )`,
@@ -1135,6 +1216,7 @@ export function createInbox(opts: InboxOptions): InboxService {
     renewLeaseSync,
     releaseSync,
     drainSteerSync,
+    requeueClaimedSync,
     drainInboundSync,
     pendingWakeupCountSync,
     activeClaimCountSync,
@@ -1142,6 +1224,17 @@ export function createInbox(opts: InboxOptions): InboxService {
     nextWakeAtSync,
     dueCellIdsSync,
     listMessagesSync,
+    consumeTimerSync(cellId, envelopeId, epoch, settle) {
+      return withTx(db, () => {
+        const now = clock.now();
+        const touched = run(db, `UPDATE inbox_messages SET status='done', first_claimed_at=?, updated_at=?
+          WHERE cell_id=? AND envelope_id=? AND type='timer.fired' AND status='pending' AND deliver_at <= ?
+          AND (expected_epoch IS NULL OR expected_epoch=?)`, [now, now, cellId, envelopeId, now, epoch]);
+        if (!touched.changes) return false;
+        settle();
+        return true;
+      });
+    },
     listSchedulesSync,
     pendingCountsSync,
     getClaimSync,
@@ -1265,7 +1358,11 @@ function isSubscribable(clock: object): clock is SubscribableClock {
 
 /** Mirrors Gate.authorizeControlSync's documented rule, for setups that do not wire a Gate. */
 function defaultControlAuthorizer(cells: CellsRepo, owner: string): ControlAuthorizer {
-  return (cellId, principalId) => {
+  return (cellId, principalId, action) => {
+    const target = cells.get(cellId);
+    if (target && target.parentId === null && (action === "pause" || action === "cancel")) {
+      return { ok: false, reason: "cannot pause or cancel a root cell" };
+    }
     const p = parsePrincipal(principalId, owner);
     if (p.kind === "owner") return { ok: true };
     if (p.kind === "cell") {

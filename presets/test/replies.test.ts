@@ -24,7 +24,7 @@ describe("docs/03 §四 row 3 — a colleague's question: one draft card, versio
     let cards = h.cards();
     expect(cards).toHaveLength(1);
     const card = cards[0]!;
-    const subjectKey = subjectKeys.inbound(q.id);
+    const subjectKey = "reply:channel:memory:grp-1:memory:grp-1";
     expect(card).toMatchObject({ cellId: "desk", subjectKey, boundVersion: 1, status: "pending" });
     expect(card.clarify).toMatchObject({
       cardType: "response",
@@ -44,7 +44,7 @@ describe("docs/03 §四 row 3 — a colleague's question: one draft card, versio
       expect(requestText(req)).toContain("语气正式一点");
       return tool("draft_reply", { text: "您好，目前网关限流为每实例 100 QPS；如需临时上调可以提申请。" });
     });
-    expect(await h.kernel.resolveApproval(card.actionId, { decision: "revise", instruction: "语气正式一点，并说明可以申请临时上调" })).toMatchObject({ status: "revising" });
+    expect(await h.kernel.resolveApproval(card.actionId, { decision: "revise", approverId: "owner", instruction: "语气正式一点，并说明可以申请临时上调" })).toMatchObject({ status: "revising" });
     await h.kernel.idle();
     cards = h.cards();
     expect(cards).toHaveLength(1);
@@ -57,10 +57,10 @@ describe("docs/03 §四 row 3 — a colleague's question: one draft card, versio
     });
 
     // A click on what the owner saw before the redraft is refused; nothing goes out.
-    expect(await h.kernel.resolveApproval(card.actionId, { decision: "approve", seenArtifactVersion: 1 })).toMatchObject({ status: "version_mismatch", currentVersion: 2 });
+    expect(await h.kernel.resolveApproval(card.actionId, { decision: "approve", approverId: "owner", seenArtifactVersion: 1 })).toMatchObject({ status: "version_mismatch", currentVersion: 2 });
     expect(h.memory.deliveries).toEqual([]);
 
-    expect(await h.kernel.resolveApproval(card.actionId, { decision: "approve", seenArtifactVersion: 2 })).toEqual({ status: "sent", actionId: card.actionId, artifactVersion: 2 });
+    expect(await h.kernel.resolveApproval(card.actionId, { decision: "approve", approverId: "owner", seenArtifactVersion: 2 })).toEqual({ status: "sent", actionId: card.actionId, artifactVersion: 2 });
     expect(h.memory.sent.map((d) => [d.target, d.content.body])).toEqual([["grp-1", "您好，目前网关限流为每实例 100 QPS；如需临时上调可以提申请。"]]);
     await h.kernel.idle();
 
@@ -68,7 +68,8 @@ describe("docs/03 §四 row 3 — a colleague's question: one draft card, versio
     expect(h.activities()).toEqual([
       expect.objectContaining({ kind: "action_completed", title: "已回复研发群：回复张三：网关限流阈值", actionId: card.actionId, restorable: false, source: expect.objectContaining({ label: "测试通道" }) }),
     ]);
-    expect(h.state<ReplyItem>("desk", KEYS.reply(subjectKey))).toMatchObject({ status: "sent" });
+    expect(h.kernel.gate.listApprovalsSync({subjectKey})[0]).toMatchObject({status:"executed"});
+    expect(h.state("desk", "desk:reply:" + subjectKey)).toBeNull();
   });
 
   it("someone else answers in the group first: the card is withdrawn and archived (restorable)", async () => {
@@ -90,7 +91,7 @@ describe("docs/03 §四 row 3 — a colleague's question: one draft card, versio
 
     expect(h.cards()).toEqual([]);
     expect(h.kernel.gate.getApprovalSync(card!.actionId)).toMatchObject({ status: "cancelled", statusReason: "群里王五已经回答了" });
-    expect(await h.kernel.resolveApproval(card!.actionId, { decision: "approve", seenArtifactVersion: 1 })).toMatchObject({ status: "already_cancelled" });
+    expect(await h.kernel.resolveApproval(card!.actionId, { decision: "approve", approverId: "owner", seenArtifactVersion: 1 })).toMatchObject({ status: "already_cancelled" });
     expect(h.memory.deliveries).toEqual([]);
     const [a] = h.activities();
     expect(a).toMatchObject({
@@ -128,4 +129,17 @@ describe("docs/03 §四 row 3 — a colleague's question: one draft card, versio
     expect(cards[0]).toMatchObject({ actionId: first!.actionId, boundVersion: 2 });
     expect((cards[0]!.clarify as ResponseCard).reply.target).toBe("channel:memory:hr");
   });
+});
+
+it("delivers to a configured owner address with another decision open on the same subject", async () => {
+  const h = await boot({kernel:{ownerAddresses:["channel:ui:*","channel:memory:phone"]}});
+  h.kernel.gate.upsertPolicyRuleSync({match:{type:"channel.send",target:"channel:memory:phone"}, effect:"allow", createdBy:"owner"});
+  const item = h.kernel.humanItems.create({
+    title:"待确认", subjectKey:"reply:channel:memory:phone:conversation", options:[{id:"reply", label:"回复", effect:"reply"}],
+  }, "desk");
+  h.script.add("desk", tool("draft_reply", {text:"已到达", to:"channel:memory:phone"}));
+  await h.memory.inject({from:"alice", threads:["conversation"], text:"请报平安"});
+  await h.kernel.idle();
+  expect(h.memory.sent.map(d => d.target)).toEqual(["phone"]);
+  expect(h.kernel.humanItems.list().map(i => i.id)).toEqual([item.id]);
 });

@@ -54,7 +54,8 @@ export type CliEvent =
   | { type: "notice"; text: string };
 
 export interface DriverIO {
-  write(line: string): void;
+  /** Returns false when stdin is already closed/destroyed so the caller knows the line was NOT accepted. */
+  write(line: string): boolean;
   /** Close the CLI's stdin. */
   end(): void;
 }
@@ -130,6 +131,7 @@ export interface CliSessionRecord {
   cwd: string;
   /** PromptSnapshot.system.hash the session was primed with. */
   systemHash: string;
+  lastDeliveredEvidenceSeq?: number;
   createdAt: number;
   updatedAt: number;
   runs: number;

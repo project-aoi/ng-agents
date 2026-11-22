@@ -7,14 +7,6 @@ export function describeAction(action: ProposedAction): string {
   switch (action.type) {
     case "channel.send":
       return `对外发送到 ${action.target}`;
-    case "workspace.exec":
-      return `在工作区执行 ${action.tool}`;
-    case "job.start":
-      return `启动后台命令：${action.command}`;
-    case "cell.spawn":
-      return `派生子任务：${action.spec.title ?? action.spec.preset ?? "未命名"}`;
-    case "cell.control":
-      return `${CONTROL_LABEL[action.action] ?? action.action}子任务 ${action.targetCellId}`;
     case "secret.use":
       return `使用密钥 ${action.secretRef}${action.purpose ? `（${action.purpose}）` : ""}`;
     case "project.start":

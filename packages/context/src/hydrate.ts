@@ -1,5 +1,5 @@
 import {
-  describeBounds,
+  stableStringify, describeBounds,
   get,
   mergeAdjacentMessages,
   NgError,
@@ -56,6 +56,7 @@ export interface CompactionPlan {
   baseCompactions: number;
   uptoSeq: number;
   keptChars: number;
+  latestExcerpt?: string;
   charsBefore: number;
   input: SummaryInput;
 }
@@ -71,6 +72,8 @@ export interface HydrateModule {
 export interface HydrateDeps extends Deps {
   evidence: EvidenceModule;
   knowledge: KnowledgeModule;
+  runtimeVersion:string;
+  toolContract(cell: CellRecord): unknown;
   resolvePrompt(cell: CellRecord): string;
   roster(cellId: string): ChildSummary[];
   tailNotes(cellId: string): string[];
@@ -127,6 +130,26 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
   }
 
   /** The frozen system prefix of a cell. Deterministic in its inputs; no timestamps. */
+  function systemHash(cell: CellRecord, text: string, forkNote = "", parentHash = ""): string {
+    return sha256Hex(stableStringify({
+      templateVersion: deps.runtimeVersion,
+      text, parentHash, forkNote, processor: cell.spec.processor, bounds: describeBounds(cell.bounds),
+      tools: deps.toolContract(cell),
+      skills: knowledge.visible(cell.id,"skill").map(k => [k.name,k.description,k.body]),
+      preferences: preferencesFor(cell).map(k => [k.name,k.body,k.applies]),
+    }));
+  }
+
+  function originalTask(cellId: string): string | null {
+    const row = get<{payload: string | null}>(db, `SELECT content -> '$.envelope.payload' AS payload FROM evidence
+      WHERE cell_id=? AND kind='inbound' AND json_extract(content,'$.envelope.type')='cell.task' ORDER BY seq LIMIT 1`,[cellId]);
+    if (!row?.payload) return null;
+    const task = JSON.parse(row.payload);
+    if (task == null) return null;
+    const refs = [...new Set((row.payload.match(/(?:res:\/\/|art_)[^\s"\],]+/g) ?? []))].join(" ").slice(0,180);
+    return `[original task] parent=${task.parentCellId ?? ""} ${refs} ${typeof task.instruction==="string" ? task.instruction : JSON.stringify(task)}`.replace(/\s+/g, " ").slice(0, 800);
+  }
+
   function buildSystem(cell: CellRecord): { text: string; skills: SkillIndexEntry[] } {
     const sections: string[] = [];
     const prompt = deps.resolvePrompt(cell).trimEnd();
@@ -185,14 +208,14 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
       const inherited = renderHistory(parent, parentRow, cell.spec.fork!.uptoSeq, "fork").messages;
       ins = {
         text: parentRow.text,
-        hash: parentRow.hash,
+        hash: systemHash(cell,parentRow.text,buildForkNote(cell,parent),parentRow.hash),
         skills: parentRow.skills,
         inherited: JSON.stringify(inherited),
         fork_note: buildForkNote(cell, parent),
       };
     } else {
       const sys = buildSystem(cell);
-      ins = { text: sys.text, hash: sha256Hex(sys.text), skills: toJson(sys.skills), inherited: null, fork_note: null };
+      ins = { text: sys.text, hash: systemHash(cell,sys.text), skills: toJson(sys.skills), inherited: null, fork_note: null };
     }
     run(
       db,
@@ -219,11 +242,14 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
     upto: number | undefined,
     openAtEnd: "error" | "fork",
   ): { messages: ModelMessage[]; uptoSeq: number } {
-    const messages = headMessages(row, true);
-    const records = evidence.list(cell.id, { afterSeq: row.summary_upto_seq, ...(upto !== undefined ? { uptoSeq: upto } : {}) });
+    // A legacy child may hydrate for the first time after its parent compacted past the fork point.
+    const futureSummary = upto !== undefined && row.summary_upto_seq > upto;
+    const messages = futureSummary ? [] : headMessages(row, true);
+    const afterSeq = futureSummary ? 0 : row.summary_upto_seq;
+    const records = evidence.list(cell.id, { afterSeq, ...(upto !== undefined ? { uptoSeq: upto } : {}) });
     messages.push(...renderRecords(records.map((r) => r.record), { openAtEnd }));
     if (messages[0]?.role === "assistant") messages.unshift(textMessage("user", HISTORY_START_TEXT));
-    let uptoSeq = Math.max(row.summary_upto_seq, records[records.length - 1]?.seq ?? 0);
+    let uptoSeq = Math.max(afterSeq, records[records.length - 1]?.seq ?? 0);
     if (row.inherited !== null && cell.spec.fork) uptoSeq = Math.max(uptoSeq, cell.spec.fork.uptoSeq);
     return { messages, uptoSeq };
   }
@@ -250,18 +276,30 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
     for (let i = records.length - 1; i >= 0; i--) suffix[i] = suffix[i + 1]! + sizes[i]!;
     // The earliest cut that keeps at most keepRecentChars: the boundary jumps forward in big steps, not every Run.
     let cut = records.length;
+    let withinTurn = records.length;
+    const openTools = new Set<string>();
     for (let i = 0; i < records.length; i++) {
-      if (isTurnStart(i) && suffix[i]! <= limits.keepRecentChars) {
-        cut = i;
-        break;
+      const record = records[i]!.record;
+      if (record.kind === "run_boundary") openTools.clear();
+      if (!openTools.size && suffix[i]! <= limits.keepRecentChars) {
+        if (isTurnStart(i)) {
+          cut = i;
+          break;
+        }
+        // A single oversized turn may fit only from the middle. Keep complete tool exchanges together.
+        if (i > 0 && withinTurn === records.length) withinTurn = i;
       }
+      if (record.kind === "tool_call") openTools.add(record.toolUseId);
+      if (record.kind === "tool_result") openTools.delete(record.toolUseId);
     }
+    if (cut === records.length) cut = withinTurn;
     if (cut === 0 && head.length === 0) return null;
     const folded = mergeAdjacentMessages([...head, ...renderRecords(records.slice(0, cut).map((r) => r.record), { openAtEnd: "error" })]);
     if (folded.length === 0 && row.summary === null) return null;
     // Folding only the inherited part: the summary then stands for the parent's history up to the fork point (the
     // child's own records all have larger seqs, so they are still rendered after it).
     const inheritedUpto = row.inherited !== null ? (cell.spec.fork?.uptoSeq ?? 0) : 0;
+    const latest = suffix[cut] === 0 ? records.findLast((_, i) => sizes[i]! > 0) : undefined;
     return {
       cellId,
       mode,
@@ -269,6 +307,7 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
       baseCompactions: row.compactions,
       uptoSeq: cut > 0 ? records[cut - 1]!.seq : Math.max(row.summary_upto_seq, inheritedUpto),
       keptChars: suffix[cut]!,
+      ...(latest ? {latestExcerpt:JSON.stringify(latest.record).slice(-Math.min(1500,limits.keepRecentChars))} : {}),
       charsBefore: total,
       input: { cellId, previousSummary: row.summary, messages: folded, maxChars: limits.summaryMaxChars },
     };
@@ -281,6 +320,14 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
       // Someone compacted (or refreshed past a compaction) while the summariser ran: drop this result.
       if (!row || row.summary_upto_seq !== plan.baseUpto || row.compactions !== plan.baseCompactions) return null;
       const cell = cells.require(plan.cellId);
+      const task = originalTask(cell.id);
+      const body = summary.split("\n").filter(line=>!line.startsWith("[original task]")).join("\n");
+      const max = limits.summaryMaxChars;
+      const prefix = task ? (task + "\n").slice(0, max) : "";
+      const remaining = max - prefix.length;
+      const label = "\n[latest work] ";
+      const suffix = plan.latestExcerpt && remaining > label.length ? label + plan.latestExcerpt.slice(-(remaining - label.length)) : "";
+      summary = (prefix + body.slice(0, remaining - suffix.length) + suffix).trim();
       // The cache is lost at a compaction anyway, so the cell switches to its own, freshly built system prefix.
       const sys = buildSystem(cell);
       run(
@@ -288,7 +335,7 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
         `UPDATE prompt_prefixes SET text = ?, hash = ?, skills = ?, epoch = ?, created_at = ?, inherited = NULL, fork_note = NULL,
            summary = ?, summary_upto_seq = ?, compactions = compactions + 1
          WHERE cell_id = ?`,
-        [sys.text, sha256Hex(sys.text), toJson(sys.skills), cell.epoch, clock.now(), summary, plan.uptoSeq, plan.cellId],
+        [sys.text, systemHash(cell,sys.text), toJson(sys.skills), cell.epoch, clock.now(), summary, plan.uptoSeq, plan.cellId],
       );
       return {
         cellId: plan.cellId,
@@ -311,7 +358,7 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
         const parentRow = ensurePrefix(parent, parent.spec.contextMode ?? "isolated");
         run(db, "UPDATE prompt_prefixes SET text = ?, hash = ?, skills = ?, fork_note = ?, epoch = ?, created_at = ? WHERE cell_id = ?", [
           parentRow.text,
-          parentRow.hash,
+          systemHash(cell,parentRow.text,buildForkNote(cell,parent),parentRow.hash),
           parentRow.skills,
           buildForkNote(cell, parent),
           cell.epoch,
@@ -322,7 +369,7 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
         const sys = buildSystem(cell);
         run(db, "UPDATE prompt_prefixes SET text = ?, hash = ?, skills = ?, epoch = ?, created_at = ? WHERE cell_id = ?", [
           sys.text,
-          sha256Hex(sys.text),
+          systemHash(cell,sys.text),
           toJson(sys.skills),
           cell.epoch,
           clock.now(),
@@ -349,6 +396,8 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
     const history = renderHistory(cell, row, undefined, "error");
     const roster = deps.roster(cellId);
     const notes = (deps.tailNotes(cellId) ?? []).filter((n) => typeof n === "string" && n.trim() !== "");
+    const task = originalTask(cell.id);
+    if (task && cell.spec.processor.kind === "llm") notes.unshift(task);
     const tail: ModelMessage[] = [];
     if (roster.length > 0) tail.push(rosterMessage(roster));
     for (const note of notes) tail.push(textMessage("user", note));
@@ -364,6 +413,7 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
       system: { text: row.text, hash: row.hash },
       history: history.messages,
       historyUptoSeq: history.uptoSeq,
+      summaryUptoSeq: row.summary_upto_seq,
       tail: notes.length > 0 ? { roster, messages: tail, notes } : { roster, messages: tail },
       skills: JSON.parse(row.skills) as SkillIndexEntry[],
       createdAt: clock.now(),

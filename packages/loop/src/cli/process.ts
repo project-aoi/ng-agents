@@ -2,6 +2,7 @@ import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
+import { groupAlive, pidAlive, processIdentity, processDescendants, processHasMarker } from "@ng/protocol";
 
 export interface CliProcess {
   readonly child: ChildProcess;
@@ -10,7 +11,8 @@ export interface CliProcess {
   readonly exited: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
   /** Last ~8 KB of stderr (diagnostics only; never parsed as protocol). */
   stderrTail(): string;
-  write(line: string): void;
+  /** Writes a line to stdin. Returns false when stdin is closed/destroyed (line was NOT accepted). */
+  write(line: string): boolean;
   endInput(): void;
   /** SIGTERM to the process group and every descendant, SIGKILL after `graceMs` if still alive. */
   kill(graceMs: number): Promise<void>;
@@ -31,9 +33,14 @@ export function spawnCli(
   const reg = opts.registry;
   const marker = reg ? `${reg.runId}:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 10)}` : null;
   const env = marker ? { ...opts.env, [CLI_PROCESS_MARKER]: marker } : opts.env;
-  const child = spawn(file, args, { cwd: opts.cwd, env, stdio: ["pipe", "pipe", "pipe"], detached: true, windowsHide: true });
+  const wrapped = marker && process.platform === "darwin";
+  // Catch TERM in the marker-bearing shell; exec resets a caught signal to default in the actual CLI.
+  const child = spawn(wrapped ? "/bin/sh" : file, wrapped ? ["-c", 'trap ":" TERM; "$@"; exit $?', `${CLI_PROCESS_MARKER}=${marker}`, file, ...args] : args, { cwd: opts.cwd, env, stdio: ["pipe", "pipe", "pipe"], detached: true, windowsHide: true });
   const record = reg && marker && child.pid ? registerCliProcess(reg, { pid: child.pid, marker, cwd: opts.cwd, bin: file }) : null;
-  if (record) child.once("exit", () => rmSync(record, { force: true }));
+  let stopping: Promise<void> | undefined;
+  if (record) child.once("exit", () => {
+    if (!stopping && !groupAlive(child.pid!)) rmSync(record, { force: true });
+  });
   let stderr = "";
   let inputOpen = true;
   const decoder = new StringDecoder("utf8");
@@ -68,14 +75,20 @@ export function spawnCli(
   child.stdin!.on("error", () => {
     inputOpen = false;
   });
+  child.stdin!.on("close", () => {
+    inputOpen = false;
+  });
 
   const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
     let settled = false;
     const done = (code: number | null, signal: NodeJS.Signals | null) => {
+      inputOpen = false;
       if (settled) return;
       settled = true;
       // stdout may close slightly after exit; never wait long for it (a helper might have inherited it).
-      void Promise.race([stdoutDone, new Promise((r) => setTimeout(r, 2_000))]).then(() => resolve({ code, signal }));
+      void Promise.race([stdoutDone, new Promise((r) => setTimeout(r, 2_000))])
+        .then(() => stopping)
+        .then(() => resolve({ code, signal }));
     };
     child.on("exit", done);
     child.on("error", (err) => {
@@ -91,8 +104,14 @@ export function spawnCli(
     exited,
     stderrTail: () => stderr,
     write(line) {
-      if (!inputOpen || child.stdin!.destroyed) return;
-      child.stdin!.write(line.endsWith("\n") ? line : `${line}\n`);
+      if (!inputOpen || child.stdin!.destroyed || child.stdin!.writableEnded || !child.stdin!.writable) return false;
+      try {
+        child.stdin!.write(line.endsWith("\n") ? line : `${line}\n`);
+        return true;
+      } catch {
+        inputOpen = false;
+        return false;
+      }
     },
     endInput() {
       if (!inputOpen) return;
@@ -100,14 +119,12 @@ export function spawnCli(
       child.stdin!.end();
     },
     async kill(graceMs) {
-      if (pid <= 0) return;
-      const tree = descendants(pid);
-      signalAll(pid, tree, "SIGTERM");
-      const gone = await Promise.race([exited.then(() => true), new Promise<boolean>((r) => setTimeout(() => r(false), graceMs))]);
-      // Helpers may outlive the CLI itself; finish them too.
-      const rest = [...tree, ...descendants(pid)];
-      signalAll(pid, rest, "SIGKILL", gone);
-      if (!gone) await Promise.race([exited, new Promise((r) => setTimeout(r, 1_000))]);
+      const leaderIsOurs = () => child.exitCode === null && child.signalCode === null;
+      if (pid <= 0 || !leaderIsOurs()) return stopping;
+      stopping ??= stopProcessTree(pid, leaderIsOurs, graceMs).then(gone => {
+        if (record && gone) rmSync(record, {force:true});
+      });
+      return stopping;
     },
   };
 }
@@ -136,13 +153,27 @@ interface CliProcessRecord {
   cwd: string;
   bin: string;
   startedAt: number;
+  identity?: string | null;
+  unknownSince?: number;
+  /** PID of the kernel process that spawned this CLI (so live re-reaps never touch the current kernel's children). */
+  ownerPid?: number;
 }
 
 function registerCliProcess(reg: CliProcessRegistration, p: { pid: number; marker: string; cwd: string; bin: string }): string | null {
   try {
     mkdirSync(reg.dir, { recursive: true });
     const path = join(reg.dir, `${p.pid}.json`);
-    const rec: CliProcessRecord = { pid: p.pid, marker: p.marker, runId: reg.runId, cellId: reg.cellId, cwd: p.cwd, bin: p.bin, startedAt: Date.now() };
+    const rec: CliProcessRecord = {
+      pid: p.pid,
+      marker: p.marker,
+      runId: reg.runId,
+      cellId: reg.cellId,
+      cwd: p.cwd,
+      bin: p.bin,
+      startedAt: Date.now(),
+      ownerPid: process.pid,
+      identity: process.platform === "darwin" ? processIdentity(p.pid) : null,
+    };
     writeFileSync(path, JSON.stringify(rec), { mode: 0o600 });
     return path;
   } catch {
@@ -150,13 +181,20 @@ function registerCliProcess(reg: CliProcessRegistration, p: { pid: number; marke
   }
 }
 
-/** Is `pid` still the process that was started with `marker`? (Linux: its environment says so; elsewhere unknown → false.) */
+/**
+ * Three-state check for whether `pid` is still the CLI process started with `marker` (cross-platform: `/proc` on
+ * Linux, `ps -E` on macOS — same utility as `@ng/workspace`):
+ * - `true`:  confirmed alive and carries `NG_CLI_PROC=<marker>`.
+ * - `false`: confirmed exited or PID recycled (does not carry the marker).
+ * - `null`:  process appears alive, but its environment could not be read (identity unknown).
+ */
+export function cliProcessStatus(pid: number, marker: string, identity?: string | null): boolean | null {
+  return processHasMarker(pid, CLI_PROCESS_MARKER, marker, identity);
+}
+
+/** Positively identified alive check (`cliProcessStatus(...) === true`). Never true for unknown identity (`null`). */
 export function cliProcessAlive(pid: number, marker: string): boolean {
-  try {
-    return readFileSync(`/proc/${pid}/environ`, "utf8").split("\0").includes(`${CLI_PROCESS_MARKER}=${marker}`);
-  } catch {
-    return false;
-  }
+  return cliProcessStatus(pid, marker) === true;
 }
 
 export interface ReapedCliProcess {
@@ -164,16 +202,27 @@ export interface ReapedCliProcess {
   cellId: string;
   runId: string;
   cwd: string;
-  /** false: the record was stale (the process had already exited, or the pid belongs to someone else now). */
+  /**
+   * - `"killed"`: positively identified orphan; terminated (SIGTERM/SIGKILL) and record removed.
+   * - `"gone"`: confirmed exited or PID recycled; stale record removed without signalling.
+   * - `"unknown"`: PID appears alive, but environment could not be read; NOT killed, record kept on disk so the
+   *   dispatcher can hold replacement CLI runs for `cellId` until confirmed gone.
+   */
+  status: "killed" | "gone" | "unknown";
+  /** true iff `status === "killed"`. */
   killed: boolean;
 }
 
 /**
  * Call once at kernel start, before any Run is dispatched: every CLI process a previous kernel left on record and that
  * is verifiably still that process is stopped with its whole tree (SIGTERM, then SIGKILL after `graceMs`), and the
- * call resolves only when they are gone. Records of processes that already exited are just removed.
+ * call resolves only when they are gone. Records of processes that already exited are removed. Records whose process
+ * is alive with unreadable identity (`null`) are KEPT untouched and reported as `status: "unknown"`.
  */
-export async function reapOrphanedCliProcesses(dir: string, opts: { graceMs?: number } = {}): Promise<ReapedCliProcess[]> {
+export async function reapOrphanedCliProcesses(
+  dir: string,
+  opts: { graceMs?: number; cellId?: string; skipOwnerPid?: number } = {},
+): Promise<ReapedCliProcess[]> {
   const graceMs = opts.graceMs ?? 3_000;
   let files: string[];
   try {
@@ -192,23 +241,94 @@ export async function reapOrphanedCliProcesses(dir: string, opts: { graceMs?: nu
         rmSync(path, { force: true });
         return;
       }
-      // Our own live children (a second loop instance in this process) are not orphans.
-      const alive = typeof rec.pid === "number" && rec.pid > 0 && cliProcessAlive(rec.pid, rec.marker);
-      if (alive) {
-        const tree = descendants(rec.pid);
-        signalAll(rec.pid, tree, "SIGTERM");
-        const deadline = Date.now() + graceMs;
-        while (Date.now() < deadline && cliProcessAlive(rec.pid, rec.marker)) await new Promise((r) => setTimeout(r, 50));
-        const still = cliProcessAlive(rec.pid, rec.marker);
-        signalAll(rec.pid, [...tree, ...descendants(rec.pid)], "SIGKILL", !still);
-        const hard = Date.now() + 2_000;
-        while (Date.now() < hard && cliProcessAlive(rec.pid, rec.marker)) await new Promise((r) => setTimeout(r, 25));
+      if (opts.cellId !== undefined && rec.cellId !== opts.cellId) return;
+      if (opts.skipOwnerPid !== undefined && rec.ownerPid === opts.skipOwnerPid) return;
+      const state = typeof rec.pid === "number" && rec.pid > 0 && typeof rec.marker === "string" ? cliProcessStatus(rec.pid, rec.marker, rec.identity) : false;
+      if (state === null) {
+        // The dispatcher retries unknown registrations within the observation window without sending a signal.
+        out.push({ pid: rec.pid, cellId: rec.cellId, runId: rec.runId, cwd: rec.cwd, status: "unknown", killed: false });
+        return;
+      }
+      if (state === true) {
+        const gone = await stopProcessTree(rec.pid, () => cliProcessStatus(rec.pid, rec.marker, rec.identity) === true, graceMs);
+        if (gone) {
+          rmSync(path, { force: true });
+          out.push({ pid: rec.pid, cellId: rec.cellId, runId: rec.runId, cwd: rec.cwd, status: "killed", killed: true });
+        } else {
+          // Still alive or identity became unreadable: keep record on disk so no replacement process runs concurrently.
+          out.push({ pid: rec.pid, cellId: rec.cellId, runId: rec.runId, cwd: rec.cwd, status: "unknown", killed: false });
+        }
+        return;
       }
       rmSync(path, { force: true });
-      out.push({ pid: rec.pid, cellId: rec.cellId, runId: rec.runId, cwd: rec.cwd, killed: alive });
+      out.push({ pid: rec.pid, cellId: rec.cellId, runId: rec.runId, cwd: rec.cwd, status: "gone", killed: false });
     }),
   );
   return out;
+}
+
+/**
+ * Re-probe any retained orphan CLI PID records for `cellId`. Records whose process has since exited (`false`) are
+ * cleaned up. Returns `"clear"` when no unresolved orphan remains for `cellId`, `"unknown"` if one is still unverified
+ * alive (caller should defer dispatching a replacement CLI run), or `"alive"` if an identifiable orphan needs reaping.
+ */
+export function probeOrphanCliCell(dir: string, cellId: string, opts: { skipOwnerPid?: number } = {}): "clear" | "unknown" | "alive" {
+  let files: string[];
+  try {
+    files = readdirSync(dir).filter((f) => f.endsWith(".json"));
+  } catch {
+    return "clear";
+  }
+  let sawUnknown = false;
+  for (const f of files) {
+    const path = join(dir, f);
+    let rec: CliProcessRecord;
+    try {
+      rec = JSON.parse(readFileSync(path, "utf8")) as CliProcessRecord;
+    } catch {
+      rmSync(path, { force: true });
+      continue;
+    }
+    if (rec.cellId !== cellId) continue;
+    if (opts.skipOwnerPid !== undefined && rec.ownerPid === opts.skipOwnerPid) continue;
+    const state = typeof rec.pid === "number" && rec.pid > 0 && typeof rec.marker === "string" ? cliProcessStatus(rec.pid, rec.marker, rec.identity) : false;
+    if (state === false) {
+      rmSync(path, { force: true });
+      continue;
+    }
+    if (state === true) return "alive";
+    if (rec.unknownSince === undefined) {
+      rec.unknownSince = Date.now();
+      writeFileSync(path, JSON.stringify(rec), { mode: 0o600 });
+    } else if (Date.now() - rec.unknownSince >= 30_000) {
+      // No verifiable process to reap. Retire the stale registration without signalling this PID.
+      rmSync(path, { force: true });
+      continue;
+    }
+    sawUnknown = true;
+  }
+  return sawUnknown ? "unknown" : "clear";
+}
+
+/** Called after identifying the leader. Its descendants can live in independent process groups. */
+async function stopProcessTree(pid: number, leaderIsOurs: () => boolean, graceMs: number): Promise<boolean> {
+  const tree = descendants(pid);
+  const running = () => groupAlive(pid) || tree.some(pidAlive) || (pidAlive(pid) && leaderIsOurs());
+  async function waitGone(ms: number) {
+    const deadline = performance.now() + ms;
+    while (running()) {
+      if (performance.now() >= deadline) return false;
+      await new Promise(r => setTimeout(r, 25));
+    }
+    return true;
+  }
+  signalAll(pid, tree, "SIGTERM");
+  if (await waitGone(graceMs)) return true;
+  const sameLeader = leaderIsOurs();
+  if (sameLeader) tree.push(...descendants(pid));
+  // A surviving group keeps its pgid after its leader exits.
+  signalAll(pid, tree, "SIGKILL", !sameLeader && pidAlive(pid));
+  return waitGone(2_000);
 }
 
 function signalAll(pid: number, tree: readonly number[], sig: NodeJS.Signals, leaderGone = false): void {
@@ -232,39 +352,9 @@ function signalAll(pid: number, tree: readonly number[], sig: NodeJS.Signals, le
   }
 }
 
-/** Descendant pids of `root` (Linux /proc; empty elsewhere). */
+/** Descendant pids of `root` (cross-platform: Linux `/proc`, macOS/POSIX `ps -eo pid=,ppid=`). */
 export function descendants(root: number): number[] {
-  let entries: string[];
-  try {
-    entries = readdirSync("/proc");
-  } catch {
-    return [];
-  }
-  const children = new Map<number, number[]>();
-  for (const e of entries) {
-    if (!/^\d+$/.test(e)) continue;
-    try {
-      const stat = readFileSync(`/proc/${e}/stat`, "utf8");
-      // comm may contain spaces/parens: fields after the last ")" are positional.
-      const after = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
-      const ppid = Number(after[1]);
-      const list = children.get(ppid) ?? [];
-      list.push(Number(e));
-      children.set(ppid, list);
-    } catch {
-      // process vanished while scanning
-    }
-  }
-  const out: number[] = [];
-  const stack = [root];
-  while (stack.length) {
-    const p = stack.pop()!;
-    for (const c of children.get(p) ?? []) {
-      out.push(c);
-      stack.push(c);
-    }
-  }
-  return out;
+  return processDescendants(root);
 }
 
 /** `<bin> --version` → first version-looking token, or null when the binary is missing or broken. */

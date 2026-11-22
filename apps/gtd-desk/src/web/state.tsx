@@ -179,7 +179,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     (t: Omit<Toast, "id">) => {
       const id = next.current++;
       setToasts((l) => [...l.slice(-3), { ...t, id }]);
-      setTimeout(() => dismiss(id), t.tone === "error" || t.tone === "warn" ? 8_000 : 4_000);
+      setTimeout(() => dismiss(id), t.action || t.tone === "error" || t.tone === "warn" ? 8_000 : 4_000);
     },
     [dismiss],
   );
@@ -412,9 +412,9 @@ export function parseRoute(hash: string): Route {
 export function routeHash(r: Route): string {
   const e = encodeURIComponent;
   if (r.view === "engage" && r.item) return `#/engage/${e(r.item.cellId)}/${e(r.item.actionId)}`;
-  if (r.view === "clarify" && r.cardId) return `#/clarify/${e(r.cardId)}`;
+  if (r.view === "clarify" && r.cardId) return `#/inbox/${e(r.cardId)}`;
   if (r.view === "agents") return `#/agents${r.cellId ? `/${e(r.cellId)}` : ""}${r.projectId ? `?project=${e(r.projectId)}` : ""}`;
-  return `#/${r.view}`;
+  return r.view==="clarify" || r.view==="engage" ? "#/inbox" : `#/${r.view}`;
 }
 
 const NavContext = createContext<(r: Route) => void>(() => undefined);

@@ -22,8 +22,8 @@ function seed() {
   });
   s.appendEvidenceSync("w", { kind: "external", source: "feishu", title: "群聊反馈", text: "用户反馈支付报错三次", runId: null, at: at() });
   s.appendEvidenceSync("sib", { kind: "assistant_text", text: "兄弟分身的报价单记录", runId: "r9", at: at() });
-  s.upsertSkillOrNoteSync("p", { kind: "note", scope: "cell", name: "报价约定", description: "项目共享笔记", body: "报价单需含税", mode: "upsert" });
-  s.upsertSkillOrNoteSync("sib", { kind: "note", scope: "cell", name: "兄弟笔记", description: "不可见", body: "报价单草稿", mode: "upsert" });
+  s.upsertSkillOrNoteSync("p", { kind: "working_note", scope: "cell", name: "报价约定", description: "项目共享笔记", body: "报价单需含税", mode: "upsert" });
+  s.upsertSkillOrNoteSync("sib", { kind: "working_note", scope: "cell", name: "兄弟笔记", description: "不可见", body: "报价单草稿", mode: "upsert" });
   s.upsertSkillOrNoteSync("desk", { kind: "preference", scope: "global", name: "语言", description: "回复语言", body: "报价单一律中文", mode: "upsert" });
   return h;
 }
@@ -33,9 +33,9 @@ describe("searchHistory", () => {
     const h = seed();
     const hits = await h.store.searchHistory("w", "报价单");
     const keys = hits.map((s) => `${s.source}:${s.cellId}:${s.kind}`).sort();
-    expect(keys).toEqual(["evidence:w:inbound", "knowledge:null:preference", "knowledge:p:note"]);
-    const note = hits.find((s) => s.kind === "note")!;
-    expect(note).toMatchObject({ uri: "note://报价约定", title: "报价约定", runId: null });
+    expect(keys).toEqual(["evidence:w:inbound", "knowledge:null:preference", "knowledge:p:working_note"]);
+    const note = hits.find((s) => s.kind === "working_note")!;
+    expect(note).toMatchObject({ uri: "working_note://报价约定", title: "报价约定", runId: null });
     expect(note.text).toContain("报价单需含税");
     expect(h.store.readResourceSync("w", note.uri!)).toBe("报价单需含税");
     for (const s of hits) expect(typeof s.rank).toBe("number");
@@ -43,7 +43,7 @@ describe("searchHistory", () => {
 
   it("falls back to LIKE for 1-2 character queries and combines terms", () => {
     const h = seed();
-    expect(h.store.searchHistorySync("w", "报价").map((s) => s.kind).sort()).toEqual(["assistant_text", "inbound", "note", "preference"]);
+    expect(h.store.searchHistorySync("w", "报价").map((s) => s.kind).sort()).toEqual(["assistant_text", "inbound", "preference", "working_note"]);
     expect(h.store.searchHistorySync("w", "支付").map((s) => s.kind).sort()).toEqual(["external", "tool_result"]);
     // a long term through FTS plus a short term through LIKE
     const both = h.store.searchHistorySync("w", "支付回调 签名");
@@ -116,7 +116,7 @@ function tree() {
   });
   s.appendEvidenceSync("sib", { kind: "assistant_text", text: "sibling mentions warehouse.orders_daily too", runId: "r2", at: at() });
   s.appendEvidenceSync("other", { kind: "assistant_text", text: "other root: warehouse.orders_daily", runId: "r3", at: at() });
-  s.upsertSkillOrNoteSync("sib", { kind: "note", scope: "cell", name: "sib-note", description: "x", body: "metrics_v3 口径说明", mode: "upsert" });
+  s.upsertSkillOrNoteSync("sib", { kind: "working_note", scope: "cell", name: "sib-note", description: "x", body: "metrics_v3 口径说明", mode: "upsert" });
   h.cells.setStatus("w1", "closed");
   return { h, spillUri: spill.spill!.uri };
 }
@@ -196,7 +196,7 @@ describe("searchHistory scopes", () => {
       "evidence:sib:assistant_text",
       "evidence:w1:assistant_text",
     ]);
-    expect(g("metrics_v3").map(keyOf).sort()).toEqual(["artifact:w2:artifact", "knowledge:sib:note"]);
+    expect(g("metrics_v3").map(keyOf).sort()).toEqual(["artifact:w2:artifact", "knowledge:sib:working_note"]);
     expect(g("kafka-topic-clicks").map(keyOf)).toEqual(["state:g:state"]);
     expect(g("zq_middle_token").map(keyOf)).toEqual(["resource:w1:resource"]);
     expect(g("warehouse.orders_daily", 2)).toHaveLength(2);

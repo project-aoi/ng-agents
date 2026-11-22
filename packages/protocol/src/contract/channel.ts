@@ -73,6 +73,7 @@ export interface OutboxFilter {
   status?: readonly OutboxStatus[];
   channelId?: string;
   cellId?: string;
+  actionId?: string;
   limit?: number;
   order?: "newest" | "oldest";          // default newest first; "oldest" = delivery order
 }
@@ -119,6 +120,8 @@ export interface ChannelHub {
   bufferedCountSync(): number;
   listOutboxSync(filter?: OutboxFilter): OutboxRecord[];
   getOutboxSync(idempotencyKey: string): OutboxRecord | undefined;
+  /** [ext] Latest outbox row linked to an approval `actionId` (handles `:retry:` keys cleanly). */
+  getLatestOutboxByActionSync(actionId: string): OutboxRecord | undefined;
 }
 
 // ==================== [ext] ingress payload for non-conversational external events ====================

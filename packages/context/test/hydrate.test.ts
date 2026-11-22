@@ -493,7 +493,7 @@ describe("hydrate: fork_prefix", () => {
     const child = h.store.hydrateSync("fixer", childBatch, "fork_prefix");
 
     expect(child.system.text).toBe(parentSnap.system.text);
-    expect(child.system.hash).toBe(parentSnap.system.hash);
+    expect(child.system.hash).not.toBe(parentSnap.system.hash);
     for (let i = 0; i < parentSnap.history.length; i++) expect(json(child.history[i])).toBe(json(parentSnap.history[i]));
 
     // Then the parent's in-flight run up to the spawn call (as the parent's own next history renders it)…
@@ -661,4 +661,43 @@ describe("hydrate: compaction", () => {
     expect(after.history.slice(1).map((m) => m.role)).toEqual(["user", "assistant"]);
     expect(assertWireInvariants(after.history)).toEqual([]);
   });
+});
+
+it("preserves the original assignment through repeated compactions of a large turn", async () => {
+  const h=deskHarness({store:{limits:{compactAtChars:1800,keepRecentChars:500,summaryMaxChars:700}}});
+  const task={...userEnvelope(h.clock,""),type:"cell.task",payload:{parentCellId:"lead",instruction:"check\n   release",artifactId:"art_release"}};
+  simulateRun(h,"desk",[task],reply("x".repeat(2500)+"last work"));
+  for(let i=0;i<2;i++) {
+    await h.store.compact("desk",{force:true});
+    const snap=h.store.hydrateSync("desk",batchOf("desk",[]),"isolated");
+    expect(json(snap.history)).toContain("check release");
+    expect(json(snap.history)).toContain("lead");
+    expect(json(snap.tail.messages)).toContain("[original task]");
+    expect(get<{summary:string}>(h.db, "SELECT summary FROM prompt_prefixes WHERE cell_id = 'desk'")!.summary.length).toBeLessThanOrEqual(700);
+    if (i===0) expect(json(snap.history)).toMatch(/\[latest work\].*last work/);
+  }
+});
+
+it("compacts a large multi-tool step only after its last result", async () => {
+  const h = deskHarness({store:{limits:{compactAtChars:1800,keepRecentChars:500,inlineChars:8_000}}});
+  simulateRun(h, "desk", [userEnvelope(h.clock, "run two checks")], runId => [
+    { kind:"tool_call", toolUseId:"a", name:"read", input:{}, runId, at:0 },
+    { kind:"tool_call", toolUseId:"b", name:"read", input:{}, runId, at:0 },
+    { kind:"tool_result", toolUseId:"a", name:"read", output:"x".repeat(3_000), runId, at:0 },
+    { kind:"tool_result", toolUseId:"b", name:"read", output:"last result", runId, at:0 },
+    { kind:"assistant_text", text:"both checks complete", runId, at:0 },
+  ]);
+  await h.store.compact("desk", {force:true});
+  const snap = h.store.hydrateSync("desk", batchOf("desk", []), "isolated");
+  const lastResult = get<{seq:number}>(h.db, "SELECT MAX(seq) AS seq FROM evidence WHERE cell_id='desk' AND kind='tool_result'")!;
+  expect(snap.summaryUptoSeq).toBe(lastResult.seq);
+  expect(json(snap.history.at(-1))).toContain("both checks complete");
+});
+
+it("hydrates a legacy assignment with a null payload", () => {
+  const h = deskHarness();
+  const envelope = {...userEnvelope(h.clock, ""), type:"cell.task", payload:null};
+  simulateRun(h,"desk",[envelope], reply("ready"));
+  const snap = h.store.hydrateSync("desk", batchOf("desk", []), "isolated");
+  expect(snap.tail.notes?.some(note=>note.startsWith("[original task]"))).toBeFalsy();
 });

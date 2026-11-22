@@ -20,7 +20,19 @@ export interface VersionedArtifact {    // human-visible deliverables: reply dra
   updatedAt: number;
 }
 
+/** A preset can project a domain record through an older state key without keeping a second writable copy. */
+export interface StateDomain {
+  serialize?(cellId:string,key:string,value:unknown):unknown;
+  project?(entry:StateEntry):StateEntry;
+  id: string;
+  migrate(): void;
+  read(cellId: string, key: string): StateEntry | undefined;
+  query(q: StateQuery): StateEntry[];
+  write(cellId: string, key: string, value: unknown): boolean;
+}
+
 export interface ContextStore {
+  installStateDomain(domain: StateDomain): void;
   // 1. Business state (transactional reads/writes relying on the per-Cell serial lock) and version-protected draft Artifact commits
   readState<T = unknown>(cellId: string, key: string): Promise<T | null>;
   commit(cellId: string, tx: {
@@ -43,6 +55,7 @@ export interface ContextStore {
   /** Cross-cell read for UI projections, e.g. every `gtd:action:` key in the system. */
   queryState(q: StateQuery): Promise<StateEntry[]>;
   getArtifact(artifactId: string): Promise<VersionedArtifact | null>;
+  getArtifactVersion(artifactId: string, version: number): Promise<ArtifactVersionRecord | null>;
   listArtifacts(cellId: string): Promise<VersionedArtifact[]>;
 
   // ---------- [ext] sync twins (the async methods delegate to these) ----------
@@ -335,7 +348,7 @@ export interface Snippet {
 
 // ---------- Knowledge (SKILL.md, notes, preferences) ----------
 
-export type KnowledgeKind = "skill" | "note" | "preference";
+export type KnowledgeKind = "skill" | "working_note" | "reference" | "preference";
 export type KnowledgeScope = "global" | "cell";
 
 /**
@@ -436,7 +449,7 @@ export interface ChildSummary {
    * (a watch, a timer, an open wait or a card), `dormant` (a wakeable worker with nothing in flight and nothing that
    * would wake it — a message does), `paused`.
    */
-  activity?: "working" | "waiting" | "dormant" | "paused";
+  activity?: "working" | "waiting" | "dormant" | "paused" | "budget_paused";
   /** Direct leaf children only: evidence the viewing cell has not looked at with inspect_cell yet (`from`..`to`). */
   unread?: { from: number; to: number };
 }
@@ -478,6 +491,7 @@ export interface PromptSnapshot {
   batch: ClaimedBatch;
   system: { text: string; hash: string };
   history: ModelMessage[];
+  summaryUptoSeq?: number;
   historyUptoSeq: number;               // last evidence seq folded into history
   tail: {
     roster: ChildSummary[];

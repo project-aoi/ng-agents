@@ -35,6 +35,8 @@ export {
   descendants,
   probeVersion,
   reapOrphanedCliProcesses,
+  probeOrphanCliCell,
+  cliProcessStatus,
   cliProcessAlive,
   CLI_PROCESS_MARKER,
   type CliProcess,

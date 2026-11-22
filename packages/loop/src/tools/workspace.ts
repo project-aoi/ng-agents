@@ -7,16 +7,18 @@ import {
   readArgsSchema,
   writeArgsSchema,
   type ExecResult,
+  type ToolResult,
   type Toolset,
 } from "@ng/protocol";
 
 export const WORKSPACE_TOOLSET = "workspace";
 
-function execOutput(r: ExecResult): string {
+function execOutput(r: ExecResult): ToolResult {
   const parts = [r.output === "" ? "(no output)" : r.output];
   if (r.truncated) parts.push("[output truncated by the workspace]");
-  if (r.exitCode !== undefined && r.exitCode !== 0) parts.push(`[exit code ${r.exitCode}]`);
-  return parts.join("\n");
+  const failed = r.exitCode !== undefined && r.exitCode !== 0;
+  if (failed) parts.push(`[exit code ${r.exitCode}]`);
+  return failed ? { output: parts.join("\n"), isError: true } : { output: parts.join("\n") };
 }
 
 // Flat object for the model (providers want `type: "object"` at the top); validated against the workspace's union.
@@ -95,9 +97,13 @@ const jobStart = defineTool({
   input: z.object({
     command: z.string().min(1),
     streamPreview: z.boolean().optional().describe("stream its output live to the user's preview"),
+    timeoutMs: z.number().int().min(1_000).optional().describe("max runtime in ms (clamped to the workspace ceiling; defaults to workspace job timeout)"),
   }),
   async handler(args, ctx) {
-    const { jobId } = await ctx.ports.workspace.startJob(args.streamPreview === undefined ? { command: args.command } : args);
+    const spec: { command: string; streamPreview?: boolean; timeoutMs?: number } = { command: args.command };
+    if (args.streamPreview !== undefined) spec.streamPreview = args.streamPreview;
+    if (args.timeoutMs !== undefined) spec.timeoutMs = args.timeoutMs;
+    const { jobId } = await ctx.ports.workspace.startJob(spec);
     return {
       output: `Started job ${jobId}. You will get a job.result message when it finishes; check on it with job_observe.`,
       data: { jobId },

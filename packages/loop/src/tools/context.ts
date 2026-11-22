@@ -13,7 +13,19 @@ import { clip, firstLine, json, selfId } from "./util";
 
 export const CONTEXT_TOOLSET = "kernel.context";
 
-const SLUG = /^[a-z0-9][a-z0-9-]{0,63}$/;
+
+
+/**
+ * Authoritative kernel / GTD / CLI state keys that models must never overwrite directly through `set_state`
+ * (BUG-020). Dedicated workbench tools manage these records. Note: `gtd:action:*` and
+ * `hub:topics` remain writable model state.
+ */
+const RESERVED_STATE_KEYS: ReadonlySet<string> = new Set(["gtd:project", "gtd:source", "gtd:activity", "desk:arbitration"]);
+const RESERVED_STATE_PREFIXES: readonly string[] = ["desk:reply:", "desk:proposal:", "desk:reminder:", "gtd:project:", "gtd:source:", "gtd:activity:", "cli:", "sys:", "cell:", "pull:"];
+
+export function isReservedStateKey(key: string): boolean {
+  return RESERVED_STATE_KEYS.has(key) || RESERVED_STATE_PREFIXES.some((p) => key.startsWith(p));
+}
 
 function describeArtifact(a: VersionedArtifact, withBody: boolean): string {
   const head = `${a.artifactId} v${a.version} (last edited by ${a.updatedBy})${a.content.title ? ` — ${a.content.title}` : ""}`;
@@ -45,6 +57,13 @@ const setState = defineTool({
   async handler(args, ctx) {
     const keys = Object.keys(args.patches);
     if (keys.length === 0) return { output: "No keys given.", isError: true };
+    const blocked = keys.filter(isReservedStateKey);
+    if (blocked.length > 0) {
+      return {
+        output: `Refused: reserved state key(s) ${blocked.join(", ")} cannot be written directly with set_state (gtd:project, gtd:source, gtd:activity, cli:*, sys:*, cell:*, pull:* are managed by dedicated tools and the kernel).`,
+        isError: true,
+      };
+    }
     await ctx.ports.context.commit(selfId(ctx), { statePatches: args.patches });
     return `Saved ${keys.join(", ")}.`;
   },
@@ -344,14 +363,14 @@ const saveNote = defineTool({
   name: "save_note",
   kind: "kernel",
   description:
-    "Keep something for later: a note (facts, links, decisions; searchable) or a preference (how the owner likes things done; shown to you in future runs). Same name replaces it unless append is set. " +
+    "Use working_note for your working memory, reference for a bookmark or observation read on demand, and preference for an owner instruction shared with future runs. Same name replaces it unless append is set. " +
     "A preference is shown to every cell unless you limit it: a rule that only makes sense in one repository or for one kind of cell — e.g. a Rust repo's commit gate — should name that directory (cwdPrefix) and/or role (roles); leave both out for a rule about how the owner wants things done everywhere. " +
     "Saving a preference again replaces its limits too (absent = everywhere), so restate them when you refine a limited one; append keeps them.",
   input: z.object({
     name: z.string().min(1),
     body: z.string().min(1),
     description: z.string().optional().describe("one line; defaults to the first line of body"),
-    kind: z.enum(["note", "preference"]).optional(),
+    kind: z.enum(["working_note", "reference", "note", "preference"]).optional(),
     scope: z.enum(["cell", "global"]).optional().describe("default: note → cell, preference → global"),
     append: z.boolean().optional(),
     cwdPrefix: z
@@ -362,10 +381,10 @@ const saveNote = defineTool({
     roles: z
       .array(z.string().min(1))
       .optional()
-      .describe('preference only: only cells of these roles see it — "worker", "project", "watcher", "desk", "hub", "sensor" (a cell matches by its role or its preset name)'),
+      .describe('preference only: only cells of these roles see it — "worker", "project", "checker", "reply_watcher", "desk", "hub", "sensor" (a cell matches by its role or its preset name)'),
   }),
   async handler(args, ctx) {
-    const kind = args.kind ?? "note";
+    const kind = args.kind === "note" ? "working_note" : args.kind ?? "working_note";
     if (kind !== "preference" && (args.cwdPrefix !== undefined || args.roles !== undefined)) {
       return { output: `cwdPrefix and roles only limit a preference; a ${kind} cannot take them. Leave them out, or save with kind "preference".`, isError: true };
     }
@@ -382,31 +401,6 @@ const saveNote = defineTool({
       ...(limits.length > 0 ? { applies } : {}),
     });
     return `Saved ${kind} "${args.name}" (${scope}${limits.length > 0 ? `; only for ${limits.join(" and ")}` : ""}).`;
-  },
-});
-
-const saveSkill = defineTool({
-  name: "save_skill",
-  kind: "kernel",
-  description:
-    "Write or replace a SKILL.md: a reusable procedure for a recurring kind of task. The description is what future runs see in the skills index, so say when to use it; the body is read on demand.",
-  input: z.object({
-    name: z.string().regex(SLUG, "lowercase slug, e.g. weekly-review"),
-    description: z.string().min(1),
-    body: z.string().min(1),
-    scope: z.enum(["global", "cell"]).optional().describe("default global"),
-  }),
-  async handler(args, ctx) {
-    const scope = args.scope ?? "global";
-    await ctx.ports.context.upsertSkillOrNote(selfId(ctx), {
-      kind: "skill",
-      name: args.name,
-      description: args.description,
-      body: args.body,
-      scope,
-      mode: "upsert",
-    });
-    return `Saved skill "${args.name}" (${scope}).`;
   },
 });
 
@@ -467,13 +461,13 @@ const readResource = defineTool({
 });
 
 /**
- * `kernel.context`: read_state, set_state, read_artifact, save_artifact, patch_artifact, save_note, save_skill,
+ * `kernel.context`: read_state, set_state, read_artifact, save_artifact, patch_artifact, save_note,
  * search_history, read_resource.
  */
 export function contextToolset(): Toolset {
   return {
     name: CONTEXT_TOOLSET,
     description: "State, versioned drafts, notes/skills, history search and paged resources.",
-    tools: [readState, setState, readArtifact, saveArtifact, patchArtifact, saveNote, saveSkill, searchHistory, readResource],
+    tools: [readState, setState, readArtifact, saveArtifact, patchArtifact, saveNote, searchHistory, readResource],
   };
 }

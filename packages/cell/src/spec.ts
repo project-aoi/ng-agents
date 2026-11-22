@@ -1,4 +1,3 @@
-import { SCRIPT_PREFIX } from "@ng/loop";
 import {
   isLeafLifetime,
   AGENT_ENGINES,
@@ -49,12 +48,17 @@ export function jsonSafeBounds(b: Partial<PolicyBounds> | undefined): Partial<Po
 export function resolveSpec(registry: Registry, input: CellSpecInput, parent: CellRecord | null): ResolvedSpec {
   if (!input || typeof input !== "object") throw new NgError("invalid_argument", "spec must be an object");
   const { fork: _fork, parentId: _parentId, ...caller } = definedEntries(input) as CellSpec;
+  if (caller.preset === "watcher") {
+    const role = caller.lifetime === "persistent" ? "reply_watcher" : "checker";
+    if (registry.presets.has(role)) caller.preset = role;
+  }
   const preset = caller.preset ? registry.presets.get(caller.preset) : undefined;
   if (caller.preset && !PRESET_NAMES.includes(caller.preset)) throw new NgError("invalid_argument", `unknown preset "${caller.preset}"`);
   if (caller.preset && !preset) throw new NgError("not_found", `preset "${caller.preset}" is not registered`);
   const defaults = (preset?.defaults ?? {}) as Partial<CellSpec>;
 
   const spec = { ...defaults, ...caller } as CellSpec;
+  if (caller.preset === "checker" || caller.preset === "reply_watcher") spec.lifetime = defaults.lifetime;
   // docs/05: a cell works where its parent works unless it says otherwise (watchers/sensors keep to themselves).
   if (typeof spec.cwd === "string" && spec.cwd) spec.cwd = normalizeCwd(spec.cwd);
   else if (parent?.spec.cwd && preset?.inheritCwd !== false) spec.cwd = parent.spec.cwd;
@@ -69,6 +73,7 @@ export function resolveSpec(registry: Registry, input: CellSpecInput, parent: Ce
   const presetBounds = (preset?.requestBounds && parent ? preset.requestBounds({ parentCellId: parent.id, parentBounds: parent.bounds }) : undefined) ?? defaults.bounds;
   const boundsRequest: Partial<PolicyBounds> | undefined =
     presetBounds || caller.bounds ? { ...definedEntries(presetBounds ?? {}), ...definedEntries(caller.bounds ?? {}) } : undefined;
+  if (boundsRequest && presetBounds?.maxDepth===0) boundsRequest.maxDepth=0;
   const safe = jsonSafeBounds(boundsRequest);
   if (safe) spec.bounds = safe;
   else delete spec.bounds;
@@ -87,7 +92,7 @@ export function validateSpec(registry: Registry, spec: CellSpec): void {
     registry.resolveTools(p.toolsets ?? []);
   } else {
     if (typeof p.entry !== "string" || !p.entry) throw new NgError("invalid_argument", "code processor entry is required");
-    if (!p.entry.startsWith(SCRIPT_PREFIX) && !registry.codeProcessors.has(p.entry)) {
+    if (!registry.codeProcessors.has(p.entry)) {
       throw new NgError("not_found", `code processor "${p.entry}" is not registered`);
     }
   }

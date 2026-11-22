@@ -45,6 +45,19 @@ describe("llm run", () => {
     expect(model.calls[0]!.metadata).toEqual({ cellId: "cell1", runId: "run_1" });
   });
 
+  it("leaves late steer and inbound messages pending after the last model step", async () => {
+    const { ports, snapshot, controller } = createFakeRun({ spec: llm([], { maxSteps: 1 }), batch: ["first"] });
+    const model = new ScriptedModelClient([() => {
+      ports.pushSteer("correction");
+      ports.pushInbound("follow-up");
+      return say("first is done");
+    }]);
+    expect(await createAgentLoop({ model, registry: makeRegistry() }).run(snapshot, ports, controller.signal)).toBe("completed");
+    expect(ports.log.drained).toHaveLength(0);
+    expect(ports.drainSteer()).toMatchObject([{ message: "correction" }]);
+    expect(ports.drainInbound!()).toHaveLength(1);
+  });
+
   it("filters tools by allowedTools ∩ bounds and by availability, identically on every run", async () => {
     const registry = makeRegistry();
     const model = new ScriptedModelClient([say("ok"), say("ok")]);
@@ -130,7 +143,8 @@ describe("llm run", () => {
       (req) => {
         const denied = toolResultsOf(req)[0]!;
         expect(denied.isError).toBe(true);
-        expect(denied.content).toBe("Not allowed: 群消息额度已用完，请转告主人");
+        expect(denied.content).toContain("Not allowed: 群消息额度已用完，请转告主人");
+        expect(denied.content).toMatch(/Draft art_\w+ v1/);
         return call("send_message", { to: "channel:ui:owner", text: "群里发不了，转告你：上线了", summary: "转告主人" });
       },
       say("已告知主人。"),

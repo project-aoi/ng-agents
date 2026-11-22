@@ -1,23 +1,20 @@
 import {
   all,
+  get,
   CELL_STATUS_KEY,
-  gtdKeys,
   isLeafLifetime,
   PAYLOAD,
   projectCellIdOf,
   pullCursorKey,
-  subjectKeys,
-  type ActionRecord,
   type CellRecord,
   type CellStatusLine,
   type ChildSummary,
-  type ProjectRecord,
   type WorkspaceOccupancy,
   type WorkspaceUser,
 } from "@ng/protocol";
 import type { KernelCore } from "./core";
 import type { AnchorReport, CellActivity, CellNode, KernelStats, RosterEntry } from "./types";
-import { waitTargetCell } from "./waits";
+import { waitTargetCell, type WaitRecord } from "./waits";
 import { effectiveCwd, workTreeKey } from "./workdir";
 
 export interface ReadModel {
@@ -43,6 +40,8 @@ export interface ReadModel {
   busyLeafChildren(cellId: string): CellRecord[];
   /** docs/05 guard 2: the five anchors of a cell's subtree. */
   anchorsOf(cellId: string): AnchorReport;
+  /** Internal waits whose target can make progress for the waiting cell. */
+  groundedWaits(waits: readonly WaitRecord[], localCells: ReadonlySet<string>): WaitRecord[];
   /** Context's tailNotesProvider: the volatile notes a coordinating cell sees after its roster. */
   tailNotes(cellId: string): string[];
 }
@@ -109,19 +108,17 @@ export function createReadModel(core: KernelCore): ReadModel {
     const epochs = new Map<string, number | undefined>();
     for (const m of messages) {
       // The kernel's own stall notice is not something the cell is waiting for (anchorsOf excludes it the same way).
-      if (m.envelope.type === PAYLOAD.stalledCheck || !keep(m.cellId)) continue;
+      if (m.envelope.type === PAYLOAD.stalledCheck || !keep(m.cellId) || m.envelope.delivery === "silent_inject") continue;
+      if (!epochs.has(m.cellId)) epochs.set(m.cellId, cells.get(m.cellId)?.epoch);
+      if (m.expectedEpoch !== null && m.expectedEpoch !== epochs.get(m.cellId)) continue;
       if (m.deliverAt > now) timer(m.cellId, m.deliverAt);
-      else if ((m.envelope.delivery ?? "wakeup") === "wakeup") {
-        // A row addressed to an earlier epoch is dropped at the next claim: it will never start anything.
-        if (!epochs.has(m.cellId)) epochs.set(m.cellId, cells.get(m.cellId)?.epoch);
-        const expected = m.envelope.expectedEpoch ?? null;
-        if (expected === null || expected === epochs.get(m.cellId)) f.due.add(m.cellId);
-      }
+      else f.due.add(m.cellId);
     }
     const schedules = perCell ? cellIds.flatMap((cellId) => inbox.listSchedulesSync({ cellId, activeOnly: true })) : inbox.listSchedulesSync({ activeOnly: true });
     for (const s of schedules) timer(s.cellId, s.nextFireAt);
-    const pending = gate.listPendingSync({ includeSnoozed: true, ...(perCell ? { cellIds } : {}) });
-    for (const a of pending) if (keep(a.cellId)) f.pending.set(a.cellId, (f.pending.get(a.cellId) ?? 0) + 1);
+    const pending = all<{cell_id:string; count:number}>(db, `SELECT cell_id, COUNT(*) AS count FROM human_items
+      WHERE cell_id IS NOT NULL AND status IN ('pending','snoozed','unknown') GROUP BY cell_id`);
+    for (const a of pending) if (keep(a.cell_id)) f.pending.set(a.cell_id, a.count);
     return f;
   }
 
@@ -130,6 +127,7 @@ export function createReadModel(core: KernelCore): ReadModel {
     if (core.dispatcher.isRunning(c.id)) return { state: "working", why: "a run is in flight" };
     const jobs = f.jobs.get(c.id);
     if (jobs?.length) return { state: "working", why: `a background job is running (${jobs[0]!.command.slice(0, 60)})` };
+    if (c.pauseReason === "budget_declined" || core.dispatcher.heldForBudget().includes(c.id)) return { state: "budget_paused", why: "budget exhausted; queued work is held" };
     if (c.status === "paused") return { state: "paused", why: "paused" };
     if (f.due.has(c.id)) return { state: "working", why: "a message is waiting to start its next run" };
     if (f.pending.get(c.id)) return { state: "waiting", why: "a card of its awaits the owner" };
@@ -252,6 +250,7 @@ export function createReadModel(core: KernelCore): ReadModel {
       const child = cells.get(r.cellId);
       if (r.statusLine) parts.push(r.statusLine);
       if (r.running) parts.push("working now");
+      else if (a?.state === "budget_paused") parts.push("budget exhausted — paused until the owner changes the budget");
       else if (a?.state === "dormant") parts.push("dormant — its turn is over; send_message to it wakes it with everything it knows");
       for (const j of r.jobs) parts.push(`job running: ${j.command.length > 80 ? `${j.command.slice(0, 80)}…` : j.command}`);
       for (const w of waits.get(r.cellId) ?? []) parts.push(w);
@@ -357,7 +356,7 @@ export function createReadModel(core: KernelCore): ReadModel {
   /** A coordinator's own notes (save_note, scope "cell"), put in front of it at every wake-up. */
   const NOTES_LIMIT = 8_000;
   function notesNote(cellId: string): string | null {
-    const notes = context.listKnowledgeSync({ kind: "note", cellId, includeGlobal: false }).filter((n) => n.scope === "cell" && n.cellId === cellId && n.body.trim());
+    const notes = context.listKnowledgeSync({ kind: "working_note", cellId, includeGlobal: false }).filter((n) => n.scope === "cell" && n.cellId === cellId && n.body.trim());
     if (notes.length === 0) return null;
     notes.sort((a, b) => a.name.localeCompare(b.name));
     let left = NOTES_LIMIT;
@@ -382,8 +381,31 @@ export function createReadModel(core: KernelCore): ReadModel {
     const notes: string[] = [];
     const own = core.waits.list([cellId]);
     if (own.length) {
-      notes.push(`[your open waits]\n${own.map((w) => `- waiting for ${w.waitingFor}: ${w.reason}${w.timeoutAt ? ` (times out ${new Date(w.timeoutAt).toISOString()})` : ""}`).join("\n")}`);
+      notes.push(`[your open waits]\n${own.map((w) => `- waiting for ${w.waitingFor}: ${w.reason} [${w.waitId}]${w.timeoutAt ? ` (times out ${new Date(w.timeoutAt).toISOString()})` : ""}`).join("\n")}`);
     }
+    const waiting = all<{cell_id: string; wait_id: string; reason: string}>(db, `SELECT w.cell_id, w.wait_id, w.reason FROM cell_waits w
+      JOIN cells c ON c.id=w.cell_id AND c.epoch=w.epoch AND c.status='active' WHERE w.waiting_for=? ORDER BY w.created_at`, [`inbox:${cellId}`]);
+    if (waiting.length) notes.push("[cells waiting on you]\n" + waiting.map(w => `${w.cell_id} [${w.wait_id}] ${w.reason}`).join("\n"));
+    const cards = all<{action_id: string; subject_key: string; status: string}>(db, `SELECT action_id,subject_key,status FROM human_items
+      WHERE cell_id=? AND status IN ('pending','snoozed','unknown') AND blocked_by IS NULL`, [cellId]);
+    if (cards.length) notes.push("[your open cards]\n" + cards.map(c => `${c.action_id} ${c.subject_key} (${c.status})`).join("\n"));
+    const budget = gate.usageSync(cellId);
+    if (budget.state !== "ok") notes.push(`[budget warning] ${budget.state}, ${budget.subtreeTokens}/${budget.limitTokens} tokens, ${budget.subtreeCents}/${budget.limitCents} cents`);
+    const jobs = core.workspace.listJobsSync({ cellId, state: ["running"] });
+    if (jobs.length) notes.push("[your running jobs]\n" + jobs.map(j => `${j.jobId} ${j.command.slice(0,120)}`).join("\n"));
+    const authors = leaf ? [cellId] : [cellId, ...cells.descendants(cellId).map(c => c.id)];
+    const edits = all<{artifact_id:string; version:number}>(db, `SELECT a.artifact_id,a.version FROM artifacts a
+      WHERE a.cell_id IN (SELECT value FROM json_each(?)) AND a.updated_by='human'
+      AND (EXISTS(SELECT 1 FROM human_items h WHERE h.artifact_id=a.artifact_id AND h.status IN ('pending','snoozed','unknown'))
+      OR (a.updated_at>=? AND NOT EXISTS(SELECT 1 FROM evidence e WHERE e.cell_id=? AND e.kind='run_boundary'
+        AND json_extract(e.content,'$.phase')='start' AND e.at>a.updated_at)))
+      ORDER BY a.updated_at DESC LIMIT 12`, [JSON.stringify(authors), clock.now()-86_400_000, cellId]);
+    if (edits.length) notes.push("[human-edited artifacts]\n" + edits.map(a => `${a.artifact_id} v${a.version}`).join("\n"));
+    const watches = all<{id:number; thread:string | null}>(db, "SELECT id,thread FROM cell_watches WHERE active=1 AND cell_id=?", [cellId]);
+    const schedules = inbox.listSchedulesSync({cellId, activeOnly:true});
+    if (watches.length || schedules.length) notes.push("[your active watches & schedules]\n" + [
+      ...watches.map(w => `watch ${w.id} ${w.thread ?? ""}`), ...schedules.map(s => `schedule ${s.id} next ${s.nextFireAt}`),
+    ].join("\n"));
     const occ = occupancyNote(cell);
     if (occ) notes.push(occ);
     // Last, right before the batch: the one thing a coordinator must not lose to a compacted or rebuilt session.
@@ -396,103 +418,116 @@ export function createReadModel(core: KernelCore): ReadModel {
 
   // ---------- docs/05 guard 2: the five anchors ----------
 
+  function groundedWaits(waits: readonly WaitRecord[], localCells: ReadonlySet<string>, cachedFacts?: Facts): WaitRecord[] {
+    const internal = waits.filter(w => waitTargetCell(w.waitingFor) !== null);
+    if (!internal.length) return [];
+    const held = new Set(core.dispatcher.heldForBudget());
+    const allCells = new Map(cells.list().map(c => [c.id, c]));
+    function available(cell: CellRecord): boolean {
+      if (held.has(cell.id)) return false;
+      for (let c: CellRecord | undefined = cell; c; c = c.parentId ? allCells.get(c.parentId) : undefined) {
+        if (c.status !== "active") return false;
+      }
+      return true;
+    }
+    const live = new Map([...allCells].filter(([,cell]) => available(cell)));
+    const edges = new Map<string, string[]>();
+    for (const w of core.waits.list()) {
+      const target = waitTargetCell(w.waitingFor);
+      if (target && live.has(target) && live.get(w.cellId)?.epoch === w.epoch) push(edges, w.cellId, target);
+    }
+
+    // An open wait is a dependency, not a source of progress. Exclude the nodes that participate in a cycle.
+    const cycle = new Map<string, boolean>();
+    function inCycle(start: string): boolean {
+      if (cycle.has(start)) return cycle.get(start)!;
+      const queue = [...(edges.get(start) ?? [])];
+      const seen = new Set<string>();
+      while (queue.length) {
+        const next = queue.pop()!;
+        if (next === start) { cycle.set(start, true); return true; }
+        if (seen.has(next)) continue;
+        seen.add(next);
+        queue.push(...(edges.get(next) ?? []));
+      }
+      cycle.set(start, false);
+      return false;
+    }
+
+    const f = cachedFacts ?? facts();
+    const working = new Set(core.dispatcher.running().filter(r => !r.stallOnly).map(r => r.cellId));
+    const cards = all<{cell_id:string; category:string; related_project_ids:string}>(db, `SELECT cell_id, category, related_project_ids FROM human_items
+      WHERE cell_id IS NOT NULL AND blocked_by IS NULL AND status IN ('pending','snoozed','unknown')`);
+    const cardOwners = new Set(cards.map(card => card.cell_id));
+    const hasSource = (id: string) => working.has(id) || f.jobs.has(id) || f.due.has(id) || f.watching.has(id) || f.nextTimer.has(id) || cardOwners.has(id);
+    const requests = inbox.listMessagesSync({status:["pending","claimed"]}).filter(m => m.envelope.delivery !== "silent_inject" &&
+      (m.expectedEpoch === null || m.expectedEpoch === live.get(m.cellId)?.epoch));
+    function canAnswer(from: string, target: string, seen: Set<string>): boolean {
+      const t = live.get(target);
+      if (!t || seen.has(target) || inCycle(target)) return false;
+      const path = new Set(seen).add(target);
+      if (!localCells.has(target) && !isLeafLifetime(t.spec.lifetime)) {
+        // An outside coordinator must have work for this particular requester.
+        const owner = cells.require(from);
+        const project = owner.preset === "project" ? from : projectCellIdOf(owner.spec) ?? cells.ancestors(from).find(c => c.preset === "project")?.id;
+        if (requests.some(m => m.cellId === target && waitTargetCell(m.envelope.from) === from)) return true;
+        if (!project) return false;
+        if (cards.some(c => c.cell_id === target && c.category === "decision" && JSON.parse(c.related_project_ids).includes(project))) return true;
+        return cells.children(target,{status:["active"]}).some(c => isLeafLifetime(c.spec.lifetime) &&
+          Array.isArray(c.spec.meta?.relatedProjectIds) && c.spec.meta.relatedProjectIds.includes(project) && canAnswer(target, c.id, path));
+      }
+      return hasSource(target) || (edges.get(target) ?? []).some(next => canAnswer(target, next, path));
+    }
+    return internal.filter(w => live.get(w.cellId)?.epoch === w.epoch && canAnswer(w.cellId, waitTargetCell(w.waitingFor)!, new Set([w.cellId])));
+  }
+
   function anchorsOf(cellId: string): AnchorReport {
     const root = cells.get(cellId);
     const empty: AnchorReport = { cellId, agent: false, external: false, internal: false, human: false, parked: true, stalled: false, detail: "no such cell" };
     if (!root) return empty;
-    const project = context.readStateSync<ProjectRecord>(cellId, gtdKeys.project);
+
     const subtree = [root, ...cells.descendants(cellId, { status: ["active", "paused"] })].filter((c) => c.status !== "closed");
     const ids = subtree.map((c) => c.id);
     const idSet = new Set(ids);
-    const now = clock.now();
+    const projectId = root.preset === "project" ? cellId : projectCellIdOf(root.spec) ?? cells.ancestors(cellId).find(c=>c.preset==="project")?.id;
     const why: string[] = [];
 
-    // 5. Parked on purpose.
-    const parked = root.status !== "active" || (project !== null && project.lifecycle !== "active");
-    if (parked) why.push(root.status !== "active" ? `the cell is ${root.status}` : `lifecycle ${project!.lifecycle}`);
+    const parked = root.status !== "active" || cells.ancestors(cellId).some(c => c.status === "paused");
+    if (parked) why.push("cell or ancestor is parked");
 
-    // 1. @Agent — a Run that is not just the stall check, due real work, or a Job.
-    let agent = false;
-    for (const r of core.dispatcher.running()) {
-      if (idSet.has(r.cellId) && !r.stallOnly) {
-        agent = true;
-        why.push(`${r.cellId} is working`);
-        break;
-      }
+    const held = new Set(core.dispatcher.heldForBudget());
+    // Descendants are ordered by depth. A manually parked ancestor suspends its whole branch.
+    const active = new Set<string>();
+    for (const cell of subtree) {
+      if (!parked && cell.status === "active" && (cell.id === cellId || active.has(cell.parentId!))) active.add(cell.id);
     }
-    const pending = ids.length ? inbox.listMessagesSync({ status: ["pending"] }).filter((m) => idSet.has(m.cellId) && m.envelope.type !== PAYLOAD.stalledCheck) : [];
-    const active = new Set(subtree.filter((c) => c.status === "active").map((c) => c.id));
-    const dueWork = pending.find((m) => m.deliverAt <= now && (m.envelope.delivery ?? "wakeup") === "wakeup" && active.has(m.cellId));
-    if (!agent && dueWork) {
-      agent = true;
-      why.push(`${dueWork.cellId} has work queued (${dueWork.envelope.type})`);
-    }
-    if (!agent) {
-      const job = core.workspace.listJobsSync({ state: ["running"] }).find((j) => idSet.has(j.cellId));
-      if (job) {
-        agent = true;
-        why.push(`a job of ${job.cellId} is running`);
-      }
-    }
-
-    // 2. @Waiting(external) — a watch, a timer/cron, or a message inside a batching window.
-    let external = false;
-    const watch = ids.length ? all<{ cell_id: string }>(db, "SELECT cell_id FROM cell_watches WHERE active = 1 ORDER BY id").find((w) => idSet.has(w.cell_id)) : undefined;
-    if (watch) {
-      external = true;
-      why.push(`${watch.cell_id} watches for an external event`);
-    }
-    const future = pending.find((m) => m.deliverAt > now);
-    if (!external && future) {
-      external = true;
-      why.push(`${future.cellId} has a timer at ${new Date(future.deliverAt).toISOString()}`);
-    }
-    if (!external) {
-      const sched = inbox.listSchedulesSync({ activeOnly: true }).find((sc) => idSet.has(sc.cellId));
-      if (sched) {
-        external = true;
-        why.push(`${sched.cellId} has a schedule`);
-      }
-    }
+    const available = [...active].filter(id => !held.has(id));
+    const waits = core.waits.list(ids);
+    const f = facts(waits.some(w => waitTargetCell(w.waitingFor) !== null) ? undefined : available);
+    const working = new Set(core.dispatcher.running().filter(r => !r.stallOnly).map(r => r.cellId));
+    const agent = available.find(id => working.has(id) || f.jobs.has(id) || f.due.has(id));
+    if (agent) why.push(`${agent} has a run, job or queued work`);
+    const external = available.find(id => f.watching.has(id) || f.nextTimer.has(id));
+    if (external) why.push(`${external} has an active watch or timer`);
 
     // 3. @Waiting(internal) — an open wait on a cell that can still answer.
-    let internal = false;
-    for (const w of core.waits.list(ids)) {
-      const target = waitTargetCell(w.waitingFor);
-      if (target === null) continue; // "human"/"external" must be backed by a card, an action or a watch/timer
-      const t = cells.get(target);
-      if (t && t.status !== "closed") {
-        internal = true;
-        why.push(`${w.cellId} waits for ${w.waitingFor}`);
-        break;
-      }
-    }
+    const backed = groundedWaits(waits, idSet, f);
+    const internal = backed.length > 0;
+    if (backed[0]) why.push(`${backed[0].cellId} waits for ${backed[0].waitingFor}`);
 
     // 4. @Human — a card, or an open action that is the owner's to do.
-    let human = false;
     // A card about this project is the owner's ball whoever holds it (the desk raises some on a project's behalf).
-    const subject = subjectKeys.project(cellId);
-    const cards = ids.length ? gate.listPendingSync({ includeSnoozed: true }).filter((a) => idSet.has(a.cellId) || a.subjectKey === subject) : [];
-    if (cards.length) {
-      human = true;
-      why.push(`${cards.length} card(s) await the owner`);
-    }
-    if (!human) {
-      const mine = context
-        .queryStateSync({ keyPrefix: gtdKeys.actionPrefix, cellIds: ids })
-        .map((e) => e.value as ActionRecord)
-        .find((a) => a && a.status === "open" && a.owner === "human");
-      if (mine) {
-        human = true;
-        why.push(`the owner has an open action: ${mine.title}`);
-      }
-    }
+    const open=all<{action_id:string;cell_id:string|null;related_project_ids:string;subject_key:string}>(db,
+      "SELECT action_id,cell_id,related_project_ids,subject_key FROM human_items WHERE blocked_by IS NULL AND status IN ('pending','unknown','snoozed')");
+    const cards=open.filter(h=>(h.cell_id && idSet.has(h.cell_id)) || (JSON.parse(h.related_project_ids) as string[]).includes(projectId ?? cellId));
+    const human = cards.length > 0;
+    if (human) why.push(`${cards.length} card(s) await the owner`);
 
     const stalled = !parked && !agent && !external && !internal && !human;
     return {
       cellId,
-      agent,
-      external,
+      agent: agent !== undefined,
+      external: external !== undefined,
       internal,
       human,
       parked,
@@ -542,8 +577,9 @@ export function createReadModel(core: KernelCore): ReadModel {
       if (isBusy) busy++;
       else if (f.watching.has(c.id) || f.nextTimer.has(c.id)) waiting++;
     }
-    const visible = gate.listPendingSync({ now }).length;
-    const allPending = gate.listPendingSync({ includeSnoozed: true }).length;
+    const counts = get<{ total:number; snoozed:number }>(db,`
+      SELECT count(*) AS total, count(*) FILTER (WHERE snoozed_until > ?) AS snoozed FROM human_items
+      WHERE category='decision' AND blocked_by IS NULL AND status IN ('pending','unknown','snoozed')`,[now])!;
     return {
       backgroundCells: live.filter((c) => c.parentId !== null).length,
       pausedCells: live.filter((c) => c.status === "paused").length,
@@ -551,12 +587,12 @@ export function createReadModel(core: KernelCore): ReadModel {
       busyCells: busy,
       runningJobs: [...f.jobs.values()].reduce((n, js) => n + js.length, 0),
       waitingCells: waiting,
-      pendingApprovals: visible,
-      snoozedApprovals: allPending - visible,
+      pendingApprovals: counts.total-counts.snoozed,
+      snoozedApprovals: counts.snoozed,
       bufferedNotifications: core.hub.bufferedCountSync(),
       focus: core.hub.isFocusSync(),
     };
   }
 
-  return { rosterFor, childSummaries, tree, stats, activeWorkspaces, anchorsOf, tailNotes, activityOf, blockingChildren, busyLeafChildren };
+  return { rosterFor, childSummaries, tree, stats, activeWorkspaces, anchorsOf, groundedWaits, tailNotes, activityOf, blockingChildren, busyLeafChildren };
 }

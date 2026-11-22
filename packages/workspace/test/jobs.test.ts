@@ -2,7 +2,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
 import { existsSync, fstatSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { isNgError, run, validatePayload, type JobResultPayload } from "@ng/protocol";
 import { defaultCommandRunner, JOB_MARKER, type CommandRunner } from "../src";
 import { markedAlive, processHasMarker, processInspection, psEnvironment } from "../src/util";
@@ -10,7 +10,7 @@ import { cleanupAll, harness, pidGone, waitFor } from "./helpers";
 
 afterEach(cleanupAll);
 
-const finished = (h: { mgr: { getJobSync(id: string): { state: string } | undefined } }, jobId: string) =>
+const finished = <J extends { state: string }>(h: { mgr: { getJobSync(id: string): J | undefined } }, jobId: string) =>
   waitFor(() => {
     const j = h.mgr.getJobSync(jobId);
     return j && j.state !== "running" ? j : undefined;
@@ -296,7 +296,7 @@ describe("jobs", () => {
   it("the kernel dies between the cancel request and the kill: recover() kills the survivor before it returns, then records cancelled once", async () => {
     const h = harness();
     const port = await h.mgr.acquire("w1", "none");
-    const { jobId } = await port.startJob({ command: "echo up; sleep 30" });
+    const { jobId } = await port.startJob({ command: "trap '' TERM; echo up; sleep 30; exit 0" });
     const job = h.mgr.getJobSync(jobId)!;
     await waitFor(() => readFileSync(job.logPath!, "utf8").includes("up"));
     // The request reached the database, then the process was gone before any signal was sent.
@@ -355,6 +355,7 @@ describe("process identity without /proc (macOS)", () => {
   function withoutProc(read: (pid: number) => string | null): number[] {
     const calls: number[] = [];
     processInspection.useProc = false;
+    processInspection.readIdentity = () => null;
     processInspection.readEnvironment = (pid) => {
       calls.push(pid);
       return read(pid);
@@ -374,9 +375,17 @@ describe("process identity without /proc (macOS)", () => {
   });
 
   it("a recycled pid (alive, but without the marker) is not ours", () => {
-    withoutProc(() => "node /usr/local/lib/node_modules/some-tool/cli.js PATH=/usr/bin:/bin HOME=/Users/someone\n");
+    withoutProc(() => "node /usr/local/lib/node_modules/some-tool/cli.js NG_JOB_ID=another PATH=/usr/bin:/bin HOME=/Users/someone\n");
     expect(processHasMarker(process.pid, JOB_MARKER, "job_abc")).toBe(false);
     expect(markedAlive(process.pid, JOB_MARKER, "job_abc")).toBe(false);
+  });
+
+  it("distinguishes argv-only SIP output from a readable environment missing our marker", () => {
+    processInspection.readCommand = () => "/usr/bin/sleep 30";
+    withoutProc(() => "/usr/bin/sleep 30\n");
+    expect(processHasMarker(process.pid, JOB_MARKER, "job_abc")).toBeNull();
+    withoutProc(() => "/usr/bin/sleep 30 HOME=/Users/test\n");
+    expect(processHasMarker(process.pid, JOB_MARKER, "job_abc")).toBe(false);
   });
 
   it("a live process whose environment cannot be read is not ours; a dead pid is not even looked up", async () => {
@@ -390,27 +399,66 @@ describe("process identity without /proc (macOS)", () => {
     expect(calls).toEqual([]);
   });
 
-  it("recover() adopts and signals nothing it cannot identify: a recycled pid and an unreadable one are finished as failed", async () => {
+  it("recover() fails recycled pids immediately, and re-attaches unreadable (null) pids for confirmation without signalling them (BUG-027)", async () => {
     const h = harness();
     await h.mgr.acquire("w1", "none");
     const stranger = spawn("sleep", ["30"], { stdio: "ignore" });
     await once(stranger, "spawn");
     try {
-      withoutProc((pid) => (pid === process.pid ? "node vitest PATH=/usr/bin:/bin HOME=/Users/me\n" : null));
+      withoutProc((pid) => (pid === process.pid ? "node vitest NG_JOB_ID=another PATH=/usr/bin:/bin HOME=/Users/me\n" : null));
+      const now = Date.now();
       run(
         h.db,
         `INSERT INTO jobs (job_id, cell_id, epoch, command, cwd, state, pid, log_path, stream_preview, started_at, updated_at)
-         VALUES ('job_recycled', 'w1', 0, 'make', NULL, 'running', ?, NULL, 0, 1, 1),
-                ('job_unreadable', 'w1', 0, 'make', NULL, 'running', ?, NULL, 0, 1, 1)`,
-        [process.pid, stranger.pid!],
+         VALUES ('job_recycled', 'w1', 0, 'make', NULL, 'running', ?, NULL, 0, ?, ?),
+                ('job_unreadable', 'w1', 0, 'make', NULL, 'running', ?, NULL, 0, ?, ?)`,
+        [process.pid, now, now, stranger.pid!, now, now],
       );
       await h.mgr.recover();
       expect(h.mgr.getJobSync("job_recycled")).toMatchObject({ state: "failed" });
-      expect(h.mgr.getJobSync("job_unreadable")).toMatchObject({ state: "failed" });
+      await waitFor(() => h.inbox.list("w1").find(e => e.type === "job.warning"));
+      await new Promise(resolve => setTimeout(resolve, 5 * 40));
+      expect(h.mgr.getJobSync("job_unreadable")).toMatchObject({ state: "running" });
+      expect(h.inbox.list("w1").filter(e => e.id === "job_unreadable:result")).toHaveLength(0);
       expect(pidGone(stranger.pid!)).toBe(false);
-      expect(stranger.exitCode).toBeNull();
+      const later = Date.now()+31_000;
+      const time = vi.spyOn(Date,"now").mockReturnValue(later);
+      try {
+        await waitFor(()=>h.mgr.getJobSync("job_unreadable")?.state==="failed");
+        expect(pidGone(stranger.pid!)).toBe(false);
+        expect(h.inbox.list("w1").filter(e=>e.id==="job_unreadable:result")).toHaveLength(1);
+      } finally { time.mockRestore(); }
     } finally {
       stranger.kill("SIGKILL");
+    }
+  });
+
+  it("holds a recovered cancellation while the process identity is unreadable", async () => {
+    const h = harness();
+    const port = await h.mgr.acquire("w1", "none");
+    const { jobId } = await port.startJob({ command: "while [ ! -f done ]; do sleep 0.05; done" });
+    const pid = h.mgr.getJobSync(jobId)!.pid!;
+    try {
+      h.mgr.close();
+      run(h.db,"UPDATE jobs SET process_identity=NULL WHERE job_id=?",[jobId]); // legacy registration
+      const calls = withoutProc(() => null);
+      const next = h.restart();
+      await next.recover();
+      await expect(next.cancelJobsForCell("w1")).rejects.toSatisfy(e => isNgError(e, "conflict"));
+      const n = calls.length;
+      await waitFor(() => calls.length >= n + 5);
+      expect(h.inbox.list("w1").filter(e => e.id === `${jobId}:warning:termination_pending`)).toHaveLength(1);
+      expect(next.getJobSync(jobId)?.state).toBe("running");
+      expect(pidGone(pid)).toBe(false);
+      expect(h.inbox.list("w1").filter(e => e.type === "job.result")).toHaveLength(0);
+      next.close();
+      const again = h.restart();
+      await again.recover();
+      writeFileSync(join(port.root, "done"), "");
+      expect(await finished({ mgr: again }, jobId)).toMatchObject({ state: "cancelled" });
+      expect(h.inbox.list("w1").filter(e => e.type === "job.result")).toHaveLength(1);
+    } finally {
+      writeFileSync(join(port.root, "done"), "");
     }
   });
 
@@ -433,7 +481,7 @@ describe("process identity without /proc (macOS)", () => {
     expect((h.inbox.list("w1")[0]!.payload as JobResultPayload).tail).toContain("late");
   });
 
-  it("a re-attached job outlives a passing `ps` failure; one that never recovers ends the watch without a signal", async () => {
+  it("a re-attached job survives repeated unreadable probes and settles from its exit file", async () => {
     const h = harness();
     const port = await h.mgr.acquire("w1", "none");
     const { jobId } = await port.startJob({ command: "while [ ! -f go ]; do sleep 0.05; done" });
@@ -459,9 +507,14 @@ describe("process identity without /proc (macOS)", () => {
       expect(next.getJobSync(jobId)!.state).toBe("running");
 
       failures = Number.POSITIVE_INFINITY;
-      const job = await finished({ mgr: next }, jobId);
-      expect(job).toMatchObject({ state: "failed" });
-      expect(pidGone(pid)).toBe(false); // left alone: it could not be identified any more
+      const before = calls.length;
+      await waitFor(() => calls.length >= before + 5);
+      expect(next.getJobSync(jobId)!.state).toBe("running");
+      expect(pidGone(pid)).toBe(false);
+      expect(h.inbox.list("w1").filter(e => e.type === "job.result")).toHaveLength(0);
+      writeFileSync(join(port.root, "go"), "");
+      expect(await finished({ mgr: next }, jobId)).toMatchObject({ state: "succeeded" });
+      expect(h.inbox.list("w1").filter(e => e.type === "job.result")).toHaveLength(1);
     } finally {
       writeFileSync(join(port.root, "go"), "");
       await waitFor(() => pidGone(pid));
@@ -469,7 +522,11 @@ describe("process identity without /proc (macOS)", () => {
   });
 
   it.runIf(process.platform === "darwin")("macOS: `ps -E` shows a real process's environment", async () => {
-    const child = spawn("sleep", ["30"], { env: { ...process.env, NG_TEST_MARK: "mark-123" }, stdio: "ignore" });
+    // Use node (non-SIP binary) because macOS SIP strips `ps -E` environments from Apple platform binaries like /bin/sleep.
+    const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], {
+      env: { ...process.env, NG_TEST_MARK: "mark-123" },
+      stdio: "ignore",
+    });
     await once(child, "spawn");
     try {
       expect(psEnvironment(child.pid!)).toContain("NG_TEST_MARK=mark-123");
@@ -481,5 +538,60 @@ describe("process identity without /proc (macOS)", () => {
     }
     await once(child, "exit");
     expect(psEnvironment(child.pid!)).toBeNull();
+  });
+});
+
+describe("job runtime timeout protection (BUG-027)", () => {
+  it("warns once for a quiet running job, including across a restart", async () => {
+    const h = harness({ limits: { jobQuietWarningMs: 120 } });
+    const port = await h.mgr.acquire("w1", "none");
+    const { jobId } = await port.startJob({ command: "while [ ! -f done ]; do sleep 0.05; done" });
+    try {
+      const e = await waitFor(() => h.inbox.list("w1").find(e => e.type === "job.warning"));
+      expect(e.payload).toMatchObject({ jobId, reason: "quiet" });
+      expect(validatePayload(e).ok).toBe(true);
+      h.mgr.close();
+      const next = h.restart();
+      await next.recover();
+      await new Promise(resolve => setTimeout(resolve, 250));
+      expect(next.getJobSync(jobId)?.state).toBe("running");
+      expect(h.inbox.list("w1").filter(e => e.id === `${jobId}:warning:quiet`)).toHaveLength(1);
+      writeFileSync(join(port.root, "done"), "");
+      expect(await finished({ mgr: next }, jobId)).toMatchObject({ state: "succeeded" });
+    } finally {
+      writeFileSync(join(port.root, "done"), "");
+    }
+  });
+
+  it("kills a runaway job when timeoutMs elapses and wakes the cell with exitCode 124", async () => {
+    const h = harness({ limits: { jobTimeoutMs: 250, maxJobTimeoutMs: 5_000, killGraceMs: 200 } });
+    const port = await h.mgr.acquire("w1", "none");
+    const { jobId } = await port.startJob({ command: "echo started; sleep 30" });
+    const pid = h.mgr.getJobSync(jobId)!.pid!;
+    expect(h.mgr.getJobSync(jobId)!.timeoutMs).toBe(250);
+
+    const job = await finished(h, jobId);
+    expect(job).toMatchObject({ state: "failed", exitCode: 124 });
+    expect(job.error).toMatch(/timed out/);
+    await waitFor(() => pidGone(pid));
+    const envs = h.inbox.list("w1");
+    expect(envs).toHaveLength(1);
+    expect(envs[0]!.payload).toMatchObject({ jobId, state: "failed", exitCode: 124, error: expect.stringMatching(/timed out/) });
+  });
+
+  it("enforces remaining timeoutMs after recover() re-attaches a surviving job", async () => {
+    const h = harness({ limits: { jobTimeoutMs: 5_000, maxJobTimeoutMs: 10_000, killGraceMs: 200 } });
+    const port = await h.mgr.acquire("w1", "none");
+    const { jobId } = await port.startJob({ command: "trap '' TERM; sleep 30; exit 0", timeoutMs: 400 });
+    const pid = h.mgr.getJobSync(jobId)!.pid!;
+    h.mgr.close();
+
+    const next = h.restart();
+    await next.recover();
+    expect(next.getJobSync(jobId)!.state).toBe("running");
+    const job = await finished({ mgr: next }, jobId);
+    expect(job).toMatchObject({ state: "failed", exitCode: 124 });
+    expect(job.error).toMatch(/timed out/);
+    expect(() => process.kill(-pid, 0)).toThrow();
   });
 });

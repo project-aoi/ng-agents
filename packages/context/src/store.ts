@@ -1,3 +1,4 @@
+import { selectRunTools } from "@ng/protocol";
 import {
   afterCommit,
   all,
@@ -67,7 +68,7 @@ const SEARCH_SCOPES: readonly SearchScope[] = ["lineage", "subtree", "global"];
 
 const KNOWLEDGE_SCHEMES: ReadonlyArray<[string, KnowledgeKind]> = [
   ["skill://", "skill"],
-  ["note://", "note"],
+  ["working_note://","working_note"], ["reference://","reference"], ["note://", "working_note"],
   ["preference://", "preference"],
 ];
 
@@ -83,9 +84,23 @@ export function createContextStore(opts: ContextStoreOptions): ContextStore {
   const knowledge = createKnowledge(deps);
   const artifacts = createArtifacts(deps);
 
+  const domains = new Map<string, import("@ng/protocol").StateDomain>();
+  function projected(q: import("@ng/protocol").StateQuery) {
+    return [...domains.values()].flatMap(domain => domain.query(q));
+  }
+
+  function projectEntry(r:StateRow) {
+    let entry=toEntryState(r);
+    for (const d of domains.values()) if (d.project) entry=d.project(entry);
+    return entry;
+  }
   const readStateSync = <T = unknown>(cellId: string, key: string): T | null => {
-    const r = get<{ value: string }>(db, "SELECT value FROM cell_state WHERE cell_id = ? AND key = ?", [cellId, key]);
-    return r ? (JSON.parse(r.value) as T) : null;
+    for (const domain of domains.values()) {
+      const entry = domain.read(cellId, key);
+      if (entry) return entry.value as T;
+    }
+    const r = get<StateRow>(db,"SELECT * FROM cell_state WHERE cell_id=? AND key=?",[cellId,key]);
+    return r ? projectEntry(r).value as T : null;
   };
 
   const defaultRoster = (cellId: string): ChildSummary[] =>
@@ -100,6 +115,12 @@ export function createContextStore(opts: ContextStoreOptions): ContextStore {
     }));
 
   const hydrateMod = createHydrate({
+    runtimeVersion:opts.runtimeVersion ?? "ng-context-06.1",
+    toolContract(cell) {
+      const p=cell.spec.processor;
+      if (!registry || p.kind!=="llm") return [];
+      return selectRunTools(registry.resolveTools(p.toolsets ?? []),p,cell.bounds,cell.spec).map(({name,description,inputSchema,kind})=>({name,description,inputSchema,kind}));
+    },
     ...deps,
     evidence,
     knowledge,
@@ -151,8 +172,11 @@ export function createContextStore(opts: ContextStoreOptions): ContextStore {
       if (keys.length > 0) {
         const now = clock.now();
         for (const key of keys) {
-          const value = tx.statePatches![key];
-          if (value === null || value === undefined) {
+          let value = tx.statePatches![key];
+          for (const d of domains.values()) if (d.serialize) value=d.serialize(cellId,key,value);
+          if ([...domains.values()].some(domain => domain.write(cellId, key, value))) {
+            run(db, "DELETE FROM cell_state WHERE cell_id=? AND key=?", [cellId,key]);
+          } else if (value === null || value === undefined) {
             run(db, "DELETE FROM cell_state WHERE cell_id = ? AND key = ?", [cellId, key]);
           } else {
             run(
@@ -183,18 +207,16 @@ export function createContextStore(opts: ContextStoreOptions): ContextStore {
       if (!uri.startsWith(scheme)) continue;
       const raw = uri.slice(scheme.length);
       if (!raw) throw new NgError("invalid_argument", `missing name in "${uri}"`);
-      try {
-        return pageOf(knowledge.readBody(cellId, kind, raw), page);
-      } catch (err) {
-        let decoded = raw;
-        try {
-          decoded = decodeURIComponent(raw);
-        } catch {
-          /* not percent-encoded */
+      let decoded = raw;
+      try { decoded = decodeURIComponent(raw); } catch { /* literal resource name */ }
+      const kinds = scheme === "note://" ? [kind, "reference" as const] : [kind];
+      for (const visibleKind of kinds) {
+        for (const name of new Set([raw, decoded])) {
+          try { return pageOf(knowledge.readBody(cellId, visibleKind, name), page); }
+          catch (err) { if (!isNgError(err, "not_found")) throw err; }
         }
-        if (!isNgError(err, "not_found") || decoded === raw) throw err;
-        return pageOf(knowledge.readBody(cellId, kind, decoded), page);
       }
+      throw new NgError("not_found", `knowledge resource "${uri}" not found`);
     }
     if (uri.startsWith("artifact://")) {
       const ref = uri.slice("artifact://".length);
@@ -228,6 +250,11 @@ export function createContextStore(opts: ContextStoreOptions): ContextStore {
   }
 
   const store: ContextStore = {
+    installStateDomain(domain) {
+      if (domains.has(domain.id)) return;
+      withTx(db, () => domain.migrate());
+      domains.set(domain.id, domain);
+    },
     // ---------- sync core ----------
     readStateSync,
     listStateSync(cellId, keyPrefix) {
@@ -235,15 +262,15 @@ export function createContextStore(opts: ContextStoreOptions): ContextStore {
         db,
         "SELECT * FROM cell_state WHERE cell_id = ? AND key >= ? AND key < ? ORDER BY key",
         [cellId, keyPrefix, prefixUpperBound(keyPrefix)],
-      ).map(toEntryState);
+      ).map(projectEntry).concat(projected({keyPrefix,cellIds:[cellId]})).sort((a,b) => a.key.localeCompare(b.key));
     },
     queryStateSync(q: StateQuery) {
       if (q.cellIds !== undefined && q.cellIds.length === 0) return [];
       const params = [q.keyPrefix, prefixUpperBound(q.keyPrefix), ...(q.cellIds ?? [])];
       const cellFilter = q.cellIds ? ` AND cell_id IN (${q.cellIds.map(() => "?").join(",")})` : "";
       return all<StateRow>(db, `SELECT * FROM cell_state WHERE key >= ? AND key < ?${cellFilter} ORDER BY key, cell_id`, params).map(
-        toEntryState,
-      );
+        projectEntry,
+      ).concat(projected(q)).sort((a,b) => a.key.localeCompare(b.key) || a.cellId.localeCompare(b.cellId));
     },
     commitSync,
     hydrateSync(cellId, batch, mode) {
@@ -307,6 +334,7 @@ export function createContextStore(opts: ContextStoreOptions): ContextStore {
     async queryState(q) {
       return store.queryStateSync(q);
     },
+    async getArtifactVersion(id,version) { return artifacts.getVersion(id,version); },
     async getArtifact(artifactId) {
       return artifacts.get(artifactId);
     },

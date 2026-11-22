@@ -1,3 +1,5 @@
+import {runtimeVersion} from "./release";
+import { createHumanItems } from "./human-items";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -69,7 +71,10 @@ function isSubscribable(clock: Clock): clock is SubscribableClock {
  *   await kernel.start();
  */
 export function createKernel(opts: KernelOptions = {}): Kernel {
-  // Resolved before anything touches the disk, so a kernel that cannot run llm cells fails fast.
+  const ownsDataDir = opts.dataDir === undefined;
+  const dataDir = resolve(opts.dataDir ?? mkdtempSync(join(tmpdir(), "ng-kernel-")));
+  mkdirSync(dataDir, { recursive: true });
+  // Resolve the backend before opening the workbench database.
   let agentBackend: AgentEngine | null = null;
   if (!opts.loop) {
     const setting = opts.agentBackend ?? (opts.model ? "api" : "auto");
@@ -87,9 +92,6 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     });
 
   // ---------- storage ----------
-  const ownsDataDir = opts.dataDir === undefined;
-  const dataDir = resolve(opts.dataDir ?? mkdtempSync(join(tmpdir(), "ng-kernel-")));
-  mkdirSync(dataDir, { recursive: true });
   const ownsDb = typeof opts.db !== "object";
   const db: Db = typeof opts.db === "object" ? opts.db : openDatabase(opts.db ?? join(dataDir, "ng.db"));
 
@@ -111,6 +113,8 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     ownerPrincipal,
     ownerAddresses,
     budgetEnforced: () => budgetSwitch.enforced(),
+    onSuperseded: (record, actor) => core.approvals.superseded(record, actor),
+    setBudgetPaused: (id, paused, principalId) => { inbox.controlSync(id, {action:paused ? "pause" : "resume", pauseReason:"budget_declined", principalId}); },
     ...(opts.secrets ? { secrets: opts.secrets } : {}),
     ...opts.gate,
   });
@@ -119,6 +123,7 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     bus,
     clock,
     ownerPrincipal,
+    cancelCellSync: (id,principalId)=>{core.lifecycle.closeCellSync(id,"cancelled",{principalId});},
     authorizeControl: (cellId, principalId, action) => gate.authorizeControlSync(cellId, principalId, action),
     resolveDesk: (cellId) => (cellId !== deskCellId && cells.get(deskCellId) ? deskCellId : cells.require(cellId).rootId),
     defaultLeaseMs: opts.leaseMs ?? DEFAULTS.leaseMs,
@@ -126,6 +131,7 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     onError: (err) => onError(err, "inbox"),
   });
   const context = createContextStore({
+    runtimeVersion:runtimeVersion(),
     db,
     bus,
     clock,
@@ -218,6 +224,7 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
   };
 
   const core: KernelCore = {
+    defaultEngine:agentBackend,
     db,
     bus,
     clock,
@@ -230,6 +237,7 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     hub,
     loop,
     dataDir,
+    cliProcDir,
     deskCellId,
     ownerPrincipal,
     ownerAddresses,
@@ -251,6 +259,7 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     dispatcher: undefined as never,
     escalations: undefined as never,
     approvals: undefined as never,
+    humanItems: undefined as never,
     readModel: undefined as never,
     waits: undefined as never,
     stall: undefined as never,
@@ -260,6 +269,7 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
   core.dispatcher = createDispatcher(core, { idleTimeoutMs: DEFAULTS.idleTimeoutMs });
   core.escalations = createEscalations(core);
   core.approvals = createApprovals(core);
+  core.humanItems = createHumanItems(core);
   core.readModel = createReadModel(core);
   core.stall = createStallMonitor(core);
   const { dispatcher, lifecycle } = core;
@@ -278,7 +288,7 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
   const unsubscribe: Array<() => void> = [];
   unsubscribe.push(bus.on("inbox.enqueued", (e) => dispatcher.notify(e.cellId)));
   // A raised budget lets the cells that were held at the budget stop start, with every message that waited for them.
-  unsubscribe.push(bus.on("ledger.raised", () => dispatcher.budgetChanged()));
+  unsubscribe.push(bus.on("ledger.raised", e => dispatcher.budgetChanged(e.cellId)));
   unsubscribe.push(
     bus.on("inbox.dead", (e) => {
       core.escalations.deadLetter(e);
@@ -290,12 +300,6 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
       if (ev.action === "cancel") {
         // The Inbox already advanced epochs and cleared the queue; stop the Runs at once, then finish the cascade.
         dispatcher.abortCells(ids, "cancel");
-        try {
-          const closed = lifecycle.closeCellSync(ev.cellId, "cancelled", { principalId: ev.principalId });
-          void track(lifecycle.cleanupClosed([...new Set([...closed, ...ids])]));
-        } catch (err) {
-          onError(err, `close after cancel of ${ev.cellId}`);
-        }
       } else if (ev.action === "pause") {
         dispatcher.abortCells(ids, "pause");
         void track(
@@ -310,21 +314,88 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
   // themselves" (docs/05 §4.2). Their prefix is rebuilt at their next Run; that costs each of them one cache miss.
   unsubscribe.push(
     bus.on("knowledge.changed", (e) => {
-      if (e.kind !== "preference") return;
+      if (e.kind !== "preference" && e.kind !== "skill") return;
       try {
         const affected = e.scope === "global" || e.cellId === null ? cells.list({ status: ["active", "paused"] }) : [cells.get(e.cellId), ...cells.descendants(e.cellId, { status: ["active", "paused"] })];
-        for (const c of affected) if (c && c.status !== "closed") context.refreshPrefixSync(c.id);
+        for (const c of affected.sort((a,b)=>(a?.depth ?? 0)-(b?.depth ?? 0))) if (c && c.status !== "closed") context.refreshPrefixSync(c.id);
       } catch (err) {
         onError(err, "refresh prefixes after a preference change");
       }
     }),
   );
-  let started = false;
+  let starting: Promise<void> | undefined;
+  let stopping: Promise<void> | undefined;
   let stopped = false;
+  let closed = false;
   let heartbeat: ReturnType<typeof setInterval> | undefined;
   let unsubscribeClock: (() => void) | undefined;
 
+  async function startRuntime() {
+    for (const preset of registry.presets.list()) if (preset.stateDomain) context.installStateDomain(preset.stateDomain(db, clock));
+    // Refresh already-materialized persistent prefixes in parent order after a new release or an offline skill edit.
+    for (const c of cells.list({status:["active","paused"]}).sort((a,b)=>a.depth-b.depth)) context.refreshPrefixSync(c.id);
+    // Ask the backend CLI for its models now, so the first Run does not have to wait for the list.
+    if (agentBackend && agentBackend !== "api") modelSettingsOf(agentBackend)?.warm();
+    // A previous process's in-flight Runs died with it; their batches go back to the queue (one attempt each).
+    inbox.recoverClaimsSync({ reason: "recovered at startup: the previous kernel stopped during this run" });
+    hub.recoverInterruptedSync();
+    core.approvals.reconcile();
+    try {
+      // A kernel that was killed leaves its CLI agents running (they have their own process groups) while their
+      // batches were just taken back above: stop them before anything is dispatched into the same directories.
+      for (const r of await reapOrphanedCliProcesses(cliProcDir)) {
+        if (r.killed) onError(new Error(`stopped a CLI agent (pid ${r.pid}) of cell "${r.cellId}" left running in ${r.cwd} by the previous kernel`), "recovery");
+        else if (r.status === "unknown") {
+          dispatcher.holdForUnknownOrphan(r.cellId);
+          onError(new Error(`deferred cell "${r.cellId}": CLI pid ${r.pid} in ${r.cwd} is alive with unreadable identity; checking the recorded identity for up to 30 seconds`), "recovery");
+        }
+      }
+    } catch (err) {
+      onError(err, "CLI process recovery");
+    }
+    try {
+      // Resume interrupted cancellations. Jobs whose exit cannot be verified remain active in the workspace.
+      await workspace.recover();
+    } catch (err) {
+      onError(err, "workspace recovery");
+    }
+    // A cell that was closed (its settle transaction committed) just before the previous kernel died may have left
+    // Jobs running: their runtime is stopped before the dispatcher hands anyone that directory (docs/05 guard 4).
+    const orphaned = new Set(workspace.listJobsSync({ state: ["running"] }).filter((j) => cells.get(j.cellId)?.status === "closed").map((j) => j.cellId));
+    await Promise.all([...orphaned].map((id) => workspace.stopRuntime(id).catch((err: unknown) => onError(err, `stop runtime of closed cell ${id}`))));
+    // Leases are renewed before the inbox looks at a moved ManualClock, so a live Run is never expired by a test step.
+    const sweep = () => {
+      dispatcher.renewAll();
+      hub.expireEditorLeasesSync();
+      if (!hub.isFocusSync() && hub.bufferedCountSync()) void track(hub.flushBuffered(true)).catch(err=>onError(err,"flush buffered notifications"));
+    };
+    sweep();
+    if (isSubscribable(clock)) unsubscribeClock = clock.subscribe(sweep);
+    heartbeat = setInterval(sweep, Math.min(15_000, Math.max(1_000, Math.floor(core.leaseMs / 3))));
+    heartbeat.unref?.();
+    if (!budgetSwitch.enforced()) gate.clearBudgetDeclinesSync(ownerPrincipal);
+    dispatcher.start();
+    inbox.start();
+    for (const id of inbox.dueCellIdsSync()) dispatcher.notify(id);
+    core.stall.start();
+    keepAwake.start();
+  }
+
+  async function stopRuntime() {
+    await starting?.catch(() => undefined);
+    core.stall.stop();
+    keepAwake.stop();
+    inbox.stop();
+    unsubscribeClock?.();
+    if (heartbeat) clearInterval(heartbeat);
+    await dispatcher.stop();
+    await Promise.allSettled([...tasks]);
+    workspace.close();
+    for (const u of unsubscribe) u();
+  }
+
   const kernel: Kernel = {
+    humanItems: core.humanItems,
     db,
     bus,
     clock,
@@ -346,61 +417,19 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     ownerAddresses,
 
     async start() {
-      if (started) return;
       if (stopped) throw new NgError("conflict", "this kernel was stopped; create a new one on the same database to continue");
-      started = true;
-      // Ask the backend CLI for its models now, so the first Run does not have to wait for the list.
-      if (agentBackend && agentBackend !== "api") modelSettingsOf(agentBackend)?.warm();
-      // A previous process's in-flight Runs died with it; their batches go back to the queue (one attempt each).
-      inbox.recoverClaimsSync({ reason: "recovered at startup: the previous kernel stopped during this run" });
-      hub.recoverInterruptedSync();
-      core.approvals.reconcile();
-      try {
-        // A kernel that was killed leaves its CLI agents running (they have their own process groups) while their
-        // batches were just taken back above: stop them before anything is dispatched into the same directories.
-        for (const r of await reapOrphanedCliProcesses(cliProcDir)) {
-          if (r.killed) onError(new Error(`stopped a CLI agent (pid ${r.pid}) of cell "${r.cellId}" left running in ${r.cwd} by the previous kernel`), "recovery");
-        }
-      } catch (err) {
-        onError(err, "CLI process recovery");
-      }
-      try {
-        // Resolves only after every job whose cancel was interrupted by the previous kernel's death is really gone.
-        await workspace.recover();
-      } catch (err) {
-        onError(err, "workspace recovery");
-      }
-      // A cell that was closed (its settle transaction committed) just before the previous kernel died may have left
-      // Jobs running: their runtime is stopped before the dispatcher hands anyone that directory (docs/05 guard 4).
-      const orphaned = new Set(workspace.listJobsSync({ state: ["running"] }).filter((j) => cells.get(j.cellId)?.status === "closed").map((j) => j.cellId));
-      await Promise.all([...orphaned].map((id) => workspace.stopRuntime(id).catch((err: unknown) => onError(err, `stop runtime of closed cell ${id}`))));
-      // Leases are renewed before the inbox looks at a moved ManualClock, so a live Run is never expired by a test step.
-      if (isSubscribable(clock)) unsubscribeClock = clock.subscribe(() => dispatcher.renewAll());
-      heartbeat = setInterval(() => dispatcher.renewAll(), Math.max(1_000, Math.floor(core.leaseMs / 3)));
-      heartbeat.unref?.();
-      dispatcher.start();
-      inbox.start();
-      for (const id of inbox.dueCellIdsSync()) dispatcher.notify(id);
-      core.stall.start();
-      keepAwake.start();
+      return starting ??= startRuntime();
     },
 
     async stop() {
-      if (stopped) return;
       stopped = true;
-      core.stall.stop();
-      keepAwake.stop();
-      inbox.stop();
-      unsubscribeClock?.();
-      if (heartbeat) clearInterval(heartbeat);
-      await dispatcher.stop();
-      await Promise.allSettled([...tasks]);
-      workspace.close();
-      for (const u of unsubscribe) u();
+      return stopping ??= stopRuntime();
     },
 
     async close() {
       await kernel.stop();
+      if (closed) return;
+      closed = true;
       if (ownsDb) {
         try {
           db.close();
@@ -420,7 +449,7 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     closeCell: (cellId, reason, o) => lifecycle.closeCell(cellId, reason, o),
     control: (cellId, cmd, o) => {
       const principalId = o?.principalId ?? ownerPrincipal;
-      const command = { action: cmd.action, principalId, ...(cmd.steerMessage !== undefined ? { steerMessage: cmd.steerMessage } : {}) };
+      const command = { action: cmd.action, principalId,...(cmd.pauseReason ? {pauseReason:cmd.pauseReason} : {}), ...(cmd.steerMessage !== undefined ? { steerMessage: cmd.steerMessage } : {}) };
       if (cmd.action !== "steer" || !isPersonPrincipal(core, principalId)) return inbox.controlSync(cellId, command);
       // A person's steer is a direct message like any other: the worker's parent gets the words in the same transaction.
       return withTx(db, () => {
@@ -432,12 +461,13 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     },
 
     ingest: (raw, channelId) => ingest(core, raw, channelId),
+    reopenProject: core.lifecycle.reopenProject,
     resolveApproval: (actionId, decision) => core.approvals.resolve(actionId, decision),
-    resolveUnknownSend: (actionId, verdict, note) => core.approvals.resolveUnknownSend(actionId, verdict, note),
+    resolveUnknownSend: (actionId, verdict, opts) => core.approvals.resolveUnknownSend(actionId, verdict, opts),
     async setFocus(on) {
       hub.setFocusSync(on);
-      if (on) return null;
-      const r = await track(hub.flushBuffered());
+      if (hub.isFocusSync()) return null;
+      const r = await track(hub.flushBuffered(true));
       return { sent: r.sent, failed: r.failed, unknown: r.unknown };
     },
 
@@ -478,7 +508,7 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
             .catch((err: unknown) => onError(err, `continue budget card ${rec.actionId}`));
         }
         // And nothing holds the cells that waited at their budget stop.
-        releasedCells.push(...dispatcher.heldForBudget());
+        releasedCells.push(...new Set([...gate.clearBudgetDeclinesSync(principalId),...dispatcher.heldForBudget()]));
         dispatcher.budgetChanged();
       }
       return { enforced: budgetSwitch.enforced(), changed, releasedCells, continuedCards };

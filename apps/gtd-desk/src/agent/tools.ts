@@ -23,13 +23,11 @@ import {
   type SendToCellResult,
   type UserMessagePayload,
 } from "@ng/protocol";
-import type { ClarifyCardDTO, EngageItemDTO, ProjectRowDTO, SendCellMessageRequest, TimelineItemDTO } from "../shared/api";
+import type { ProjectRowDTO, SendCellMessageRequest, TimelineItemDTO } from "../shared/api";
 import type { Delivery } from "../server/agents";
 import { DeskError, type Desk, type DeskActor, type ProjectOp } from "../server/desk";
 import { isLeafCell, unpulledOf } from "../server/projections/agents";
-import { inputOf, projectOfAction, readActions, readProjects, type DeskSettings, type Located } from "../server/projections/common";
-import { projectClarify } from "../server/projections/clarify";
-import { projectEngage } from "../server/projections/engage";
+import { inputOf, linkedApprovalId, projectOfAction, readActions, readProjects, type DeskSettings, type Located } from "../server/projections/common";
 import { AGENT_TOOLS, type AgentToolDoc } from "./guide";
 import type { AgentControlPlane, AgentToolResult } from "./routes";
 
@@ -51,7 +49,7 @@ type Handler = (args: Args, principalId: Principal) => Promise<AgentToolResult> 
 
 /** The `text` an agent reads for an owner-only card (outgoing send, exhausted budget). */
 export function ownerOnlyText(cardId: string, why: string): string {
-  return `Refused: only the owner can decide card ${cardId} (${why}). You may not approve or continue it on their behalf, even on their say-so. Tell the owner to confirm it themselves in the workbench UI (待确认 / Clarify). The card is still pending.`;
+  return `Refused: only the owner can approve card ${cardId} (${why}). You may not approve or continue it on their behalf, even on their say-so. Tell the owner to confirm it themselves in the workbench UI (待我处理). The card is still pending.`;
 }
 
 const OWNER_TEXT: Readonly<Record<BallOwner, string>> = { human: "主人", agent: "agent", waiting: "等待外部" };
@@ -90,6 +88,7 @@ const ARG_ALIASES: Readonly<Record<string, readonly string[]>> = {
   id: ["projectId", "project_id", "cellId", "cell_id", "cardId", "card_id", "artifactId", "artifact_id"],
   projectId: ["project_id", "project"],
   actionId: ["action_id", "action"],
+  seenVersion: ["seenArtifactVersion", "artifactVersion"],
   query: ["q", "text", "keywords"],
   state: ["op", "action", "status"],
   note: ["reason", "comment"],
@@ -196,43 +195,17 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
     return ownerOnlyApproval({ ...rec.action, card: rec.card }, kernel.ownerAddresses);
   }
 
-  function cardKind(c: ClarifyCardDTO): string {
-    if (c.cardType === "response") {
-      if (c.reply?.confirmVerb === "accept") return "结果请主人过目";
-      if (c.reply?.confirmVerb === "merge") return `合入确认（${c.reply.targetLabel}）`;
-      return `对外回复，发给 ${c.reply?.targetLabel ?? "对方"}`;
-    }
-    if (c.cardType === "project_proposal") return "立项方案";
-    if (c.cardType === "escalation") return c.escalation ? `受阻：${c.escalation.reasonLabel}` : "受阻";
-    return "需要确认";
+  function cardLine(item: ReturnType<typeof desk.listHumanItems>[number]) {
+    const parts = [`rev=${item.itemRevision}`, item.artifactVersion !== null && `草稿 v${item.artifactVersion}`,
+      item.project?.title, item.ownerOnly && "[ownerOnly]"].filter(Boolean);
+    return {data:item, line:`- ${item.id}「${item.title}」 ${parts.join(" · ")}`};
   }
 
-  function cardLine(c: ClarifyCardDTO): { line: string; data: Record<string, unknown> } {
-    const rec = gate.getApprovalSync(c.id);
-    const why = rec ? ownerOnlyOf(rec) : null;
-    const ask = c.escalation?.explanation ?? c.proposal?.outcome ?? (c.draft ? oneLine(c.draft.body, 120) : c.prep.summary);
-    const line = `- ${c.id}「${c.title}」 ${cardKind(c)}${c.projectId ? `，项目 ${c.projectId}` : ""}${c.state !== "pending" ? `，状态 ${c.state}` : ""}${ask ? ` — ${oneLine(ask, 140)}` : ""}${why ? ` [ownerOnly：${why}]` : ""}`;
-    return {
-      line,
-      data: {
-        id: c.id,
-        title: c.title,
-        cardType: c.cardType,
-        kind: cardKind(c),
-        state: c.state,
-        projectId: c.projectId,
-        ask: ask ?? null,
-        ownerOnly: why !== null,
-        ...(why ? { ownerOnlyReason: why } : {}),
-        createdAt: c.createdAt,
-      },
-    };
-  }
-
-  function humanLine(i: EngageItemDTO): string {
-    const due = i.dueAt !== null ? `，到期 ${isoMin(i.dueAt)}${i.overdue ? "（已超时）" : ""}` : "";
-    const where = i.project ? `项目 ${i.project.id}「${i.project.title}」` : "随手待办";
-    return `- ${i.actionId}「${i.title}」${i.nextStep && i.nextStep !== i.title ? ` — 下一步：${oneLine(i.nextStep, 120)}` : ""}（${where}${due}）`;
+  function cardQueue() {
+    const all = desk.listHumanItems(true);
+    const items = all.filter(item => !item.snoozedUntil || item.snoozedUntil <= now());
+    const cards = items.filter(i => i.category === "decision");
+    return {items, cards, snoozed: all.filter(i => i.category === "decision").length - cards.length};
   }
 
   function projectLine(p: ProjectRowDTO): string {
@@ -300,6 +273,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         const w = kernel.listWaits([c.id])[0];
         return w ? `等待中（waiting for ${w.waitingFor}：${oneLine(w.reason, 60)}）` : `等待中（${a.why}）`;
       }
+      case "budget_paused": return "额度用尽暂停";
       case "dormant":
         return "待命可唤醒";
       default:
@@ -365,11 +339,11 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
 
   const handlers: Record<string, Handler> = {
     workbench_overview(args) {
-      const input = inputOf(kernel, settings);
-      const engage = projectEngage(input);
-      const clarify = projectClarify(input);
+      const clarify = cardQueue();
       const radar = desk.radar();
-      const human = engage.items.map((i) => ({ line: humanLine(i), data: { id: i.actionId, cellId: i.cellId, title: i.title, nextStep: i.nextStep, projectId: i.project?.id ?? null, dueAt: i.dueAt, overdue: i.overdue } }));
+      const human = clarify.items.filter(i=>i.category === "action").map(i=>({
+        line:cardLine(i).line, data:{...i, nextStep:i.description, projectId:i.project?.id ?? null, overdue:i.dueAt != null && i.dueAt<now()}
+      }));
       const cards = clarify.cards.map(cardLine);
       const running = runningLines();
       const ws = workspaceLines();
@@ -412,21 +386,10 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       });
     },
 
-    capture(args, principalId) {
-      const text = str(args["text"])!;
-      // The owner's words, delivered to the desk the way 随手记 delivers them (from the owner's own ui address, so the
-      // desk files it as the owner's item and its answers go back to the owner), but signed by the agent.
-      const owner = "channel:ui:owner" as const;
-      const payload: UserMessagePayload = { text, replyTo: owner, sender: { id: principalId, displayName: "主 Agent" } };
-      const env = createEnvelope<UserMessagePayload>(
-        { id: newId("agcap", clock), from: owner, to: inboxAddr(deskId), principalId, kind: "event", type: PAYLOAD.userMessage, payload },
-        clock,
-      );
-      kernel.inbox.enqueueSync(deskId, env);
-      return ok(
-        `Handed to the desk (message ${env.id}). It triages it in the background: a note or a reminder is filed at once, a message to answer becomes a card, a task may become a project. Nothing more to do now; the result shows up in workbench_overview.`,
-        { envelopeId: env.id },
-      );
+    async capture(args,principalId) {
+      const clientId=str(args["clientId"]);
+      const receipt=await desk.ingest({text:str(args["text"])!,...(clientId ? {clientId} : {})},{principalId});
+      return ok(`Captured message ${receipt.id}. The workbench routes it to the matching watcher or the desk.`,{envelopeId:receipt.id});
     },
 
     chat_with_desk(args, principalId) {
@@ -438,7 +401,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const from = since ?? context.lastEvidenceSeqSync(deskId);
       let sent: Delivery | null = null;
       if (text) {
-        sent = desk.deliverCellMessage(deskId, { text, clientId: newId("agchat", clock), conversationId, ...(replyToId ? { replyToId } : {}) }, { principalId });
+        sent = desk.directMessage(deskId, { text, clientId: newId("agchat", clock), conversationId, ...(replyToId ? { replyToId } : {}) }, { principalId });
         if (!sent.ok) return fail(`Not passed on: ${sent.message}`, { outcome: sent.outcome });
       }
       const t = desk.timeline(deskId, { afterSeq: from, limit: 50 });
@@ -470,7 +433,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         ...(replyToId ? { replyToId } : {}),
         conversationId: str(args["conversationId"]) ?? principalId,
       };
-      return deliveredToCell(id, desk.deliverCellMessage(id, req, { principalId }), mode, notifyParent);
+      return deliveredToCell(id, desk.directMessage(id, req, { principalId }), mode, notifyParent);
     },
 
     inspect_cell(args) {
@@ -478,8 +441,19 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const afterSeq = typeof args["afterSeq"] === "number" ? Math.max(0, Math.floor(args["afterSeq"])) : 0;
       const detail = str(args["detail"]) === "full" ? "full" : "summary";
       const r = kernel.inspectCell(id, { afterSeq, detail });
-      const more = r.more ? `\n(More follows: inspect_cell ${id} with afterSeq ${r.toSeq}.)` : "";
-      return ok(`${r.text}${more}`, { cellId: r.cellId, title: r.title, state: r.state, fromSeq: r.fromSeq, toSeq: r.toSeq, more: r.more, directChats: r.directChats, artifactIds: r.artifactIds });
+      const nextAfterSeq = r.resumeAfterSeq ?? r.toSeq;
+      const more = r.more ? `\n(More follows: inspect_cell ${id} with afterSeq ${nextAfterSeq}.)` : "";
+      return ok(`${r.text}${more}`, {
+        cellId: r.cellId,
+        title: r.title,
+        state: r.state,
+        fromSeq: r.fromSeq,
+        toSeq: r.toSeq,
+        more: r.more,
+        ...(r.resumeAfterSeq !== undefined ? { resumeAfterSeq: r.resumeAfterSeq } : {}),
+        directChats: r.directChats,
+        artifactIds: r.artifactIds,
+      });
     },
 
     read_resource(args) {
@@ -507,7 +481,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       };
       let r: { projectId: string; started: boolean };
       try {
-        r = startProjectSync(kernel, init, { principalId });
+        r = desk.createProject(init,{principalId});
       } catch (err) {
         if (isNgError(err, "invalid_argument") && /\bcwd\b|directory|path/i.test(err.message)) {
           return fail(
@@ -542,7 +516,8 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const waits = kernel.listWaits(ids.filter((cid) => kernel.getCell(cid)?.status !== "closed"));
       const running = new Set(kernel.activeRuns().map((r) => r.cellId));
       const artifacts = ids.flatMap((cid) => context.listArtifactsSync(cid)).sort((a, b) => b.updatedAt - a.updatedAt);
-      const cards = gate.listPendingSync({ includeSnoozed: true }).filter((r) => ids.includes(r.cellId) || r.subjectKey === `project:${id}`);
+      const cards = desk.listHumanItems(true).filter(r => r.category === "decision" &&
+        ((r.cellId && ids.includes(r.cellId)) || r.relatedProjectIds.includes(id) || r.subjectKey === `project:${id}`));
       const anchors = cell && cell.status !== "closed" ? kernel.anchorsOf(id) : null;
       // BUG-011.3: a parked project is paused underneath, but it is brought back with activate — never resume.
       const state =
@@ -591,7 +566,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         section("它的分身（运行中 / 等待中 / 待命可唤醒 / 已归档）", cellLines),
         ...(unpulled.length ? [section("尚未汇总至项目的 Worker 最新动态", unpulled.map((u) => `- ${u.cellId}：${u.count} 条新记录\n${u.text.split("\n").map((l) => `  ${l}`).join("\n")}`))] : []),
         section("报告与草稿", artifacts.map((a) => `- ${a.artifactId} v${a.version}${a.content.title ? `「${a.content.title}」` : ""}（${a.content.format}，${a.updatedBy} 更新于 ${isoMin(a.updatedAt)}）`)),
-        section("待确认卡片", cards.map((r) => `- ${r.actionId}「${r.card.title ?? r.action.summary}」${ownerOnlyOf(r) ? " [ownerOnly]" : ""}${r.snoozedUntil && r.snoozedUntil > now() ? `（推迟到 ${isoMin(r.snoozedUntil)}）` : ""}`)),
+        section("待确认卡片", cards.map(r => cardLine(r).line)),
       ].join("\n\n");
       return ok(text, {
         id,
@@ -605,12 +580,16 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         stalledSince: record.stalledSince ?? null,
         ball: row?.ball ? { owner: row.ball.owner, text: row.ball.text } : null,
         usage: { tokens: usage.subtreeTokens, limitTokens: usage.limitTokens, enforced: kernel.budgetLimits().enforced },
-        actions: actions.map((a) => ({ id: a.record.id, cellId: a.cellId, title: a.record.title, owner: a.record.owner, status: a.record.status, nextStep: a.record.nextStep ?? null, carriedBy: a.record.cellId ?? null })),
+        actions: actions.map(({ record, cellId }) => {
+          const linked = linkedApprovalId(record);
+          return { id: record.id, cellId, title: record.title, owner: record.owner, status: record.status, nextStep: record.nextStep ?? null,
+            carriedBy: record.cellId ?? null, ...(linked ? { itemRevision: kernel.gate.getApprovalSync(linked)?.itemRevision } : {}) };
+        }),
         cells: below.map((c) => ({ id: c.id, title: c.title, preset: c.preset, status: c.status, state: cellStateText(c), running: running.has(c.id), waitingFor: waits.filter((w) => w.cellId === c.id).map((w) => w.waitingFor), statusLine: statusLineOf(c.id) })),
         unpulled: unpulled.map((u) => ({ cellId: u.cellId, count: u.count })),
         waits: waits.map((w) => ({ cellId: w.cellId, waitingFor: w.waitingFor, reason: w.reason })),
         artifacts: artifacts.map((a) => ({ id: a.artifactId, title: a.content.title ?? null, version: a.version, cellId: a.cellId, updatedAt: a.updatedAt })),
-        cards: cards.map((r) => ({ id: r.actionId, title: r.card.title ?? r.action.summary, ownerOnly: ownerOnlyOf(r) !== null })),
+        cards,
       });
     },
 
@@ -619,17 +598,15 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const text = str(args["text"])!;
       const record = projectRecordOf(id);
       if (!record && !kernel.getCell(id)) return noProject(id);
-      if (args["urgent"] === true) {
-        const cell = kernel.getCell(id);
-        if (cell?.status === "closed") return sendFailure(id, { status: "closed", closeReason: cell.closeReason }, true);
-        const r = kernel.control(id, { action: "steer", steerMessage: text }, { principalId });
-        if (r.applied) return ok(`Passed to ${id} as an interruption: it takes it between its current steps.`, { applied: true });
-        if (r.reason === "closed") return sendFailure(id, { status: "closed", closeReason: kernel.getCell(id)?.closeReason ?? null }, true);
-        return fail(`Not passed on: ${r.reason ?? "refused"}.`, { applied: false, reason: r.reason ?? null });
+      const mode=args["urgent"]===true ? "steer" : "enqueue";
+      const cell=kernel.getCell(id);
+      if (cell?.status==="closed") return sendFailure(id,{status:"closed",closeReason:cell.closeReason},true);
+      const r=desk.directMessage(id,{text,mode,clientId:newId("agmsg",clock),conversationId:principalId},{principalId});
+      if (mode==="enqueue" && r.ok && r.id) {
+        const delivered={status:"delivered" as const,envelopeId:r.id,targetStatus:cell?.status==="paused" ? "paused" as const : "active" as const};
+        return ok(deliveredText(id,delivered,true),delivered);
       }
-      const r = kernel.sendToCell(id, { text, summary: "主人的新要求（经主 Agent）", id: newId("agmsg", clock) }, { principalId });
-      if (r.status !== "delivered") return sendFailure(id, r, true);
-      return ok(deliveredText(id, r, true), r);
+      return deliveredToCell(id,r,mode,undefined);
     },
 
     async set_project_state(args, principalId) {
@@ -647,34 +624,42 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const nextStep = str(args["nextStep"]);
       const r = await desk.addProjectAction(projectId, { title: str(args["title"])!, owner, ...(nextStep ? { nextStep } : {}) }, as(principalId));
       return ok(
-        `Recorded action ${r.actionId}「${str(args["title"])}」 on project ${projectId} (${owner === "human" ? "the owner's to-do" : "waiting"}); the project was told. ${owner === "human" ? "When the owner has done it, complete_action with what happened." : ""}`.trim(),
+        `Recorded action ${r.actionId}「${str(args["title"])}」 on project ${projectId} (${owner === "human" ? "the owner's to-do" : "waiting"}); the project was told. ${owner === "human" ? "When the owner has done it, decide_human_item with the current option and revision." : ""}`.trim(),
         { actionId: r.actionId },
       );
     },
 
-    async complete_action(args, principalId) {
-      const projectId = str(args["projectId"])!;
-      const actionId = str(args["actionId"])!;
-      if (!projectRecordOf(projectId)) return noProject(projectId);
-      const actions = projectActionsOf(projectId);
-      const a = actions.find((x) => x.record.id === actionId);
-      if (!a) {
-        const open = actions.filter((x) => x.record.status === "open").map((x) => `${x.record.id}「${x.record.title}」`);
-        return fail(`Project ${projectId} has no action ${actionId}. Its open actions: ${open.join("; ") || "none"}.`);
-      }
-      if (a.record.status !== "open") return ok(`Action ${actionId}「${a.record.title}」 is already ${a.record.status}; nothing changed.`, { status: a.record.status });
-      const note = str(args["note"]);
-      const r = await desk.done(a.cellId, actionId, note ? { note } : {}, as(principalId));
-      return ok(
-        `Ticked off ${actionId}「${a.record.title}」 on project ${projectId}${note ? " with the note" : ""}; the project was told and continues with whatever waited on it.${r.closedTasks ? ` ${r.closedTasks} background cell(s) that existed only for it were closed.` : ""}`,
-        { outcome: r.outcome, closedTasks: r.closedTasks ?? 0 },
-      );
+    list_human_items() {
+      const items = desk.listHumanItems();
+      return ok(`待处理 ${items.length} 项\n${JSON.stringify(items, null, 2)}`, {items});
+    },
+    async decide_human_item(args,principalId) {
+      const result = await desk.decideHumanItem(str(args.id)!,{
+        optionId:str(args.optionId)!, seenItemRevision:args.seenItemRevision as number,
+        ...(typeof args.seenVersion==="number" ? {seenArtifactVersion:args.seenVersion} : {}),
+        ...(typeof args.seenAttempt==="number" ? {seenAttempt:args.seenAttempt} : {}),
+        ...(typeof args.until==="number" ? {until:args.until} : {}), ...(typeof args.note==="string" ? {note:args.note} : {}),
+        ...(typeof args.resumeProjectId==="string" ? {resumeProjectId:args.resumeProjectId} : {}),
+        ...(Array.isArray(args.confirmedClosure) ? {confirmedClosure:args.confirmedClosure as string[]} : {}),
+        ...(Array.isArray(args.confirmedTargets) ? {confirmedTargets:args.confirmedTargets as string[]} : {}),
+      },as(principalId));
+      if (["already_cancelled", "not_found", "not_unknown", "not_pending", "failed", "version_mismatch", "revision_mismatch"].includes(result.status) ||
+        (result.status === "unknown" && args.optionId !== "system.defer")) return fail(JSON.stringify(result), result);
+      return ok(JSON.stringify(result),result);
+    },
+    async reopen_project(args,principalId) {
+      const result = await desk.reopenProject(str(args.projectId)!,as(principalId));
+      return ok("项目已重新打开",result);
+    },
+    async undo_human_decision(args,principalId) {
+      const result = await desk.undoHumanDecision(str(args.activityId)!,as(principalId));
+      return ok(result.message,result);
     },
 
     list_cards() {
-      const clarify = projectClarify(inputOf(kernel, settings));
+      const clarify = cardQueue();
       const cards = clarify.cards.map(cardLine);
-      const text = `${section("待确认卡片", cards.map((c) => c.line))}${clarify.snoozed ? `\n另有 ${clarify.snoozed} 张卡被推迟。` : ""}\nCards marked ownerOnly can only be decided by the owner in the workbench UI.`;
+      const text = `${section("待确认卡片", cards.map((c) => c.line))}${clarify.snoozed ? `\n另有 ${clarify.snoozed} 张卡被推迟。` : ""}\nCards marked ownerOnly require the owner for execution in the workbench UI.`;
       return ok(text, { cards: cards.map((c) => c.data), snoozed: clarify.snoozed });
     },
 
@@ -682,40 +667,37 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const id = str(args["id"])!;
       const decision = args["decision"] as "approve" | "deny" | "continue" | "snooze" | "dismiss";
       const note = str(args["note"]);
+      const seenVersion = typeof args["seenVersion"] === "number" ? args["seenVersion"] : undefined;
+      const rev = { seenItemRevision: args["seenItemRevision"] as number };
       const rec = gate.getApprovalSync(id);
-      if (!rec) return fail(`There is no card "${id}". Card ids come from list_cards / workbench_overview.`);
+      if (!rec) {
+        const item = kernel.humanItems.get(id);
+        if (!item) return fail(`There is no card "${id}". Card ids come from list_cards / workbench_overview.`);
+        const options = item.options.filter(o => decision === "snooze" ? o.effect === "defer" :
+          decision === "deny" || decision === "dismiss" ? o.effect === "terminate" && o.terminateMode !== "cancel_task" :
+          o.effect === "complete" || o.effect === "reply");
+        if (options.length !== 1) return fail(`Choose the exact option with decide_human_item: ${JSON.stringify(item.options)}`);
+        const result = await desk.decideHumanItem(id, { ...rev,optionId:options[0]!.id,
+          ...(note ? {note} : {}), ...(seenVersion === undefined ? {} : {seenArtifactVersion:seenVersion}),
+          ...(decision === "snooze" ? {until:now() + (typeof args.minutes === "number" && args.minutes>0 ? args.minutes : 120)*60_000} : {})
+        },as(principalId));
+        return ok(JSON.stringify(result),result);
+      }
       if (rec.status !== "pending") return fail(`Card ${id} is no longer pending (${rec.status}); nothing to decide.`, { status: rec.status });
       const why = ownerOnlyOf(rec);
       if (why && (decision === "approve" || decision === "continue")) return fail(ownerOnlyText(id, why), { ownerOnly: true, reason: why });
       const actor = as(principalId, note);
       const title = rec.card.title ?? rec.action.summary;
       try {
-        switch (decision) {
-          case "approve": {
-            // The tool has no version argument: the agent approves the draft as it stands now (what list_cards showed).
-            const seen = rec.artifactId ? (context.getArtifactSync(rec.artifactId)?.version ?? null) : null;
-            const r = await desk.approve(id, seen !== null ? { seenVersion: seen } : {}, actor);
-            return r.ok ? ok(`Approved「${title}」: ${r.message}.`, { outcome: r.outcome }) : fail(`Not approved: ${r.message} (${r.outcome}).`, { outcome: r.outcome });
-          }
-          case "deny": {
-            const r = await desk.deny(id, note ? { note } : {}, actor);
-            return r.ok ? ok(`Denied「${title}」; whoever asked was told${note ? " why" : ""}.`, { outcome: r.outcome }) : fail(`Not denied: ${r.message}.`, { outcome: r.outcome });
-          }
-          case "continue": {
-            const r = await desk.extend(id, note ? { note } : {}, actor);
-            return r.ok ? ok(`Continued「${title}」: ${r.message}.`, { outcome: r.outcome }) : fail(`Not continued: ${r.message}.`, { outcome: r.outcome });
-          }
-          case "snooze": {
-            const minutes = typeof args["minutes"] === "number" && args["minutes"] > 0 ? args["minutes"] : 120;
-            const until = now() + Math.round(minutes * 60_000);
-            const r = await desk.snooze(id, { until }, actor);
-            return r.ok ? ok(`Snoozed「${title}」 until ${isoMin(until)}; it comes back to the owner's cards then.`, { outcome: r.outcome, until }) : fail(`Not snoozed: ${r.message}.`, { outcome: r.outcome });
-          }
-          case "dismiss": {
-            const r = await desk.dismiss(id, note ? { note } : {}, actor);
-            return r.ok ? ok(`Took down「${title}」 without an answer (archived; the owner can move it back).`, { outcome: r.outcome }) : fail(`Not dismissed: ${r.message}.`, { outcome: r.outcome });
-          }
-        }
+        const common = {...rev, ...(note ? {note} : {})};
+        const until = now()+Math.round((typeof args.minutes==="number" && args.minutes>0 ? args.minutes : 120)*60_000);
+        const result = await (decision==="approve" ? desk.approve(id,{...rev,...(seenVersion!==undefined ? {seenVersion} : {})},actor)
+          : decision==="continue" ? desk.extend(id,common,actor) : decision==="deny" ? desk.deny(id,common,actor)
+          : decision==="snooze" ? desk.snooze(id,{...rev,until},actor) : desk.dismiss(id,common,actor));
+        const data = {outcome:result.outcome, ...("currentVersion" in result && result.currentVersion!==undefined ? {currentVersion:result.currentVersion} : {}),
+          ...(result.currentRevision!==undefined ? {currentRevision:result.currentRevision} : {}), ...(decision==="snooze" ? {until} : {})};
+        const verbs = {approve:"Approved",continue:"Continued",deny:"Denied",snooze:"Snoozed",dismiss:"Took down"};
+        return result.ok ? ok(`${verbs[decision]}「${title}」：${result.message}`,data) : fail(result.message,data);
       } catch (err) {
         if (isNgError(err, "bounds_violation")) return fail(ownerOnlyText(id, why ?? err.message), { ownerOnly: true, reason: err.message });
         throw err;
@@ -775,7 +757,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       });
     },
 
-    save_preference(args) {
+    save_preference(args,principalId) {
       const name = str(args["name"])!;
       const text = str(args["text"])!;
       if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name)) return fail(`name must be a short slug (letters, digits, "-", "_", "."), e.g. "code-change-followup"; got "${name}".`);
@@ -784,7 +766,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const applies = { ...(cwdPrefix ? { cwdPrefix } : {}), ...(roles.length > 0 ? { roles } : {}) };
       const existed = context.getKnowledgeSync({ kind: "preference", name, scope: "global" }) !== null;
       try {
-        context.upsertSkillOrNoteSync(deskId, {
+        desk.savePreference({
           kind: "preference",
           name,
           description: oneLine(text.split("\n")[0], 120),
@@ -792,7 +774,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
           scope: "global",
           mode: "upsert",
           ...(cwdPrefix || roles.length > 0 ? { applies } : {}),
-        });
+        },{principalId});
       } catch (err) {
         if (isNgError(err, "invalid_argument")) return fail(`${err.message}. cwdPrefix is the absolute path of a directory on this machine; roles are names like "worker" or "project".`);
         throw err;
@@ -834,7 +816,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const waits = kernel.listWaits([id]);
       const running = kernel.activeRuns().some((r) => r.cellId === id);
       const children = kernel.listCells({ parentId: id });
-      const cards = gate.listPendingSync({ includeSnoozed: true }).filter((r) => r.cellId === id);
+      const cards = desk.listHumanItems(true).filter(r => r.category === "decision" && r.cellId === id);
       const project = projectRecordOf(id);
       const tail = n > 0 ? evidenceTail(id, n) : [];
       const head = [
@@ -843,7 +825,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         `状态行：${statusLineOf(id) ?? "—"}`,
         `在等：${waits.length ? waits.map((w) => `${w.waitingFor}（${oneLine(w.reason, 80)}${w.timeoutAt ? `，${isoMin(w.timeoutAt)} 超时` : ""}）`).join("；") : "—"}`,
         ...(project ? [`持有项目记录：${project.lifecycle}「${project.title}」`] : []),
-        ...(cards.length ? [`待确认卡片：${cards.map((r) => r.actionId).join(", ")}`] : []),
+        ...(cards.length ? [`待确认卡片：${cards.map(r => cardLine(r).line).join(", ")}`] : []),
         `子节点：${children.length ? children.map((x) => `${x.id}（${x.preset ?? "cell"}，${x.status}）`).join("、") : "—"}`,
       ];
       return ok(`${head.join("\n")}\n\n${section("最近记录", tail.map((t) => `- ${t.line}`))}`, {
@@ -855,7 +837,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         parentId: c.parentId,
         cwd: c.spec.cwd ?? null,
         state: activity?.state ?? "closed",
-        directChats: chats,
+        directChats: chats, cards,
         running,
         waits: waits.map((w) => ({ waitingFor: w.waitingFor, reason: w.reason, timeoutAt: w.timeoutAt })),
         children: children.map((x) => ({ id: x.id, preset: x.preset, status: x.status, title: x.title })),
@@ -875,12 +857,12 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       let cellId: string;
       try {
         if (preset === "project") {
-          cellId = startProjectSync(kernel, { title, outcome: title, brief: instruction, source: { label: "主 Agent", principalId, at: now() }, ...(cwd ? { cwd } : {}) }, { principalId, parentId }).projectId;
+          cellId = desk.createProject({ title, outcome: title, brief: instruction, source: { label: "主 Agent", principalId, at: now() }, ...(cwd ? { cwd } : {}) }, { principalId },parentId).projectId;
         } else {
           const spec: CellSpecInput = { preset: preset as NonNullable<CellSpecInput["preset"]>, title };
           if (cwd) spec.cwd = cwd;
           if (preset === "hub") spec.meta = { role: ROLES.hub, gtd: { source: { title, description: instruction, kind: "channel", mode: "active", processor: "llm" } } };
-          const addr = kernel.spawnCell(parentId, spec, { instruction, title }, { principalId });
+          const addr = desk.spawnCell(parentId, spec, { instruction, title }, { principalId });
           cellId = addr.slice("inbox:".length);
         }
       } catch (err) {
@@ -895,7 +877,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       );
     },
 
-    control_cell(args, principalId) {
+    async control_cell(args, principalId) {
       const id = str(args["id"])!;
       const action = args["action"] as "message" | "steer" | "pause" | "resume" | "cancel";
       const text = str(args["text"]);
@@ -903,7 +885,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       if ((action === "message" || action === "steer") && !text) return fail(`control_cell ${action} needs text: what to tell the cell.`);
       if (action === "message" || action === "steer") {
         const mode = action === "steer" ? "steer" : "enqueue";
-        return deliveredToCell(id, desk.deliverCellMessage(id, { text: text!, clientId: newId("agmsg", clock), mode, conversationId: principalId }, { principalId }), mode, undefined);
+        return deliveredToCell(id, desk.directMessage(id, { text: text!, clientId: newId("agmsg", clock), mode, conversationId: principalId }, { principalId }), mode, undefined);
       }
       const cell = kernel.getCell(id);
       if (!cell) return sendFailure(id, { status: "not_found" }, isProject);
@@ -911,14 +893,16 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         if (action === "cancel") return ok(`${id} had already closed (${cell.closeReason ?? "?"}); nothing to cancel.`, { applied: false, reason: "closed" });
         return sendFailure(id, { status: "closed", closeReason: cell.closeReason }, isProject);
       }
-      const r = kernel.control(id, { action }, { principalId });
-      if (!r.applied) return fail(`Not applied: ${r.reason ?? "refused"}.`, { applied: false, reason: r.reason ?? null });
+      // BUG-020: route pause / resume / cancel through DeskService (keeps root guard, project lifecycle & cards in sync).
+      const r = await desk.cellControl(id, { action }, as(principalId));
+      if (!r.ok) return fail(`Not applied: ${r.message}`, { applied: false, outcome: r.outcome });
       const what: Record<"pause" | "resume" | "cancel", string> = {
         pause: "it and everything below it are paused",
         resume: "it continues",
         cancel: "it and everything below it are stopped and closed (files and branches are left as they are)",
       };
-      return ok(`${action} applied to ${id}: ${what[action]}.`, { applied: true, epoch: r.epoch });
+      const epoch = kernel.getCell(id)?.epoch;
+      return ok(`${action} applied to ${id}: ${what[action]}（${r.message}）.`, { applied: true, outcome: r.outcome, ...(epoch !== undefined ? { epoch } : {}) });
     },
   };
 

@@ -109,7 +109,7 @@ describe("spawnCell", () => {
       "desk",
       {
         id: "child",
-        preset: "worker",
+        preset: "inline",
         // one-shot: the kernel closes it once it is done, which waits for its child (the maxDepth it asks for: it gets 1)
         lifetime: "one_shot",
         processor: { kind: "code", entry: "test.greedy" },
@@ -205,7 +205,7 @@ describe("updateCell", () => {
   it("owner may widen within the parent (授权 1 对 1 直连); a cell may only narrow; narrowing cascades down", async () => {
     const h = await boot({ setup: setupWith(idle) });
     // given spawn depth (a worker has none by default) so the narrowing can be seen to cascade
-    h.kernel.spawnCell("desk", { id: "w", preset: "worker", processor: { kind: "code", entry: "test.idle" }, bounds: { maxDepth: 1 } });
+    h.kernel.spawnCell("desk", { id: "w", preset: "inline", processor: { kind: "code", entry: "test.idle" }, bounds: { maxDepth: 1 } });
     h.kernel.spawnCell("w", { id: "ww", preset: "worker", processor: { kind: "code", entry: "test.idle" }, bounds: { tools: new Set(["read", "bash"]) } });
     // the desk holds `inbox:*` (DEFAULT_ROOT_BOUNDS): internal messaging inside the tree is inherited; no channel unasked
     expect(h.kernel.getCell("w")!.bounds.canSendTo).toEqual(["inbox:*"]);
@@ -230,7 +230,7 @@ describe("updateCell", () => {
     expectNgError(
       () => h.kernel.updateCell("w", { bounds: { canSendTo: ["channel:ui:owner"] } }, { principalId: "cell:w" }),
       "bounds_violation",
-      /a cell may change its own title, meta, watches, schedules only, not bounds/,
+      /a cell may change its own title, meta, watches, schedules, cwd only, not bounds/,
     );
     expectNgError(() => h.kernel.updateCell("w", { processor: { kind: "code", entry: "test.idle" } }, { principalId: "cell:w" }), "bounds_violation", /not processor/);
     // ...and nothing of a cell that is not its descendant (a child may not touch its parent)
@@ -292,7 +292,7 @@ describe("closeCell", () => {
     );
     expect(r.type).toBe("defer");
     h.kernel.control("watch", { action: "pause" });
-    await h.memory.inject({ from: "carol", text: "queued while paused", threads: ["memory:t1"] });
+    await h.memory.inject({ from: "carol", text: "route to desk while paused", threads: ["memory:t1"] });
     const epochs = Object.fromEntries(["proj", "watch", "build"].map((id) => [id, h.kernel.getCell(id)!.epoch]));
 
     const res = await h.kernel.closeCell("proj", "cancelled");
@@ -327,7 +327,7 @@ describe("closeCell", () => {
     expect(subtreeRuns()).toBe(before);
     expect(h.kernel.inbox.listMessagesSync({ cellId: "watch", status: ["pending"] })).toEqual([]);
     expect(h.kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.userMessage }).map((m) => (m.envelope.payload as { text: string }).text)).toEqual([
-      "after close",
+      "route to desk while paused", "after close",
     ]);
   });
 
@@ -371,7 +371,7 @@ describe("closeCell", () => {
     expect(h.kernel.getCell("w")!.status).toBe("active");
     await h.kernel.closeCell("w", "completed");
     expect(results()).toEqual(["做完了", "第一轮完成", "Closed (completed) by owner; its turns were already reported."]);
-    expect(h.kernel.inbox.listMessagesSync({ cellId: "desk", envelopeId: "w:closed" })[0]!.envelope.payload).toMatchObject({
+    expect(h.kernel.inbox.listMessagesSync({ cellId: "desk", envelopeId: "w:0:closed" })[0]!.envelope.payload).toMatchObject({
       status: "completed",
       childState: "closed",
       data: { closedBy: "owner", synthetic: true },
@@ -385,7 +385,7 @@ describe("closeCell", () => {
     expect(h.kernel.getCell("p")!.status).toBe("active");
     await h.kernel.closeCell("p", "completed");
     expect(results().slice(3)).toEqual(["阶段一完成", "Closed (completed) by owner before it reported a result."]);
-    expect(h.kernel.inbox.listMessagesSync({ cellId: "desk", envelopeId: "p:closed" })).toHaveLength(1);
+    expect(h.kernel.inbox.listMessagesSync({ cellId: "desk", envelopeId: "p:0:closed" })).toHaveLength(1);
 
     // the parent closing its own child: no synthetic report
     h.kernel.spawnCell("desk", { id: "b", preset: "worker", processor: { kind: "code", entry: "test.idle" } });
@@ -395,7 +395,7 @@ describe("closeCell", () => {
     h.kernel.spawnCell("desk", { id: "c", preset: "worker", processor: { kind: "code", entry: "test.idle" } });
     await h.kernel.closeCell("c", "completed");
     expect(results()).toHaveLength(6);
-    expect(h.kernel.inbox.listMessagesSync({ cellId: "desk", envelopeId: "c:closed" })[0]!.envelope.payload).toMatchObject({ status: "completed", data: { synthetic: true } });
+    expect(h.kernel.inbox.listMessagesSync({ cellId: "desk", envelopeId: "c:0:closed" })[0]!.envelope.payload).toMatchObject({ status: "completed", data: { synthetic: true } });
 
     // closing twice is a no-op; a non-ancestor cell may not close
     expect(await h.kernel.closeCell("c")).toEqual({ closed: [] });

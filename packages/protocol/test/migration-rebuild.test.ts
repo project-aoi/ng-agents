@@ -42,7 +42,7 @@ describe("cells v1 → v2 (preset CHECK lifted by a table rebuild)", () => {
     old.close();
 
     const db = openDatabase(path);
-    expect(schemaVersions(db)["@ng/cell"]).toBe(2);
+    expect(schemaVersions(db)["@ng/cell"]).toBe(6);
     expect(all<{ id: string }>(db, "SELECT id FROM cells ORDER BY id").map((r) => r.id)).toEqual(["desk", "w1"]);
     expect(all(db, "PRAGMA foreign_key_check")).toEqual([]);
     expect(all<{ foreign_keys: number }>(db, "PRAGMA foreign_keys")[0]!.foreign_keys).toBe(1);

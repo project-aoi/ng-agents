@@ -60,6 +60,6 @@ describe("trust grows gradually (docs/03 原则 4)", () => {
     f.gate.upsertPolicyRuleSync({ ...input, id: rule.id, maxUses: 0 });
     expect(f.gate.trustCandidatesSync()).toHaveLength(1);
     expect(ruleInputForClass("cell.control|cancel", { createdBy: "owner" })).toBeNull();
-    expect(ruleInputForClass("job.start", { createdBy: "owner" })).toMatchObject({ match: { type: "job.start" }, maxUses: 20 });
+    expect(ruleInputForClass("job.start", { createdBy: "owner" })).toBeNull();
   });
 });

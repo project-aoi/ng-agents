@@ -31,6 +31,7 @@ import { startToolBridge, type BridgeCallResult, type ToolBridge } from "./bridg
 import { cliEnvironment } from "./env";
 import { spawnCli, type CliProcess } from "./process";
 import { launchChoice, type CliModelChoice } from "./models";
+import { rebuildFreshPrompt, renderEvidenceInbound, type AppendedInput } from "./input";
 import { forkNoteIndex, freshPrompt, tailText } from "./render";
 import type { CliAdapter, CliCapabilities, CliDriver, CliEvent, CliModels, CliSessionRecord, DriverIO, LaunchRequest } from "./types";
 
@@ -130,8 +131,12 @@ interface LegOutcome {
   turnOk: boolean;
   turnError: string | undefined;
   resumeFailed: string | undefined;
-  /** Steer texts that need an interrupt + resume (CLI without live input). */
-  relaunchWith: string[];
+  /** Whether a live steer triggered an intentional interrupt/kill in this leg (Codex). */
+  interruptedForSteer: boolean;
+  /** Envelope IDs already submitted as the initial prompt of this leg (avoid duplicating on same-session resume). */
+  promptItemIds: ReadonlySet<string>;
+  /** Unconfirmed steer/inbound items (in arrival order) that must be carried to the next leg or requeued. */
+  relaunchItems: AppendedInput[];
 }
 
 /**
@@ -166,16 +171,22 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
     }
   };
 
+  const activeCells = new Set<string>();
+  const readingParent = new Map<string,Promise<void>>();
   async function run(snapshot: PromptSnapshot, ports: RunPorts, signal: AbortSignal): Promise<RunOutcome> {
     if (signal.aborted) return "cancelled";
     const processor = snapshot.spec.processor;
     if (processor.kind !== "llm") throw new NgError("invalid_argument", `the ${engine} loop runs llm processors only`);
     try {
+      activeCells.add(snapshot.cellId);
+      const forkInProgress = readingParent.get(snapshot.cellId);
+      if (forkInProgress) await raceAbort(forkInProgress, signal);
+      if (signal.aborted) return "cancelled";
       return await runLlm(snapshot, ports, signal, processor);
     } catch (err) {
       if (signal.aborted) return "cancelled";
       throw err;
-    }
+    } finally { activeCells.delete(snapshot.cellId); }
   }
 
   async function runLlm(snapshot: PromptSnapshot, ports: RunPorts, signal: AbortSignal, processor: LlmProcessorSpec): Promise<RunOutcome> {
@@ -216,28 +227,50 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
     const maxSteps = processor.maxSteps;
 
     // ---------- input ----------
-    const steerNotes: string[] = [];
+    const initialBatchIds = new Set(snapshot.batch.envelopes.map((e) => e.id));
+    const tracked = new Map<string, AppendedInput>();
+    const steerSeqToEnvelopeId = new Map<number, string>();
+    const initialTail = tailText(snapshot);
+    const initialSteerItems: AppendedInput[] = [];
     for (const m of ports.drainSteer()) {
-      const text = steerNoteText(m);
-      await append({ kind: "system_note", text });
-      steerNotes.push(text);
+      const text = steerNoteText(m.message);
+      const item: AppendedInput = { envelopeId: m.envelopeId, kind: "steer", text, status: "queued" };
+      tracked.set(item.envelopeId, item);
+      initialSteerItems.push(item);
     }
-    const input = [tailText(snapshot), ...steerNotes].filter((t) => t.trim()).join("\n\n");
+    const input = [initialTail, ...initialSteerItems.map((i) => i.text)].filter((t) => t.trim()).join("\n\n");
     if (!input) return "completed";
 
     // ---------- session plan ----------
     const own = await ports.context.readState<CliSessionRecord>(cellId, CLI_SESSION_KEY);
     const sameModel = (r: CliSessionRecord) => (r.model ?? "") === (model ?? "");
     let plan: { session?: LaunchRequest["session"]; prompt: string; forkedFrom?: string };
+    let releaseParent: (()=>void) | undefined;
+    let forkDelivered: number | undefined;
     let forkBase: CliSessionRecord["reported"];
+    const priorCursor = own?.lastDeliveredEvidenceSeq ?? 0;
     if (own && own.engine === engine && own.cwd === access.root && own.systemHash === snapshot.system.hash && sameModel(own)) {
-      plan = { session: { id: own.sessionId, mode: "resume" }, prompt: input };
+      const missed = (ports.listEvidence?.({ afterSeq: priorCursor }) ?? []).filter(entry =>
+        entry.seq <= snapshot.historyUptoSeq && (entry.record.kind === "system_note" ||
+        (entry.record.kind === "inbound" && !initialBatchIds.has(entry.record.envelope.id))));
+      const seenEnvelopes = new Set<string>();
+      const catchup = missed.flatMap(({ record }) => {
+        if (record.kind === "system_note") return [record.text];
+        if (record.kind !== "inbound" || seenEnvelopes.has(record.envelope.id)) return [];
+        seenEnvelopes.add(record.envelope.id);
+        return [renderEvidenceInbound(record.envelope)];
+      });
+      plan = { session: { id: own.sessionId, mode: "resume" }, prompt: [...(catchup.length ? ["[Earlier events already handled while you were asleep — use as context]\n" + catchup.join("\n")] : []), input].join("\n\n") };
     } else {
       plan = { prompt: freshPrompt(snapshot.history, input) };
       const forkIdx = snapshot.mode === "fork_prefix" && adapter.canFork && !own ? forkNoteIndex(snapshot.history) : -1;
       if (forkIdx >= 0) {
         const parent = await ports.context.readState<CliSessionRecord>(cellId, CLI_FORK_SESSION_KEY);
-        if (parent && parent.engine === engine && sameModel(parent)) {
+        const point = snapshot.spec.fork;
+        if (parent && point && parent.engine === engine && sameModel(parent) && (engine !== "claude" || parent.cwd===access.root)
+            && !activeCells.has(point.fromCellId) && !readingParent.has(point.fromCellId) && parent.lastDeliveredEvidenceSeq !== undefined &&
+            ports.canForkSession(point.fromCellId,point.uptoSeq,parent.sessionId,parent.lastDeliveredEvidenceSeq)) {
+          forkDelivered = parent.lastDeliveredEvidenceSeq;
           forkBase = parent.reported;
           plan = { session: { id: parent.sessionId, mode: "fork" }, prompt: freshPrompt(snapshot.history.slice(forkIdx), input), forkedFrom: parent.sessionId };
           // The fork note is the first "earlier" message the child shows; the parent's part is in the forked session.
@@ -262,6 +295,10 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
     // from its own record; a fork starts from its parent's history, so from the parent's figure.
     const zeroUsage = { tokens: 0, cached: 0 };
     let reported = plan.session?.mode === "resume" ? (own?.reported ?? zeroUsage) : plan.session?.mode === "fork" ? (forkBase ?? zeroUsage) : zeroUsage;
+    let sessionBaselineSeq = plan.session?.mode === "resume" ? priorCursor : plan.session?.mode === "fork" ? (forkDelivered ?? snapshot.historyUptoSeq) : snapshot.historyUptoSeq;
+    let sessionProgress = false;
+    let awaitingSessionConfirmation = false;
+    let eventChain = Promise.resolve();
     let sessionModel: string | null = null;
     let sessionCreatedAt = own && plan.session?.mode === "resume" ? own.createdAt : clock.now();
     let endOutcome: EndOutcome | undefined;
@@ -271,22 +308,28 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
     let steps = 0;
     let callCounter = 0;
     let leg = 0;
-    const live: { proc: CliProcess | null; driver: CliDriver | null } = { proc: null, driver: null };
+    const live: { proc: CliProcess | null; driver: CliDriver | null; legTurns: number } = { proc: null, driver: null, legTurns: 0 };
     let endTimer: ReturnType<typeof setTimeout> | undefined;
     let persist: Promise<unknown> = Promise.resolve();
     const io: DriverIO = {
-      write: (line) => live.proc?.write(line),
+      write: (line) => live.proc?.write(line) ?? false,
       end: () => live.proc?.endInput(),
     };
 
+    const requeueUnconfirmed = (reason: string): void => {
+      const ids = [...tracked.values()].filter((x) => x.status !== "confirmed").map((x) => x.envelopeId);
+      if (ids.length > 0) ports.requeueEnvelopes?.(ids, reason);
+    };
+
     const persistSession = (final: boolean) => {
-      if (!sessionId) return;
+      if (!sessionId || (sessionId !== own?.sessionId && !sessionProgress)) return;
       const rec: CliSessionRecord = {
         engine,
         sessionId,
         model: model ?? null,
         cwd: access.root,
         systemHash: snapshot.system.hash,
+        lastDeliveredEvidenceSeq: sessionBaselineSeq,
         createdAt: sessionCreatedAt,
         updatedAt: clock.now(),
         runs: (own && own.sessionId === sessionId ? own.runs : 0) + (final ? 1 : 0),
@@ -328,10 +371,15 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
         if (endOutcome) interruptAndKill();
         return { text: RUN_ALREADY_ENDED, isError: true };
       }
+      sessionProgress = true;
       const tool = byName.get(name)!;
       const toolUseId = `mcp_${runId}_${++callCounter}`;
       await append({ kind: "tool_call", toolUseId, name, input: args });
-      countStep();
+      await countStep();
+      if (stopReason === "steps") {
+        await append({ kind:"tool_result", toolUseId, name, output:RUN_ALREADY_ENDED, isError:true });
+        return {text:RUN_ALREADY_ENDED, isError:true};
+      }
       let result: ToolResult;
       try {
         result = normalizeToolResult(
@@ -344,6 +392,10 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
       let text = ev.modelText ?? result.output;
       if (result.awaitsWakeup) awaitsWakeup = true;
       if (result.endRun) {
+        // The CLI demonstrably processed the active turn of this leg to invoke this tool: confirm items belonging to
+        // this active turn (including turn_end follow-ups), while leaving any mid-turn queued steers unconfirmed.
+        await eventChain;
+        await confirmTurn(leg, live.legTurns + 1);
         if (endOutcome === undefined || RUN_END_PRECEDENCE.indexOf(result.endRun) < RUN_END_PRECEDENCE.indexOf(endOutcome)) endOutcome = result.endRun;
         text = `${text}\n\n${RUN_ENDED_NOTICE}`;
         armEndGrace();
@@ -351,9 +403,42 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
       return { text, ...(result.isError ? { isError: true } : {}) };
     }
 
-    function countStep(): void {
+    async function confirmTurn(legNo: number, turn: number) {
+      if (stopReason === "cancelled" || stopReason === "timeout" || signal.aborted) return;
+      sessionProgress = true;
+      for (const item of tracked.values()) {
+        if (item.status !== "sent" || item.sentInLeg !== legNo || (item.confirmAtTurn ?? 1) !== turn) continue;
+        item.status = "confirmed";
+        if (item.kind === "steer") {
+          const ev = await append({kind:"system_note", text:item.text});
+          steerSeqToEnvelopeId.set(ev.seq, item.envelopeId);
+        }
+      }
+      awaitingSessionConfirmation = !sessionId;
+      confirmCursor();
+    }
+
+    function confirmCursor() {
+      if (sessionId && ports.confirmCliInput && ports.listEvidence) {
+        let through = sessionBaselineSeq;
+        for (const { seq, record } of ports.listEvidence({ afterSeq: through })) {
+          if (record.kind !== "inbound" && record.kind !== "system_note") continue;
+          if (seq > snapshot.historyUptoSeq) {
+            const id = record.kind === "inbound" ? record.envelope.id : steerSeqToEnvelopeId.get(seq);
+            if (!id || (!initialBatchIds.has(id) && tracked.get(id)?.status !== "confirmed")) break;
+          }
+          through = seq;
+        }
+        ports.confirmCliInput(sessionId, through);
+      }
+    }
+
+    async function countStep(): Promise<void> {
       steps++;
-      if (maxSteps !== undefined && steps > maxSteps && !endOutcome) stop("steps");
+      if (maxSteps !== undefined && steps > maxSteps && !endOutcome) {
+        await confirmTurn(leg, live.legTurns + 1);
+        stop("steps");
+      }
     }
 
     let bridge: ToolBridge | null = null;
@@ -368,9 +453,29 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
 
       let nextPrompt = plan.prompt;
       let nextSession = plan.session;
-      let fellBack = false;
+      let nextPromptItems: AppendedInput[] = initialSteerItems;
+      const failedSessions = new Set<string>();
+      let totalFreshRebuilds = 0;
+      const MAX_FRESH_REBUILDS = 2;
+      let relaunchesWithoutProgress = 0;
+      const MAX_RELAUNCHES_WITHOUT_PROGRESS = 4;
       for (;;) {
         leg++;
+        if (nextSession?.mode === "fork") {
+          const point=snapshot.spec.fork!;
+          if (activeCells.has(point.fromCellId) || readingParent.has(point.fromCellId) ||
+              !ports.canForkSession(point.fromCellId,point.uptoSeq,nextSession.id,forkDelivered!)) {
+            nextSession=undefined;
+            sessionBaselineSeq = snapshot.historyUptoSeq;
+            nextPrompt=freshPrompt(snapshot.history,input);
+            delete plan.forkedFrom;
+            reported=zeroUsage;
+          } else {
+            readingParent.set(point.fromCellId,new Promise<void>(resolve=>{
+              releaseParent=()=>{readingParent.delete(point.fromCellId);resolve();releaseParent=undefined;};
+            }));
+          }
+        }
         const req: LaunchRequest = {
           engine,
           bin,
@@ -386,51 +491,95 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
           tmpDir,
           extraArgs: opts.extraArgs ?? [],
         };
-        const out = await runLeg(req);
+        const out = await runLeg(req, nextPromptItems);
+        releaseParent?.();
         if (stopReason === "cancelled" || signal.aborted) return "cancelled";
-        if (stopReason === "budget") return "budget_stopped";
+        if (stopReason === "budget") {
+          requeueUnconfirmed("run stopped by budget before mid-run input was confirmed");
+          return "budget_stopped";
+        }
         if (stopReason === "timeout") throw new Error(`${engine} run exceeded ${runTimeoutMs} ms and was stopped`);
-        if (endOutcome) return finish(endOutcome);
+        if (endOutcome) {
+          requeueUnconfirmed("run ended by tool before mid-run input was confirmed");
+          return finish(endOutcome);
+        }
         if (stopReason === "steps") {
           // Same outcome as the API loop: work is left, so this is not "completed" (docs/05 guard 1).
           await append({ kind: "system_note", text: `[run stopped after ${maxSteps} tool calls (step limit); the kernel wakes you to continue]` });
+          requeueUnconfirmed("run hit step limit before mid-run input was confirmed");
           return "step_limit";
         }
-        if (refused) return "refused";
+        if (refused) {
+          requeueUnconfirmed("model refused before mid-run input was confirmed");
+          return "refused";
+        }
         const resumeTrouble =
-          req.session !== undefined && (out.resumeFailed !== undefined || (!out.sawSession && !out.turnOk && out.relaunchWith.length === 0));
-        if (resumeTrouble && !fellBack) {
-          fellBack = true;
+          req.session !== undefined &&
+          !failedSessions.has(req.session.id) &&
+          totalFreshRebuilds < MAX_FRESH_REBUILDS &&
+          (out.resumeFailed !== undefined || (!out.sawSession && !out.turnOk));
+        if (resumeTrouble) {
+          failedSessions.add(req.session!.id);
+          totalFreshRebuilds++;
           debug({ type: "notice", cellId, text: `${engine}: ${req.session!.mode} of session ${req.session!.id} failed (${out.resumeFailed ?? out.turnError ?? `exit ${out.code}`}); starting a fresh session primed with the history` });
           if (req.session!.mode === "resume") forgetSession();
           else persist = persist.then(() => ports.context.commit(cellId, { statePatches: { [CLI_FORK_SESSION_KEY]: null } })).catch(() => undefined);
           sessionId = null;
+          sessionProgress = false;
+          awaitingSessionConfirmation = false;
+          sessionBaselineSeq = snapshot.historyUptoSeq;
           reported = zeroUsage;
           sessionCreatedAt = clock.now();
           delete plan.forkedFrom;
           nextSession = undefined;
-          nextPrompt = freshPrompt(snapshot.history, [input, ...out.relaunchWith].join("\n\n"));
+          nextPromptItems = out.relaunchItems;
+          nextPrompt = rebuildFreshPrompt(snapshot, initialBatchIds, ports, tracked, steerSeqToEnvelopeId, out.relaunchItems);
           continue;
         }
-        if (out.relaunchWith.length > 0) {
-          if (sessionId) {
-            nextSession = { id: sessionId, mode: "resume" };
-            nextPrompt = out.relaunchWith.join("\n\n");
-          } else {
-            // No session to continue (the CLI never reported one): the input must still reach a model — a follow-up
-            // that was absorbed into this Run's claim would otherwise be marked done unseen. Start over with the history.
-            fellBack = true;
-            reported = zeroUsage;
-            nextSession = undefined;
-            nextPrompt = freshPrompt(snapshot.history, [input, ...out.relaunchWith].join("\n\n"));
+        const canRelaunch =
+          out.relaunchItems.length > 0 &&
+          out.turnError === undefined &&
+          (out.turnOk || out.interruptedForSteer);
+        if (canRelaunch) {
+          if (out.turnOk) relaunchesWithoutProgress = 0;
+          else relaunchesWithoutProgress++;
+          if (relaunchesWithoutProgress <= MAX_RELAUNCHES_WITHOUT_PROGRESS) {
+            if (sessionId) {
+              // On Codex interrupt+resume of the same session, items already sent in this leg's prompt are in the
+              // session history; send only the newly arrived items in the resume prompt while still confirming all
+              // tracked items on turn_end (or carrying them all into rebuildFreshPrompt if resume fails).
+              const promptTexts = out.interruptedForSteer
+                ? out.relaunchItems.filter((i) => !out.promptItemIds.has(i.envelopeId))
+                : out.relaunchItems;
+              if (promptTexts.length > 0) {
+                nextSession = { id: sessionId, mode: "resume" };
+                nextPromptItems = out.relaunchItems;
+                nextPrompt = promptTexts.map((i) => i.text).join("\n\n");
+                continue;
+              }
+            } else if (totalFreshRebuilds < MAX_FRESH_REBUILDS) {
+              totalFreshRebuilds++;
+              // No session to continue (the CLI never reported one): rebuild from SQLite evidence + unconfirmed inputs.
+              reported = zeroUsage;
+              nextSession = undefined;
+              nextPromptItems = out.relaunchItems;
+              nextPrompt = rebuildFreshPrompt(snapshot, initialBatchIds, ports, tracked, steerSeqToEnvelopeId, out.relaunchItems);
+              continue;
+            }
           }
-          continue;
+          // Exhausted retries: return unconfirmed envelopes to pending so the next Run picks them up.
+          requeueUnconfirmed("cli exhausted relaunch retries before mid-run input was confirmed");
+          if (out.turnOk) return finish("completed");
         }
-        if (out.turnOk && out.turnError === undefined) return finish("completed");
+        if (out.turnOk && out.turnError === undefined) {
+          requeueUnconfirmed("cli exited before mid-run input was confirmed");
+          return finish("completed");
+        }
         const detail = out.turnError ?? (out.code === 127 ? `could not start "${bin}"` : `exited with code ${out.code ?? out.signal}`);
         throw new Error(`${engine} CLI failed: ${detail}${out.stderr.trim() ? `\n${out.stderr.trim().slice(-1_500)}` : ""}`);
       }
     } finally {
+      releaseParent?.();
       signal.removeEventListener("abort", onAbort);
       clearTimeout(runTimer);
       if (endTimer) clearTimeout(endTimer);
@@ -445,53 +594,100 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
       return outcome === "completed" && awaitsWakeup ? "yielded_waiting" : outcome;
     }
 
-    async function runLeg(req: LaunchRequest): Promise<LegOutcome> {
+    async function runLeg(req: LaunchRequest, promptItems: readonly AppendedInput[]): Promise<LegOutcome> {
       const d = adapter.createDriver(req);
       live.driver = d;
+      live.legTurns = 0;
       debug({ type: "launch", engine, cellId, runId, argv: d.argv, cwd: req.cwd, ...(req.session ? { session: req.session } : {}), caps, permissions: adapter.describePermissions(caps) });
       const legNo = leg;
       const native = new Map<string, string>();
-      const state: LegOutcome = { code: null, signal: null, stderr: "", sawSession: false, turnOk: false, turnError: undefined, resumeFailed: undefined, relaunchWith: [] };
+      const promptItemIds = new Set(promptItems.map((i) => i.envelopeId));
+      const state: LegOutcome = {
+        code: null,
+        signal: null,
+        stderr: "",
+        sawSession: false,
+        turnOk: false,
+        turnError: undefined,
+        resumeFailed: undefined,
+        interruptedForSteer: false,
+        promptItemIds,
+        relaunchItems: [],
+      };
       let finished = false;
       let finishTimer: ReturnType<typeof setTimeout> | undefined;
-      let pendingSteer: string[] = [];
-      let chain: Promise<void> = Promise.resolve();
+      let pendingSteer: AppendedInput[] = [];
+      let legTurns = 0;
+      let turnActive = true;
+      let nextConfirmTurn = 1;
+      eventChain = Promise.resolve();
+
+      for (const item of promptItems) {
+        item.status = "sent";
+        item.sentInLeg = legNo;
+        item.confirmAtTurn = 1;
+      }
 
       const finishInput = () => {
-        if (finished) return;
-        finished = true;
-        d.finish(io);
+        if (!finished) {
+          finished = true;
+          d.finish(io);
+        } else if (legTurns < nextConfirmTurn) {
+          return;
+        }
+        if (finishTimer) return;
         // A CLI that keeps running after its input is done is stopped.
         finishTimer = setTimeout(() => killNow(), Math.max(killGraceMs, 5_000));
       };
 
       /**
-       * Hand extra input to the CLI. A CLI with live input takes it on stdin. One without (codex exec) needs a new
-       * process on the same session:
-       * - `interrupt` (a steer — the owner or a parent says the work is off course): the running turn is cut short
-       *   and the session resumed with the text;
-       * - `turn_end` (a follow-up absorbed after the turn finished by itself): the process is left to exit on its own
-       *   and the session is then resumed — nothing that is still compiling or testing is ever killed for it.
+       * Hand extra input to the CLI as a single joined turn. A CLI with live input takes it on stdin; however, even
+       * when `d.steer()` returns `true`, each item stays unconfirmed (`status = "sent"`, `confirmAtTurn`) until its
+       * target turn completes cleanly — catching closed-stdin races and queued multi-steer partial exits.
        */
-      const deliver = (texts: string[], mode: DeliverMode) => {
-        if (texts.length === 0 || finished || stopReason || endOutcome) return;
-        const delivered = texts.every((t) => d.steer(t, io));
-        if (delivered) return;
-        if (mode === "interrupt" && (!state.sawSession || !sessionId)) {
-          // Interrupt + resume needs the session to exist on the CLI's side first.
-          pendingSteer.push(...texts);
+      const deliver = (items: AppendedInput[], mode: DeliverMode) => {
+        if (items.length === 0 || finished || stopReason || endOutcome) return;
+        const joined = items.map((i) => i.text).join("\n\n");
+        if (d.steer(joined, io)) {
+          const targetTurn = Math.max(nextConfirmTurn, legTurns + (turnActive ? 1 : 0)) + 1;
+          nextConfirmTurn = targetTurn;
+          for (const item of items) {
+            item.status = "sent";
+            item.sentInLeg = legNo;
+            item.confirmAtTurn = targetTurn;
+          }
+          turnActive = true;
           return;
         }
-        state.relaunchWith.push(...texts);
+        if (mode === "interrupt" && (!state.sawSession || !sessionId)) {
+          // Interrupt + resume needs the session to exist on the CLI's side first.
+          pendingSteer.push(...items);
+          return;
+        }
         if (mode === "interrupt") {
+          state.interruptedForSteer = true;
           finished = true;
           killNow();
-        } else finishInput();
+        } else {
+          finishInput();
+        }
       };
       /** docs/05 §3.3: messages that reached the cell during this turn join the Run (the kernel port decides who absorbs). */
-      const absorbInbound = (): string[] => {
+      const absorbInbound = (): AppendedInput[] => {
         try {
-          return (ports.drainInbound?.() ?? []).map((a) => a.text);
+          const drained = ports.drainInbound?.() ?? [];
+          const items: AppendedInput[] = [];
+          for (const a of drained) {
+            const existing = tracked.get(a.envelope.id);
+            if (existing) {
+              if (existing.status !== "confirmed") items.push(existing);
+              continue;
+            }
+            const item: AppendedInput = { envelopeId: a.envelope.id, kind: "inbound", text: a.text, status: "queued" };
+            tracked.set(item.envelopeId, item);
+            items.push(item);
+          }
+          return items;
         } catch (err) {
           debug({ type: "notice", cellId, text: `absorbing follow-ups failed: ${err instanceof Error ? err.message : String(err)}` });
           return [];
@@ -499,21 +695,31 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
       };
 
       const handle = async (e: CliEvent): Promise<void> => {
+        if (finishTimer && nextConfirmTurn > legTurns && ["text", "tool_start", "tool_end", "usage"].includes(e.type)) {
+          clearTimeout(finishTimer);
+          finishTimer = undefined;
+        }
         switch (e.type) {
           case "session":
+            releaseParent?.();
             state.sawSession = true;
             if (e.model) sessionModel = e.model;
             if (sessionId !== e.sessionId) {
               sessionId = e.sessionId;
+              if (awaitingSessionConfirmation) {
+                confirmCursor();
+                awaitingSessionConfirmation = false;
+              }
               persistSession(false);
             }
             if (pendingSteer.length) {
-              const texts = pendingSteer;
+              const items = pendingSteer;
               pendingSteer = [];
-              deliver(texts, "interrupt");
+              deliver(items, "interrupt");
             }
             break;
           case "text":
+            sessionProgress = true;
             await append({ kind: "assistant_text", text: e.text, model: sessionModel ?? model ?? engine });
             break;
           case "tool_start": {
@@ -522,10 +728,11 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
               killNow();
               break;
             }
+            sessionProgress = true;
             const id = `cli_${runId}_${legNo}_${e.id}`;
             native.set(e.id, id);
             await append({ kind: "tool_call", toolUseId: id, name: e.name, input: e.input });
-            countStep();
+            await countStep();
             break;
           }
           case "tool_end": {
@@ -556,21 +763,29 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
             break;
           }
           case "turn_end":
-            if (e.ok) state.turnOk = true;
-            else if (e.refused) refused = true;
-            else if (!e.stopped) state.turnError = e.error ?? "turn failed";
+            legTurns++;
+            live.legTurns = legTurns;
+            if (e.ok && !e.stopped) {
+              state.turnOk = true;
+              await confirmTurn(legNo, legTurns);
+            } else if (e.stopped && e.ok && !e.refused && stopReason !== "cancelled" && stopReason !== "timeout") {
+              // A stopped turn confirms its original prompt, not a steer queued for a later turn.
+              await confirmTurn(legNo, legTurns);
+            } else if (e.refused) refused = true;
+            else if (!e.ok && !e.stopped) state.turnError = e.error ?? "turn failed";
+            turnActive = Boolean(e.more);
             if (e.more) break;
             if (!endOutcome && !stopReason && !refused) {
-              const texts: string[] = [];
+              const items: AppendedInput[] = [];
               if (pendingSteer.length && state.sawSession) {
-                texts.push(...pendingSteer);
+                items.push(...pendingSteer);
                 pendingSteer = [];
               }
               // The turn ended by itself: only now are follow-ups taken in. They are part of this Run's claim from
               // here on, so they must reach the model before the Run may end (live input, or a resume of the session).
-              if (e.ok) texts.push(...absorbInbound());
-              if (texts.length) {
-                deliver(texts, "turn_end");
+              if (e.ok && !e.stopped) items.push(...absorbInbound());
+              if (items.length) {
+                deliver(items, "turn_end");
                 if (!finished) break;
               }
             }
@@ -599,7 +814,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
             debug({ type: "notice", cellId, text: `${engine}: unparsable output (${err instanceof Error ? err.message : String(err)})` });
             return;
           }
-          for (const e of events) chain = chain.then(() => handle(e)).catch((err: unknown) => debug({ type: "notice", cellId, text: `event handling failed: ${err instanceof Error ? err.message : String(err)}` }));
+          for (const e of events) eventChain = eventChain.then(() => handle(e)).catch((err: unknown) => debug({ type: "notice", cellId, text: `event handling failed: ${err instanceof Error ? err.message : String(err)}` }));
         },
       });
       live.proc = p;
@@ -608,34 +823,54 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
 
       const poll = setInterval(() => {
         if (finished || stopReason || endOutcome) return;
-        let msgs: string[];
+        let msgs: ReturnType<RunPorts["drainSteer"]>;
         try {
           msgs = ports.drainSteer();
         } catch {
           return;
         }
         if (msgs.length === 0) return;
-        chain = chain.then(async () => {
-          const texts: string[] = [];
+        eventChain = eventChain.then(async () => {
+          const ended = Boolean(finished || stopReason || endOutcome);
+          const items: AppendedInput[] = [];
           for (const m of msgs) {
-            const text = steerNoteText(m);
-            await append({ kind: "system_note", text });
-            texts.push(text);
+            const existing = tracked.get(m.envelopeId);
+            if (existing) {
+              if (existing.status !== "confirmed") items.push(existing);
+              continue;
+            }
+            const text = steerNoteText(m.message);
+            const item: AppendedInput = { envelopeId: m.envelopeId, kind: "steer", text, status: "queued" };
+            tracked.set(item.envelopeId, item);
+            items.push(item);
           }
-          deliver(texts, "interrupt");
+          if (!ended) deliver(items, "interrupt");
         });
       }, pollMs);
 
       const exit = await p.exited;
       clearInterval(poll);
       if (finishTimer) clearTimeout(finishTimer);
-      await chain;
+      await eventChain;
       live.proc = null;
       live.driver = null;
       state.code = exit.code;
       state.signal = exit.signal;
       state.stderr = p.stderrTail();
-      if (pendingSteer.length && !endOutcome && !stopReason) state.relaunchWith.push(...pendingSteer);
+      // Any item written to this leg whose confirmation turn never completed goes back to queued in arrival order.
+      const unconfirmed: AppendedInput[] = [];
+      for (const item of tracked.values()) {
+        if (item.status === "confirmed") continue;
+        if (item.status === "sent" && item.sentInLeg === legNo) {
+          item.status = "queued";
+          delete item.sentInLeg;
+          delete item.confirmAtTurn;
+        }
+        unconfirmed.push(item);
+      }
+      if (!endOutcome && !stopReason && !refused) {
+        state.relaunchItems = unconfirmed;
+      }
       debug({ type: "exit", cellId, code: exit.code, signal: exit.signal, stderr: state.stderr });
       return state;
     }

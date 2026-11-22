@@ -2,7 +2,18 @@
 // The kernel and the app talk to `createChannelHub`; adapters are thin transports registered on it.
 
 export { createChannelHub } from "./hub";
-export type { ChannelHubImpl, ChannelHubOptions, EditReceipt, FlushReceipt, FlushResult, IngressSink, ResolveUnknownResult } from "./hub";
+export type {
+  ChannelHubImpl,
+  ChannelHubOptions,
+  EditReceipt,
+  FlushReceipt,
+  FlushResult,
+  IngressSink,
+  PrepareSendReceipt,
+  PrepareSendResult,
+  PreparedSendAttempt,
+  ResolveUnknownResult,
+} from "./hub";
 export { BaseChannel } from "./base";
 export type { BaseChannelOptions } from "./base";
 export * from "./types";

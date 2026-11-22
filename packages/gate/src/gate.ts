@@ -1,5 +1,7 @@
 import { randomBytes } from "node:crypto";
 import {
+  checkCardOptions,
+  projectCellIdOf,
   NgError,
   OWNER_PRINCIPAL,
   actionClassOf,
@@ -22,6 +24,7 @@ import {
   toBool,
   toJson,
   withTx,
+  type CardOption,
   type ApprovalFilter,
   type ApprovalOutcome,
   type ApprovalRecord,
@@ -52,6 +55,7 @@ import { attenuateBounds, meetBounds } from "./attenuate";
 import { approvalCardFor } from "./card";
 import {
   ACTION_TYPES,
+  isBudgetEscalation,
   actionShapeFeedback,
   boundsFeedback,
   effectiveSideEffect,
@@ -74,6 +78,7 @@ const CONTROL_ACTIONS: readonly ControlAction[] = ["cancel", "pause", "resume", 
 const TOKEN_PREFIX = "ngt_";
 
 export interface GateOptions {
+  onSuperseded?(old: ApprovalRecord, principalId: string): void;
   db: Db;
   bus: Bus;
   clock?: Clock;
@@ -98,6 +103,7 @@ export interface GateOptions {
    * alert, no denied action, no stopped Run. Default: always enforced.
    */
   budgetEnforced?: () => boolean;
+  setBudgetPaused?: (cellId:string, paused:boolean, actor:string) => void;
 }
 
 /** The Gate contract plus maintenance helpers that only the kernel/app use. */
@@ -109,6 +115,8 @@ export interface GateService extends Gate {
 }
 
 // ==================== rows ====================
+
+const approvalSelect = `SELECT action_id,cell_id,epoch,principal_id,subject_key,action_type,action,action_hash,card,artifact_id,bound_version,proposed_version,item_revision,disposition AS status,status_reason,snoozed_until,approver_id,human_edited,outcome,created_at,updated_at,resolved_at FROM human_items`;
 
 interface ApprovalRow {
   action_id: string;
@@ -123,6 +131,7 @@ interface ApprovalRow {
   artifact_id: string | null;
   bound_version: number | null;
   proposed_version: number | null;
+  item_revision: number;
   status: ApprovalStatus;
   status_reason: string | null;
   snoozed_until: number | null;
@@ -195,6 +204,8 @@ function toApproval(r: ApprovalRow): ApprovalRecord {
     card: fromJson<Deliverable>(r.card),
     artifactId: r.artifact_id,
     boundVersion: r.bound_version,
+    proposedVersion: r.proposed_version,
+    itemRevision: r.item_revision,
     status: r.status,
     statusReason: r.status_reason,
     snoozedUntil: r.snoozed_until,
@@ -343,7 +354,6 @@ export function createGate(opts: GateOptions): GateService {
     return {
       cellId: cell.id,
       bounds: cell.bounds,
-      openChildren: cells.children(cell.id, { status: ["active", "paused"] }).length,
       isStrictDescendant: (id) => isStrictDescendant(cell.id, id),
       secretConfigured: (ref) => secrets.has(ref),
     };
@@ -468,13 +478,14 @@ export function createGate(opts: GateOptions): GateService {
     return get<ApprovalRow>(db, "SELECT * FROM approvals WHERE action_id = ?", [actionId]);
   }
 
-  function pendingBySubject(subjectKey: string): ApprovalRow | undefined {
-    return get<ApprovalRow>(db, "SELECT * FROM approvals WHERE subject_key = ? AND status = 'pending'", [subjectKey]);
+  function pendingBySubject(subjectKey: string, cellId?: string): ApprovalRow | undefined {
+    return get<ApprovalRow>(db, `${approvalSelect} WHERE subject_key = ? AND disposition = 'pending' AND cell_id IS NOT NULL AND action_hash <> ''
+      ${cellId === undefined ? "" : "AND cell_id = ?"} ORDER BY created_at DESC, action_id DESC LIMIT 1`, cellId === undefined ? [subjectKey] : [subjectKey, cellId]);
   }
 
   function resolveRow(row: ApprovalRow, status: ApprovalStatus, reason: string | null): void {
     const now = clock.now();
-    run(db, "UPDATE approvals SET status = ?, status_reason = ?, resolved_at = ?, updated_at = ? WHERE action_id = ?", [
+    run(db, "UPDATE human_items SET disposition = ?, status_reason = ?, item_revision = item_revision + 1, resolved_at = ?, updated_at = ? WHERE action_id = ?", [
       status,
       reason === null ? null : redact(reason),
       now,
@@ -515,13 +526,46 @@ export function createGate(opts: GateOptions): GateService {
     return false;
   }
 
+  function budgetOptions(cell:CellRecord, options?:CardOption[], legacy=false):CardOption[] {
+    const usage=usageOf(cell);
+    const ledger=usage.limitedBy ? usageOf(cells.require(usage.limitedBy)) : usage;
+    const increment=(spent:number,limit:number) => Number.isFinite(limit) ? Math.max(1,Math.ceil(limit/2),Math.ceil(spent-limit+limit/4)) : 0;
+    const defaults={tokens:increment(ledger.subtreeTokens,ledger.limitTokens),cents:increment(ledger.subtreeCents,ledger.limitCents)};
+    const base:CardOption[]=options ?? [{id:"system.execute",label:"追加额度",effect:"execute"}];
+    return base.map(option=>{
+      if (option.effect!=="execute") return option;
+      const requested=option.payload?.raise as {tokens?:number;cents?:number}|undefined;
+      let tokens=requested === undefined ? defaults.tokens : requested?.tokens ?? 0;
+      let cents=requested === undefined ? defaults.cents : requested?.cents ?? 0;
+      if (!Number.isSafeInteger(tokens) || tokens<0 || !Number.isFinite(cents) || cents<0 || !(tokens+cents>0)) {
+        if (!legacy) throw new NgError("invalid_argument","a budget option must specify a positive allowance");
+        ({tokens,cents}=defaults);
+      }
+      const savedLedger=legacy ? option.payload?.ledgerCellId : undefined;
+      const frozenLedger=typeof savedLedger==="string" && chainOf(cell).some(c=>c.id===savedLedger) ? savedLedger : ledger.cellId;
+      const label=`为 ${cells.require(frozenLedger).title ?? frozenLedger} 追加 ${tokens} tokens、${cents} 美分并继续`;
+      return {...option,label,payload:{...option.payload,raise:{tokens,cents},ledgerCellId:frozenLedger}};
+    });
+  }
+
   function deferAction(action: ProposedAction, meta: AuthorizeMeta, cell: CellRecord, boundVersion: number | undefined): AuthorizeResult {
     const now = clock.now();
     const card = redact(approvalCardFor(action));
     const storedAction = redact(withoutCard(action));
     const actionHash = hashAction(action);
     const artifactId = action.artifactId ?? null;
+    const related = new Set(action.relatedProjectIds ?? []);
+    const issuerProject = cell.preset === "project" ? cell.id : projectCellIdOf(cell.spec);
+    if (issuerProject) related.add(issuerProject);
+    if (action.cardOptions) {
+      checkCardOptions(action.cardOptions, { callback: true, controlled: action.type !== "custom" || !!ownerOnlyApproval(action, ownerAddresses) });
+      for (const option of action.cardOptions) {
+        if (option.terminateMode === "cancel_task" && !related.has(option.targetCellIds![0]!)) throw new NgError("invalid_argument", "unrelated cancel target");
+      }
+    }
+    for (const id of action.relatedProjectIds ?? []) if (cells.get(id)?.preset !== "project") throw new NgError("invalid_argument","unknown related project");
     const existing = pendingBySubject(action.subjectKey);
+    if (existing && existing.cell_id !== cell.id) return {type:"deny", feedback:`Subject ${action.subjectKey} already has a pending card from ${existing.cell_id}`};
     let actionId: string;
 
     if (
@@ -537,18 +581,25 @@ export function createGate(opts: GateOptions): GateService {
         artifactId !== null && artifactId === existing.artifact_id ? (existing.proposed_version ?? boundVersion ?? null) : (boundVersion ?? null);
       run(
         db,
-        `UPDATE approvals SET principal_id = ?, action = ?, action_hash = ?, card = ?, artifact_id = ?, bound_version = ?,
-           proposed_version = ?, status_reason = NULL, updated_at = ? WHERE action_id = ?`,
+        `UPDATE human_items SET principal_id = ?, action = ?, action_hash = ?, card = ?, artifact_id = ?, bound_version = ?,
+           proposed_version = ?, item_revision = item_revision + 1, status_reason = NULL, updated_at = ? WHERE action_id = ?`,
         [meta.principalId, toJson(storedAction), actionHash, toJson(card), artifactId, boundVersion ?? null, proposed, now, actionId],
       );
     } else {
       actionId = newId("act", clock);
-      if (existing) resolveRow(existing, "superseded", `superseded by ${actionId}`);
+      if (existing) {
+        resolveRow(existing, "superseded", `superseded by ${actionId}`);
+        opts.onSuperseded?.(toApproval(existing), meta.principalId);
+      }
+      const predecessor = get<{ action_id: string }>(db, `SELECT h.action_id FROM human_items h
+        WHERE h.subject_key = ? AND h.status IN ('pending','snoozed','unknown')
+        AND NOT EXISTS (SELECT 1 FROM human_items next WHERE next.blocked_by = h.action_id AND next.status IN ('pending','snoozed','unknown'))
+        LIMIT 1`, [action.subjectKey]);
       run(
         db,
-        `INSERT INTO approvals (action_id, cell_id, epoch, principal_id, subject_key, action_type, action, action_hash, card,
-           artifact_id, bound_version, proposed_version, status, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+        `INSERT INTO human_items (action_id, cell_id, epoch, principal_id, subject_key, action_type, action, action_hash, card,
+           artifact_id, bound_version, proposed_version, disposition, created_at, updated_at, blocked_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
         [
           actionId,
           cell.id,
@@ -564,9 +615,12 @@ export function createGate(opts: GateOptions): GateService {
           boundVersion ?? null,
           now,
           now,
+          predecessor?.action_id ?? null,
         ],
       );
     }
+    run(db, "UPDATE human_items SET options=?,related_project_ids=? WHERE action_id=?",
+      [isBudgetEscalation(action) ? toJson(budgetOptions(cell,action.cardOptions)) : action.cardOptions ? toJson(action.cardOptions) : null, toJson([...related]), actionId]);
     emitApproval({ action_id: actionId, cell_id: cell.id, subject_key: action.subjectKey }, "pending");
     const result: AuthorizeResult = { type: "defer", actionId, approvalCard: card };
     if (boundVersion !== undefined) result.boundArtifactVersion = boundVersion;
@@ -639,6 +693,10 @@ export function createGate(opts: GateOptions): GateService {
         if (meta.epoch !== cell.epoch) {
           return deny(`stale epoch ${meta.epoch} (current ${cell.epoch}): this task was cancelled or restarted. Stop here.`);
         }
+        const kernelEscalation = action.type === "custom" && action.name === "kernel.escalation";
+        if ((action.subjectKey.startsWith("kernel:") || kernelEscalation) && meta.principalId !== "kernel:escalation") {
+          return deny("kernel escalation identities and subjects are reserved");
+        }
         const principal = parsePrincipal(meta.principalId, ownerPrincipal);
         if (principal.kind === "cell" && principal.cellId !== cell.id) {
           return deny(`principal ${meta.principalId} may not act for cell "${cell.id}"`);
@@ -663,7 +721,11 @@ export function createGate(opts: GateOptions): GateService {
           boundVersion = v;
         }
 
-        const baseline: "allow" | "defer" = effectiveSideEffect(action, cell.bounds, ownerAddresses) === "external" ? "defer" : "allow";
+        // Recovery requests and budget increases need an explicit decision, even with a broad standing rule.
+        if (isBudgetEscalation(action) || kernelEscalation) return deferAction(action, meta, cell, boundVersion);
+
+        const sideEffect = effectiveSideEffect(action, cell.bounds, ownerAddresses);
+        const baseline: "allow" | "defer" = sideEffect === "external" ? "defer" : "allow";
         const rule = pickRule(listRules(), action, chainIds);
         if (rule?.effect === "deny") return deny(`blocked by the owner's policy${rule.note ? `: ${rule.note}` : ""}`);
         const decision: "allow" | "defer" = rule ? (rule.effect === "defer" ? "defer" : "allow") : baseline;
@@ -671,7 +733,25 @@ export function createGate(opts: GateOptions): GateService {
         // A card spends nothing, and asking the owner is how an exhausted budget (or a join whose workers used it up)
         // still surfaces; the hard stop applies to everything that would act right away.
         if (decision === "defer") return deferAction(action, meta, cell, boundVersion);
-        if (exhausted) {
+        if (action.type === "channel.send" && !ownerAddresses.some(pattern => addressCovers(pattern, action.target))) {
+          // Never auto-allow a new send on a subject that still has an unverified unknown send waiting on the owner.
+          const unresolvedUnknown = get<{ action_id: string }>(
+            db,
+            "SELECT action_id FROM human_items WHERE subject_key = ? AND status IN ('pending','unknown','snoozed') AND (action_type <> 'channel.send' OR disposition <> 'pending' OR cell_id <> ? OR epoch <> ?) LIMIT 1",
+            [action.subjectKey,cell.id,cell.epoch],
+          );
+          if (unresolvedUnknown) {
+            return deny(
+              `an earlier send (${unresolvedUnknown.action_id}) for subject "${action.subjectKey}" has unresolved or unknown delivery status — wait for the owner to verify it before sending again`,
+            );
+          }
+        }
+        const pending = ownerOnlyApproval(action, ownerAddresses) !== null ? pendingBySubject(action.subjectKey) : undefined;
+        if (pending?.cell_id === cell.id && pending.epoch === cell.epoch && pending.action_type === action.type) {
+          // A newly enabled rule applies to future actions. Keep an already presented owner decision on its card.
+          return deferAction(action, meta, cell, boundVersion);
+        }
+        if (exhausted && !(action.type === "channel.send" && sideEffect === "notify_owner")) {
           return deny(`budget exhausted: ${describeLimit(exhausted, cell.id)}. Stop and report; the owner can raise the budget.`);
         }
 
@@ -687,11 +767,11 @@ export function createGate(opts: GateOptions): GateService {
       });
     },
 
-    async approve(actionId, approverId, seenArtifactVersion) {
-      return gate.approveSync(actionId, approverId, seenArtifactVersion);
+    async approve(actionId, approverId, seenArtifactVersion, approveOpts) {
+      return gate.approveSync(actionId, approverId, seenArtifactVersion, approveOpts);
     },
 
-    approveSync(actionId, approverId, seenArtifactVersion): ApproveResult {
+    approveSync(actionId, approverId, seenArtifactVersion, approveOpts = {}): ApproveResult {
       const decider = assertOwnerOrAgent(approverId, "approving a card");
       return withTx(db, (): ApproveResult => {
         const row = approvalRow(actionId);
@@ -701,10 +781,19 @@ export function createGate(opts: GateOptions): GateService {
           const ownerOnly = ownerOnlyApproval({ ...action, card: fromJson<Deliverable>(row.card) }, ownerAddresses);
           if (ownerOnly !== null) throw new NgError("bounds_violation", `approving this card needs the owner (${ownerOnly}); ${approverId} may not`);
         }
-        if (row.status === "approved" || row.status === "executed" || row.status === "failed" || row.status === "unknown") return "approved";
-        if (row.status !== "pending") return "already_cancelled";
+        const retryingFailedSend = row.status === "failed" && action.type === "channel.send";
+        if (row.status === "approved" || row.status === "executed" || row.status === "unknown" || (row.status === "failed" && !retryingFailedSend)) {
+          if (approveOpts.seenItemRevision !== undefined && approveOpts.seenItemRevision !== row.item_revision) {
+            return "revision_mismatch";
+          }
+          return "approved";
+        }
+        if (row.status !== "pending" && !retryingFailedSend) return "already_cancelled";
+        if (approveOpts.seenItemRevision !== undefined && approveOpts.seenItemRevision !== row.item_revision) {
+          return "revision_mismatch";
+        }
         const cancel = (reason: string): ApproveResult => {
-          resolveRow(row, "cancelled", reason);
+          if (row.status === "pending" || retryingFailedSend) resolveRow(row, "cancelled", reason);
           return "already_cancelled";
         };
 
@@ -717,14 +806,18 @@ export function createGate(opts: GateOptions): GateService {
         if (outOfBounds) return cancel(`no longer within the task's permissions: ${outOfBounds}`);
 
         let bound = row.bound_version;
-        let humanEdited = false;
+        let humanEdited = toBool(row.human_edited);
         if (row.artifact_id !== null) {
           const current = artifacts.currentVersion(row.artifact_id);
           if (current === undefined) return cancel("draft no longer exists");
           if (seenArtifactVersion !== current) {
             if (row.bound_version !== current) {
-              run(db, "UPDATE approvals SET bound_version = ?, updated_at = ? WHERE action_id = ?", [current, clock.now(), row.action_id]);
-              emitApproval(row, "pending");
+              run(db, "UPDATE human_items SET bound_version = ?, item_revision = item_revision + 1, updated_at = ? WHERE action_id = ?", [
+                current,
+                clock.now(),
+                row.action_id,
+              ]);
+              emitApproval(row, row.status);
             }
             return "version_mismatch";
           }
@@ -735,12 +828,12 @@ export function createGate(opts: GateOptions): GateService {
         const now = clock.now();
         run(
           db,
-          `UPDATE approvals SET status = 'approved', status_reason = NULL, approver_id = ?, bound_version = ?, human_edited = ?,
-             resolved_at = ?, updated_at = ? WHERE action_id = ?`,
+          `UPDATE human_items SET disposition = 'approved', status_reason = NULL, approver_id = ?, bound_version = ?, human_edited = ?,
+             item_revision = item_revision + 1, resolved_at = COALESCE(resolved_at, ?), updated_at = ? WHERE action_id = ?`,
           [approverId, bound, humanEdited ? 1 : 0, now, now, row.action_id],
         );
-        // Trust statistics describe the owner's own judgement (what the weekly review offers to auto-allow).
-        if (decider === "owner") bumpStat(actionClassOf(action), { approved: true, edited: humanEdited });
+        // Trust statistics describe the owner's own judgement (only counted on the initial pending -> approved transition).
+        if (decider === "owner" && row.status === "pending" && action.type !== "custom") bumpStat(actionClassOf(action), { approved: true, edited: humanEdited });
         emitApproval(row, "approved");
         return "approved";
       });
@@ -768,7 +861,7 @@ export function createGate(opts: GateOptions): GateService {
           now,
           ...ids,
         ]);
-        const pending = all<ApprovalRow>(db, `SELECT * FROM approvals WHERE status = 'pending' AND cell_id IN (${inList})`, ids);
+        const pending = all<ApprovalRow>(db, `${approvalSelect} WHERE (disposition='pending' OR (disposition='failed' AND action_type='channel.send')) AND cell_id IN (${inList})`, ids);
         for (const row of pending) resolveRow(row, "cancelled", "authority revoked");
       });
     },
@@ -878,56 +971,102 @@ export function createGate(opts: GateOptions): GateService {
     },
 
     getApprovalSync(actionId) {
-      const row = approvalRow(actionId);
+      const row = get<ApprovalRow>(db, `${approvalSelect} WHERE action_id=? AND cell_id IS NOT NULL AND action_hash<>''`, [actionId]);
       return row ? toApproval(row) : undefined;
     },
 
-    findPendingBySubjectSync(subjectKey) {
-      const row = pendingBySubject(subjectKey);
+    findPendingBySubjectSync(subjectKey, cellId) {
+      const row = pendingBySubject(subjectKey, cellId);
       return row ? toApproval(row) : undefined;
     },
 
-    snoozeSync(actionId, until) {
+    snoozeSync(actionId, until, snoozeOpts = {}) {
       if (typeof until !== "number" || !Number.isFinite(until)) throw new NgError("invalid_argument", "snooze: until must be a timestamp");
       return withTx(db, () => {
         const row = approvalRow(actionId);
         if (!row || row.status !== "pending") return "not_pending";
-        run(db, "UPDATE approvals SET snoozed_until = ?, updated_at = ? WHERE action_id = ?", [until, clock.now(), actionId]);
+        if (snoozeOpts.seenItemRevision !== undefined && snoozeOpts.seenItemRevision !== row.item_revision) return "revision_mismatch";
+        run(db, "UPDATE human_items SET snoozed_until = ?, item_revision = item_revision + 1, updated_at = ? WHERE action_id = ?", [
+          until,
+          clock.now(),
+          actionId,
+        ]);
         emitApproval(row, "pending");
         return "snoozed";
       });
     },
 
-    denySync(actionId, approverId, reason) {
+    denySync(actionId, approverId, reason, denyOpts = {}) {
       // Declining is never an escalation of privilege: an agent may deny even an owner-only card.
       const decider = assertOwnerOrAgent(approverId, "denying a card");
       return withTx(db, () => {
         const row = approvalRow(actionId);
         if (!row || row.status !== "pending") return "not_pending";
+        if (denyOpts.seenItemRevision !== undefined && denyOpts.seenItemRevision !== row.item_revision) return "revision_mismatch";
         const now = clock.now();
         run(
           db,
-          "UPDATE approvals SET status = 'denied', status_reason = ?, approver_id = ?, resolved_at = ?, updated_at = ? WHERE action_id = ?",
+          "UPDATE human_items SET disposition = 'denied', status_reason = ?, approver_id = ?, item_revision = item_revision + 1, resolved_at = ?, updated_at = ? WHERE action_id = ?",
           [reason === undefined ? null : redact(reason), approverId, now, now, actionId],
         );
-        if (decider === "owner") bumpStat(actionClassOf(fromJson<ProposedAction>(row.action)), { approved: false });
+        if (decider === "owner" && row.action_type !== "custom") bumpStat(actionClassOf(fromJson<ProposedAction>(row.action)), { approved: false });
         emitApproval(row, "denied");
         return "denied";
       });
     },
 
-    withdrawSync(actionId, reason) {
+    reviseSync(actionId, approverId, reviseOpts = {}) {
+      assertOwnerOrAgent(approverId, "revising a card");
       return withTx(db, () => {
         const row = approvalRow(actionId);
         if (!row || row.status !== "pending") return "not_pending";
+        if (reviseOpts.seenItemRevision !== undefined && reviseOpts.seenItemRevision !== row.item_revision) return "revision_mismatch";
+        if (reviseOpts.seenArtifactVersion !== undefined && row.artifact_id !== null) {
+          const current = artifacts.currentVersion(row.artifact_id);
+          if (current !== undefined && reviseOpts.seenArtifactVersion !== current) {
+            if (row.bound_version !== current) {
+              run(db, "UPDATE human_items SET bound_version = ?, item_revision = item_revision + 1, updated_at = ? WHERE action_id = ?", [
+                current,
+                clock.now(),
+                row.action_id,
+              ]);
+              emitApproval(row, "pending");
+            }
+            return "version_mismatch";
+          }
+        }
+        run(db, "UPDATE human_items SET item_revision = item_revision + 1, updated_at = ? WHERE action_id = ?", [clock.now(), actionId]);
+        emitApproval(row, "pending");
+        return "revised";
+      });
+    },
+
+    withdrawSync(actionId, reason, withdrawOpts = {}) {
+      return withTx(db, () => {
+        const row = get<ApprovalRow>(db, `${approvalSelect} WHERE action_id=? AND cell_id IS NOT NULL AND action_hash<>''`, [actionId]);
+        if (!row || row.status !== "pending") return "not_pending";
+        if (withdrawOpts.seenItemRevision !== undefined && withdrawOpts.seenItemRevision !== row.item_revision) return "revision_mismatch";
         resolveRow(row, "cancelled", reason);
         return "cancelled";
       });
     },
 
+    setSendAbandonedSync(actionId, activityId, abandoned, seenItemRevision) {
+      return withTx(db, () => {
+        const row = get<ApprovalRow>(db, `${approvalSelect} WHERE action_id=?`, [actionId]);
+        if (!row || row.action_type !== "channel.send" || row.item_revision !== seenItemRevision) return false;
+        const reason = `abandoned:${activityId}`;
+        if (abandoned ? row.status !== "failed" : row.status !== "cancelled" || row.status_reason !== reason) return false;
+        if (!abandoned && get(db,`SELECT 1 FROM human_items WHERE subject_key=? AND blocked_by IS NULL
+          AND status IN ('pending','snoozed','unknown')`,[row.subject_key])) return false;
+        resolveRow(row, abandoned ? "cancelled" : "failed", abandoned ? reason : null);
+        return true;
+      });
+    },
+
     cancelForCellSync(cellId, reason) {
       return withTx(db, () => {
-        const rows = all<ApprovalRow>(db, "SELECT * FROM approvals WHERE status = 'pending' AND cell_id = ?", [cellId]);
+        const rows = all<ApprovalRow>(db, `${approvalSelect} WHERE (disposition='pending' OR (disposition='failed' AND action_type='channel.send')) AND cell_id = ?`, [cellId]);
         for (const row of rows) resolveRow(row, "cancelled", reason);
         return rows.length;
       });
@@ -948,14 +1087,51 @@ export function createGate(opts: GateOptions): GateService {
           throw new NgError("conflict", `approval "${actionId}" is ${row.status}, not approved`);
         }
         const now = clock.now();
-        run(db, "UPDATE approvals SET status = ?, outcome = ?, resolved_at = COALESCE(resolved_at, ?), updated_at = ? WHERE action_id = ?", [
-          status,
-          toJson(redact(outcome ?? {})),
-          now,
-          now,
-          actionId,
-        ]);
+        run(
+          db,
+          "UPDATE human_items SET disposition = ?, outcome = ?, item_revision = item_revision + 1, resolved_at = COALESCE(resolved_at, ?), updated_at = ? WHERE action_id = ?",
+          [status, toJson(redact(outcome ?? {})), now, now, actionId],
+        );
         emitApproval(row, status);
+      });
+    },
+
+    recordStandingSendSync(actionId, action, meta) {
+      return withTx(db, () => {
+        const prior = get<ApprovalRow>(db,`${approvalSelect} WHERE action_id=?`,[actionId]);
+        if (prior && prior.cell_id === meta.cellId && prior.epoch === meta.epoch && prior.action_hash === hashAction(action)) return toApproval(prior);
+        if (prior || get(db, `SELECT 1 FROM human_items WHERE subject_key=? AND status IN ('pending','unknown','snoozed')`,[action.subjectKey]))
+          throw new NgError("conflict", "这个主题已有待处理的发送记录");
+        const now = clock.now();
+        const card = redact(approvalCardFor(action));
+        const storedAction = redact(withoutCard(action));
+        const actionHash = hashAction(action);
+        const artifactId = action.artifactId ?? null;
+        run(
+          db,
+          `INSERT INTO human_items (action_id, cell_id, epoch, principal_id, subject_key, action_type, action, action_hash, card,
+             artifact_id, bound_version, proposed_version, item_revision, disposition, approver_id, outcome, created_at, updated_at, resolved_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'approved', 'policy:standing_rule', NULL, ?, ?, ?)`,
+          [
+            actionId,
+            meta.cellId,
+            meta.epoch,
+            meta.principalId,
+            action.subjectKey,
+            action.type,
+            toJson(storedAction),
+            actionHash,
+            toJson(card),
+            artifactId,
+            meta.artifactVersion ?? null,
+            meta.artifactVersion ?? null,
+            now,
+            now,
+            now,
+          ],
+        );
+        emitApproval({ action_id: actionId, cell_id: meta.cellId, subject_key: action.subjectKey }, "approved");
+        return toApproval(approvalRow(actionId)!);
       });
     },
 
@@ -968,7 +1144,11 @@ export function createGate(opts: GateOptions): GateService {
         if (current === undefined || !Number.isInteger(version) || version < 1 || version > current) {
           throw new NgError("invalid_argument", `draft "${row.artifact_id}" has no version ${String(version)}`);
         }
-        run(db, "UPDATE approvals SET bound_version = ?, updated_at = ? WHERE action_id = ?", [version, clock.now(), actionId]);
+        run(db, "UPDATE human_items SET bound_version = ?, item_revision = item_revision + 1, updated_at = ? WHERE action_id = ?", [
+          version,
+          clock.now(),
+          actionId,
+        ]);
         emitApproval(row, "pending");
         return "rebound";
       });
@@ -1024,6 +1204,7 @@ export function createGate(opts: GateOptions): GateService {
       return withTx(db, (): TokenCheck => {
         const r = inspectToken(token);
         if ("fail" in r) return { ok: false, reason: r.fail };
+        if (!action || !ACTION_TYPES.includes(action.type)) return {ok:false, reason:"mismatch"};
         let hash: string;
         try {
           hash = hashAction(action);
@@ -1061,6 +1242,9 @@ export function createGate(opts: GateOptions): GateService {
       if (!CONTROL_ACTIONS.includes(action)) return { ok: false, reason: `unknown control action ${JSON.stringify(action)}` };
       const target = cells.get(cellId);
       if (!target) return { ok: false, reason: `unknown cell "${cellId}"` };
+      if (target.parentId === null && (action === "pause" || action === "cancel")) {
+        return { ok: false, reason: "cannot pause or cancel a root cell" };
+      }
       if (!isNonEmptyString(principalId)) return { ok: false, reason: "principal required" };
       const p = parsePrincipal(principalId, ownerPrincipal);
       // An external main agent orchestrates like the owner (docs/05 §5.3); it is only kept from owner-only decisions.
@@ -1080,6 +1264,32 @@ export function createGate(opts: GateOptions): GateService {
       return usageOf(cells.require(cellId), view);
     },
 
+    declineBudgetSync(cellId, approverId) {
+      assertOwnerOrAgent(approverId, "declining a budget");
+      withTx(db, () => {
+        const cell = cells.require(cellId);
+        ensureLedger([cell.id]);
+        run(db,"UPDATE ledger SET declined_at=? WHERE cell_id=?",[clock.now(),cell.id]);
+        if (cell.parentId !== null && cell.status === "active") opts.setBudgetPaused?.(cell.id,true,approverId);
+      });
+    },
+
+    clearBudgetDeclinesSync(approverId, cellId) {
+      assertOwner(approverId, "restoring a declined budget");
+      return withTx(db, () => {
+        const rows = all<{cell_id:string}>(db,
+          "UPDATE ledger SET declined_at=NULL, stopped_at=NULL WHERE declined_at IS NOT NULL" + (cellId ? " AND cell_id=?" : "") + " RETURNING cell_id", cellId ? [cellId] : []);
+        for (const {cell_id} of rows) {
+          if (cells.require(cell_id).pauseReason === "budget_declined") opts.setBudgetPaused?.(cell_id,false,approverId);
+        }
+        return rows.map(row => row.cell_id);
+      });
+    },
+
+    budgetDeclinedSync(cellId) {
+      return get(db, "SELECT 1 FROM ledger WHERE cell_id = ? AND declined_at IS NOT NULL", [cellId]) !== undefined;
+    },
+
     raiseBudgetSync(cellId, add, approverId) {
       assertOwner(approverId, "raising a budget");
       const tokens = add?.tokens ?? 0;
@@ -1092,12 +1302,13 @@ export function createGate(opts: GateOptions): GateService {
         const now = clock.now();
         ensureLedger([cell.id]);
         const t = Math.floor(tokens);
-        run(db, "UPDATE ledger SET raised_tokens = raised_tokens + ?, raised_cents = raised_cents + ?, updated_at = ? WHERE cell_id = ?", [
+        run(db, "UPDATE ledger SET declined_at = NULL, raised_tokens = raised_tokens + ?, raised_cents = raised_cents + ?, updated_at = ? WHERE cell_id = ?", [
           t,
           cents,
           now,
           cell.id,
         ]);
+        if (cell.pauseReason === "budget_declined" && (t > 0 || cents > 0)) opts.setBudgetPaused?.(cell.id,false,approverId);
         run(db, "INSERT INTO budget_raises (cell_id, tokens, cents, approver_id, at) VALUES (?, ?, ?, ?, ?)", [cell.id, t, cents, approverId, now]);
         const own = ownLedger(cell);
         // Re-arm the alerts so crossing the new limit is announced again.
@@ -1197,7 +1408,7 @@ export function createGate(opts: GateOptions): GateService {
           if (r.match.type !== "*" && r.match.type !== cls.type) return false;
           if (r.match.target === undefined) return true;
           // cell.control classes are keyed by control verb while rule targets match cell ids: only a target-less rule covers them.
-          return cls.target !== null && cls.type !== "cell.control" && addressCovers(r.match.target, cls.target);
+          return cls.target !== null && addressCovers(r.match.target, cls.target);
         });
         return !covered;
       });
@@ -1220,5 +1431,17 @@ export function createGate(opts: GateOptions): GateService {
     },
   };
 
+  // Old cards had no frozen amount. Materialize it once before the first client can see or approve them.
+  withTx(db, () => {
+    const rows=all<{action_id:string;action:string;card:string;cell_id:string;options:string|null}>(db,
+      "SELECT action_id,action,card,cell_id,options FROM human_items WHERE disposition='pending' AND action_type='custom' AND action_hash<>''");
+    for (const row of rows) {
+      const action=fromJson<ProposedAction>(row.action);
+      if (!isBudgetEscalation({...action, card:fromJson<Deliverable>(row.card)})) continue;
+      const options=budgetOptions(cells.require(row.cell_id),row.options ? fromJson<CardOption[]>(row.options) : undefined,true);
+      const json=toJson(options);
+      if (json!==row.options) run(db,"UPDATE human_items SET options=?,item_revision=item_revision+1 WHERE action_id=?",[json,row.action_id]);
+    }
+  });
   return gate;
 }

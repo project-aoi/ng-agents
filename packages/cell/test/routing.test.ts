@@ -22,6 +22,22 @@ describe("ingress routing", () => {
     await h.kernel.idle();
   });
 
+  it("a paused subscription leaves both thread and filter traffic with the desk until resumed", async () => {
+    const h = await boot({start:false});
+    h.kernel.spawnCell("desk", {id:"watch",preset:"hub",watches:[
+      {threadOrFilter:{thread:"memory:news"}},{threadOrFilter:{"payload.topic":"build"}},
+    ]});
+    const route = (id: string, byThread: boolean) => h.kernel.ingest({id, from:"channel:memory:test", principalId:"memory:test",
+      type:PAYLOAD.userMessage, kind:"event", threads:byThread?["memory:news"]:[], payload:{text:"ping",topic:byThread?"news":"build"}, createdAt:h.clock.now()}, "memory");
+    h.kernel.control("watch",{action:"pause"});
+    expect(await route("paused-thread",true)).toMatchObject({cellIds:["desk"]});
+    expect(await route("paused-filter",false)).toMatchObject({cellIds:["desk"]});
+    expect(h.kernel.inbox.listMessagesSync({cellId:"watch"})).toEqual([]);
+    h.kernel.control("watch",{action:"resume"});
+    expect(await route("active-thread",true)).toMatchObject({cellIds:["watch"]});
+    expect(await route("active-filter",false)).toMatchObject({cellIds:["watch"]});
+  });
+
   it("ingress needs a desk when nobody watches it (so an HTTP adapter answers non-2xx and the sender retries)", async () => {
     const h = await boot({ desk: false });
     await expect(h.memory.inject({ from: "x", text: "hi" })).rejects.toThrow(/no desk/);

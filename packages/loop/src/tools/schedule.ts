@@ -9,7 +9,7 @@ const setReminder = defineTool({
   kind: "kernel",
   description: [
     "Wake yourself later with a timer.fired message carrying this label: once (at, or inSeconds) or on a cron schedule.",
-    "Use it for the owner's reminders and for your own follow-ups/timeouts; give related timers a cancelGroup so cancel_scheduled can clear them together (e.g. when the awaited reply arrives).",
+    "Use this for the cell's own follow-ups and timeouts. Use remind_me for the owner's personal reminders; give related timers a cancelGroup so cancel_scheduled can clear them together (e.g. when the awaited reply arrives).",
   ].join(" "),
   input: z.object({
     label: z.string().min(1).describe("what it is about; you will see it when it fires"),
@@ -44,7 +44,7 @@ const setReminder = defineTool({
     };
     const r = await ctx.ports.scheduleSelf({ type: PAYLOAD.timerFired, payload, ...(args.id ? { id: args.id } : {}) }, rule);
     const when = rule.deliverAt !== undefined ? `for ${new Date(rule.deliverAt).toISOString()}` : `on cron "${rule.cron}"${rule.tz ? ` (${rule.tz})` : ""}`;
-    return { output: r === "deduped" ? `Already set (id ${args.id}).` : `Reminder set ${when}.`, data: { deliverAt: rule.deliverAt, cron: rule.cron } };
+    return { awaitsWakeup: true, output: r === "deduped" ? `Already set (id ${args.id}).` : `Reminder set ${when}.`, data: { deliverAt: rule.deliverAt, cron: rule.cron } };
   },
 });
 

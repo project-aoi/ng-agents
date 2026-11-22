@@ -67,7 +67,7 @@ function toRecord(r: KnowledgeRow): KnowledgeRecord {
   };
 }
 
-const KINDS: readonly KnowledgeKind[] = ["skill", "note", "preference"];
+const KINDS: readonly KnowledgeKind[] = ["skill", "working_note", "reference", "preference"];
 const SCOPES: readonly KnowledgeScope[] = ["global", "cell"];
 
 /** `~` / `~/x` → under the owner's home, then resolved: the expansion the kernel applies to `spec.cwd`. null if relative. */

@@ -28,7 +28,7 @@ describe("the project and its resting workers", () => {
       },
       (req) => {
         expect(requestText(req)).toContain("退避已实现，最大重试 5 次");
-        return tool("save_note", { kind: "note", scope: "cell", name: "board", description: "项目白板", body: `- ${worker}（待命）：退避已实现，最大 5 次，提交 9f2c1` });
+        return tool("save_note", { kind: "working_note", scope: "cell", name: "board", description: "项目白板", body: `- ${worker}（待命）：退避已实现，最大 5 次，提交 9f2c1` });
       },
       {},
     );
@@ -56,7 +56,7 @@ describe("the project and its resting workers", () => {
         return {
           toolCalls: [
             { name: "update_project", input: { summary: "退避重试已实现；主人把最大重试改成了 3 次" } },
-            { name: "save_note", input: { kind: "note", scope: "cell", name: "board", description: "项目白板", body: `- ${worker}（待命，记录已看完）：退避已实现；主人直接让它把最大重试从 5 改成 3（提交 7aa01）` } },
+            { name: "save_note", input: { kind: "working_note", scope: "cell", name: "board", description: "项目白板", body: `- ${worker}（待命，记录已看完）：退避已实现；主人直接让它把最大重试从 5 改成 3（提交 7aa01）` } },
           ],
         };
       },
@@ -167,7 +167,7 @@ describe("the project and its resting workers", () => {
         ],
       },
       (req) => {
-        const ids = [...lastToolResult(req).matchAll(/Started (?:worker|watcher) (\S+)/g)].map((m) => m[1]!);
+        const ids = [...lastToolResult(req).matchAll(/Started (?:worker|checker) (\S+)/g)].map((m) => m[1]!);
         worker = ids[0]!;
         watcher = ids[1]!;
         return {};

@@ -14,7 +14,7 @@
    - **理想体验**：分身**绝对不碰这批改动**（不 `stash`、不 `checkout -f`、不 `reset`），立即把现场发给 `desk`（无人认领的改动明显不属于本项目）并 `wait` 结束本轮；`desk` 核查全局记录确认不是任何分身留下的，向主人弹出一张清晰的阻塞选择卡（*等你提交完再继续 / 你自己 stash 后继续 / 让分身另开独立 worktree 做*），按主人拍板答复该分身。主人也可以直接在 `Agents` 视图里对这个分身说「另开 worktree 做」——这句话本身就是答复。
 3. **用例 5C（多项目同时被同一公共 CI / 共享依赖挂死——共因单点修复与批量唤醒）**：
    - 项目 1（做新特性）和项目 2（修历史 Bug）各自的 `worker` 在跑门禁时，同时撞上主干 `develop` 公共 lint 检查坏了。
-   - **理想体验**：两个分身不各自乱改公共配置互踩，而是双双上报 `desk` 并等待；`desk` 识别出是同一个公共阻塞因，在 `desk:arbitration` 台账记下两个等待者，**只派 1 个公共修复 `worker`**（若原目录停在特性分支，指示其在独立临时 worktree 基于远端主干修复）；修复者本轮结束的通知到达后，`desk` 必要时用 `inspect_cell` 核实，再逐一发信唤醒两个等待中的分身执行 `rebase develop` 继续完活。
+   - **理想体验**：两个分身不各自乱改公共配置互踩，而是双双上报 `desk` 并等待；`desk` 识别出是同一个公共阻塞因，按共同原因及各自等待标识关联两个项目，**只派 1 个公共修复 `worker`**（若原目录停在特性分支，指示其在独立临时 worktree 基于远端主干修复）；修复者本轮结束的通知到达后，`desk` 必要时用 `inspect_cell` 核实，再逐一发信唤醒两个等待中的分身执行 `rebase develop` 继续完活。
 
 ---
 
@@ -28,7 +28,7 @@ sequenceDiagram
     participant W2 as "项目 B Worker"
     participant Desk as "desk Cell (跨项目仲裁)"
     participant Fixer as "唯一公共修复 Worker"
-    participant Owner as "主人 (Clarify 阻塞卡 / Agents 直连)"
+    participant Owner as "主人 (待我处理的阻塞卡 / Agents 直连)"
 
     K-->>P: "唤醒尾部 [active workspaces]: trae-x 工作树里 W2 (项目 B) 正在改代码"
     P->>W1: "dispatch: 只做查阅 / 或先 git worktree add 独立工作树再改"
@@ -50,7 +50,7 @@ sequenceDiagram
     else 分支 3：多项目共因公共 CI 阻塞
         W1->>Desk: "上报公共 CI 故障 + wait(inbox:desk)"
         W2->>Desk: "上报同一公共 CI 故障 + wait(inbox:desk)"
-        Desk->>Desk: "写入 state desk:arbitration = { key, fixer, waiters: [W1, W2] }"
+        Desk->>Desk: "读取双方等待与关联项目，查找同一原因的活跃修复者"
         Desk->>Fixer: "仅派 1 个修复 Worker (原仓停在特性分支则在独立 worktree 基于 origin/develop 修)"
         Fixer-->>Desk: "回合结束通知 cell.result(turn) -> 必要时 inspect_cell 核实"
         Desk->>W1: "send_message: CI 已修复，请 rebase develop 后继续"

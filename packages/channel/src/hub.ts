@@ -1,7 +1,7 @@
 import {
   NgError,
   OWNER_PRINCIPAL,
-  afterCommit,
+  afterCommit, get,
   channelAddr,
   deliverableSchema,
   fromJson,
@@ -26,7 +26,20 @@ import {
   type OutboxStatus,
   type SendReceipt,
 } from "@ng/protocol";
-import { GLOBAL_STATE, countByStatus, insertRow, listRows, readState, rowById, rowByKey, toRecord, writeState, type OutboxRow } from "./outbox";
+import {
+  GLOBAL_STATE,
+  countByStatus,
+  insertRow,
+  latestRowByAction,
+  listRows,
+  maxAttemptsByAction,
+  readState,
+  rowById,
+  rowByKey,
+  toRecord,
+  writeState,
+  type OutboxRow,
+} from "./outbox";
 import { isChannelAdapter, isHttpChannel, type ChannelInfo, type DeliveryResult, type HttpRequestLike, type HttpResponseLike } from "./types";
 import { DEFAULT_SEND_TIMEOUT_MS, errorMessage, jsonResponse, receiptToResult, runWithTimeout } from "./util";
 
@@ -70,9 +83,32 @@ export type EditReceipt = "edited" | "refused" | "unsupported" | "not_sent" | "f
 
 export type ResolveUnknownResult = "resolved" | "not_unknown" | "not_found";
 
+/** Step 1 output of the 3-step outbound send Saga (written inside TX 1 before releasing SQLite lock for network I/O). */
+export interface PreparedSendAttempt {
+  kind: "deliver";
+  rowId: string;
+  idempotencyKey: string;
+  attemptSeq: number;
+  channelId: string;
+}
+
+export interface PrepareSendReceipt {
+  kind: "receipt";
+  receipt: SendReceipt;
+  rowId: string | null;
+  idempotencyKey: string;
+  attemptSeq: number;
+  error?: string;
+}
+
+export type PrepareSendResult = PreparedSendAttempt | PrepareSendReceipt;
+
 export interface ChannelHubImpl extends ChannelHub {
   onIngress(sink: IngressSink): void;
-  flushBuffered(): Promise<FlushResult>;
+  flushBuffered(whileUnfocused?: boolean): Promise<FlushResult>;
+  focusInfoSync(): {manual:boolean;editors:number};
+  setEditorLeaseSync(id:string, active:boolean): void;
+  expireEditorLeasesSync(): boolean;
   /** Stops routing a channel's sends and ingress. Returns false if it was not registered. */
   unregister(channelId: string): boolean;
   /** id, kind, capabilities and live status of every registered channel (信源 drawer). */
@@ -84,10 +120,28 @@ export interface ChannelHubImpl extends ChannelHub {
   /** Edits an already-sent message on channels that declare `withdrawOrEdit`. */
   edit(idempotencyKey: string, content: Deliverable, opts?: { actionToken?: string }): Promise<EditReceipt>;
   /**
+   * 3-Step Saga TX 1: validate token & channel, persist or update the outbox row to `pending` with the next monotonic
+   * attempt sequence. Safe to call inside a caller's `withTx`.
+   */
+  prepareSendAttemptSync(req: HubSendRequest): PrepareSendResult;
+  /**
+   * 3-Step Saga Step 2 (outside TX): transmit the exact pre-registered attempt directly through the channel adapter,
+   * NEVER calling `hub.send()` (which would see the `pending` row and short-circuit to `unknown`). Does not mutate DB.
+   */
+  deliverPreparedAttempt(rowId: string, attemptSeq: number): Promise<DeliveryResult>;
+  /**
+   * 3-Step Saga TX 2: write the transport outcome guarded by `WHERE id = ? AND status = 'pending' AND attempts = ?`,
+   * preventing a late stale attempt from clobbering a newer retry or manual resolution.
+   */
+  finalizePreparedAttemptSync(rowId: string, attemptSeq: number, result: DeliveryResult): { applied: boolean; row: OutboxRecord | undefined };
+  releasePreparedAttempt(rowId: string, attemptSeq: number): void;
+  /**
    * A human checked an `unknown` send on the external side and records the verdict (`sent`, or `failed` so it can
    * be retried with `retryFailed`). The note is appended to the row's error for the audit trail.
    */
   resolveUnknownSync(idempotencyKey: string, verdict: "sent" | "failed", note?: string): ResolveUnknownResult;
+  /** Same as `resolveUnknownSync`, resolving the latest outbox row associated with `actionId` (handles `:retry:` keys). */
+  resolveUnknownByActionSync(actionId: string, verdict: "sent" | "failed", note?: string): ResolveUnknownResult;
   /** At startup: rows left `pending` by a previous process become `unknown` (never re-sent). Returns the count. */
   recoverInterruptedSync(): number;
 }
@@ -106,6 +160,8 @@ export function createChannelHub(opts: ChannelHubOptions): ChannelHubImpl {
   const channels = new Map<string, Channel>();
   /** Same-key sends issued while one is in flight share its receipt instead of reporting the `pending` row as unknown. */
   const inflight = new Map<string, Promise<SendReceipt>>();
+  /** Prepared Saga attempts currently in-flight between TX 1 and TX 2 (`rowId → attemptSeq`). */
+  const preparedInflight = new Map<string, number>();
   let sink: IngressSink | null = null;
   let flushChain: Promise<unknown> = Promise.resolve();
 
@@ -170,8 +226,8 @@ export function createChannelHub(opts: ChannelHubOptions): ChannelHubImpl {
       const r = run(
         db,
         `UPDATE outbox SET status = ?, error = ?, external_id = COALESCE(?, external_id), sent_at = ?, updated_at = ?
-         WHERE id = ? AND status = 'pending'`,
-        [result.status, sent ? null : result.error, sent ? (result.externalId ?? null) : null, sent ? now : null, now, row.id],
+         WHERE id = ? AND status = 'pending' AND attempts = ?`,
+        [result.status, sent ? null : result.error, sent ? (result.externalId ?? null) : null, sent ? now : null, now, row.id, row.attempts],
       );
       if (r.changes > 0) emitChanged(row, result.status);
     });
@@ -182,8 +238,14 @@ export function createChannelHub(opts: ChannelHubOptions): ChannelHubImpl {
     return d.kind === "receipt" ? Promise.resolve(d.receipt) : track(key, deliverRow(d.row, d.channel));
   }
 
+  function focusInfoSync() {
+    const manual = readState<boolean>(db, GLOBAL_STATE, "manual_dnd") === true;
+    const editors = get<{n:number}>(db,"SELECT COUNT(*) AS n FROM editor_leases WHERE expires_at>?",[clock.now()])!.n;
+    return {manual,editors};
+  }
   function isFocusSync(): boolean {
-    return readState<boolean>(db, GLOBAL_STATE, "focus") === true;
+    const {manual, editors} = focusInfoSync();
+    return manual || editors > 0;
   }
 
   function checkIngress(channelId: string, raw: Omit<Envelope, "to">): Omit<Envelope, "to"> {
@@ -215,9 +277,10 @@ export function createChannelHub(opts: ChannelHubOptions): ChannelHubImpl {
 
   // ---------- flush ----------
 
-  async function flushNow(): Promise<FlushResult> {
+  async function flushNow(whileUnfocused = false): Promise<FlushResult> {
     const out: FlushResult = { sent: 0, failed: 0, unknown: 0, receipts: [] };
     for (const row of listRows(db, { status: ["buffered_dnd"], order: "oldest" })) {
+      if (whileUnfocused && isFocusSync()) break;
       const d = withTx(db, (): Decision | null => {
         const now = clock.now();
         const channel = channels.get(row.channel_id);
@@ -365,13 +428,13 @@ export function createChannelHub(opts: ChannelHubOptions): ChannelHubImpl {
       }
     },
 
-    flushBuffered() {
+    flushBuffered(whileUnfocused = false) {
       try {
         assertNoTx("flushBuffered");
       } catch (err) {
         return Promise.reject(err);
       }
-      const p = flushChain.then(flushNow, flushNow);
+      const p = flushChain.then(() => flushNow(whileUnfocused), () => flushNow(whileUnfocused));
       flushChain = p.catch(() => undefined);
       return p;
     },
@@ -408,9 +471,194 @@ export function createChannelHub(opts: ChannelHubOptions): ChannelHubImpl {
       return r.status === "sent" ? "edited" : r.status;
     },
 
+    prepareSendAttemptSync(req: HubSendRequest): PrepareSendResult {
+      const addr = parseAddress(req.target);
+      if (!addr || addr.kind !== "channel") throw new NgError("invalid_argument", `prepareSendAttempt: "${req.target}" is not a channel address`);
+      if (!req.idempotencyKey) throw new NgError("invalid_argument", "prepareSendAttempt: idempotencyKey is required");
+      assertContent(req.content, "prepareSendAttempt");
+      return withTx(db, (): PrepareSendResult => {
+        const now = clock.now();
+        const existing = (req.actionId ? latestRowByAction(db, req.actionId) : undefined) ?? rowByKey(db, req.idempotencyKey);
+        const maxAttempts = Math.max(existing?.attempts ?? 0, req.actionId ? maxAttemptsByAction(db, req.actionId) : 0);
+
+        if (existing) {
+          if (existing.status === "sent") {
+            return { kind: "receipt", receipt: "sent", rowId: existing.id, idempotencyKey: existing.idempotency_key, attemptSeq: existing.attempts };
+          }
+          if (existing.status === "unknown" || existing.status === "pending") {
+            return {
+              kind: "receipt",
+              receipt: "unknown",
+              rowId: existing.id,
+              idempotencyKey: existing.idempotency_key,
+              attemptSeq: existing.attempts,
+              ...(existing.error ? { error: existing.error } : {}),
+            };
+          }
+          const nextContentJson = JSON.stringify(req.content);
+          const contentChanged = existing.content !== nextContentJson || existing.target !== addr.target || existing.channel_id !== addr.channelId;
+          if (existing.status === "buffered_dnd") {
+            if (req.respectDnd !== false && req.urgent !== true && isFocusSync()) {
+              return { kind: "receipt", receipt: "buffered_dnd", rowId: existing.id, idempotencyKey: existing.idempotency_key, attemptSeq: existing.attempts };
+            }
+            if (req.actionToken !== undefined || (contentChanged && opts.requireToken)) {
+              const tok = checkToken(req.actionToken, addr.addr, req.content);
+              if (!tok.ok) {
+                const error = `refused: ${tok.reason}`;
+                run(db, "UPDATE outbox SET status = 'failed', refused = 1, error = ?, updated_at = ? WHERE id = ?", [error, now, existing.id]);
+                emitChanged(existing, "failed");
+                return { kind: "receipt", receipt: "failed", rowId: existing.id, idempotencyKey: existing.idempotency_key, attemptSeq: existing.attempts, error };
+              }
+            }
+            const channel = channels.get(existing.channel_id);
+            if (!channel) {
+              const error = `channel "${existing.channel_id}" is not registered`;
+              run(db, "UPDATE outbox SET status = 'failed', error = ?, updated_at = ? WHERE id = ?", [error, now, existing.id]);
+              emitChanged(existing, "failed");
+              return { kind: "receipt", receipt: "failed", rowId: existing.id, idempotencyKey: existing.idempotency_key, attemptSeq: existing.attempts, error };
+            }
+            const attemptSeq = maxAttempts + 1;
+            run(
+              db,
+              "UPDATE outbox SET status = 'pending', content = ?, attempts = ?, error = NULL, updated_at = ? WHERE id = ? AND status = 'buffered_dnd'",
+              [nextContentJson, attemptSeq, now, existing.id],
+            );
+            afterCommit(db, () => preparedInflight.set(existing.id, attemptSeq));
+            emitChanged(existing, "pending");
+            return { kind: "deliver", rowId: existing.id, idempotencyKey: existing.idempotency_key, attemptSeq, channelId: existing.channel_id };
+          }
+          if (existing.status === "failed" && !existing.refused && !contentChanged) {
+            if (req.actionToken !== undefined) {
+              const tok = checkToken(req.actionToken, addr.addr, req.content);
+              if (!tok.ok) {
+                const error = `refused: ${tok.reason}`;
+                run(db, "UPDATE outbox SET refused = 1, error = ?, updated_at = ? WHERE id = ?", [error, now, existing.id]);
+                emitChanged(existing, "failed");
+                return { kind: "receipt", receipt: "failed", rowId: existing.id, idempotencyKey: existing.idempotency_key, attemptSeq: existing.attempts, error };
+              }
+            }
+            const channel = channels.get(existing.channel_id);
+            if (!channel) {
+              const error = `channel "${existing.channel_id}" is not registered`;
+              run(db, "UPDATE outbox SET error = ?, updated_at = ? WHERE id = ?", [error, now, existing.id]);
+              emitChanged(existing, "failed");
+              return { kind: "receipt", receipt: "failed", rowId: existing.id, idempotencyKey: existing.idempotency_key, attemptSeq: existing.attempts, error };
+            }
+            const attemptSeq = maxAttempts + 1;
+            run(
+              db,
+              "UPDATE outbox SET status = 'pending', attempts = ?, error = NULL, updated_at = ? WHERE id = ? AND status = 'failed' AND refused = 0",
+              [attemptSeq, now, existing.id],
+            );
+            afterCommit(db, () => preparedInflight.set(existing.id, attemptSeq));
+            emitChanged(existing, "pending");
+            return { kind: "deliver", rowId: existing.id, idempotencyKey: existing.idempotency_key, attemptSeq, channelId: existing.channel_id };
+          }
+          // existing.status === "failed" && (existing.refused || contentChanged): fall through to create a fresh :retry:
+          // row linked by actionId with full token verification so modified content never reuses the old idempotency_key.
+        }
+
+        const key = existing ? `${req.idempotencyKey}:retry:${newId("r", clock)}` : req.idempotencyKey;
+        const base = {
+          id: newId("out", clock),
+          idempotencyKey: key,
+          channelId: addr.channelId,
+          target: addr.target,
+          content: req.content,
+          urgent: req.urgent === true,
+          cellId: req.cellId ?? null,
+          actionId: req.actionId ?? null,
+          now,
+        };
+        const ref = { id: base.id, idempotency_key: key, channel_id: addr.channelId };
+        const token = checkToken(req.actionToken, addr.addr, req.content);
+        if (!token.ok) {
+          const error = `refused: ${token.reason}`;
+          insertRow(db, { ...base, status: "failed", refused: true, attempts: maxAttempts, error });
+          emitChanged(ref, "failed");
+          return { kind: "receipt", receipt: "failed", rowId: base.id, idempotencyKey: key, attemptSeq: maxAttempts, error };
+        }
+        const channel = channels.get(addr.channelId);
+        if (!channel) {
+          const error = `channel "${addr.channelId}" is not registered`;
+          insertRow(db, { ...base, status: "failed", refused: false, attempts: maxAttempts, error });
+          emitChanged(ref, "failed");
+          return { kind: "receipt", receipt: "failed", rowId: base.id, idempotencyKey: key, attemptSeq: maxAttempts, error };
+        }
+        if (req.respectDnd !== false && req.urgent !== true && isFocusSync()) {
+          insertRow(db, { ...base, status: "buffered_dnd", refused: false, attempts: maxAttempts, error: null });
+          emitChanged(ref, "buffered_dnd");
+          emitFocus(true);
+          return { kind: "receipt", receipt: "buffered_dnd", rowId: base.id, idempotencyKey: key, attemptSeq: maxAttempts };
+        }
+        const attemptSeq = maxAttempts + 1;
+        insertRow(db, { ...base, status: "pending", refused: false, attempts: attemptSeq, error: null });
+        afterCommit(db, () => preparedInflight.set(base.id, attemptSeq));
+        emitChanged(ref, "pending");
+        return { kind: "deliver", rowId: base.id, idempotencyKey: key, attemptSeq, channelId: addr.channelId };
+      });
+    },
+
+    async deliverPreparedAttempt(rowId: string, attemptSeq: number): Promise<DeliveryResult> {
+      assertNoTx("deliverPreparedAttempt");
+      const row = rowById(db, rowId);
+      if (!row) return { status: "failed", error: `outbox row "${rowId}" not found` };
+      if (row.status !== "pending" || row.attempts !== attemptSeq) {
+        return row.status === "sent"
+          ? { status: "sent", ...(row.external_id ? { externalId: row.external_id } : {}) }
+          : { status: row.status === "failed" ? "failed" : "unknown", error: row.error ?? "prepared attempt is no longer pending" };
+      }
+      const channel = channels.get(row.channel_id);
+      if (!channel) return { status: "failed", error: `channel "${row.channel_id}" is not registered` };
+      // Keep preparedInflight set across transmit() until finalizePreparedAttemptSync commits TX 2 (never clear early).
+      preparedInflight.set(row.id, attemptSeq);
+      // Transmit directly through the channel adapter (never hub.send(), which would short-circuit on the pending row).
+      const work = transmit(channel, row);
+      track(row.idempotency_key, work.then((r) => r.status));
+      return await work;
+    },
+
+    releasePreparedAttempt(rowId, attemptSeq) {
+      if (preparedInflight.get(rowId) === attemptSeq) preparedInflight.delete(rowId);
+    },
+
+    finalizePreparedAttemptSync(rowId: string, attemptSeq: number, result: DeliveryResult) {
+      return withTx(db, () => {
+        const existing = rowById(db, rowId);
+        if (!existing) return { applied: false, row: undefined };
+        afterCommit(db, () => hub.releasePreparedAttempt(rowId, attemptSeq));
+        const now = clock.now();
+        const sent = result.status === "sent";
+        const r = run(
+          db,
+          `UPDATE outbox SET status = ?, error = ?, external_id = COALESCE(?, external_id), sent_at = ?, updated_at = ?
+           WHERE id = ? AND status = 'pending' AND attempts = ?`,
+          [result.status, sent ? null : result.error, sent ? (result.externalId ?? null) : null, sent ? now : null, now, rowId, attemptSeq],
+        );
+        if (r.changes > 0) emitChanged(existing, result.status);
+        const updated = rowById(db, rowId);
+        return { applied: r.changes > 0, row: updated ? toRecord(updated) : undefined };
+      });
+    },
+
     resolveUnknownSync(idempotencyKey, verdict, note) {
       return withTx(db, (): ResolveUnknownResult => {
         const row = rowByKey(db, idempotencyKey);
+        if (!row) return "not_found";
+        if (row.status !== "unknown") return "not_unknown";
+        const now = clock.now();
+        const audit = `${row.error ? `${row.error}; ` : ""}verified on the external side as ${verdict}${note ? `: ${note}` : ""}`;
+        run(db, "UPDATE outbox SET status = ?, error = ?, sent_at = ?, updated_at = ? WHERE id = ? AND status = 'unknown'",
+          [verdict, audit, verdict === "sent" ? now : null, now, row.id]);
+        emitChanged(row, verdict);
+        return "resolved";
+      });
+    },
+
+    resolveUnknownByActionSync(actionId, verdict, note) {
+      return withTx(db, (): ResolveUnknownResult => {
+        // Look up latest row by action_id FIRST (fixes :retry: key mismatch), then fall back to idempotency_key.
+        const row = latestRowByAction(db, actionId) ?? rowByKey(db, actionId);
         if (!row) return "not_found";
         if (row.status !== "unknown") return "not_unknown";
         const now = clock.now();
@@ -427,7 +675,7 @@ export function createChannelHub(opts: ChannelHubOptions): ChannelHubImpl {
         let n = 0;
         const now = clock.now();
         for (const row of listRows(db, { status: ["pending"], order: "oldest" })) {
-          if (inflight.has(row.idempotency_key)) continue;
+          if (inflight.has(row.idempotency_key) || preparedInflight.has(row.id)) continue;
           run(db, "UPDATE outbox SET status = 'unknown', error = ?, updated_at = ? WHERE id = ? AND status = 'pending'", [INTERRUPTED, now, row.id]);
           emitChanged(row, "unknown");
           n++;
@@ -449,11 +697,28 @@ export function createChannelHub(opts: ChannelHubOptions): ChannelHubImpl {
     setFocusSync(on) {
       withTx(db, () => {
         const was = isFocusSync();
-        writeState(db, GLOBAL_STATE, "focus", on, clock.now());
-        if (was !== on) emitFocus(on);
+        writeState(db, GLOBAL_STATE, "manual_dnd", on, clock.now());
+        if (was !== isFocusSync() || was) emitFocus(isFocusSync());
       });
     },
 
+    focusInfoSync,
+    setEditorLeaseSync(id, active) {
+      if (typeof id !== "string" || !/^[a-zA-Z0-9_-]{8,96}$/.test(id) || typeof active !== "boolean") throw new NgError("invalid_argument","invalid editor lease");
+      withTx(db, () => {
+        const was = isFocusSync();
+        if (active) run(db,"INSERT INTO editor_leases(id,expires_at) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET expires_at=excluded.expires_at",[id,clock.now()+45_000]);
+        else run(db,"DELETE FROM editor_leases WHERE id=?",[id]);
+        if (was !== isFocusSync()) emitFocus(isFocusSync());
+      });
+    },
+    expireEditorLeasesSync() {
+      return withTx(db, () => {
+        const removed = run(db,"DELETE FROM editor_leases WHERE expires_at<=?",[clock.now()]).changes;
+        if (removed) emitFocus(isFocusSync());
+        return !!removed;
+      });
+    },
     isFocusSync,
 
     bufferedCountSync() {
@@ -470,6 +735,11 @@ export function createChannelHub(opts: ChannelHubOptions): ChannelHubImpl {
 
     getOutboxSync(idempotencyKey) {
       const row = rowByKey(db, idempotencyKey);
+      return row ? toRecord(row) : undefined;
+    },
+
+    getLatestOutboxByActionSync(actionId) {
+      const row = latestRowByAction(db, actionId) ?? rowByKey(db, actionId);
       return row ? toRecord(row) : undefined;
     },
   };

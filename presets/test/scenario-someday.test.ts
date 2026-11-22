@@ -92,7 +92,7 @@ describe("docs/05 scenario 5 — an idea for later: research, park, bring it bac
     expect(h.project(project!)).toMatchObject({ lifecycle: "active" });
     expect(h.project(project!)!.completedAt).toBeUndefined();
     const [card] = h.kernel.gate.listPendingSync({ includeSnoozed: true });
-    expect(card).toMatchObject({ cellId: project, subjectKey: subjectKeys.project(project!) });
+    expect(card).toMatchObject({ cellId: project, subjectKey: expect.stringContaining(`action:${project}:`) });
     expect(h.actions(project).find((a) => a.id === phase2)).toMatchObject({ status: "open", owner: "agent" });
     expect(h.actions(project).find((a) => a.id === phase2)!.cellId).toBeUndefined(); // not started before the go-ahead
     expect(childrenOf(h, project!, "worker")).toHaveLength(2);
@@ -107,7 +107,7 @@ describe("docs/05 scenario 5 — an idea for later: research, park, bring it bac
       {},
     );
     h.script.setDefault("worker", () => tool("wait", { reason: "working", waitingFor: "inbox:desk" }));
-    expect(await h.kernel.resolveApproval(card!.actionId, { decision: "approve" })).toMatchObject({ status: "approved" });
+    expect(await h.kernel.resolveApproval(card!.actionId, { decision: "approve", approverId: "owner" })).toMatchObject({ status: "approved" });
     await h.kernel.idle();
     expect(childrenOf(h, project!, "worker")).toHaveLength(3);
     expect(h.actions(project).find((a) => a.id === phase2)).toMatchObject({ status: "open", phase: 2, cellId: childrenOf(h, project!, "worker")[2] });

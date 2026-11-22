@@ -48,6 +48,7 @@ export const PAYLOAD = {
   userMessage: "user.message",
   timerFired: "timer.fired",
   jobResult: "job.result",
+  jobWarning: "job.warning",
   cellTask: "cell.task",
   cellResult: "cell.result",
   cellProgress: "cell.progress",
@@ -60,6 +61,7 @@ export const PAYLOAD = {
   cellMessage: "cell.message",
   cellDirectChat: "cell.direct_chat",
   stalledCheck: "kernel.stalled_check",
+  arbitrationUnanswered: "kernel.arbitration_unanswered",
   runContinue: "kernel.continue",
   waitTimeout: "kernel.wait_timeout",
 } as const;
@@ -99,6 +101,7 @@ export interface JobResultPayload {
   tail: string;                         // last lines of output
   logUri?: string;                      // res:// URI of the full log, if stored
   durationMs?: number;
+  error?: string;                       // infrastructure or timeout error reason, if any
 }
 
 /** First message of a spawned cell (spawnCell's initialPayload: a string becomes `instruction`, anything else `input`). */
@@ -159,6 +162,7 @@ export interface ApprovalResolvedPayload {
   action: ProposedAction;
   approverId?: string;
   humanEdited?: boolean;
+  humanDiff?: string;                   // compact diff of human edits when humanEdited === true
   artifactVersion?: number;             // the version that was approved/sent
   outcome?: ApprovalOutcome;
   note?: string;
@@ -170,6 +174,8 @@ export interface ApprovalRevisePayload {
   instruction: string;
   artifactId?: string;
   artifactVersion?: number;
+  humanEdited?: boolean;
+  humanDiff?: string;                   // compact diff of human edits when humanEdited === true
   voice?: boolean;
 }
 
@@ -196,6 +202,8 @@ export interface SourceHitPayload {
 
 /** [docs/05] One cell talking to another (RunPorts.sendToCell): a forwarded follow-up, a request for arbitration, a ruling. */
 export interface CellMessagePayload {
+  fromProjectCellId?: string;
+  fromTitle?: string;
   fromCellId: string;
   text: string;
   summary?: string;
@@ -238,13 +246,15 @@ export interface StalledCheckPayload {
 
 /** [docs/05 guard 1] The previous Run stopped at its step limit with work left; continue where it stopped. */
 export interface RunContinuePayload {
-  reason: "step_limit";
+  reason: "step_limit" | "budget_raised";
   /** Consecutive continuations so far (1 = first). */
   count: number;
 }
 
 /** [docs/05 guard 2] A wait registered with a timeout ran out without an answer from `waitingFor`. */
 export interface WaitTimeoutPayload {
+  waitId?: string;
+  registrationId?: string;
   waitingFor: string;
   reason: string;
   since: number;
@@ -254,6 +264,7 @@ export interface KernelPayloadMap {
   "user.message": UserMessagePayload;
   "timer.fired": TimerFiredPayload;
   "job.result": JobResultPayload;
+  "job.warning": { jobId: string; reason: "quiet" | "identity_unknown" | "termination_pending"; message: string };
   "cell.task": CellTaskPayload;
   "cell.result": CellResultPayload;
   "cell.progress": CellProgressPayload;
@@ -265,6 +276,7 @@ export interface KernelPayloadMap {
   "cell.message": CellMessagePayload;
   "cell.direct_chat": CellDirectChatPayload;
   "kernel.stalled_check": StalledCheckPayload;
+  "kernel.arbitration_unanswered": { causeKey: string; waiters: Array<{cellId: string; waitId: string; registrationId: string | null}> };
   "kernel.continue": RunContinuePayload;
   "kernel.wait_timeout": WaitTimeoutPayload;
 }
@@ -309,6 +321,7 @@ export const kernelPayloadSchemas = {
     scheduleId: z.string().optional(),
     firedAt: z.number().optional(),
   }),
+  "job.warning": z.looseObject({ jobId: z.string(), reason: z.enum(["quiet", "identity_unknown", "termination_pending"]), message: z.string() }),
   "job.result": z.looseObject({
     jobId: z.string(),
     command: z.string(),
@@ -317,6 +330,7 @@ export const kernelPayloadSchemas = {
     tail: z.string(),
     logUri: z.string().optional(),
     durationMs: z.number().optional(),
+    error: z.string().optional(),
   }),
   "cell.task": z.looseObject({
     parentCellId: z.string(),
@@ -358,6 +372,7 @@ export const kernelPayloadSchemas = {
     action: actionShape,
     approverId: z.string().optional(),
     humanEdited: z.boolean().optional(),
+    humanDiff: z.string().optional(),
     artifactVersion: z.number().int().optional(),
     outcome: z.looseObject({}).optional(),
     note: z.string().optional(),
@@ -367,6 +382,8 @@ export const kernelPayloadSchemas = {
     instruction: z.string(),
     artifactId: z.string().optional(),
     artifactVersion: z.number().int().optional(),
+    humanEdited: z.boolean().optional(),
+    humanDiff: z.string().optional(),
     voice: z.boolean().optional(),
   }),
   "control.steer": z.looseObject({ message: z.string() }),
@@ -391,8 +408,9 @@ export const kernelPayloadSchemas = {
     projectCellId: z.string().optional(),
     at: z.number(),
   }),
+  "kernel.arbitration_unanswered": z.looseObject({causeKey: z.string(), waiters: z.array(z.object({cellId:z.string(),waitId:z.string(),registrationId:z.string().nullable()}))}),
   "kernel.stalled_check": z.looseObject({ projectCellId: z.string(), stalledSince: z.number(), detail: z.string() }),
-  "kernel.continue": z.looseObject({ reason: z.literal("step_limit"), count: z.number().int() }),
+  "kernel.continue": z.looseObject({ reason: z.enum(["step_limit","budget_raised"]), count: z.number().int() }),
   "kernel.wait_timeout": z.looseObject({ waitingFor: z.string(), reason: z.string(), since: z.number() }),
 } as const satisfies Record<KernelPayloadType, z.ZodType>;
 

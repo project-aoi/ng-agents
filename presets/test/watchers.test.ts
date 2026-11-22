@@ -28,7 +28,7 @@ describe("await_reply — the zero-token reply watcher reports to its project in
     const h = await boot();
     const { project, watcher } = await waitForZhang(h);
     expect(h.kernel.getCell(watcher)).toMatchObject({
-      preset: "watcher",
+      preset: "reply_watcher",
       status: "active",
       spec: { lifetime: "persistent", processor: { kind: "code", entry: "gtd.wait_match" }, watches: [{ threadOrFilter: { thread: "memory:dm-zhang" } }] },
     });
@@ -61,18 +61,39 @@ describe("await_reply — the zero-token reply watcher reports to its project in
     expect(h.script.requests.filter((r) => r.cellId === watcher)).toEqual([]); // zero tokens
   });
 
-  it("a timeout puts the drafted nudge on the owner's card (the project's one card); confirming sends it and sets the next check", async () => {
+  it.each([false, true])("tracks an unknown standing nudge until verified (owner address=%s)", async ownerAddress => {
+    const h = await boot(ownerAddress ? {kernel:{ownerAddresses:["channel:ui:*","channel:memory:zhang"]}} : {});
+    const {watcher}=await waitForZhang(h);
+    h.kernel.gate.upsertPolicyRuleSync({match:{type:"channel.send",target:"channel:memory:zhang"},effect:"allow",createdBy:"owner"});
+    h.memory.respondWith("unknown");
+    h.clock.set(T0+HOUR);
+    await h.kernel.idle();
+    const item=h.kernel.humanItems.list().find(i=>i.cellId===watcher)!;
+    expect(item).toMatchObject({status:"unknown",attempt:1});
+    expect(h.state<WatcherState>(watcher,KEYS.watcher)?.cardActionId).toBe(item.id);
+    await h.kernel.humanItems.decide(item.id,{optionId:"system.sent",seenArtifactVersion:item.artifactVersion!,
+      seenItemRevision:item.itemRevision,seenAttempt:1},"owner");
+    await h.kernel.idle();
+    expect(h.state<WatcherState>(watcher,KEYS.watcher)).toMatchObject({status:"waiting",nudges:1});
+    expect(h.memory.deliveries).toHaveLength(1);
+  });
+
+  it("a timeout puts the drafted nudge on the watcher's own card; confirming sends it and sets the next check", async () => {
     const h = await boot();
     const { project, watcher } = await waitForZhang(h);
     h.clock.set(T0 + HOUR);
     await h.kernel.idle();
     const [card] = h.cards();
-    expect(card).toMatchObject({ cellId: watcher, subjectKey: subjectKeys.project(project) });
+    expect(card).toMatchObject({ cellId: watcher, subjectKey: subjectKeys.cell(watcher) });
     const esc = card!.clarify as EscalationCard;
     expect(esc).toMatchObject({ cardType: "escalation", title: "张三还没回复：等张三给 Doubao work 的代码地址", escalation: { reason: "waiting_timeout", nudgeTarget: "channel:memory:zhang", nudgeDraft: { version: 1 } } });
     expect(h.state<WatcherState>(watcher, KEYS.watcher)).toMatchObject({ status: "overdue" });
 
-    expect(await h.kernel.resolveApproval(card!.actionId, { decision: "approve", seenArtifactVersion: 1 })).toMatchObject({ status: "sent" });
+    h.memory.respondWith("failed");
+    expect(await h.kernel.resolveApproval(card!.actionId, { decision:"approve", approverId:"owner", seenArtifactVersion:1 })).toMatchObject({status:"failed"});
+    await h.kernel.idle();
+    expect(h.state<WatcherState>(watcher, KEYS.watcher)).toMatchObject({cardActionId:card!.actionId, status:"overdue"});
+    expect(await h.kernel.resolveApproval(card!.actionId, { decision: "approve", approverId: "owner", seenArtifactVersion: 1 })).toMatchObject({ status: "sent" });
     expect(h.memory.sent.map((d) => [d.target, d.content.body])).toEqual([["zhang", "您好，想跟进一下：等张三给 Doubao work 的代码地址。方便的话请回复一下，谢谢！"]]);
     await h.kernel.idle();
     expect(h.state<WatcherState>(watcher, KEYS.watcher)).toMatchObject({ status: "waiting", nudges: 1, dueAt: T0 + HOUR + DAY });
@@ -201,6 +222,8 @@ describe("cells from before docs/05", () => {
     // As an old database has it: an item root stored as a persistent "worker" with the depth it was given then (the
     // worker preset is a leaf now; stored bounds are not recomputed).
     h.kernel.spawnCell("desk", { id: "prj_old", preset: "worker", lifetime: "persistent", title: "旧事项", processor: { kind: "code", entry: LEGACY.joinAll }, bounds: { maxDepth: 2 } });
+    // Restore the original persisted bounds, as in an installation upgraded from the earlier schema.
+    h.kernel.db.prepare("UPDATE cells SET bounds=json_set(bounds,'$.maxDepth',2) WHERE id='prj_old'").run();
     h.kernel.spawnCell("prj_old", { id: "prj_old-edit1", preset: "inline", title: "按意见改稿", processor: { kind: "llm", prompt: LEGACY.editor, toolsets: [LEGACY.editor, "kernel.context"] }, meta: { role: "editor" } });
     h.script.add("editor", (req) => {
       expect(req.tools.map((t) => t.name)).not.toContain("submit_draft");
@@ -219,4 +242,17 @@ describe("cells from before docs/05", () => {
       expect.objectContaining({ childCellId: "prj_old", status: "cancelled", summary: "这个事项是旧版本创建的，已无法继续；请重新发起。" }),
     ]);
   });
+});
+
+it("keeps both overdue reply watchers' decisions visible within one project", async () => {
+  const h = await boot();
+  const parties = ["alice","bob"];
+  h.script.add("project", ...parties.map(who => tool("await_reply", {who, description:"等回复", thread:"memory:"+who, to:"channel:memory:"+who, waitHours:1})), tool("wait", {reason:"等回复"}));
+  const { projectId } = startProjectSync(h.kernel, {title:"分头跟进", outcome:"收齐回复", brief:"分别询问"});
+  await h.kernel.idle();
+  const watchers = childrenOf(h, projectId);
+  expect(watchers).toHaveLength(2);
+  h.clock.advance(HOUR);
+  await h.kernel.idle();
+  expect(h.cards().map(card => card.subjectKey).sort()).toEqual(watchers.map(id => subjectKeys.cell(id)).sort());
 });

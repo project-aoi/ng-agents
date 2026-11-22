@@ -45,7 +45,6 @@ describe("Clarify projection", () => {
       ["revise_voice", "🎙 按住口述修改意见", "main", false],
       ["snooze", "⏱ 推迟到下午", "main", false],
       ["skip", "下一张 →", "main", false],
-      ["to_human", "转给我来处理", "more", false],
       ["dismiss", "不需要处理（归档）", "more", false],
     ]);
     expect(c.buttons[1]).toMatchObject({ endpoint: { path: `/api/clarify/${actionId}/revise`, body: { voice: true } }, input: { field: "instruction" } });
@@ -129,7 +128,7 @@ describe("Clarify projection", () => {
       ["resolve_offline", "✓ 线下已解决，直接完结"],
       ["skip", "下一张 →"],
     ]);
-    expect(c.buttons[1]!.endpoint!.body).toEqual({ until: kernel.clock.now() + DAY });
+    expect(c.buttons[1]!.endpoint!.body).toEqual({ until: kernel.clock.now() + DAY, seenItemRevision: 1 });
   });
 
   it("cards without GTD card data are shown generically with confirm / deny", async () => {
@@ -258,13 +257,14 @@ describe("Radar projection — docs/05", () => {
 
   it("a project's workers and watchers are detail of its row, never rows of their own; summary and directory come from the record", async () => {
     const { kernel } = await bootDesk();
-    const p = makeProject(kernel, "竞品调研", { summary: "A、B 两家已整理完", cwd: "/srv/code/research" });
+    const p = makeProject(kernel, "竞品调研", { summary: "A、B 两家已整理完", cwd: process.cwd() });
+    kernel.updateCell(p,{cwd:process.cwd()});
     kernel.spawnCell(p, { id: "w1", preset: "worker", title: "扒 A 公司" });
     kernel.spawnCell("w1", { id: "w1a", preset: "worker", title: "扒 A 的定价" });
     kernel.spawnCell(p, { id: "wt", preset: "watcher", title: "等 C 报价", watches: [{ threadOrFilter: { thread: "memory:quote-c" } }] });
     const radar = projectRadar(view(kernel));
     expect(radar.projects.map((r) => r.id)).toEqual([p]);
-    expect(radar.projects[0]).toMatchObject({ summary: "A、B 两家已整理完", cwd: "/srv/code/research" });
+    expect(radar.projects[0]).toMatchObject({ summary: "A、B 两家已整理完", cwd: process.cwd() });
     expect(radar.projects[0]!.workers.map((w) => [w.cellId, w.title, w.state])).toEqual([
       ["w1", "扒 A 公司", "idle"],
       ["w1a", "扒 A 的定价", "idle"],
@@ -324,11 +324,11 @@ describe("status projection", () => {
       backend: "scripted",
       clarify: { pending: 1, snoozed: 0 },
       today: { archivedNotifications: 2, notesSaved: 1 },
-      radar: { activeProjects: 1, stalledProjects: 1 },
+      radar: { activeProjects: 1, stalledProjects: 0 },
       focus: { on: false, buffered: 0 },
     });
     expect(s.statusLine.clarify).toBe("后台已静默归档 2 条通知 · 自动存好 1 条随手笔记 · 后台没有在途任务");
-    expect(s.statusLine.radar).toMatch(/^1 个进行中项目 · 1 个停滞待补下一步 · 下次周回顾 /);
+    expect(kernel.humanItems.list().some(item => item.relatedProjectIds.includes(p))).toBe(true);
     expect(projectActivity(view(kernel)).counts).toMatchObject({ notification_archived: 2, note_saved: 1 });
   });
 });
@@ -336,7 +336,7 @@ describe("status projection", () => {
 describe("sources projection", () => {
   it("lists channels with their webhook paths and sensors with readable schedules", async () => {
     const { kernel } = await bootDesk();
-    kernel.spawnCell("desk", { id: "s2", preset: "sensor", title: "支付报错探头" });
+    kernel.spawnCell("desk", { id: "s2", preset: "sensor", title: "支付报错探头",processor:{kind:"code",entry:"gtd.sensor_script",args:{script:"checks/probe.sh"}},schedules:[{cron:"0 9 * * 1"}] });
     writeSource(kernel, "s2", { title: "支付报错探头", schedule: { cron: "0 9 * * 1" }, mode: "observe", processor: "code", runCount: 3 });
     const s = projectSources(view(kernel));
     expect(s.channels.map((c) => [c.id, c.label, c.hookPath])).toEqual([

@@ -1,7 +1,8 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { gtdKeys, PAYLOAD, type ActionRecord, type ModelRequest, type ProjectRecord } from "@ng/protocol";
+import { retireDeskState } from "../src/shared/retire-desk-state";
+import { run, withTx, gtdKeys, PAYLOAD, type ActionRecord, type ModelRequest, type ProjectRecord } from "@ng/protocol";
 import { BUILTIN_SKILLS, seedBuiltinSkills, setProjectLifecycleSync, startApprovedProjectSync, startProjectSync } from "../src";
 import { skillDigest } from "../src/shared/seed";
 import { SUPERSEDED_SKILL_DIGESTS } from "../src/shared/skills";
@@ -97,7 +98,7 @@ describe("project tools", () => {
     const started: string[] = [];
     const startedBy = (req: ModelRequest) => {
       const out = lastToolResult(req);
-      started.push(/^Started (?:worker|watcher) (\S+)/.exec(out)![1]!);
+      started.push(/^Started (?:worker|checker) (\S+)/.exec(out)![1]!);
       return out;
     };
     h.script.add(
@@ -124,8 +125,8 @@ describe("project tools", () => {
     expect(h.script.pending("project")).toBe(0);
     const [byDefault, explicit, reader] = started.map((id) => h.kernel.getCell(id)!);
     // The watcher sees the project's repository, remotes and tools (no private directory any more).
-    expect(byDefault!.spec).toMatchObject({ preset: "watcher", cwd: repo, lifetime: "one_shot" });
-    expect(explicit!.spec).toMatchObject({ preset: "watcher", cwd: other });
+    expect(byDefault!.spec).toMatchObject({ preset: "checker", cwd: repo, lifetime: "one_shot" });
+    expect(explicit!.spec).toMatchObject({ preset: "checker", cwd: other });
     expect(reader!.spec).toMatchObject({ preset: "worker", cwd: repo, lifetime: "wakeable" });
     for (const c of [byDefault!, explicit!, reader!]) {
       expect(c.spec.cwdMode).toBeUndefined();
@@ -177,20 +178,15 @@ describe("project tools", () => {
     const record = h.project(projectId)! as ProjectRecord & { retro?: string };
     expect(record).toMatchObject({ lifecycle: "completed", summary: "改版上线了\n细节见 MR" });
     expect(record.retro).toBeUndefined();
-    // finish_project itself does not touch them (only reports them); the kernel's close hook then settles a completed
-    // project's books, so they end as done
     const open = h.actions(projectId);
-    expect(open.map((a) => [a.title, a.status])).toEqual([
-      ["确认需求", "done"],
-      ["写文档", "done"],
-    ]);
+    expect(open.map(a=>[a.title,a.status])).toEqual([["确认需求","open"],["写文档","open"]]);
     const result = h.kernel.context
       .listEvidenceSync(projectId)
       .map((e) => e.record)
       .find((r) => r.kind === "tool_result" && r.name === "finish_project");
     const output = result && "output" in result ? String(result.output) : "";
     expect(output).toBe(
-      "Recorded as completed and the owner's board shows it; the project closes when this turn ends; stop here." +
+      "Requested project settlement after this run drains; stop here." +
         ` Note: these actions were still open on the books — ${open[0]!.id}「确认需求」(the owner); ${open[1]!.id}「写文档」(agent).`,
     );
     expect(h.notices().at(-1)).toBe("「官网改版」已完成：改版上线了");
@@ -283,10 +279,11 @@ describe("project tools", () => {
 
   it("update_project keeps the record and the board line; track_action updates and reopens", async () => {
     const h = await boot();
+    const repo=gitRepo("updated");
     let id = "";
     h.script.add(
       "project",
-      tool("update_project", { summary: "方案已定", title: "新标题", cwd: "/tmp/somewhere" }),
+      tool("update_project", { summary: "方案已定", title: "新标题", cwd: repo }),
       tool("track_action", { title: "写测试", owner: "agent" }),
       (req) => {
         id = /Recorded action (\S+)「/.exec(lastToolResult(req))![1]!;
@@ -297,7 +294,7 @@ describe("project tools", () => {
     );
     const { projectId } = startProjectSync(h.kernel, { title: "旧标题", outcome: "o", brief: "b" });
     await h.kernel.idle();
-    expect(h.project(projectId)).toMatchObject({ title: "新标题", summary: "方案已定", cwd: "/tmp/somewhere" });
+    expect(h.project(projectId)).toMatchObject({ title: "新标题", summary: "方案已定", cwd: repo });
     expect(h.kernel.getCell(projectId)?.title).toBe("新标题");
     expect(h.state(projectId, "cell:status")).toMatchObject({ text: "方案已定" });
     const a = h.state<ActionRecord>(projectId, gtdKeys.action(id))!;
@@ -379,24 +376,28 @@ describe("desk tools for projects in flight", () => {
     const [card] = h.cards();
     expect(card?.clarify.cardType).toBe("project_proposal");
     const deskCalls = h.script.callsOf("desk").length;
-    expect(h.kernel.control("desk", { action: "pause" })).toMatchObject({ applied: true });
-    await h.kernel.resolveApproval(card!.actionId, { decision: "approve", seenArtifactVersion: 1 });
+    // Root cell cannot be paused (BUG-020); approve and synchronously start before the desk's microtask runs, then verify idempotency + desk wakeup.
+    expect(h.kernel.control("desk", { action: "pause" })).toMatchObject({ applied: false });
+    const resolving = h.kernel.resolveApproval(card!.actionId, { decision: "approve", approverId: "owner", seenArtifactVersion: 1 });
+    const id = h.kernel.gate.getApprovalSync(card!.actionId)!.artifactId!;
+    h.kernel.context.commitSync("desk",{artifact:{artifactId:id,expectedVersion:1,updatedBy:"human",content:{format:"json",body:"{}",data:{}}}});
     const started = startApprovedProjectSync(h.kernel, card!.actionId);
-    expect(started).toEqual({ projectId: `proj_${card!.actionId.replace(/^act_/, "")}`, started: true });
+    await resolving;
+    expect(started).toEqual({ projectId: `proj_${card!.actionId.replace(/^act_/, "")}`, started: false });
     expect(startApprovedProjectSync(h.kernel, card!.actionId)).toEqual({ projectId: started!.projectId, started: false });
-    h.kernel.control("desk", { action: "resume" });
     await h.kernel.idle();
     expect(projects(h)).toEqual([started!.projectId]);
     expect(h.script.callsOf("desk")).toHaveLength(deskCalls); // the approval wake-up was pure bookkeeping
     expect(h.kernel.getCell(started!.projectId)).toMatchObject({ preset: "project", spec: { cwd: repo } });
     expect(h.project(started!.projectId)).toMatchObject({ title: "官网改版", lifecycle: "active", source: { label: "随手记" }, proposal: { outcome: "新版官网上线" } });
-    expect(h.actions(started!.projectId).map((a) => [a.title, a.owner])).toEqual(expect.arrayContaining([["盘点页面", "agent"], ["对齐风格", "human"]]));
+    expect(h.actions(started!.projectId).map((a) => [a.title, a.owner])).toEqual([["盘点页面", "agent"]]);
   });
 });
 
 describe("setProjectLifecycleSync agrees with the kernel's close hook", () => {
   it("someday keeps the actions; an ended record is never flipped; repeating is a no-op", async () => {
     const h = await boot();
+    h.script.add("project",tool("track_action",{title:"a",owner:"human",nextStep:"做 a"}));
     const { projectId } = startProjectSync(h.kernel, { title: "p", outcome: "o", brief: "b", plan: [{ title: "a", owner: "human", nextStep: "做 a" }] });
     await h.kernel.idle();
     const t = h.clock.now();
@@ -476,8 +477,47 @@ describe("built-in skills", () => {
     expect(Object.fromEntries(BUILTIN_SKILLS.map((s) => [s.name, skillDigest(s)]))).toEqual({
       "project-relay": "4b065c12c6a48438292d8b85bf840628d8f5e1feac591130fec0f027799c323b",
       "domain-hub": "e180da2ffb0a7c0251f94f16f036fd5aeea230f04e1cef4580022f4156165e53",
-      "workspace-arbitration": "ec1b4870c4c4cbcba535712f7331837a06000b4b120028ff3919b3a3e98de5d0",
+      "workspace-arbitration": "558c6187ddfa8a62c2dddf1c700d255a374a0310a1f13d93bf735fca3563b441",
       "habit-and-routine-discovery": "83ec914cbc32826910118b0100d5770b9e7d5b81c79607f25a3da1adc2efa430",
     });
   });
+});
+
+it.each(["agent", "human"] as const)("migrates approved legacy proposals while preserving %s edit provenance", async updatedBy => {
+  const h = await boot();
+  h.script.add("desk", tool("propose_project", {title:"整理", outcome:"整理完成", actions:[{title:"核查", owner:"agent"}]}));
+  await h.ui.capture({text:"整理一下"});
+  await h.kernel.idle();
+  const card = h.cards()[0]!;
+  const id = card.artifactId!;
+  const before = h.kernel.context.getArtifactSync(id)!;
+  if (updatedBy === "human") h.kernel.context.commitSync("desk", {artifact:{artifactId:id, expectedVersion:1, content:before.content, updatedBy}});
+  const version = h.kernel.context.getArtifactSync(id)!.version;
+  expect(h.kernel.gate.approveSync(card.actionId, "owner", version)).toBe("approved");
+  run(h.kernel.db, "INSERT INTO cell_state(cell_id,key,value,updated_at) VALUES('desk',?,?,?)", ["desk:proposal:"+id, JSON.stringify({phases:["核查"]}), h.clock.now()]);
+  withTx(h.kernel.db, () => retireDeskState(h.kernel.db, h.clock));
+  expect(h.kernel.gate.getApprovalSync(card.actionId)).toMatchObject({
+    status:"approved", boundVersion:version+1, proposedVersion:updatedBy === "agent" ? version+1 : 1, humanEdited:updatedBy === "human",
+  });
+  expect(h.kernel.context.getArtifactSync(id)?.content.data).toMatchObject({phases:["核查"]});
+});
+
+it("reopens the same reassigned human action in the project's current epoch and clears its snooze", async () => {
+  const h = await boot();
+  const {projectId} = startProjectSync(h.kernel, {id:"reassign", title:"跟进", outcome:"办妥", brief:"跟进"});
+  await h.kernel.idle();
+  const key = gtdKeys.action("call");
+  const record = {id:"call", title:"打电话", owner:"human", status:"open", projectCellId:projectId, createdAt:h.clock.now(), updatedAt:h.clock.now()};
+  const write = (owner:string) => h.kernel.context.commitSync(projectId, {statePatches:{[key]:{...record, owner}}});
+  write("human");
+  const item = h.kernel.humanItems.list().find(i => i.title === record.title)!;
+  await h.kernel.humanItems.decide(item.id, {optionId:"system.defer", seenItemRevision:item.itemRevision, until:h.clock.now()+60_000}, "owner");
+  write("agent");
+  await h.kernel.closeCell(projectId, "cancelled");
+  await h.kernel.reopenProject(projectId, "owner");
+  write("human");
+  const reopened = h.kernel.humanItems.get(item.id)!;
+  expect(reopened).toMatchObject({status:"pending", epoch:h.kernel.getCell(projectId)!.epoch, snoozedUntil:null});
+  expect(reopened.epoch).toBeGreaterThan(item.epoch!);
+  await expect(h.kernel.humanItems.decide(item.id, {optionId:"done", seenItemRevision:reopened.itemRevision}, "owner")).resolves.toMatchObject({status:"resolved"});
 });

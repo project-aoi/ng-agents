@@ -27,6 +27,16 @@ describe("SKILL.md files", () => {
 });
 
 describe("upsertSkillOrNote", () => {
+  it("keeps old note links readable after classifying a saved bookmark as reference", () => {
+    const h = setup();
+    h.store.upsertSkillOrNoteSync("desk", {kind:"reference",scope:"cell",name:"my link",description:"Saved link",body:"https://example.org/bookmark",mode:"upsert"});
+    expect(h.store.readResourceSync("desk","note://my%20link")).toBe("https://example.org/bookmark");
+    expect(h.store.listKnowledgeSync({cellId:"desk",kind:"working_note"})).toHaveLength(0);
+    h.store.upsertSkillOrNoteSync("desk", {kind:"working_note",scope:"cell",name:"my link",description:"Saved link",body:"project plan",mode:"upsert"});
+    expect(h.store.readResourceSync("desk","note://my link")).toBe("project plan");
+    expect(h.store.readResourceSync("desk","reference://my link")).toBe("https://example.org/bookmark");
+  });
+
   it("writes a skill file with front matter and keeps the index row in sync", async () => {
     const h = setup();
     await h.store.upsertSkillOrNote("desk", {
@@ -75,8 +85,8 @@ describe("upsertSkillOrNote", () => {
     };
     expect(bad({ kind: "skill", scope: "global", name: "../etc", description: "d", body: "b", mode: "upsert" })).toBe(true);
     expect(bad({ kind: "skill", scope: "global", name: "Weekly Review", description: "d", body: "b", mode: "upsert" })).toBe(true);
-    expect(bad({ kind: "note", scope: "global", name: "n", body: "b", mode: "upsert" })).toBe(true);
-    expect(bad({ kind: "note", scope: "global", name: "n", description: "d", mode: "append" })).toBe(true);
+    expect(bad({ kind: "working_note", scope: "global", name: "n", body: "b", mode: "upsert" })).toBe(true);
+    expect(bad({ kind: "working_note", scope: "global", name: "n", description: "d", mode: "append" })).toBe(true);
     expect(bad({ kind: "fact", scope: "global", name: "n", description: "d", body: "b", mode: "upsert" })).toBe(true);
   });
 
@@ -91,7 +101,7 @@ describe("upsertSkillOrNote", () => {
       }
       return null;
     };
-    expect(error({ ...pref, kind: "note", applies: { roles: ["worker"] } })).toMatch(/only limit preferences, not a note/);
+    expect(error({ ...pref, kind: "working_note", applies: { roles: ["worker"] } })).toMatch(/only limit preferences, not a working_note/);
     expect(error({ ...pref, kind: "skill", applies: { cwdPrefix: "/repo" } })).toMatch(/only limit preferences/);
     expect(error({ ...pref, applies: { cwdPrefix: "repo/sub" } })).toMatch(/cwdPrefix must be an absolute directory path/);
     expect(error({ ...pref, applies: { cwdPrefix: "  " } })).toMatch(/cwdPrefix must be an absolute directory path/);
@@ -106,14 +116,14 @@ describe("upsertSkillOrNote", () => {
     expect(h.store.getKnowledgeSync({ kind: "preference", scope: "global", name: "gate" })).not.toHaveProperty("applies");
     expect(h.store.listKnowledgeSync({ kind: "preference" }).map((k) => k.applies)).toEqual([undefined]);
     // a note saved without applies is unaffected
-    expect(error({ ...pref, kind: "note", name: "n" })).toBeNull();
+    expect(error({ ...pref, kind: "working_note", name: "n" })).toBeNull();
   });
 
   it("notes and preferences live in the database, scoped per cell with ancestor inheritance", () => {
     const h = setup({ cells: [{ id: "desk" }, { id: "p", parentId: "desk" }, { id: "w", parentId: "p" }, { id: "x", parentId: "desk" }] });
-    h.store.upsertSkillOrNoteSync("p", { kind: "note", scope: "cell", name: "供应商联系人", description: "联系人", body: "A: 张三", mode: "upsert" });
-    h.store.upsertSkillOrNoteSync("w", { kind: "note", scope: "global", name: "牙医", description: "电话", body: "周五下午", mode: "upsert" });
-    expect(h.store.getKnowledgeSync({ kind: "note", scope: "cell", cellId: "p", name: "供应商联系人" })?.body).toBe("A: 张三");
+    h.store.upsertSkillOrNoteSync("p", { kind: "working_note", scope: "cell", name: "供应商联系人", description: "联系人", body: "A: 张三", mode: "upsert" });
+    h.store.upsertSkillOrNoteSync("w", { kind: "working_note", scope: "global", name: "牙医", description: "电话", body: "周五下午", mode: "upsert" });
+    expect(h.store.getKnowledgeSync({ kind: "working_note", scope: "cell", cellId: "p", name: "供应商联系人" })?.body).toBe("A: 张三");
     expect(h.store.readResourceSync("w", "note://供应商联系人")).toBe("A: 张三");
     expect(h.store.readResourceSync("w", `note://${encodeURIComponent("供应商联系人")}`)).toBe("A: 张三");
     expect(h.store.readResourceSync("x", "note://牙医")).toBe("周五下午");
@@ -121,7 +131,7 @@ describe("upsertSkillOrNote", () => {
     expect(h.store.listKnowledgeSync({ cellId: "p" }).map((k) => k.name)).toEqual(["供应商联系人", "牙医"]);
     expect(h.store.listKnowledgeSync({ cellId: "p", includeGlobal: false }).map((k) => k.name)).toEqual(["供应商联系人"]);
     // nearest scope wins on a name clash
-    h.store.upsertSkillOrNoteSync("w", { kind: "note", scope: "cell", name: "牙医", description: "电话", body: "改到周六", mode: "upsert" });
+    h.store.upsertSkillOrNoteSync("w", { kind: "working_note", scope: "cell", name: "牙医", description: "电话", body: "改到周六", mode: "upsert" });
     expect(h.store.readResourceSync("w", "note://牙医")).toBe("改到周六");
     expect(h.store.readResourceSync("p", "note://牙医")).toBe("周五下午");
     expect(existsSync(join(h.dataDir, "skills"))).toBe(false);

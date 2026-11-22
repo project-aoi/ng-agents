@@ -48,6 +48,14 @@ export function rowById(db: Db, id: string): OutboxRow | undefined {
   return get<OutboxRow>(db, "SELECT * FROM outbox WHERE id = ?", [id]);
 }
 
+export function latestRowByAction(db: Db, actionId: string): OutboxRow | undefined {
+  return get<OutboxRow>(db, "SELECT * FROM outbox WHERE action_id = ? ORDER BY rowid DESC LIMIT 1", [actionId]);
+}
+
+export function maxAttemptsByAction(db: Db, actionId: string): number {
+  return get<{ n: number }>(db, "SELECT COALESCE(MAX(attempts), 0) AS n FROM outbox WHERE action_id = ?", [actionId])?.n ?? 0;
+}
+
 export interface NewRow {
   id: string;
   idempotencyKey: string;
@@ -90,6 +98,10 @@ export function listRows(db: Db, filter: OutboxFilter = {}): OutboxRow[] {
   if (filter.cellId !== undefined) {
     where.push("cell_id = ?");
     params.push(filter.cellId);
+  }
+  if (filter.actionId !== undefined) {
+    where.push("action_id = ?");
+    params.push(filter.actionId);
   }
   const dir = filter.order === "oldest" ? "ASC" : "DESC";
   let sql = `SELECT * FROM outbox${where.length ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY created_at ${dir}, rowid ${dir}`;

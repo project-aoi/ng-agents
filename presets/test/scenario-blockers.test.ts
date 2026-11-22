@@ -9,13 +9,6 @@ const KEY = "ci-develop-lint";
 const TITLE = "develop 分支 lint 任务挂了";
 const FIXED = "ci已修复（MR !77），可以 rebase develop 然后继续推进";
 
-/** The desk's own note of open blockers (state key "desk:arbitration"), as its prompt and the workspace-arbitration skill describe it. */
-interface BlockerNote {
-  title: string;
-  fixer: string;
-  waiters: string[];
-  openedAt: number;
-}
 
 /** Each project dispatches one feature worker on its first run, then just ends its turns. */
 function projectsDispatchOnce(h: Harness): void {
@@ -54,7 +47,6 @@ describe("docs/05 scenario 4 — several workers blocked by the same CI failure:
 
     const repo1 = gitRepo("svc1");
     const repo2 = gitRepo("svc2");
-    let openedAt = 0;
     // 1. The first report: the desk looks at its note (nothing open), starts one fixer and notes the blocker.
     h.script.add(
       "desk",
@@ -65,20 +57,11 @@ describe("docs/05 scenario 4 — several workers blocked by the same CI failure:
         expect(names).toEqual(expect.arrayContaining(["read_state", "set_state", "spawn_cell", "send_message"]));
         expect(names).not.toContain("open_blocker");
         expect(names).not.toContain("resolve_blocker");
-        return tool("read_state", { key: KEYS.arbitration });
-      },
-      (req) => {
-        expect(lastToolResult(req)).toBe(`${KEYS.arbitration}: (not set)`);
-        return tool("spawn_cell", { preset: "worker", title: "修复公共 CI", cwd: repo1, instruction: "在独立 worktree 基于 origin/develop 修复 lint，提 MR 并合入。" });
+        // The report can wake the desk before the sender registers its wait.
+        return tool("spawn_cell", { preset: "worker", title: "修复公共 CI", meta:{relatedProjectIds:[p1]}, cwd: repo1, instruction: "在独立 worktree 基于 origin/develop 修复 lint，提 MR 并合入。" });
       },
       (req) => {
         fixers.push(/cell id (\S+)\. It starts now; you are woken when its turn is over\./.exec(lastToolResult(req))![1]!);
-        openedAt = h.clock.now();
-        const note: Record<string, BlockerNote> = { [KEY]: { title: TITLE, fixer: fixers[0]!, waiters: [childrenOf(h, p1)[0]!], openedAt } };
-        return tool("set_state", { patches: { [KEYS.arbitration]: note } });
-      },
-      (req) => {
-        expect(lastToolResult(req)).toBe(`Saved ${KEYS.arbitration}.`);
         return tool("wait", { reason: "修复中" });
       },
     );
@@ -88,7 +71,7 @@ describe("docs/05 scenario 4 — several workers blocked by the same CI failure:
     expect(h.kernel.listWaits([w1])).toEqual([expect.objectContaining({ waitingFor: "inbox:desk" })]);
     expect(fixers).toHaveLength(1);
     expect(h.kernel.getCell(fixers[0]!)).toMatchObject({ parentId: "desk", preset: "worker", spec: { cwd: repo1, lifetime: "wakeable" } });
-    expect(h.state<Record<string, BlockerNote>>("desk", KEYS.arbitration)).toEqual({ [KEY]: { title: TITLE, fixer: fixers[0], waiters: [w1], openedAt } });
+    expect(h.kernel.listWaits([w1])[0]?.waitingFor).toBe("inbox:desk");
 
     // 2. The same cause from another project: the desk's note says a fixer is on it, so the reporter only joins the note.
     h.script.add(
@@ -96,23 +79,15 @@ describe("docs/05 scenario 4 — several workers blocked by the same CI failure:
       (req) => {
         expect(requestText(req)).toContain("工作区冲突/公共受阻请求裁决");
         expect(requestText(req)).toContain(repo2);
-        return tool("read_state", { key: KEYS.arbitration });
+        expect(requestText(req)).toContain(fixers[0]!);
+        return tool("wait", { reason: "joined" });
       },
-      (req) => {
-        // the note is the desk's memory across wake-ups
-        const out = lastToolResult(req);
-        expect(out).toContain(`"fixer": "${fixers[0]}"`);
-        expect(out).toContain(`"${w1}"`);
-        const note: Record<string, BlockerNote> = { [KEY]: { title: TITLE, fixer: fixers[0]!, waiters: [w1, childrenOf(h, p2)[0]!], openedAt } };
-        return tool("set_state", { patches: { [KEYS.arbitration]: note } });
-      },
-      tool("wait", { reason: "joined" }),
     );
     const p2 = startProjectSync(h.kernel, { title: "服务二的 bugfix", outcome: "bug 修复", brief: "修 bug", cwd: repo2 }).projectId;
     await h.kernel.idle();
     const w2 = childrenOf(h, p2)[0]!;
     expect(h.kernel.listWaits([w2])).toEqual([expect.objectContaining({ waitingFor: "inbox:desk" })]);
-    expect(h.state<Record<string, BlockerNote>>("desk", KEYS.arbitration)).toEqual({ [KEY]: { title: TITLE, fixer: fixers[0], waiters: [w1, w2], openedAt } });
+    expect(h.kernel.listWaits([w1,w2])).toHaveLength(2);
     // exactly one fixer for the one cause
     expect(childrenOf(h, "desk", "worker")).toEqual(fixers);
 
@@ -128,10 +103,7 @@ describe("docs/05 scenario 4 — several workers blocked by the same CI failure:
       "desk",
       (req) => {
         expect(requestText(req)).toContain("develop 的 lint 已修复");
-        return tool("read_state", { key: KEYS.arbitration });
-      },
-      (req) => {
-        expect(lastToolResult(req)).toContain(`"waiters": [\n      "${w1}",\n      "${w2}"\n    ]`);
+        expect(requestText(req)).toContain(w1);
         return {
           toolCalls: [w1, w2].map((id) => ({ name: "send_message", input: { to: `inbox:${id}`, summary: "公共问题已处理", text: FIXED } })),
         };
@@ -140,9 +112,8 @@ describe("docs/05 scenario 4 — several workers blocked by the same CI failure:
         const out = lastToolResult(req);
         expect(out).toContain(`Delivered to ${w1}.`);
         expect(out).toContain(`NOT DELIVERED — ${w2} is closed (it was cancelled). Nothing was stored.`);
-        return tool("set_state", { patches: { [KEYS.arbitration]: null } });
+        return tool("wait", { reason:"resolved" });
       },
-      tool("wait", { reason: "resolved" }),
     );
     expect(h.kernel.sendToCell(fixers[0]!, { text: "主人：CI 已经绿了，收尾吧" })).toMatchObject({ status: "delivered" });
     await h.kernel.idle();
@@ -152,7 +123,7 @@ describe("docs/05 scenario 4 — several workers blocked by the same CI failure:
     // the fixer rests (dormant): the desk could send it more, nothing keeps it busy
     expect(h.kernel.getCell(fixers[0]!)).toMatchObject({ status: "active" });
     expect(h.kernel.activityOf([fixers[0]!]).get(fixers[0]!)!.state).toBe("dormant");
-    expect(h.state("desk", KEYS.arbitration)).toBeNull();
+    expect(h.state("desk", "desk:arbitration")).toBeNull();
     // the live waiter was woken by the desk's message and finished its own work; its project's books close the action
     expect(h.kernel.activityOf([w1]).get(w1)!.state).toBe("dormant");
     expect(h.kernel.listWaits([w1])).toEqual([]);
@@ -178,26 +149,19 @@ describe("docs/05 scenario 4 — several workers blocked by the same CI failure:
       },
       (req) => {
         expect(lastToolResult(req)).toContain('NOT DELIVERED — there is no cell "nope".');
-        return tool("set_state", { patches: { [KEYS.arbitration]: { "svc-down": { title: "测试环境挂了", fixer: null, waiters: ["desk"] } } } });
+        return tool("set_state", { patches: { ["desk:arbitration"]: { "svc-down": { title: "测试环境挂了", fixer: null, waiters: ["desk"] } } } });
       },
-      tool("read_state", { key: KEYS.arbitration }),
       (req) => {
-        expect(lastToolResult(req)).toBe(`${KEYS.arbitration} = ${JSON.stringify({ "svc-down": { title: "测试环境挂了", fixer: null, waiters: ["desk"] } }, null, 2)}`);
-        return tool("set_state", { patches: { [KEYS.arbitration]: null } });
-      },
-      tool("read_state", { key: KEYS.arbitration }),
-      (req) => {
-        expect(lastToolResult(req)).toBe(`${KEYS.arbitration}: (not set)`);
-        return tool("wait", { reason: "done" });
+        expect(lastToolResult(req)).toContain("reserved");
+        return tool("wait",{reason:"done"});
       },
     );
     await h.ui.capture({ text: "测试一下仲裁笔记" });
     await h.kernel.idle();
     expect(h.script.pending("desk")).toBe(0);
     expect(childrenOf(h, "desk", "worker")).toEqual([]);
-    expect(h.state("desk", KEYS.arbitration)).toBeNull();
+    expect(h.state("desk", "desk:arbitration")).toBeNull();
     // the desk's prompt tells it to keep exactly this note
-    expect(KEYS.arbitration).toBe("desk:arbitration");
-    expect(systemOf(h, "desk")).toContain('key "desk:arbitration"');
+    expect(systemOf(h, "desk")).toContain("relatedProjectIds");
   });
 });

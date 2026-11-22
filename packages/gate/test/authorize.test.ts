@@ -68,36 +68,15 @@ describe("authorize — deny (and nothing persisted)", () => {
   it("workspace tools, jobs and secrets outside bounds", () => {
     const f = setup();
     withWorker(f);
-    denied(f, exec("code_rpc"), meta("w1"), /tool "code_rpc" is outside/);
-    denied(f, exec("format_disk"), meta("w1"), /unknown tool/);
-    f.addCell("ro", "desk", { tools: ["read", "write", "bash"], isolation: "shared_ro" });
-    denied(f, exec("write"), meta("ro"), /read-only workspace/);
-    denied(f, { type: "job.start", summary: "", subjectKey: "s", sideEffect: "internal", command: "make" }, meta("ro"), /read-only/);
-    f.addCell("nobash", "desk", { tools: ["read"], isolation: "git_worktree" });
-    denied(f, { type: "job.start", summary: "", subjectKey: "s", sideEffect: "internal", command: "make" }, meta("nobash"), /needs the "bash" tool/);
     denied(f, secretUse("feishu"), meta("w1"), /secret "feishu" is outside/);
     denied(f, secretUse("github", { tool: "code_rpc" }), meta("w1"), /tool "code_rpc" is outside/);
     // in bounds but no value on the host
     denied(f, secretUse("feishu"), meta("desk"), /not configured on the host/);
   });
 
-  it("spawn beyond depth or concurrency, and control of non-descendants", () => {
-    const f = setup();
-    withWorker(f, "w1", { maxDepth: 0, maxConcurrentChildren: 0 });
-    const spawn = (over: Record<string, unknown> = {}) =>
-      ({ type: "cell.spawn", summary: "", subjectKey: "s", sideEffect: "internal", spec: { processor: { kind: "llm" } }, ...over }) as ProposedAction;
-    denied(f, spawn(), meta("w1"), /maxDepth 0/);
-    denied(f, spawn({ spec: { parentId: "w1", processor: { kind: "llm" } } }), meta("desk"), /only create children of the requesting cell/);
-    f.addCell("w2", "desk", { tools: ["read"] });
-    f.addCell("w3", "desk", { tools: ["read"] });
-    denied(f, spawn(), meta("desk"), /already has 3 open children \(max 3\)/);
-
-    const control = (targetCellId: string) =>
-      ({ type: "cell.control", summary: "", subjectKey: "s", sideEffect: "internal", targetCellId, action: "cancel" }) as ProposedAction;
-    denied(f, control("w2"), meta("w1"), /not a descendant/);
-    denied(f, control("w1"), meta("w1"), /not a descendant/);
-    denied(f, control("desk"), meta("w1"), /not a descendant/);
-    denied(f, control("ghost"), meta("desk"), /not a descendant/);
+  it.each(["workspace.exec","job.start","cell.spawn","cell.control"])("rejects retired %s approval requests",type=>{
+    const f=setup();
+    denied(f,{type,subjectKey:"s",summary:"",sideEffect:"internal"},meta("desk"),/unknown type/);
   });
 
   it("budget exhausted for the cell or any ancestor", () => {
@@ -163,32 +142,7 @@ describe("authorize — allow (single-use token, no card)", () => {
 
     expectType(f.gate.authorizeSync(exec("read", { sideEffect: "none" }), meta("desk")), "allow");
     expectType(f.gate.authorizeSync(exec("bash"), meta("w1")), "allow");
-    expectType(f.gate.authorizeSync({ type: "job.start", summary: "", subjectKey: "s", sideEffect: "internal", command: "pnpm test" }, meta("w1")), "allow");
-    expectType(
-      f.gate.authorizeSync({ type: "cell.spawn", summary: "", subjectKey: "s", sideEffect: "internal", spec: { processor: { kind: "llm" } } }, meta("desk")),
-      "allow",
-    );
-    expectType(
-      f.gate.authorizeSync({ type: "cell.control", summary: "", subjectKey: "s", sideEffect: "internal", targetCellId: "w1", action: "steer" }, meta("desk")),
-      "allow",
-    );
     expect(approvalRows(f)).toEqual([]);
-    expect(f.events.filter((e) => e.topic === "approval.changed")).toEqual([]);
-  });
-
-  it("host work is internal whatever the isolation: mutating tools and jobs in the owner's real directory need no card (docs/05)", () => {
-    const f = setup();
-    expect(f.cells.require("desk").bounds.isolation).toBe("none");
-    for (const tool of ["write", "edit", "bash", "code_rpc"]) expectType(f.gate.authorizeSync(exec(tool, { subjectKey: tool }), meta("desk")), "allow");
-    const job: ProposedAction = { type: "job.start", summary: "", subjectKey: "j", sideEffect: "internal", command: "pnpm build" };
-    expectType(f.gate.authorizeSync(job, meta("desk")), "allow");
-    expect(approvalRows(f)).toEqual([]);
-    for (const isolation of ISOLATION_LEVELS) {
-      const bounds = makeBounds({ isolation });
-      expect(derivedSideEffect(exec("bash"), bounds, ["channel:ui:*"]), isolation).toBe("internal");
-      expect(derivedSideEffect(exec("read"), bounds, ["channel:ui:*"]), isolation).toBe("none");
-      expect(derivedSideEffect(job, bounds, ["channel:ui:*"]), isolation).toBe("internal");
-    }
   });
 
   it("secret.use returns only the ref — never the value", () => {
@@ -242,7 +196,6 @@ describe("authorize — defer (external side effects become one Clarify card)", 
     expectType(f.gate.authorizeSync(project, meta("desk")), "defer");
     // host work is internal by itself, but a declared external side effect is respected
     expectType(f.gate.authorizeSync(exec("bash", { subjectKey: "e", sideEffect: "external" }), meta("desk")), "defer");
-    expectType(f.gate.authorizeSync({ type: "job.start", summary: "", subjectKey: "f", sideEffect: "external", command: "git push" }, meta("desk")), "defer");
     expectType(f.gate.authorizeSync(exec("read", { subjectKey: "g" }), meta("desk")), "allow");
     expectType(f.gate.authorizeSync({ type: "custom", name: "x", summary: "", subjectKey: "h", sideEffect: "external" }, meta("desk")), "defer");
   });
@@ -320,19 +273,19 @@ describe("authorize — one pending card per subjectKey", () => {
     expect(p3.actionId).toBe(p2.actionId);
   });
 
-  it("a defer from another cell (or of another type) supersedes the old card", () => {
+  it("another cell cannot displace the issuer's card or use a kernel subject", () => {
     const f = setup();
     withWorker(f);
     f.addCell("w2", "desk", { tools: ["read"], canSendTo: ["channel:feishu:*"], maxTokens: 1000, maxCents: 10, isolation: "git_worktree" });
     const a = expectType(f.gate.authorizeSync(send("channel:feishu:oc_1", { subjectKey: "project:p1" }), meta("desk")), "defer");
-    const b = expectType(f.gate.authorizeSync(send("channel:feishu:oc_2", { subjectKey: "project:p1" }), meta("w2")), "defer");
-    expect(b.actionId).not.toBe(a.actionId);
-    expect(f.gate.getApprovalSync(a.actionId)).toMatchObject({ status: "superseded", statusReason: `superseded by ${b.actionId}` });
+    expect(f.gate.authorizeSync(send("channel:feishu:oc_2", {subjectKey:"project:p1"}), meta("w2"))).toMatchObject({type:"deny"});
+    expect(f.gate.authorizeSync(send("channel:feishu:oc_2", {subjectKey:"kernel:w2:step_limit"}), meta("w2"))).toMatchObject({type:"deny"});
+    expect(f.gate.getApprovalSync(a.actionId)).toMatchObject({status:"pending", itemRevision:1});
     const c = expectType(
-      f.gate.authorizeSync({ type: "custom", name: "merge", summary: "合入", subjectKey: "project:p1", sideEffect: "external" }, meta("w2")),
+      f.gate.authorizeSync({ type: "custom", name: "merge", summary: "合入", subjectKey: "project:p1", sideEffect: "external" }, meta("desk")),
       "defer",
     );
-    expect(f.gate.getApprovalSync(b.actionId)!.status).toBe("superseded");
+    expect(f.gate.getApprovalSync(a.actionId)!.status).toBe("superseded");
     expect(f.gate.listPendingSync().map((p) => p.actionId)).toEqual([c.actionId]);
     expect(f.gate.findPendingBySubjectSync("project:p1")!.actionId).toBe(c.actionId);
   });
@@ -361,7 +314,7 @@ describe("authorize — policy rules", () => {
     withWorker(f);
     f.gate.upsertPolicyRuleSync({ match: { type: "*" }, effect: "allow", createdBy: "owner" });
     expectType(f.gate.authorizeSync(send("channel:feishu:oc_1"), meta("w1")), "deny");
-    expectType(f.gate.authorizeSync(exec("code_rpc"), meta("w1")), "deny");
+    expectType(f.gate.authorizeSync(secretUse("github",{tool:"code_rpc"}), meta("w1")), "deny");
   });
 
   it("most specific rule wins: nearer scope, exact type, exact target; deny breaks ties", () => {
@@ -375,15 +328,15 @@ describe("authorize — policy rules", () => {
     // the w1-scoped defer rule is nearer than the global allow
     expectType(f.gate.authorizeSync(send("channel:feishu:oc_1", { subjectKey: "c" }), meta("w1")), "defer");
 
-    f.gate.upsertPolicyRuleSync({ match: { type: "workspace.exec", target: "read" }, effect: "allow", createdBy: "owner" });
-    f.gate.upsertPolicyRuleSync({ match: { type: "workspace.exec", target: "read" }, effect: "deny", createdBy: "owner" });
+    f.gate.upsertPolicyRuleSync({ match: { type: "custom", target: "read" }, effect: "allow", createdBy: "owner" });
+    f.gate.upsertPolicyRuleSync({ match: { type: "custom", target: "read" }, effect: "deny", createdBy: "owner" });
     expectType(f.gate.authorizeSync(exec("read"), meta("desk")), "deny");
   });
 
   it("a defer rule turns an internal action into a card; disabled rules are ignored", () => {
     const f = setup();
     withWorker(f);
-    const r = f.gate.upsertPolicyRuleSync({ match: { type: "workspace.exec", target: "bash" }, effect: "defer", createdBy: "owner" });
+    const r = f.gate.upsertPolicyRuleSync({ match: { type: "custom", target: "bash" }, effect: "defer", createdBy: "owner" });
     expectType(f.gate.authorizeSync(exec("bash"), meta("w1")), "defer");
     f.gate.upsertPolicyRuleSync({ id: r.id, match: r.match, effect: "defer", enabled: false, createdBy: "owner" });
     expectType(f.gate.authorizeSync(exec("bash", { subjectKey: "z" }), meta("w1")), "allow");

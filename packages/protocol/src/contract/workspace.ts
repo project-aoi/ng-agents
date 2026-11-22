@@ -15,7 +15,7 @@ export interface Workspace {
    * gone, and remove an explicit (or legacy) container. Never touches a host directory, a branch or a worktree.
    * Idempotent; resolves once nothing of the cell is still running.
    */
-  stopRuntime(cellId: string): Promise<void>;
+  stopRuntime(cellId: string, stillClosed?: () => boolean): Promise<void>;
 
   // ---------- [ext] ----------
   /**
@@ -44,7 +44,7 @@ export interface WorkspacePort {
   // `result` envelope carrying expectedEpoch into the owning Cell's Inbox
   // [ext] every job that started ends with exactly one job.result (succeeded | failed | cancelled), id `${jobId}:result`;
   //       delivery "wakeup", except "silent_inject" for a job the cell cancelled itself through `cancelJob`.
-  startJob(spec: { command: string; streamPreview?: boolean }): Promise<{ jobId: string }>;
+  startJob(spec: { command: string; streamPreview?: boolean; timeoutMs?: number }): Promise<{ jobId: string }>;
   observeJob(jobId: string): Promise<{ state: "running" | "succeeded" | "failed" | "cancelled"; tail: string }>;
   writeJobInput?(jobId: string, input: string): Promise<void>;
   cancelJob(jobId: string): Promise<void>;
@@ -89,6 +89,7 @@ export interface JobRecord {
   cwd: string | null;
   state: JobState;
   pid: number | null;
+  processIdentity?: string | null;
   logPath: string | null;
   exitCode: number | null;
   streamPreview: boolean;
@@ -102,6 +103,8 @@ export interface JobRecord {
    * group is confirmed gone, then becomes `cancelled`. A crash in between leaves it for recover() to finish.
    */
   cancelRequestedAt: number | null;
+  /** [ext] Maximum allowed runtime in ms before the workspace terminates the job as timed out. */
+  timeoutMs?: number | null;
 }
 
 export type WorkspaceStatus = "active" | "hibernated" | "destroyed" | "failed";

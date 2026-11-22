@@ -79,7 +79,6 @@ describe("demo mode: the workbench's scenarios played through the real kernel an
     const status = await d.get<StatusDTO>("/api/status");
     expect(status).toMatchObject({ demo: true, backend: "demo" });
     expect(status.notifications.length).toBeGreaterThan(5);
-    expect(status.today.archivedNotifications).toBeGreaterThan(0);
     expect(status.background.running).toBeGreaterThan(0);
 
     // 📥 Clarify: a reply waiting for the owner (redrafted after a follow-up) and a proposal raised by a source hit.
@@ -97,15 +96,12 @@ describe("demo mode: the workbench's scenarios played through the real kernel an
     const quick = engage.items.filter((i) => i.kind === "quick");
     expect(quick.find((i) => i.title.startsWith("给 HR"))).toMatchObject({ overdue: true, source: { label: "定时提醒" }, project: null });
     expect(quick.find((i) => i.title === "要 Doubao work 的代码")).toMatchObject({ project: { title: "Harness 对比" } });
-    const deep = engage.items.find((i) => i.kind === "deep")!;
-    expect(deep).toMatchObject({ title: "回复李总：MySQL 8.0 迁移方案", send: { state: "ready" } });
-    const detail = await d.get<EngageDetailDTO>(`/api/engage/${deep.cellId}/${deep.actionId}`);
-    expect(detail.artifact).toMatchObject({ updatedBy: "human" });
-    expect(detail.artifact!.decisions[0]).toMatchObject({ label: "迁移窗口二选一" });
-    expect(detail.artifact!.decisions[0]!.text).toContain("双写灰度一周");
-    expect(detail.artifact!.parked).toHaveLength(1);
-    expect(detail.contextPack.references.length).toBeGreaterThan(0);
-    expect(detail.contextPack.rawInput?.text).toContain("MySQL 5.7 升 8.0");
+    const pool = await d.get<{items: Array<{title:string;artifact:EngageDetailDTO["artifact"]}>}>("/api/human-items");
+    const deep = pool.items.find(i=>i.title.includes("MySQL 8.0"))!;
+    expect(deep.artifact).toMatchObject({updatedBy:"human"});
+    expect(deep.artifact!.decisions[0]).toMatchObject({label:"迁移窗口二选一"});
+    expect(deep.artifact!.decisions[0]!.text).toContain("双写灰度一周");
+    expect(deep.artifact!.parked).toHaveLength(1);
 
     // 🧭 Radar: a project running with one worker result in, one waiting on the owner, one waiting on a reply, and a
     // parked idea with its report.
@@ -121,7 +117,7 @@ describe("demo mode: the workbench's scenarios played through the real kernel an
     expect(row("Harness 对比")).toMatchObject({ ball: { owner: "human", engage: expect.any(Object) }, summary: expect.stringContaining("trae 部分已分析完"), stalled: false });
     expect(row("压测服务器采购比价")).toMatchObject({ ball: { owner: "waiting" }, waiting: { replied: 0, total: 1 }, stalled: false });
     expect(row("压测服务器采购比价").ball!.text).toContain("北辰网络");
-    expect(row("压测服务器采购比价").workers.map((w) => [w.preset, w.state])).toEqual([["watcher", "waiting"]]);
+    expect(row("压测服务器采购比价").workers.map((w) => [w.preset, w.state])).toEqual([["reply_watcher", "waiting"]]);
     // Parked is its own state, not also "paused" (BUG-011.3); its report opens from the row (BUG-010).
     expect(radar.someday).toEqual([expect.objectContaining({ title: "极简模式", lifecycle: "someday", paused: false, summary: expect.stringContaining("调研报告") })]);
     expect(radar.someday[0]!.artifacts).toEqual([expect.objectContaining({ artifactId: "art_demo_minimal", title: "极简模式调研报告" })]);
@@ -143,6 +139,7 @@ describe("demo mode: the workbench's scenarios played through the real kernel an
     // Activity: archived notifications, saved notes, reminders, a withdrawn card, sent replies.
     const activity = await d.get<ActivityListDTO>("/api/activity");
     expect(activity.counts.notification_archived).toBeGreaterThanOrEqual(2);
+    expect(status.today.archivedNotifications).toBe(activity.items.filter(i=>i.kind==="notification_archived" && i.at>=status.today.since).length);
     expect(activity.counts.note_saved).toBeGreaterThanOrEqual(1);
     expect(activity.counts.reminder_set).toBe(2);
     expect(activity.counts.card_withdrawn).toBe(1);
@@ -187,7 +184,7 @@ describe("demo mode: the workbench's scenarios played through the real kernel an
     expect((await d.get<ClarifyQueueDTO>("/api/clarify")).cards.some((c) => c.title.includes("发布计划"))).toBe(false);
 
     const card = (await d.get<ClarifyQueueDTO>("/api/clarify")).cards.find((c) => c.title === "回复王敏：导出按门店筛选")!;
-    const r = await d.post<ClarifyMutationResponse>(`/api/clarify/${card.id}/revise`, { instruction: "语气再正式一点" });
+    const r = await d.post<ClarifyMutationResponse>(`/api/clarify/${card.id}/revise`, { instruction: "语气再正式一点", seenItemRevision: card.itemRevision });
     expect(r).toMatchObject({ ok: true, outcome: "revising" });
     const redrafted = await eventually(
       () => d.get<ClarifyQueueDTO>("/api/clarify"),
@@ -198,7 +195,7 @@ describe("demo mode: the workbench's scenarios played through the real kernel an
 
     // The owner got the code: ticking the project's action off wakes it, it sends a worker on, the report grows.
     const action = (await d.get<EngageListDTO>("/api/engage")).items.find((i) => i.title === "要 Doubao work 的代码")!;
-    await d.post(`/api/engage/${action.cellId}/${action.actionId}/done`, { note: "代码在 ~/code/doubao" });
+    await d.post(`/api/engage/${action.cellId}/${action.actionId}/done`, { note: "代码在 ~/code/doubao",seenItemRevision:action.itemRevision });
     const radar = await eventually(
       () => d.get<RadarDTO>("/api/radar"),
       (v) => v.projects.some((p) => p.title === "Harness 对比" && p.summary?.includes("两边都分析完了") === true),

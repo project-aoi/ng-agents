@@ -14,6 +14,20 @@
 //   messages / control / trigger (always 200, the outcome — not_found included — is in the body), and the two
 //   version-protected saves (409 with ArtifactSaveResponse / ClarifyMutationResponse).
 
+import type { HumanItem, ProjectProposal, ClarifyCard } from "@ng/protocol";
+
+export interface HumanItemDTO extends HumanItem {
+  actionRefs: Array<{cellId:string; actionId:string}>;
+  resumeTarget: {id:string; title:string} | null;
+  proposal: ProjectProposal | null;
+  projects: Array<{id:string; title:string}>;
+  closeTargets: Record<string, Array<{id:string; title:string}>>;
+  project: {id:string; title:string; paused:boolean; parked:boolean} | null;
+  artifact: ArtifactDTO | null;
+  ownerOnly: boolean;
+  attempted: {target:string; body:string} | null;
+}
+
 // ==================== shared vocabulary ====================
 
 /** 🔵 我来处理 · 🟢 Agent 处理中 · 🟡 等待外部 (the action's title says what is awaited) */
@@ -192,6 +206,7 @@ export interface ModelsDTO {
 export type SetModelRequest = { tier: ModelTierDTO; mode: "auto" } | { tier: ModelTierDTO; mode: "fixed"; model: string; effort?: string };
 
 export interface StatusDTO {
+  humanPending?:number;
   generatedAt: number;
   /** Demo mode (no CLI agent and no API model available, or NG_DESK_DEMO=1): the UI labels itself as a demo. */
   demo: boolean;
@@ -200,7 +215,7 @@ export interface StatusDTO {
   /** The model the main agents run on right now, e.g. "Opus 5.5 · xhigh" (CLI backends, once the CLI has listed its models). */
   model?: string;
   auth: { tokenRequired: boolean };
-  focus: { on: boolean; buffered: number };
+  focus: { on: boolean; buffered: number; manual?:boolean; editors?:number };
   clarify: { pending: number; snoozed: number };
   background: {
     /** Background clones doing something right now (a run or a long command). */
@@ -274,7 +289,7 @@ export interface FocusRequest {
 
 export interface FocusResponse {
   ok: true;
-  focus: { on: boolean; buffered: number };
+  focus: { on: boolean; buffered: number; manual?:boolean; editors?:number };
   /** Leaving focus delivers what was held back; these are the receipts. */
   flushed: { sent: number; failed: number; unknown: number } | null;
   message: string;
@@ -310,6 +325,8 @@ export interface ClarifyCardDTO {
   projectId: string | null;
   createdAt: number;
   updatedAt: number;
+  /** Monotonic card revision checked on every decision to reject stale concurrent clicks / MCP calls. */
+  itemRevision: number;
 
   /** Block 1 — source & status bar: "飞书 · 12 分钟前" + "已备好初稿 v2 · 等待确认". */
   sourceBar: {
@@ -341,7 +358,7 @@ export interface ClarifyCardDTO {
     usage: { tokens: number; limitTokens: number; cents: number; limitCents: number; text: string } | null;
   } | null;
   /** Last send attempt when the card stays visible because of it. */
-  outcome: { state: "send_unknown" | "send_failed"; message: string; error?: string } | null;
+  outcome: { state: "send_unknown" | "send_failed"; message: string; error?: string; attemptedBody?: string; target?: string } | null;
 
   /** Block 4 — the fixed button row (1 primary + 2 adjust/defer + 下一张) and the secondary actions. */
   buttons: ButtonDTO[];
@@ -364,6 +381,8 @@ export interface ClarifyQueueDTO {
 export interface ApproveRequest {
   /** The draft version the owner was looking at (`card.sourceBar.version`); omit for cards without a draft. */
   seenVersion?: number | null;
+  /** The card revision the caller saw (`card.itemRevision`); when provided, stale decisions are rejected. */
+  seenItemRevision: number;
 }
 
 /**
@@ -372,10 +391,11 @@ export interface ApproveRequest {
  * failed            sending failed, nothing delivered; approving again retries
  * unknown           "发送结果未知，请核实" — the card stays; verify it, it is never re-sent automatically
  * version_mismatch  "草稿已更新，请重看" — `currentVersion` is what to show; approving that version works
+ * revision_mismatch "这张卡刚刚变动过，请刷新后再确认" — `currentRevision` is what to show
  * already_cancelled the task was stopped or the card withdrawn
  * not_found         no such card
  */
-export type ApproveOutcome = "sent" | "approved" | "failed" | "unknown" | "version_mismatch" | "already_cancelled" | "not_found";
+export type ApproveOutcome = "sent" | "approved" | "failed" | "unknown" | "version_mismatch" | "revision_mismatch" | "already_cancelled" | "not_found";
 
 export interface MutationResult<V, O extends string = string> {
   ok: boolean;
@@ -388,6 +408,7 @@ export interface MutationResult<V, O extends string = string> {
 
 export interface ApproveResponse extends MutationResult<ClarifyQueueDTO, ApproveOutcome> {
   currentVersion?: number | null;
+  currentRevision?: number;
   error?: string;
   /** The card after the click (null when it left the queue). */
   card: ClarifyCardDTO | null;
@@ -397,11 +418,13 @@ export interface ApproveResponse extends MutationResult<ClarifyQueueDTO, Approve
 export interface ReviseRequest {
   instruction: string;
   voice?: boolean;
+  seenItemRevision: number;
 }
 
 /** POST /api/clarify/:cardId/snooze — "⏱ 推迟到下午"; `until` defaults to the next afternoon slot. */
 export interface SnoozeRequest {
   until?: number;
+  seenItemRevision: number;
 }
 
 /** POST /api/clarify/:cardId/extend — "⏱ 再等 1 天" (`until` defaults to +1 day) / "⏱ 追加额度继续" (`raise` defaults to +50%). */
@@ -409,21 +432,20 @@ export interface ExtendRequest {
   until?: number;
   raise?: { tokens?: number; cents?: number };
   note?: string;
+  seenItemRevision: number;
 }
 
 /** POST /api/clarify/:cardId/resolve-offline · /dismiss · /deny · /someday · /abandon */
 export interface NoteRequest {
+  seenVersion?: number;
   note?: string;
-}
-
-/** POST /api/clarify/:cardId/to-human — "转给我来处理" */
-export interface ToHumanRequest {
-  effort?: Effort;
-  nextStep?: string;
+  seenItemRevision: number;
 }
 
 /** POST /api/clarify/:cardId/verify — the owner checked an unknown send on the other side. */
 export interface VerifyRequest {
+  seenAttempt: number;
+  seenItemRevision: number;
   verdict: "sent" | "failed";
   note?: string;
 }
@@ -445,28 +467,29 @@ export type ClarifyOutcome =
   | "someday"
   | "continued"
   | "resolved_offline"
-  | "to_human"
   | "dismissed"
   | "denied"
   | "verified"
   | "abandoned"
   | "saved"
   | "conflict"
+  | "revision_mismatch"
   | "not_pending"
   | "not_found";
 
 export interface ClarifyMutationResponse extends MutationResult<ClarifyQueueDTO, ClarifyOutcome> {
   card: ClarifyCardDTO | null;
-  /** to_human: the new Engage item · someday: the Radar row id. */
-  engageItem?: { cellId: string; actionId: string };
   projectId?: string;
   /** plan save conflict: the plan document as it is now. */
   current?: ArtifactDTO;
+  /** revision_mismatch: the card's current itemRevision. */
+  currentRevision?: number;
 }
 
 // ==================== 🎯 Engage (GET /api/engage?effort=15m|45m|low_energy) ====================
 
 export interface EngageItemDTO {
+  itemRevision?: number; // linked approval, if present
   /** Use both in /api/engage/:cellId/:actionId paths. */
   cellId: string;
   actionId: string;
@@ -515,12 +538,15 @@ export interface EngageDetailDTO {
 
 /** POST /api/engage/:cellId/:actionId/done — "✓ 已办完" */
 export interface DoneRequest {
+  seenVersion?: number;
+  seenItemRevision?: number; // required when the action is linked to an approval
   note?: string;
 }
 
 /** POST /api/engage/:cellId/:actionId/send — "定稿发送" */
 export interface EngageSendRequest {
   seenVersion: number;
+  seenItemRevision: number;
 }
 
 export type EngageOutcome = "done" | "already_done" | ApproveOutcome;
@@ -529,6 +555,7 @@ export interface EngageMutationResponse extends MutationResult<EngageListDTO, En
   /** Background tasks stopped because the item is finished. */
   closedTasks?: number;
   currentVersion?: number | null;
+  currentRevision?: number;
   error?: string;
 }
 
@@ -676,7 +703,7 @@ export interface TopologyNodeDTO {
   parentId: string | null;
   /** The project it belongs to (itself, for a project node); null for the desk, sources and hubs. */
   projectId: string | null;
-  preset: "inline" | "worker" | "watcher" | "sensor" | "project" | "hub" | null;
+  preset: "inline" | "worker" | "checker" | "reply_watcher" | "watcher" | "sensor" | "project" | "hub" | null;
   /** "总助理" | "项目协调" | "执行分身" | "外部盯梢" | "信源巡检" | "领域中枢" */
   roleLabel: string;
   title: string;

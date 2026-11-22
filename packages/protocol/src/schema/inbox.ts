@@ -3,7 +3,13 @@ import type { SchemaModule } from "./types";
 // Owner: @ng/inbox.
 export const inboxSchema: SchemaModule = {
   owner: "@ng/inbox",
-  version: 1,
+  version: 2,
+  migrations: [{
+    version: 2,
+    up: `ALTER TABLE inbox_messages ADD COLUMN first_claimed_at INTEGER;
+         UPDATE inbox_messages SET first_claimed_at = updated_at
+         WHERE claim_id IS NOT NULL OR attempts > 0 OR updated_at <> created_at OR status IN ('claimed','done','handed_back','dead');`,
+  }],
   ddl: /* sql */ `
 CREATE TABLE IF NOT EXISTS inbox_schedules (
   id             TEXT PRIMARY KEY,
@@ -44,11 +50,17 @@ CREATE TABLE IF NOT EXISTS inbox_messages (
   schedule_id    TEXT REFERENCES inbox_schedules(id),
   expected_epoch INTEGER,
   claim_id       TEXT,
+  first_claimed_at INTEGER,
   attempts       INTEGER NOT NULL DEFAULT 0,
   created_at     INTEGER NOT NULL,
   updated_at     INTEGER NOT NULL,
   UNIQUE (cell_id, envelope_id)                -- transport idempotency: same id twice → "deduped"
 );
+CREATE TRIGGER IF NOT EXISTS record_first_claim AFTER UPDATE OF status ON inbox_messages
+WHEN NEW.status = 'claimed' AND OLD.first_claimed_at IS NULL
+BEGIN
+  UPDATE inbox_messages SET first_claimed_at = NEW.updated_at WHERE seq = NEW.seq;
+END;
 -- "due pending by cell": WHERE cell_id = ? AND status = 'pending' AND deliver_at <= ? ORDER BY seq
 CREATE INDEX IF NOT EXISTS idx_inbox_due ON inbox_messages(cell_id, status, deliver_at, seq);
 -- next wakeup across all cells

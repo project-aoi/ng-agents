@@ -9,7 +9,7 @@ import {
   type ProjectProposal,
 } from "@ng/protocol";
 import type { ArtifactDTO, ButtonDTO, ClarifyCardDTO, ClarifyCardState, ClarifyQueueDTO, ProposalDTO } from "../../shared/api";
-import { approvalProjectId, linkedApprovalId, readActions, readActivities, type ProjectionInput } from "./common";
+import { approvalProjectId, linkedApprovalId, readActions, type ProjectionInput } from "./common";
 import { artifactDTO, button, channelLabelOfAddress, effortLabel, enc, ownerLabel, post, sourceInfo, waitingDTO } from "./format";
 import { afternoonSlot, whenText } from "./time";
 
@@ -41,16 +41,11 @@ function candidates(input: ProjectionInput): Candidates {
   const actions = readActions(kernel).filter((a) => a.record.status === "open" && a.record.owner === "human");
   // A card the owner took over ("转给我来处理") lives on as an Engage item until it is sent or checked off.
   const hidden = new Set(actions.map((a) => linkedApprovalId(a.record)).filter((id): id is string => id !== null));
-  const abandoned = new Set(
-    readActivities(kernel)
-      .filter((a) => a.record.kind === "card_withdrawn" && a.record.actionId && !a.record.restoredAt)
-      .map((a) => a.record.actionId!),
-  );
   const outcomes = kernel.gate
     .listApprovalsSync({ status: ["unknown", "failed"] })
     .filter((r) => r.action.type === "channel.send")
     // A failed send of an Engage item is retried from Engage; an unknown one always needs verification here.
-    .filter((r) => r.status === "unknown" || (!abandoned.has(r.actionId) && !hidden.has(r.actionId)));
+    .filter((r) => r.status === "unknown" || !hidden.has(r.actionId));
   const revising = new Set<string>();
   for (const cellId of new Set(pending.map((p) => p.cellId))) {
     for (const m of kernel.inbox.listMessagesSync({ cellId, type: PAYLOAD.approvalRevise, status: ["pending", "claimed"] })) {
@@ -169,21 +164,22 @@ function statusText(card: ClarifyCard | null, state: ClarifyCardState, draft: Ar
   }
 }
 
-function buttonsFor(input: ProjectionInput, rec: ApprovalRecord, card: ClarifyCard | null, state: ClarifyCardState, version: number | null): ButtonDTO[] {
+function buttonsFor(input: ProjectionInput, rec: ApprovalRecord, card: ClarifyCard | null, state: ClarifyCardState, version: number | null, seenAttempt?: number): ButtonDTO[] {
   const { now, settings } = input;
   const base = `/api/clarify/${enc(rec.actionId)}`;
   const skip = button({ id: "skip", label: "下一张 →", client: "skip" });
+  const rev = rec.itemRevision;
   if (state === "send_unknown") {
     return [
-      button({ id: "verify_sent", label: "✓ 已核实：对方收到了", primary: true, endpoint: post(`${base}/verify`, { verdict: "sent" }) }),
-      button({ id: "verify_failed", label: "✗ 已核实：对方没收到", endpoint: post(`${base}/verify`, { verdict: "failed" }), hint: "之后可以重新发送" }),
+      button({ id: "verify_sent", label: "✓ 已核实：对方收到了", primary: true, endpoint: post(`${base}/verify`, { verdict: "sent", seenItemRevision: rev, seenAttempt }) }),
+      button({ id: "verify_failed", label: "✗ 已核实：对方没收到", endpoint: post(`${base}/verify`, { verdict: "failed", seenItemRevision: rev, seenAttempt }), hint: "之后可以重新发送" }),
       skip,
     ];
   }
   if (state === "send_failed") {
     return [
-      button({ id: "retry_send", label: "↻ 重新发送", primary: true, endpoint: post(`${base}/approve`, { seenVersion: version }) }),
-      button({ id: "abandon", label: "不发了", endpoint: post(`${base}/abandon`), confirm: "放弃发送这条消息？" }),
+      button({ id: "retry_send", label: "↻ 重新发送", primary: true, endpoint: post(`${base}/approve`, { seenVersion: version, seenItemRevision: rev }) }),
+      button({ id: "abandon", label: "不发了", endpoint: post(`${base}/abandon`, { seenItemRevision: rev }), confirm: "放弃发送这条消息？" }),
       skip,
     ];
   }
@@ -193,10 +189,10 @@ function buttonsFor(input: ProjectionInput, rec: ApprovalRecord, card: ClarifyCa
     const primary = d.primary === true;
     switch (d.id) {
       case "confirm":
-        main.push(button({ id: "confirm", label: d.label, primary, endpoint: post(`${base}/approve`, { seenVersion: version }) }));
+        main.push(button({ id: "confirm", label: d.label, primary, endpoint: post(`${base}/approve`, { seenVersion: version, seenItemRevision: rev }) }));
         break;
       case "deny":
-        main.push(button({ id: "deny", label: d.label, primary, endpoint: post(`${base}/deny`) }));
+        main.push(button({ id: "deny", label: d.label, primary, endpoint: post(`${base}/deny`, { seenItemRevision: rev }) }));
         break;
       case "revise_voice":
         main.push(
@@ -204,7 +200,7 @@ function buttonsFor(input: ProjectionInput, rec: ApprovalRecord, card: ClarifyCa
             id: "revise_voice",
             label: d.label,
             primary,
-            endpoint: post(`${base}/revise`, { voice: true }),
+            endpoint: post(`${base}/revise`, { voice: true, seenItemRevision: rev }),
             input: { field: "instruction", kind: "instruction", placeholder: "说说要怎么改，比如“语气再正式一点”" },
             ...(state === "revising" ? { hint: "正在按上一条意见重拟，新版本到了会自动刷新" } : {}),
           }),
@@ -212,7 +208,7 @@ function buttonsFor(input: ProjectionInput, rec: ApprovalRecord, card: ClarifyCa
         break;
       case "snooze": {
         const until = afternoonSlot(now, settings.snoozeAfternoonHour);
-        main.push(button({ id: "snooze", label: d.label, primary, endpoint: post(`${base}/snooze`, { until }), hint: `到 ${whenText(until, now)} 回到待确认` }));
+        main.push(button({ id: "snooze", label: d.label, primary, endpoint: post(`${base}/snooze`, { until, seenItemRevision: rev }), hint: `到 ${whenText(until, now)} 回到待确认` }));
         break;
       }
       case "edit_plan":
@@ -227,7 +223,7 @@ function buttonsFor(input: ProjectionInput, rec: ApprovalRecord, card: ClarifyCa
         );
         break;
       case "someday":
-        main.push(button({ id: "someday", label: d.label, primary, endpoint: post(`${base}/someday`), hint: "不占用任何后台资源，可在项目全局里重新启动" }));
+        main.push(button({ id: "someday", label: d.label, primary, endpoint: post(`${base}/someday`, { seenItemRevision: rev, seenVersion: version }), hint: "不占用任何后台资源，可在项目全局里重新启动" }));
         break;
       case "extend": {
         const waiting = card?.cardType === "escalation" && card.escalation.reason === "waiting_timeout";
@@ -236,7 +232,7 @@ function buttonsFor(input: ProjectionInput, rec: ApprovalRecord, card: ClarifyCa
             id: "extend",
             label: d.label,
             primary,
-            endpoint: post(`${base}/extend`, waiting ? { until: now + DAY } : {}),
+            endpoint: post(`${base}/extend`, waiting ? { until: now + DAY, seenItemRevision: rev } : { seenItemRevision: rev }),
             hint: waiting ? `到 ${whenText(now + DAY, now)} 再检查` : card?.cardType === "escalation" && card.escalation.reason === "budget_exhausted" ? "额度追加 50% 后继续" : "继续推进",
           }),
         );
@@ -244,7 +240,7 @@ function buttonsFor(input: ProjectionInput, rec: ApprovalRecord, card: ClarifyCa
       }
       case "resolve_offline":
         main.push(
-          button({ id: "resolve_offline", label: d.label, primary, endpoint: post(`${base}/resolve-offline`), confirm: "确认已在线下解决？相关后台任务会一并结束。" }),
+          button({ id: "resolve_offline", label: d.label, primary, endpoint: post(`${base}/resolve-offline`, { seenItemRevision: rev }), confirm: "确认已在线下解决，并通知后台继续？" }),
         );
         break;
       case "skip":
@@ -253,8 +249,7 @@ function buttonsFor(input: ProjectionInput, rec: ApprovalRecord, card: ClarifyCa
     }
   }
   const more: ButtonDTO[] = [
-    button({ id: "to_human", label: "转给我来处理", group: "more", endpoint: post(`${base}/to-human`), hint: "放进专注工作区，由你亲自处理" }),
-    button({ id: "dismiss", label: "不需要处理（归档）", group: "more", endpoint: post(`${base}/dismiss`), hint: "归档后可在顶栏记录里移回待确认" }),
+    button({ id: "dismiss", label: "不需要处理（归档）", group: "more", endpoint: post(`${base}/dismiss`, { seenItemRevision: rev }), hint: "归档后可在顶栏记录里移回待确认" }),
   ];
   return [...main, ...more];
 }
@@ -263,6 +258,7 @@ function buildCard(input: ProjectionInput, rec: ApprovalRecord, state: ClarifyCa
   const { kernel, now } = input;
   const card = asClarifyCard(rec.card.data);
   const draftId = draftIdOf(rec, card);
+  const attempt = state === "send_unknown" ? kernel.hub.getLatestOutboxByActionSync(rec.actionId) : undefined;
   const draft = draftId ? artifactDTO(kernel, draftId, now) : null;
   const version = draft?.version ?? null;
   const draftUpdated = draft !== null && rec.boundVersion !== null && draft.version !== rec.boundVersion && draft.updatedBy === "agent";
@@ -293,6 +289,7 @@ function buildCard(input: ProjectionInput, rec: ApprovalRecord, state: ClarifyCa
     projectId: approvalProjectId(kernel, rec),
     createdAt: rec.createdAt,
     updatedAt: rec.updatedAt,
+    itemRevision: rec.itemRevision,
     sourceBar: {
       source: sourceInfo(card?.source) ?? { label: "系统", at: rec.createdAt },
       statusText: statusText(card, state, draft, draftUpdated),
@@ -309,8 +306,8 @@ function buildCard(input: ProjectionInput, rec: ApprovalRecord, state: ClarifyCa
       : null,
     outcome:
       state === "send_unknown" || state === "send_failed"
-        ? { state, message: OUTCOME_MESSAGE[state], ...(outcomeError ? { error: outcomeError } : {}) }
+        ? { state, message: OUTCOME_MESSAGE[state], ...(attempt ? { attemptedBody: attempt.content.body, target: attempt.target } : {}), ...(outcomeError ? { error: outcomeError } : {}) }
         : null,
-    buttons: buttonsFor(input, rec, card, state, version),
+    buttons: buttonsFor(input, rec, card, state, version, attempt?.attempts),
   };
 }

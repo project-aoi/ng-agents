@@ -4,11 +4,13 @@ import {
   PAYLOAD,
   parsePrincipal,
   pullCursorKey,
+  type ApprovalResolvedPayload,
   type CellDirectChatState,
   type CellInspection,
   type Envelope,
   type EvidenceEntry,
   type InspectCellOptions,
+  type JobResultPayload,
 } from "@ng/protocol";
 import type { KernelCore } from "./core";
 
@@ -20,15 +22,50 @@ import type { KernelCore } from "./core";
 const SUMMARY_CHARS = 12_000;
 const FULL_CHARS = 40_000;
 const MAX_CHARS = 120_000;
+const RES_URI_RE = /res:\/\/[^\s\]\)"',]+/;
 
 const one = (text: string, max: number) => {
   const line = text.replace(/\s+/g, " ").trim();
   return line.length > max ? `${line.slice(0, max)}…` : line;
 };
 
+/**
+ * Tail-focused brief for error tool outputs (BUG-034): real failure reasons and exit codes appear at the end, and
+ * any `[res://...]` spill link must never be truncated away.
+ */
+function errorTail(output: string, max = 200): string {
+  const uri = RES_URI_RE.exec(output)?.[0];
+  const flat = output.replace(/\s+/g, " ").trim();
+  if (flat.length <= max) return flat;
+  let tail = `…${flat.slice(flat.length - max)}`;
+  if (uri && !tail.includes(uri)) {
+    const link = ` [${uri}]`;
+    const room = Math.max(40, max - link.length);
+    tail = `…${flat.slice(flat.length - room)}${link}`;
+  }
+  return tail;
+}
+
 function payloadText(env: Envelope): string {
   const p = env.payload as Record<string, unknown> | null;
   if (!p || typeof p !== "object") return typeof p === "string" ? p : "";
+  if (env.type === PAYLOAD.jobResult) {
+    const jr = p as Partial<JobResultPayload>;
+    const exit = jr.exitCode !== undefined && jr.exitCode !== null ? ` (exit ${jr.exitCode})` : "";
+    const err = jr.error ? ` — ${one(jr.error, 120)}` : "";
+    const log = jr.logUri ? ` [${jr.logUri}]` : "";
+    const tail = jr.tail ? ` · ${errorTail(jr.tail, 120)}` : "";
+    return `job ${jr.jobId ?? "?"} ${jr.state ?? "?"}${exit}: ${one(String(jr.command ?? ""), 100)}${err}${log}${tail}`;
+  }
+  if (env.type === PAYLOAD.approvalResolved) {
+    const ar = p as Partial<ApprovalResolvedPayload> & { decision?: string };
+    const act = ar.action as { type?: string; summary?: string } | undefined;
+    const summary = act?.summary ? ` "${one(act.summary, 100)}"` : "";
+    const receipt = ar.outcome?.receipt ? ` (${ar.outcome.receipt})` : "";
+    const err = ar.outcome?.error ? ` — ${one(ar.outcome.error, 120)}` : "";
+    const note = ar.note ? ` · note: ${one(ar.note, 100)}` : "";
+    return `approval ${ar.actionId ?? "?"} ${ar.decision ?? ar.status ?? "?"}${receipt}${summary}${err}${note}`;
+  }
   for (const k of ["text", "instruction", "message", "summary", "label", "reason", "detail"]) if (typeof p[k] === "string" && p[k]) return p[k] as string;
   return "";
 }
@@ -68,23 +105,10 @@ export function inspectCell(
     return kind === "owner" || kind === "agent";
   };
 
-  const lines: string[] = [];
+  const formatted: Array<{ seq: number; text: string }> = [];
   const artifactIds = new Set<string>();
   const openCalls = new Map<string, number>();
-  let used = 0;
-  let toSeq = afterSeq;
-  let more = false;
   let directChats = 0;
-  const push = (seq: number, text: string): boolean => {
-    if (used + text.length > maxChars && lines.length > 0) {
-      more = true;
-      return false;
-    }
-    lines.push(text);
-    used += text.length + 1;
-    toSeq = seq;
-    return true;
-  };
 
   for (const { seq, record: r } of records) {
     let line: string | null = null;
@@ -115,7 +139,7 @@ export function inspectCell(
         if ((r.name === "save_artifact" || r.name === "patch_artifact") && typeof id === "string") artifactIds.add(id);
         const brief = detail === "full" ? JSON.stringify(r.input ?? {}) : callBrief(r.name, r.input);
         line = `#${seq} · ${r.name}${brief ? `: ${detail === "full" ? brief : one(brief, 240)}` : ""}`;
-        openCalls.set(r.toolUseId, lines.length);
+        openCalls.set(r.toolUseId, formatted.length);
         break;
       }
       case "tool_result": {
@@ -123,28 +147,77 @@ export function inspectCell(
         openCalls.delete(r.toolUseId);
         if (detail === "full") {
           line = `#${seq}   ${r.isError ? "failed" : "result"}: ${r.output}`;
-        } else if (at !== undefined && lines[at] !== undefined) {
-          // One line per step: the outcome is appended to the call it belongs to.
-          const tail = r.isError ? ` → failed: ${one(r.output, 200)}` : ` → ${one(r.output.split("\n").filter((l) => l.trim()).slice(-1)[0] ?? "ok", 120)}`;
-          lines[at] += tail;
-          used += tail.length;
-          toSeq = seq;
+        } else if (at !== undefined && formatted[at] !== undefined) {
+          // One line per step: error outputs take the tail 200 chars preserving any [res://...] link.
+          // Keep formatted[at].seq at the original tool_call seq so formatted stays monotonically ordered under parallel calls.
+          const tail = r.isError ? ` → failed: ${errorTail(r.output, 200)}` : ` → ${one(r.output.split("\n").filter((l) => l.trim()).slice(-1)[0] ?? "ok", 120)}`;
+          formatted[at]!.text += tail;
         } else if (r.isError) {
-          line = `#${seq}   ${r.name} failed: ${one(r.output, 200)}`;
-        } else toSeq = Math.max(toSeq, seq);
+          line = `#${seq}   ${r.name} failed: ${errorTail(r.output, 200)}`;
+        }
         break;
       }
       case "external":
         line = `#${seq} ← external ${r.source}${r.title ? ` "${r.title}"` : ""}: ${one(r.text, 300)}`;
         break;
     }
-    if (line === null) {
-      if (!more) toSeq = Math.max(toSeq, seq);
-      continue;
-    }
-    if (!push(seq, line)) break;
+    if (line !== null) formatted.push({ seq, text: line });
   }
-  if (!more && records.length > 0) toSeq = records[records.length - 1]!.seq;
+
+  // Head 20% + Tail 80% truncation when formatted lines exceed maxChars (BUG-034).
+  const clipMiddle = (text: string, budget: number): string => {
+    if (text.length <= budget) return text;
+    const headLen = Math.max(40, Math.floor(budget * 0.2));
+    const tailLen = Math.max(80, budget - headLen - 40);
+    return `${text.slice(0, headLen)}\n…[truncated ${text.length - headLen - tailLen} chars — showing head 20% + tail 80%]…\n${text.slice(text.length - tailLen)}`;
+  };
+  const totalChars = formatted.reduce((n, e) => n + e.text.length + 1, 0);
+  let lines: string[];
+  let more = false;
+  const toSeq = records.length > 0 ? records[records.length - 1]!.seq : afterSeq;
+  let resumeAfterSeq = toSeq;
+
+  if (totalChars <= maxChars) {
+    lines = formatted.map((e) => e.text);
+  } else if (formatted.length === 1) {
+    lines = [clipMiddle(formatted[0]!.text, maxChars)];
+  } else {
+    more = true;
+    const headBudget = Math.max(160, Math.floor(maxChars * 0.2));
+    const tailBudget = Math.max(400, maxChars - headBudget - 120);
+    const headEntries: Array<{ seq: number; text: string }> = [];
+    let headUsed = 0;
+    for (const e of formatted) {
+      if (headUsed + e.text.length + 1 > headBudget) {
+        if (headEntries.length === 0) headEntries.push({ seq: e.seq, text: clipMiddle(e.text, headBudget) });
+        break;
+      }
+      headEntries.push(e);
+      headUsed += e.text.length + 1;
+    }
+    const tailEntries: Array<{ seq: number; text: string }> = [];
+    let tailUsed = 0;
+    for (let i = formatted.length - 1; i >= headEntries.length; i--) {
+      const e = formatted[i]!;
+      if (tailUsed + e.text.length + 1 > tailBudget) {
+        if (tailEntries.length === 0) tailEntries.unshift({ seq: e.seq, text: clipMiddle(e.text, tailBudget) });
+        break;
+      }
+      tailEntries.unshift(e);
+      tailUsed += e.text.length + 1;
+    }
+    const omittedCount = formatted.length - headEntries.length - tailEntries.length;
+    if (omittedCount <= 0) {
+      more = false;
+      lines = [...headEntries.map((e) => e.text), ...tailEntries.map((e) => e.text)];
+    } else {
+      const firstOmitted = formatted[headEntries.length]!.seq;
+      const lastOmitted = formatted[formatted.length - tailEntries.length - 1]!.seq;
+      resumeAfterSeq = headEntries[headEntries.length - 1]?.seq ?? afterSeq;
+      const marker = `…[${omittedCount} record(s) #${firstOmitted}–#${lastOmitted} omitted — showing head 20% + tail 80%; inspect_cell with afterSeq ${resumeAfterSeq} to read the middle]`;
+      lines = [...headEntries.map((e) => e.text), marker, ...tailEntries.map((e) => e.text)];
+    }
+  }
 
   for (const a of context.listArtifactsSync(targetId)) artifactIds.add(a.artifactId);
   const activity = core.readModel.activityOf([targetId]).get(targetId);
@@ -158,7 +231,7 @@ export function inspectCell(
     artifactIds.size > 0 ? `artifacts: ${[...artifactIds].join(", ")}` : null,
   ].filter(Boolean);
   const foot = more
-    ? `[cut at #${toSeq}: more follows — inspect_cell again with afterSeq ${toSeq}]`
+    ? `[middle omitted between #${resumeAfterSeq} and tail: inspect_cell with afterSeq ${resumeAfterSeq} to inspect omitted steps]`
     : detail === "summary" && lines.length > 0
       ? `[summary view — for the exact commands and outputs of a step: inspect_cell with detail "full" and afterSeq just before it; a res:// link in an output is read with read_resource]`
       : null;
@@ -166,8 +239,8 @@ export function inspectCell(
 
   // The cursor is the inspector's own, and only for cells below it: a desk that looks into a project's worker does
   // not make the project believe it has read anything.
-  if (inspector && inspector !== targetId && toSeq > cursor && cells.ancestors(targetId).some((a) => a.id === inspector)) {
-    context.commitSync(inspector, { statePatches: { [pullCursorKey(targetId)]: toSeq } });
+  if (inspector && inspector !== targetId && resumeAfterSeq > cursor && afterSeq <= cursor && cells.ancestors(targetId).some((a) => a.id === inspector)) {
+    context.commitSync(inspector, { statePatches: { [pullCursorKey(targetId)]: resumeAfterSeq } });
   }
   return {
     cellId: targetId,
@@ -176,6 +249,7 @@ export function inspectCell(
     fromSeq,
     toSeq: lines.length > 0 ? toSeq : 0,
     more,
+    ...(more ? { resumeAfterSeq } : {}),
     directChats,
     artifactIds: [...artifactIds],
     text,

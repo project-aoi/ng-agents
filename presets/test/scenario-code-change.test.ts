@@ -148,7 +148,7 @@ describe("docs/05 scenario 2 — a small code change, follow-ups in the same dir
     expect(h.of("run.started").filter((e) => e.cellId === writer1)).toHaveLength(2);
     expect(h.kernel.activityOf([writer1]).get(writer1)!.state).toBe("dormant");
     // The watcher reported once and was closed; it looked from the project's directory.
-    expect(h.kernel.getCell(watcher)).toMatchObject({ preset: "watcher", status: "closed", spec: { cwd: repo, lifetime: "one_shot" } });
+    expect(h.kernel.getCell(watcher)).toMatchObject({ preset: "checker", status: "closed", spec: { cwd: repo, lifetime: "one_shot" } });
     expect(h.kernel.getCell(screencast)).toMatchObject({ status: "active", spec: { cwd: repo } });
     expect(h.project(project!)).toMatchObject({ lifecycle: "active" });
     const byTitle = Object.fromEntries(h.actions(project).map((a) => [a.title, a]));

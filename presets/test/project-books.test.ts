@@ -51,11 +51,11 @@ describe("a project's books are kept before its model runs", () => {
     expect(acts.map((a) => [a.title, a.owner, a.status, a.nextStep ?? null, a.phase ?? null, a.projectCellId])).toEqual(
       expect.arrayContaining([
         ["拉一份现有页面清单", "agent", "open", null, 1, projectId],
-        ["和市场部对齐风格", "human", "open", "约市场部 15 分钟", null, projectId],
         ["等设计稿", "waiting", "open", null, null, projectId],
       ]),
     );
-    expect(acts).toHaveLength(3);
+    expect(acts).toHaveLength(2);
+    expect(h.project(projectId)?.proposal?.actions).toContainEqual(expect.objectContaining({title:"和市场部对齐风格",owner:"human"}));
     expect(acts.find((a) => a.owner === "waiting")?.waiting).toMatchObject({ description: "等设计稿", parties: [] });
   });
 
@@ -134,4 +134,21 @@ describe("a project's books are kept before its model runs", () => {
     expect(h.state<ProjectRecord>(projectId, gtdKeys.project)).toMatchObject({ lifecycle: "active" });
     void lastToolResult;
   });
+});
+
+it("tracks a worker spawned during the same project turn", async () => {
+  const h = await boot();
+  h.script.add("project", tool("spawn_cell", {preset:"worker", title:"查日志", instruction:"查日志"}), () => {
+    const [worker] = childrenOf(h, "project", "worker");
+    return tool("track_action", {title:"记录排查", owner:"agent", cellId:worker!});
+  }, {});
+  startProjectSync(h.kernel, {id:"project", title:"排查", outcome:"确认原因", brief:"核对日志"});
+  await h.kernel.idle();
+  const [worker] = childrenOf(h, "project", "worker");
+  expect(h.actions("project")).toContainEqual(expect.objectContaining({title:"记录排查", cellId:worker!}));
+  await h.kernel.closeCell(worker!, "completed");
+  h.script.add("project", tool("track_action", {title:"过期派工", owner:"agent", cellId:worker!}), {});
+  h.kernel.sendToCell("project", {text:"记录新动作"});
+  await h.kernel.idle();
+  expect(h.actions("project").some(a => a.title === "过期派工")).toBe(false);
 });

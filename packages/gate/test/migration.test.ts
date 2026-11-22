@@ -71,6 +71,7 @@ describe("gate schema migrations", () => {
     applySchemas(db, ALL_SCHEMAS);
     expect(schemaVersions(db)["@ng/gate"]).toBe(gateSchema.version);
     expect(cols(db, "approvals")).toContain("proposed_version");
+    expect(cols(db, "approvals")).toContain("item_revision");
     expect(cols(db, "action_tokens")).toContain("secret_ref");
     expect(cols(db, "ledger")).toEqual(expect.arrayContaining(["revoked_at", "revoke_reason"]));
     expect(cols(db, "usage_log")).toEqual(expect.arrayContaining(["raw_tokens", "cached_tokens"]));
@@ -94,7 +95,8 @@ describe("gate schema migrations", () => {
     run(db, "INSERT INTO ledger (cell_id, own_tokens, own_cents, subtree_tokens, subtree_cents, updated_at) VALUES ('desk', 300, 2.5, 300, 2.5, 1)");
 
     applySchemas(db, ALL_SCHEMAS);
-    expect(schemaVersions(db)["@ng/gate"]).toBe(3);
+    expect(schemaVersions(db)["@ng/gate"]).toBe(gateSchema.version);
+    expect(cols(db, "approvals")).toContain("item_revision");
     expect(cols(db, "usage_log")).toEqual(["id", "cell_id", "tokens", "cents", "at", "raw_tokens", "cached_tokens"]);
     // a pre-v3 row: raw_tokens unknown (NULL = same as tokens), no cache reads
     expect(all(db, "SELECT cell_id, tokens, cents, raw_tokens, cached_tokens FROM usage_log")).toEqual([
@@ -113,4 +115,55 @@ describe("gate schema migrations", () => {
     // limits act on old and new charges alike: 410 + 600 ≥ 1000
     expect(gate.meter("desk", { tokens: 600, billedCents: 0 })).toBe("hard_stop");
   });
+
+  it("v3 → v4 adds item_revision defaulting to 1 on existing approval rows (BUG-020)", () => {
+    const { db, clock } = oldDatabase(2);
+    db.exec(gateSchema.migrations!.find((m) => m.version === 3)!.up);
+    run(db, "UPDATE schema_versions SET version = 3 WHERE owner = '@ng/gate'");
+    run(
+      db,
+      `INSERT INTO approvals (action_id, cell_id, epoch, principal_id, subject_key, action_type, action, action_hash, card, created_at, updated_at)
+       VALUES ('act_v3', 'desk', 0, 'cell:desk', 'msg:v3', 'custom', '{"type":"custom","name":"x","summary":"s","subjectKey":"msg:v3","sideEffect":"external"}', 'h', '{"format":"card","body":""}', 1, 1)`,
+    );
+    expect(cols(db, "approvals")).not.toContain("item_revision");
+    applySchemas(db, ALL_SCHEMAS);
+    expect(schemaVersions(db)["@ng/gate"]).toBe(gateSchema.version);
+    expect(cols(db, "approvals")).toContain("item_revision");
+    const gate = createGate({ db, bus: createBus(), clock, secrets: memorySecretStore({}) });
+    expect(gate.getApprovalSync("act_v3")).toMatchObject({ actionId: "act_v3", itemRevision: 1 });
+    expect(gate.approveSync("act_v3", "owner", undefined, { seenItemRevision: 99 })).toBe("revision_mismatch");
+    expect(gate.approveSync("act_v3", "owner", undefined, { seenItemRevision: 1 })).toBe("approved");
+    expect(gate.getApprovalSync("act_v3")!.itemRevision).toBe(2);
+  });
+});
+
+it("migrates an unknown send ahead of its later draft with both original IDs and versions", () => {
+  const {db} = oldDatabase(2);
+  for (const v of [3,4]) db.exec(gateSchema.migrations!.find(m=>m.version===v)!.up);
+  run(db,"UPDATE schema_versions SET version=4 WHERE owner='@ng/gate'");
+  for (const [id,status,v] of [["original","unknown",3],["later","pending",4],["last","failed",5]] as const) {
+    run(db,`INSERT INTO approvals(action_id,cell_id,epoch,principal_id,subject_key,action_type,action,action_hash,card,
+      artifact_id,bound_version,item_revision,status,snoozed_until,created_at,updated_at)
+      VALUES(?,'desk',0,'cell:desk','reply:mail:abc','channel.send','{}','hash','{}','draft',?,7,?,900,1,1)`,[id,v,status]);
+  }
+  applySchemas(db,ALL_SCHEMAS);
+  const shown = () => all(db,"SELECT action_id,bound_version,status,snoozed_until FROM approvals WHERE status IN ('unknown','pending')");
+  expect(shown()).toEqual([{action_id:"original",bound_version:3,status:"unknown",snoozed_until:900}]);
+  run(db,"UPDATE human_items SET disposition='cancelled' WHERE action_id='later'");
+  expect(all(db,"SELECT blocked_by FROM human_items WHERE action_id='last'")).toEqual([{blocked_by:"original"}]);
+  run(db,"UPDATE human_items SET disposition='executed' WHERE action_id='original'");
+  expect(all(db,"SELECT action_id FROM approvals WHERE status='failed'")).toEqual([{action_id:"last"}]);
+  db.close();
+});
+
+it("keeps a retired pending permission request as a versioned reply and preserves its original parameters", () => {
+  const {db}=oldDatabase(2);
+  const action={type:"job.start",subjectKey:"prior:job",summary:"run old job",sideEffect:"internal",command:"pwd"};
+  run(db,`INSERT INTO approvals (action_id,cell_id,epoch,principal_id,subject_key,action_type,action,action_hash,card,created_at,updated_at)
+    VALUES ('old-job','desk',0,'cell:desk','prior:job','job.start',?,'hash','{}',1,1)`,[JSON.stringify(action)]);
+  applySchemas(db,ALL_SCHEMAS);
+  expect(all(db,`SELECT action_id,action_type,item_revision,status,json_extract(action,'$.args.originalAction.command') AS preserved
+     FROM human_items WHERE action_id='old-job'`)).toEqual([{action_id:"old-job",action_type:"custom",item_revision:2,status:"pending",preserved:"pwd"}]);
+  expect(all(db,"SELECT action_id FROM approvals WHERE action_id='old-job'")).toEqual([]);
+  db.close();
 });

@@ -1,6 +1,6 @@
 # 用例 8：主人直连 `Worker` 对话、父项目零滞后同步与退场主动 Pull
 
-> **遵循原则**：`P-UX-1`（实况流零运行时黑话、工程名词原样）、`P-UX-2`（两个入口都带归属）、`P-UX-6`（第四视图「分身实况 · Agents」）、`P-KERN-1`（纯叶节点回合结束即待命、父节点主动 Pull）、`P-KERN-2`（发话走同步事务）、`P-KERN-4`（花名册与白板笔记走动态尾部）、`P-SAFE-4`（`owner` 与 `agent:*` 身份）
+> **遵循原则**：`P-UX-1`（实况流零运行时黑话、工程名词原样）、`P-UX-2`（两个入口都带归属）、`P-UX-6`（「分身实况」）、`P-KERN-1`（纯叶节点回合结束即待命、父节点主动 Pull）、`P-KERN-2`（发话走同步事务）、`P-KERN-4`（花名册与白板笔记走动态尾部）、`P-SAFE-4`（`owner` 与 `agent:*` 身份）
 
 ---
 
@@ -66,7 +66,7 @@ sequenceDiagram
 4. **项目主动 Pull 并写进白板**（提示词契约见 [prompts.ts](../../presets/src/shared/prompts.ts) `project` §1、§3）：
    - 通知标出主人直连时，项目**必须**先 `inspect_cell` 再信任分身的自述：拿到的记录把人的直连消息单独标为 `the owner, directly (owner)` / `(agent:<id>)`，并给出每一步命令、路径与结局；需要原样输出时用 `detail: "full"`，超长输出经 `read_resource` 读 `res://` 链接。
    - 游标 `pull:<workerId>` 推进到本次读到的位置，下次尾部花名册只显示其后的新区间；`desk` 或控制面读同一分身不推进项目的游标。
-   - 项目把「主人直接让它把最大重试从 5 次改成 3 次」写进白板笔记 `board`（`save_note`，`kind: "note"`，`scope: "cell"`），并用 `update_project / track_action` 对齐账本——白板挂在每次唤醒的动态尾部，不进冻结前缀，会话压缩或重建后依旧在眼前。
+   - 项目把「主人直接让它把最大重试从 5 次改成 3 次」写进白板笔记 `board`（`save_note`，`kind: "working_note"`，`scope: "cell"`），并用 `update_project / track_action` 对齐账本——白板挂在每次唤醒的动态尾部，不进冻结前缀，会话压缩或重建后依旧在眼前。
 5. **查询零滞后**：任何查询方（外部主 Agent 的 `get_project`、`Agents` 拓扑与项目节点的时间线头部）都以「子分身最新证据序号 − 项目的 Pull 游标」判断是否有未汇总动态，并当场从 `evidence` 读出这段尾部（主人原话、分身回复、关键操作）——不跑任何模型，也不推进任何游标。
 6. **带回与拒收**：父节点 `close_cell` 关掉的叶节点，`Cell` 之间 `send_message` 对它同步返回 `closed`；人直连时由 `reopenLeafSync`（[lifecycle.ts](../../packages/cell/src/lifecycle.ts)）在同一事务内判定：全部祖先仍开 → 恢复 `active`（停在关闭时推进后的纪元）、恢复授权、保留 CLI 会话记录，此前的监听与定时不恢复，由这条消息唤醒它；任一祖先已关闭 → 以 `archived` 拒收。脚本节点不接受自然语言对话，以 `code` 拒收。拒收不留下任何投递或抄送。
 
@@ -89,7 +89,7 @@ sequenceDiagram
   - 直连发话、抄送与带回：[packages/cell/src/messages.ts](../../packages/cell/src/messages.ts)（`directMessage`、`ccDirectChat`、`sendCellMessage`）、[packages/cell/src/kernel.ts](../../packages/cell/src/kernel.ts)（人的 `steer` 抄送）、[packages/cell/src/lifecycle.ts](../../packages/cell/src/lifecycle.ts)（`reopenLeafSync`）、[packages/cell/src/waits.ts](../../packages/cell/src/waits.ts)
   - 回合结算与退场通知：[packages/cell/src/dispatcher.ts](../../packages/cell/src/dispatcher.ts)（`settleRun`、`notifySettled`）、[packages/protocol/src/payloads.ts](../../packages/protocol/src/payloads.ts)（`CellResultPayload.turn`、`CellDirectChatPayload`）、[packages/protocol/src/contract/cell.ts](../../packages/protocol/src/contract/cell.ts)（`CELL_TURN_KEY`、`CELL_DIRECT_CHAT_KEY`、`pullCursorKey`）
   - 主动 Pull 与动态尾部：[packages/cell/src/inspect.ts](../../packages/cell/src/inspect.ts)、[packages/cell/src/readmodel.ts](../../packages/cell/src/readmodel.ts)（花名册未读区间、`tailNotes`）
-  - 第四视图与控制面契约：[apps/gtd-desk/src/shared/api.ts](../../apps/gtd-desk/src/shared/api.ts)（「分身实况 Agents」一节）、[apps/gtd-desk/src/server/app.ts](../../apps/gtd-desk/src/server/app.ts)、[apps/gtd-desk/src/agent/tools.ts](../../apps/gtd-desk/src/agent/tools.ts)
+  - 分身实况视图与控制面契约：[apps/gtd-desk/src/shared/api.ts](../../apps/gtd-desk/src/shared/api.ts)（「分身实况 Agents」一节）、[apps/gtd-desk/src/server/app.ts](../../apps/gtd-desk/src/server/app.ts)、[apps/gtd-desk/src/agent/tools.ts](../../apps/gtd-desk/src/agent/tools.ts)
   - 角色契约：[presets/src/shared/prompts.ts](../../presets/src/shared/prompts.ts)（`worker` §2–§3、`project` §1、§3）
 - **自动化回归测试（修改相关代码必跑）**：
   - [packages/cell/test/wakeable.test.ts](../../packages/cell/test/wakeable.test.ts)（待命唤醒与静默抄送、`wakeup` 抄送与 `steer` 抄送、`agent:*` 身份保留、`clientId` 幂等、带回被关闭的分身与拒收脚本/归档节点、`desk` 主对话带 `replyToId`、`inspect_cell` 游标只属于祖先检视者）

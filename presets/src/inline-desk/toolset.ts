@@ -1,3 +1,4 @@
+import {createSensorSpec,sensorProcessor} from "../shared/sensor";
 import { z } from "zod";
 import {
   anyCovers,
@@ -119,7 +120,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
       const t = now(ctx);
       const env = currentItem(ctx);
       const line = `- ${args.title}${args.url ? ` ${args.url}` : ""}${args.content ? `：${args.content}` : ""}（${formatWhen(t, cfg.timeZone)}）\n`;
-      await ctx.ports.context.upsertSkillOrNote(self(ctx), { kind: "note", name: list, description: `${list}（主人随手存下的内容）`, body: line, scope: "cell", mode: "append" });
+      await ctx.ports.context.upsertSkillOrNote(self(ctx), { kind: "reference", name: list, description: `${list}（主人随手存下的内容）`, body: line, scope: "cell", mode: "append" });
       const a: ActivityRecord = newActivity(
         {
           id: newId("note", ctx.clock),
@@ -166,7 +167,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
         { id, kind: "reminder_set", title: `已设好提醒：${args.text}`, detail: whenText, remindAt: when, source: itemSource(env, t), rawInput: itemRawInput(env).text, restorable: false },
         t,
       );
-      await ctx.ports.context.commit(self(ctx), { statePatches: { [gtdKeys.activity(id)]: a, [KEYS.reminder(id)]: data } });
+      await ctx.ports.context.commit(self(ctx), { statePatches: { [gtdKeys.activity(id)]: a } });
       await notifyOwner(ctx.ports, owner, `已设好 ${whenText} 的提醒：${args.text}`, `reminder-set:${id}`);
       return `Reminder set for ${new Date(when).toISOString()} (cancel with cancel_scheduled cancelGroup "reminder:${id}"). The owner was told.`;
     },
@@ -212,6 +213,12 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
       to: z.string().optional().describe("channel:<channelId>:<target>; default: whoever sent the current message"),
       title: z.string().optional().describe("card title in Chinese, e.g. 回复张三：限流阈值"),
       targetLabel: z.string().optional().describe('recipient as the owner would name them, e.g. "张三（飞书）"'),
+      expectedVersion: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .describe("required when updating a draft the owner edited themselves: read the artifact first and pass its current version"),
       prep: prepInput.optional(),
     }),
     async run(args, ctx) {
@@ -227,10 +234,9 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
         const open = (await readReplyItems(ports)).filter((i) => i.status === "pending" && i.actionId && i.threads?.some((th) => threads.has(th)));
         if (open.length === 1) subjectKey = open[0]!.subjectKey;
       }
-      subjectKey ??= env ? subjectKeys.inbound(env.id) : undefined;
+      subjectKey ??= env ? `reply:${args.to ?? replyAddressOf(env) ?? env.from}:${env.threads?.[0] ?? env.id}` : undefined;
       if (!subjectKey) return { output: "There is no message to reply to in this wake-up; give `to` and use send_message for a new conversation.", isError: true };
-      const key = KEYS.reply(subjectKey);
-      let item = await ports.context.readState<ReplyItem>(self(ctx), key);
+      let item = (await readReplyItems(ports)).find(i => i.subjectKey === subjectKey);
       const to = args.to ?? item?.target ?? replyAddressOf(env);
       if (!to || !isChannelAddr(to)) return { output: `No reply address: pass to as channel:<channelId>:<target>.`, isError: true };
       if (anyCovers([`${owner.split(":").slice(0, 2).join(":")}:*`], to)) return { output: "That is the owner's own address: use send_message for notes to the owner.", isError: true };
@@ -238,21 +244,32 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
       const title = args.title ?? item?.title ?? `回复：${clip(itemRawInput(env).text, 40) || "消息"}`;
       const targetLabel = args.targetLabel ?? item?.targetLabel ?? target;
 
+      if (item?.status === "sent" && item.target === target && !revise) return "This reply was already sent.";
       let artifactId = item?.artifactId;
       let version: number;
       const content = { format: "text" as const, title, body: args.text };
       if (artifactId) {
         const cur = await ports.context.getArtifact(artifactId);
-        // Only the owner's own redraft request may replace a version they edited; otherwise Context parks our text
-        // beside theirs (docs/04 §3: background updates never overwrite handwritten changes).
-        const expected = cur && (revise || cur.updatedBy === "agent") ? cur.version : undefined;
-        const r = await ports.context.commit(self(ctx), { artifact: { artifactId, content, updatedBy: "agent", ...(expected !== undefined ? { expectedVersion: expected } : {}) } });
-        if (!r.ok && r.parked && item) {
-          await ports.context.commit(self(ctx), { statePatches: { [key]: { ...item, updatedAt: t } } });
-          return `The owner has edited this draft themselves (v${r.currentArtifact.version}): their text and their card stay as they are, and your new version was put beside it for them to use. Nothing else to do.`;
+        if (!revise && cur?.updatedBy === "agent" && cur.content.body === content.body && cur.content.title === title &&
+            cur.content.format === content.format && (args.expectedVersion === undefined || args.expectedVersion === cur.version)) {
+          version = cur.version;
+        } else {
+          // BUG-032: NEVER auto-fill cur.version when cur.updatedBy === "human" (even during revise). Unless the model
+          // explicitly read the human's edited version and passed expectedVersion, omit expectedVersion so Context keeps
+          // the owner's version untouched and parks the agent's text beside it.
+          const expected =
+            args.expectedVersion !== undefined
+              ? args.expectedVersion
+              : cur && cur.updatedBy === "agent"
+                ? cur.version
+                : undefined;
+          const r = await ports.context.commit(self(ctx), { artifact: { artifactId, content, updatedBy: "agent", ...(expected !== undefined ? { expectedVersion: expected } : {}) } });
+          if (!r.ok && r.parked && item) {
+            return `The owner has edited this draft themselves (v${r.currentArtifact.version}): their text and their card stay as they are, and your new version was put beside it for them to use. Read the artifact first and pass expectedVersion: ${r.currentArtifact.version} if they asked you to revise their edited text.`;
+          }
+          if (!r.ok) return { output: `The draft changed meanwhile (now v${r.currentArtifact.version} by ${r.currentArtifact.updatedBy}); read it and redraft.`, isError: true };
+          version = r.artifactVersion ?? (cur?.version ?? 0) + 1;
         }
-        if (!r.ok) return { output: `The draft changed meanwhile (now v${r.currentArtifact.version} by ${r.currentArtifact.updatedBy}); read it and redraft.`, isError: true };
-        version = r.artifactVersion ?? (cur?.version ?? 0) + 1;
       } else {
         artifactId = newId("art", ctx.clock);
         const r = await ports.context.commit(self(ctx), { artifact: { artifactId, content, updatedBy: "agent" } });
@@ -280,15 +297,28 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
         "send",
       );
       const action: ChannelSendAction = { type: "channel.send", target, content, artifactId, summary: title, subjectKey, sideEffect: "external", card: cardDeliverable(card, args.text) };
-      const r = await ports.authorize(action, { artifactVersion: version });
+      const r = await ports.submitReply(action, version, revise?.id ?? env?.id ?? subjectKey);
       if (r.type === "deny") return { output: `Not allowed: ${r.feedback}`, isError: true };
-      if (r.type === "allow") {
-        const receipt = await ports.notifyChannel({ target, content, idempotencyKey: `reply:${artifactId}:v${version}`, actionToken: r.actionToken });
-        await ports.context.commit(self(ctx), { statePatches: { [key]: { ...item, status: receipt === "sent" ? "sent" : "pending", updatedAt: t } } });
-        return `A standing rule allowed it: sent (${receipt}).`;
+      if (r.type === "delivery") {
+        const sent = r.receipt === "sent";
+        const statePatches: Record<string, unknown> = {};
+        if (sent) {
+          const done = newActivity(
+            { id: `sent-${r.actionId}`, kind: "action_completed", title: `已回复${targetLabel}：${title}`, source: item.source, rawInput: item.rawInput.text, actionId: r.actionId, restorable: false }, t,
+          );
+          statePatches[gtdKeys.activity(done.id)] = done;
+        }
+        if (sent) await ports.context.commit(self(ctx), { statePatches });
+        const messages = {
+          sent: "A standing rule allowed it: sent (sent).",
+          failed: "Delivery failed. The owner can retry on the failed-send card.",
+          unknown: "Delivery status is unknown. The owner must verify the receipt before retrying.",
+          pending: "This reply is already being sent. Wait for its receipt.",
+          cancelled: "The owner closed this reply.",
+        };
+        return { output: `${messages[r.receipt]} Action ${r.actionId}, draft ${artifactId}.`, isError: !sent, data: { receipt: r.receipt, actionId: r.actionId } };
       }
-      await ports.context.commit(self(ctx), { statePatches: { [key]: { ...item, actionId: r.actionId } } });
-      return { output: `Draft v${version} is on the owner's card. Nothing is sent until they confirm.`, endRun: "deferred_for_approval", data: { actionId: r.actionId, artifactId, version } };
+      return { output: `Draft v${version} (${artifactId}) is on the owner's card ${r.actionId}. Nothing is sent until they confirm.`, endRun: "deferred_for_approval", data: { actionId: r.actionId, artifactId, version } };
     },
   });
 
@@ -312,6 +342,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
         return { output: `Which card? Pending reply cards: ${list}. Pass subjectKey.`, isError: true };
       }
       const r = ports.withdrawApproval ? await ports.withdrawApproval({ actionId: item.actionId! }, args.reason) : "not_pending";
+      if (r !== "cancelled") return "This card has already been decided.";
       const t = now(ctx);
       const a: ActivityRecord = newActivity(
         {
@@ -328,7 +359,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
         t,
       );
       const linked = await closeLinkedActions(ports, item.actionId!, "cancelled", t);
-      await ports.context.commit(self(ctx), { statePatches: { [KEYS.reply(item.subjectKey)]: { ...item, status: "withdrawn", updatedAt: t }, [gtdKeys.activity(a.id)]: a, ...linked } });
+      await ports.context.commit(self(ctx), { statePatches: { [gtdKeys.activity(a.id)]: a, ...linked } });
       return r === "cancelled" ? "Card withdrawn and archived." : "The card was no longer pending (already decided); archived the item.";
     },
   });
@@ -522,6 +553,9 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
         title: args.title,
         outcome: args.outcome,
         ...(args.background ? { background: args.background } : {}),
+        ...(args.cwd ? { cwd: args.cwd } : {}),
+        ...(args.repos ? { repos: args.repos } : {}),
+        ...(args.phases ? { phases: args.phases } : {}),
         actions: args.actions.map((a) => ({ title: a.title, owner: a.owner, ...(a.effort ? { effort: a.effort } : {}), ...(a.nextStep ? { nextStep: a.nextStep } : {}) })),
       };
       const artifactId = newId("art", ctx.clock);
@@ -533,11 +567,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
         source: itemSource(env, t),
         rawInput: itemRawInput(env),
         ...(env ? { envelope: env } : {}),
-        ...(args.cwd ? { cwd: args.cwd } : {}),
-        ...(args.repos?.length ? { repos: args.repos.map((r) => ({ name: r.name, cwd: r.cwd, ...(r.defaultBranch ? { defaultBranch: r.defaultBranch } : {}) })) } : {}),
-        ...(args.phases?.length ? { phases: args.phases } : {}),
       };
-      await ports.context.commit(self(ctx), { statePatches: { [KEYS.proposal(artifactId)]: remembered } });
       const card = proposalCard(
         { subjectKey, title: args.title, source: remembered.source, rawInput: remembered.rawInput, prep: prepOf(args.prep, args.background ?? "") },
         proposal,
@@ -548,8 +578,34 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
       const action: ProjectStartAction = { type: "project.start", proposal, artifactId, summary: `立项：${args.title}`, subjectKey, sideEffect: "external", card: cardDeliverable(card, body) };
       const r = await ports.authorize(action, { artifactVersion: version });
       if (r.type === "deny") return { output: `Not allowed: ${r.feedback}`, isError: true };
-      if (r.type === "allow") return "A standing rule allowed it; call apply_updates to start it.";
-      return { output: "The proposal card is waiting for the owner; you are woken with the decision.", endRun: "deferred_for_approval", data: { actionId: r.actionId, artifactId } };
+      if (r.type === "allow") {
+        // BUG-032: standing rule allowed project.start directly — launch the project now and return projectId.
+        const init: ProjectInit = {
+          title: proposal.title,
+          outcome: proposal.outcome,
+          brief: ["已按主人的常设规则自动确认立项，按此方案开始推进。", proposal.background ?? ""].filter(Boolean).join("\n"),
+          proposal,
+          plan: proposal.actions.map((a) => ({ title: a.title, owner: a.owner, ...(a.nextStep ? { nextStep: a.nextStep } : {}), ...(a.effort ? { effort: a.effort } : {}) })),
+          source: remembered.source,
+          ...(remembered.rawInput.text ? { rawInput: remembered.rawInput.text } : {}),
+          ...(proposal.cwd ? { cwd: proposal.cwd } : {}),
+          ...(proposal.repos?.length ? { repos: proposal.repos } : {}),
+          ...(proposal.phases?.length ? { phases: proposal.phases } : {}),
+        };
+        let launched: { projectId: string; started: boolean };
+        try {
+          launched = await launchProject(ports, init, ctx.clock);
+        } catch (err) {
+          if (isCwdError(err)) return cwdRefusal(err);
+          return { output: `Not started: ${errorText(err)}`, isError: true };
+        }
+        await notifyOwner(ports, owner, `已按常设规则自动立项：${proposal.title}，后台开始推进`, `project:${launched.projectId}`);
+        return {
+          output: `A standing rule allowed it: started project ${launched.projectId}「${proposal.title}」 and told the owner.`,
+          data: { projectId: launched.projectId, artifactId, started: launched.started },
+        };
+      }
+      return { output: `The proposal card ${r.actionId} (draft ${artifactId}) is waiting for the owner; you are woken with the decision.`, endRun: "deferred_for_approval", data: { actionId: r.actionId, artifactId } };
     },
   });
 
@@ -720,7 +776,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
     async run(args, ctx) {
       if (!args.cron && !args.watchThread) return { output: "Give cron or watchThread.", isError: true };
       const processor: ProcessorSpec = args.check
-        ? { kind: "code", entry: args.check }
+        ? sensorProcessor(args.check)
         : args.script
           ? { kind: "code", entry: PROCESSORS.sensorScript, args: { script: args.script } }
           : SENSOR_LLM_PROCESSOR;
@@ -732,9 +788,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
         mode: args.mode ?? "active",
         processor: processor.kind,
       };
-      const spec: CellSpec = { id: newId("src", ctx.clock), preset: "sensor", title: args.title, processor, meta: { role: ROLES.sensor, gtd: { source } } };
-      if (args.cron) spec.schedules = [{ cron: args.cron, ...(args.tz ? { tz: args.tz } : {}) }];
-      if (args.watchThread) spec.watches = [{ threadOrFilter: { thread: args.watchThread } }];
+      const spec = createSensorSpec(newId("src",ctx.clock),source,processor,args.watchThread);
       const addr = await ctx.ports.spawnCell(spec, { instruction: args.description ?? args.title });
       await notifyOwner(ctx.ports, owner, `已添加信源：${args.title}${args.mode === "observe" ? "（观察模式，只记笔记不出卡）" : ""}`, `source:${spec.id}`);
       return `Source added (${addr}). It stays silent unless it finds something.`;

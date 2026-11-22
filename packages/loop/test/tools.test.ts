@@ -59,7 +59,7 @@ describe("kernel.comms send_message", () => {
     const r = await invoke(run, "send_message", { to: "channel:ui:owner", text: "三点有会", summary: "会议提醒" });
     expect(r.output).toBe("Sent.");
     const action = run.ports.log.authorizations[0]!.action as ChannelSendAction;
-    expect(action).toMatchObject({ type: "channel.send", sideEffect: "notify_owner", target: "channel:ui:owner", subjectKey: "msg:env_1" });
+    expect(action).toMatchObject({ type: "channel.send", sideEffect: "notify_owner", target: "channel:ui:owner", subjectKey: "reply:channel:ui:owner:env_1" });
     expect(action.card).toBeUndefined();
     expect(run.ports.artifacts.size).toBe(0);
     const send = run.ports.log.sends[0]!;
@@ -86,7 +86,7 @@ describe("kernel.comms send_message", () => {
     const card = asClarifyCard(send.card?.data);
     expect(card).toMatchObject({
       cardType: "response",
-      subjectKey: "msg:env_feishu_1",
+      subjectKey: "reply:channel:feishu:oc_group:feishu:oc_group",
       source: { label: "飞书", channelId: "feishu", principalId: "feishu:ou_zhang", envelopeId: "env_feishu_1" },
       rawInput: { text: "方案什么时候能好？", kind: "message" },
       prep: { summary: "查了排期表", checked: [{ label: "排期", uri: "note://schedule" }] },
@@ -175,10 +175,10 @@ describe("kernel.comms send_message", () => {
     expect(run.ports.log.sends).toEqual([]);
   });
 
-  it("uses the project subject inside a project", async () => {
+  it("keeps the reply scoped to its recipient and thread inside a project", async () => {
     const run = fakeRun({ spec: { meta: { projectCellId: "proj_1" } }, batch: [feishuMessage] });
     await invoke(run, "send_message", { to: "channel:ui:owner", text: "进度 2/3", summary: "进度" });
-    expect(run.ports.log.authorizations[0]!.action.subjectKey).toBe("project:proj_1");
+    expect(run.ports.log.authorizations[0]!.action.subjectKey).toBe(`reply:channel:ui:owner:${feishuMessage.threads?.[0] ?? feishuMessage.id}`);
   });
 });
 
@@ -210,7 +210,7 @@ describe("kernel.comms request_approval / report_to_parent / handback / wait", (
 
   it("goes ahead immediately when a standing rule allows the request", async () => {
     const run = fakeRun({ authorize: () => ({ type: "allow", actionToken: "tok" }) });
-    const r = await invoke(run, "request_approval", { kind: "action", title: "合并 PR #108", summary: "merge #108", action: { name: "merge_pr", args: { pr: 108 } } });
+    const r = await invoke(run, "request_approval", { kind: "action", title: "合并 PR #108", summary: "merge #108", action: { name: "merge_pr", args: { pr: 108 } }, options: [{id:"investigate",label:"先核对",effect:"reply"}] });
     expect(r.output).toContain("go ahead");
     expect(r.endRun).toBeUndefined();
     expect(run.ports.log.authorizations[0]!.action).toMatchObject({ type: "custom", name: "merge_pr", args: { pr: 108 }, sideEffect: "external" });
@@ -462,13 +462,11 @@ describe("kernel.context", () => {
     expect((await invoke(run, "read_state", { key: "tmp" })).output).toBe("tmp: (not set)");
     await invoke(run, "save_note", { name: "reading-list", body: "https://example.com/a\n更多", append: true });
     await invoke(run, "save_note", { name: "tone", body: "回复同事用简短中文", kind: "preference" });
-    await invoke(run, "save_skill", { name: "weekly-review", description: "每周五回顾时用", body: "1. ..." });
     expect(run.ports.log.knowledge).toEqual([
-      { kind: "note", name: "reading-list", body: "https://example.com/a\n更多", description: "https://example.com/a", scope: "cell", mode: "append" },
+      { kind: "working_note", name: "reading-list", body: "https://example.com/a\n更多", description: "https://example.com/a", scope: "cell", mode: "append" },
       { kind: "preference", name: "tone", body: "回复同事用简短中文", description: "回复同事用简短中文", scope: "global", mode: "upsert" },
-      { kind: "skill", name: "weekly-review", description: "每周五回顾时用", body: "1. ...", scope: "global", mode: "upsert" },
     ]);
-    expect((await invoke(run, "save_skill", { name: "Bad Name", description: "d", body: "b" })).isError).toBe(true);
+    expect(() => tool("save_skill")).toThrow("no tool");
     run.ports.resources.set("res://cell1/r1", "abcdefghij");
     // A page says whether more follows and where; the last page and a whole short text come back bare.
     // An explicit page size is carried into the next call.
@@ -487,6 +485,24 @@ describe("kernel.context", () => {
     const capped = (await invoke(run, "read_resource", { uri: "res://cell1/big", limit: 1_000_000 })).output;
     expect(capped.startsWith(`${"z".repeat(64_000)}\n…[characters 0–64000 shown; more follows`)).toBe(true);
     expect((await invoke(run, "read_resource", { uri: "res://cell1/big", offset: 100_000, limit: 64_000 })).output).toBe("z".repeat(50_000));
+  });
+
+  it("BUG-020: set_state blocks reserved authoritative keys/prefixes while allowing normal and gtd:action:* keys", async () => {
+    const run = fakeRun();
+    for (const key of ["gtd:project", "gtd:project:x", "gtd:source", "gtd:source:1", "gtd:activity", "gtd:activity:a1", "cli:session", "sys:meta"]) {
+      const r = await invoke(run, "set_state", { patches: { [key]: { v: 1 } } });
+      expect(r.isError, key).toBe(true);
+      expect(r.output, key).toContain("reserved");
+      expect(run.ports.state.has(key), key).toBe(false);
+    }
+    // Allowed keys still succeed cleanly.
+    const ok = await invoke(run, "set_state", {
+      patches: { "gtd:action:a1": { title: "ok" }, "hub:topics": ["a"], "memo:1": "hi" },
+    });
+    expect(ok.isError).toBeUndefined();
+    expect(run.ports.state.get("gtd:action:a1")).toEqual({ title: "ok" });
+    expect((await invoke(run, "set_state", {patches:{"desk:arbitration":{}}})).isError).toBe(true);
+    expect(run.ports.state.get("hub:topics")).toEqual(["a"]);
   });
 
   describe("patch_artifact", () => {
@@ -648,10 +664,10 @@ describe("kernel.context", () => {
     ]);
     for (const input of [
       { name: "n", body: "b", cwdPrefix: "/work/trae-x" },
-      { name: "n", body: "b", kind: "note", roles: ["worker"] },
+      { name: "n", body: "b", kind: "working_note", roles: ["worker"] },
     ]) {
       const r = await invoke(run, "save_note", input);
-      expect(r).toMatchObject({ isError: true, output: expect.stringContaining('only limit a preference; a note cannot take them') });
+      expect(r).toMatchObject({ isError: true, output: expect.stringContaining('only limit a preference; a working_note cannot take them') });
     }
     expect(run.ports.log.knowledge).toHaveLength(3);
     expect(tool("save_note").description).toContain("leave both out for a rule about how the owner wants things done everywhere");
@@ -722,7 +738,7 @@ describe("kernel.cells", () => {
     await invoke(run, "close_cell", { cellId: "w1", reason: "cancelled" });
     expect(await invoke(run, "update_cell", { cellId: "w1", title: "新标题" })).toEqual({ output: "Updated w1: title." });
     // without cellId it is the cell itself (its own watches/schedules/title/meta — the kernel refuses anything else)
-    expect(await invoke(run, "update_cell", { watches: [{ thread: "github:org/repo#9" }] })).toEqual({ output: "Updated this cell: watches." });
+    expect(await invoke(run, "update_cell", { watches: [{ thread: "github:org/repo#9" }] })).toEqual({ output: "Updated this cell: watches.", awaitsWakeup: true });
     expect(run.ports.log.controls).toEqual([
       { cellId: "w1", action: "steer", steerMessage: "先修单测" },
       { cellId: "w1", action: "pause" },
@@ -859,7 +875,13 @@ describe("workspace", () => {
     const run = fakeRun({ exec: (t) => (t === "bash" ? { output: "1 failed", exitCode: 1 } : { output: "file text" }) });
     expect((await invoke(run, "read", { op: "read_file", path: "src/a.ts", limit: 20 })).output).toBe("file text");
     expect((await invoke(run, "read", { op: "search" })).isError).toBe(true);
-    expect((await invoke(run, "bash", { command: "pnpm test" })).output).toBe("1 failed\n[exit code 1]");
+    const failBash = await invoke(run, "bash", { command: "pnpm test" });
+    expect(failBash.output).toBe("1 failed\n[exit code 1]");
+    expect(failBash.isError).toBe(true);
+    const okRun = fakeRun({ exec: () => ({ output: "all green", exitCode: 0 }) });
+    const okBash = await invoke(okRun, "bash", { command: "pnpm test" });
+    expect(okBash.output).toBe("all green");
+    expect(okBash.isError).toBeUndefined();
     expect(run.ports.log.execs).toEqual([
       { tool: "read", args: { op: "read_file", path: "src/a.ts", limit: 20 } },
       { tool: "bash", args: { command: "pnpm test" } },
@@ -871,5 +893,15 @@ describe("workspace", () => {
     expect((await invoke(run, "job_observe", { jobId })).output).toContain("state: running");
     await invoke(run, "job_cancel", { jobId });
     expect(run.ports.log.jobs[0]).toMatchObject({ input: ["y\n"], cancelled: true });
+  });
+
+  it("Review fix (BUG-020): set_state blocks kernel-owned cell:* and pull:* keys alongside gtd:project/source/activity, cli:*, sys:*", async () => {
+    const run = fakeRun();
+    for (const key of ["cell:turn", "cell:direct_chat", "cell:result", "pull:w1", "gtd:project", "gtd:source:1", "gtd:activity:1", "cli:session", "sys:flag"]) {
+      const r = await invoke(run, "set_state", { patches: { [key]: { bad: true } } });
+      expect(r.isError, `expected ${key} to be blocked`).toBe(true);
+    }
+    const okRes = await invoke(run, "set_state", { patches: { "gtd:action:a1": { title: "ok" } } });
+    expect(okRes.isError).toBeUndefined();
   });
 });

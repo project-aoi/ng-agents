@@ -43,7 +43,7 @@ interface Setup {
   run(opts?: Partial<FakeRunOptions>): ReturnType<typeof createFakeRun>;
 }
 
-function setup(engine: CliEngine, turns: FakeCliTurn[], loopOpts: { endRunGraceMs?: number } = {}): Setup {
+function setup(engine: CliEngine, turns: FakeCliTurn[], loopOpts: { endRunGraceMs?: number; runTimeoutMs?: number } = {}): Setup {
   const fake = installFakeCli(tempDir(`${engine}-bin`), engine, turns);
   const root = tempDir(`${engine}-ws`);
   const debug: CliDebugEvent[] = [];
@@ -54,7 +54,8 @@ function setup(engine: CliEngine, turns: FakeCliTurn[], loopOpts: { endRunGraceM
     env: fake.env,
     pollMs: 30,
     killGraceMs: 500,
-    endRunGraceMs: loopOpts.endRunGraceMs ?? 4_000,
+    endRunGraceMs: 4_000,
+    ...loopOpts,
     onDebug: (e) => debug.push(e),
   });
   return {
@@ -72,6 +73,15 @@ function setup(engine: CliEngine, turns: FakeCliTurn[], loopOpts: { endRunGraceM
   };
 }
 
+function watchCursor(r:FakeRun) {
+  const confirmations:number[] = [];
+  r.ports.confirmCliInput = (_,seq) => confirmations.push(seq);
+  return confirmations;
+}
+async function recordBatch(r:FakeRun) {
+  for(const envelope of r.snapshot.batch.envelopes)
+    await r.ports.context.appendEvidence(r.snapshot.cellId,{kind:"inbound",envelope,runId:r.snapshot.runId,at:0});
+}
 const launches = (s: Setup) => s.debug.filter((d): d is Extract<CliDebugEvent, { type: "launch" }> => d.type === "launch");
 
 async function runOf(s: Setup, r: ReturnType<typeof createFakeRun>): Promise<RunOutcome> {
@@ -345,8 +355,11 @@ describe.each(ENGINES)("CLI loop with a fake %s", (engine) => {
       },
     ]);
     const r = s.run();
+    await recordBatch(r);
+    const cursor = watchCursor(r);
     const t0 = Date.now();
     expect(await runOf(s, r)).toBe("yielded_waiting");
+    expect(cursor.at(-1)).toBe(1);
     expect(Date.now() - t0).toBeLessThan(8_000);
     expect(r.ports.state.has("late")).toBe(false);
     const results = s.fake.log().filter((e) => e.type === "mcp_result");
@@ -367,12 +380,40 @@ describe.each(ENGINES)("CLI loop with a fake %s", (engine) => {
       },
     ], { endRunGraceMs: 1_000 });
     const r = s.run();
+    await recordBatch(r);
+    const cursor = watchCursor(r);
     const t0 = Date.now();
     expect(await runOf(s, r)).toBe("deferred_for_approval");
+    expect(cursor.at(-1)).toBe(1);
     const took = Date.now() - t0;
     expect(took).toBeGreaterThanOrEqual(900);
     expect(took).toBeLessThan(5_000);
     expect(r.ports.log.authorizations[0]?.result.type).toBe("defer");
+  });
+
+  it("replays a post-settlement system note once, and confirms only the input seen by this session", async () => {
+    const s = setup(engine, [{actions:[{text:"first"}]}, {actions:[{text:"second"}]}]);
+    const first = s.run();
+    await runOf(s, first);
+    const own = first.ports.state.get(CLI_SESSION_KEY) as CliSessionRecord;
+    const next = s.run({runId:"second", batch:["next task"]});
+    next.snapshot.historyUptoSeq = 101;
+    next.snapshot.summaryUptoSeq = 101;
+    next.ports.state.set(CLI_SESSION_KEY, {...own,lastDeliveredEvidenceSeq:100});
+    const evidence = [
+      {seq:100,cellId:next.snapshot.cellId,record:{runId:"history",kind:"system_note" as const,text:"already received",at:0}},
+      {seq:101,cellId:next.snapshot.cellId,record:{runId:"history",kind:"system_note" as const,text:"closure was deferred",at:1}},
+      {seq:102,cellId:next.snapshot.cellId,record:{runId:"history",kind:"inbound" as const,envelope:next.snapshot.batch.envelopes[0]!,at:2}},
+      {seq:103,cellId:next.snapshot.cellId,record:{runId:"history",kind:"system_note" as const,text:"late note",at:3}},
+    ];
+    next.ports.listEvidence = opts => evidence.filter(e => e.seq > (opts?.afterSeq ?? 0));
+    const confirmed: number[] = [];
+    next.ports.confirmCliInput = (session, seq) => { expect(session).toBe(own.sessionId); confirmed.push(seq); };
+    await runOf(s,next);
+    const prompt = s.fake.prompts()[1]!;
+    expect(prompt.match(/closure was deferred/g)).toHaveLength(1);
+    expect(prompt).not.toMatch(/already received|late note/);
+    expect(confirmed.at(-1)).toBe(102);
   });
 
   it("resumes its session on the next Run with only the new input", async () => {
@@ -487,6 +528,17 @@ describe.each(ENGINES)("CLI loop with a fake %s", (engine) => {
     if (engine === "agy") expect(s.fake.log().some((e) => e.type === "cancel")).toBe(true);
   }, 30_000);
 
+  it("rebuilds from the SQLite fork point when the parent CLI advanced",async()=>{
+    const s=setup(engine,[{actions:[{text:"child"}]}]);
+    const child=s.run({cellId:"child",parentId:"parent",spec:{processor:{kind:"llm",toolsets:TOOLSETS},contextMode:"fork_prefix",fork:{fromCellId:"parent",uptoSeq:100}},
+      history:[{role:"user",content:[{type:"text",text:"original parent evidence"}]},{role:"user",content:[{type:"text",text:FORK_NOTE_PREFIX+" parent"}]}],batch:["child task"]});
+    child.ports.state.set(CLI_FORK_SESSION_KEY,{engine,sessionId:"stale",model:null,cwd:s.root,lastDeliveredEvidenceSeq:100});
+    child.ports.canForkSession=()=>false;
+    await runOf(s,child);
+    expect(launches(s)[0]!.session).toBeUndefined();
+    expect(s.fake.prompts()[0]).toContain("original parent evidence");
+  });
+
   it("continues a fork_prefix child from the parent's CLI session when the CLI can fork", async () => {
     const s = setup(engine, [{ actions: [{ text: "parent" }] }, { actions: [{ text: "child" }] }]);
     const parent = s.run({ cellId: "parent", runId: "run_p" });
@@ -498,7 +550,7 @@ describe.each(ENGINES)("CLI loop with a fake %s", (engine) => {
       cellId: "child",
       runId: "run_c",
       parentId: "parent",
-      spec: { processor: { kind: "llm", toolsets: TOOLSETS, allowedTools: ["read"] }, contextMode: "fork_prefix" },
+      spec: { processor: { kind: "llm", toolsets: TOOLSETS, allowedTools: ["read"] }, contextMode: "fork_prefix",fork:{fromCellId:"parent",uptoSeq:1} },
       batch: ["do the subtask"],
       history: [
         { role: "user", content: [{ type: "text", text: "parent's own question" }] },
@@ -607,7 +659,7 @@ describe("CLI usage metering (BUG-002)", () => {
       cellId: "child",
       runId: "run_c",
       parentId: "parent",
-      spec: { processor: { kind: "llm", toolsets: TOOLSETS, allowedTools: ["read"] }, contextMode: "fork_prefix" },
+      spec: { processor: { kind: "llm", toolsets: TOOLSETS, allowedTools: ["read"] }, contextMode: "fork_prefix",fork:{fromCellId:"parent",uptoSeq:1} },
       batch: ["do the subtask"],
       history: [{ role: "user", content: [{ type: "text", text: `${FORK_NOTE_PREFIX} "parent" up to the moment it created this cell. You are now "child".` }] }],
     });
@@ -667,15 +719,83 @@ describe("CLI loop with a fake codex: hidden tool items (BUG-008)", () => {
   it("counts them as steps: a turn of many exec calls stops at maxSteps", async () => {
     const s = setup("codex", [{ actions: [1, 2, 3, 4].map((n) => exec(`call_${n}`, `step(${n})`, { output: "ok", status: "completed" })) }]);
     const r = s.run({ spec: { processor: { kind: "llm", toolsets: TOOLSETS, allowedTools: ["read"], maxSteps: 2 } } });
+    await recordBatch(r);
+    const cursor = watchCursor(r);
     expect(await runOf(s, r)).toBe("step_limit");
+    expect(cursor.at(-1)).toBe(1);
     expect(r.ports.log.evidence.some((e) => e.kind === "system_note" && e.text.includes("run stopped after 2 tool calls (step limit)"))).toBe(true);
   });
 });
 
 describe("CLI loop errors", () => {
+  it.each(["cancelled", "timeout"])("does not confirm the initial steer when Claude acknowledges %s", async reason => {
+    const s = setup("claude", [
+      {actions:[{text:"working"},{sleep:20_000}], acknowledgeInterrupt:true},
+      {actions:[{text:"continued"}]},
+    ], reason === "timeout" ? {runTimeoutMs:3_000} : {});
+    const first = s.run();
+    const steer = "review the red folder";
+    first.ports.pushSteer(steer);
+    const old = await first.ports.context.appendEvidence(first.snapshot.cellId, {kind:"system_note", text:"already in the fresh prompt", runId:null, at:0});
+    first.snapshot.historyUptoSeq = old.seq;
+    await recordBatch(first);
+    const cursor = watchCursor(first);
+    const outcome = runOf(s, first);
+    if (reason === "cancelled") {
+      await waitFor(() => first.ports.log.evidence.some(e => e.kind === "assistant_text"), "the first text");
+      first.controller.abort();
+      expect(await outcome).toBe("cancelled");
+    } else await expect(outcome).rejects.toThrow(/exceeded/);
+    expect(s.fake.prompts()[0]).toContain(steer);
+    expect(s.fake.log().some(e => e.type === "interrupt_ack")).toBe(true);
+    expect(cursor).toEqual([]);
+    expect(first.ports.state.get(CLI_SESSION_KEY)).toMatchObject({ lastDeliveredEvidenceSeq:old.seq });
+    const history = first.ports.listEvidence!({});
+    expect(history.some(e => e.record.kind === "system_note" && e.record.text.includes(steer))).toBe(false);
+
+    const next = s.run({runId:"next", batch:[steer]});
+    next.snapshot.historyUptoSeq = history.at(-1)!.seq;
+    next.ports.listEvidence = filter => history.filter(e => e.seq > (filter?.afterSeq ?? 0));
+    next.ports.state.set(CLI_SESSION_KEY, first.ports.state.get(CLI_SESSION_KEY));
+    expect(await runOf(s, next)).toBe("completed");
+    expect(launches(s).at(-1)?.session?.mode).toBe("resume");
+    expect(s.fake.prompts().at(-1)?.split(steer)).toHaveLength(2);
+  }, 15_000);
+
+  it("confirms a waiting tool's input when stdout reports the new session after its MCP result", async () => {
+    const s = setup("claude", [{actions:[
+      {mcp:"wait", args:{reason:"nothing left"}},
+      {sleep:10_000},
+    ]}], {endRunGraceMs:300});
+    s.fake.env["FAKECLI_DELAY_INIT"] = "1";
+    const r = s.run();
+    await recordBatch(r);
+    const confirmed = watchCursor(r);
+    expect(await runOf(s,r)).toBe("yielded_waiting");
+    expect(confirmed).toEqual([1]);
+    expect(r.ports.state.get(CLI_SESSION_KEY)).toMatchObject({engine:"claude"});
+  });
+
+  it("pairs the MCP call which crosses the step limit with an error result", async () => {
+    const s = setup("claude", [{actions:[
+      {mcp:"set_state", args:{patches:{first:true}}},
+      {mcp:"set_state", args:{patches:{overflow:true}}},
+    ]}]);
+    const r = s.run({spec:{processor:{kind:"llm",toolsets:TOOLSETS,maxSteps:1}}});
+    expect(await runOf(s,r)).toBe("step_limit");
+    const calls = r.ports.log.evidence.filter(e=>e.kind === "tool_call");
+    const results = r.ports.log.evidence.filter(e=>e.kind === "tool_result");
+    expect(calls).toHaveLength(2);
+    expect(results).toHaveLength(2);
+    expect(results[1]).toMatchObject({toolUseId:calls[1]!.toolUseId, isError:true});
+    expect(r.ports.state.has("overflow")).toBe(false);
+  });
+
   it("surfaces a failing CLI as an error (the kernel retries the claim)", async () => {
     const s = setup("codex", [{ actions: [{ fail: "model overloaded" }] }]);
-    await expect(runOf(s, s.run())).rejects.toThrow(/model overloaded/);
+    const first = s.run();
+    await expect(runOf(s, first)).rejects.toThrow(/model overloaded/);
+    expect(first.ports.state.get(CLI_SESSION_KEY)).toBeFalsy();
   });
 
   it("refuses container workspaces instead of running the CLI on the host", async () => {
@@ -685,3 +805,25 @@ describe("CLI loop errors", () => {
     expect(launches(s)).toHaveLength(0);
   });
 });
+
+  it("requeues an unconfirmed live steer and delivers it once on the next resume", async () => {
+    const s = setup("claude", [{ actions: [{sleep:600}, {mcp:"wait",args:{reason:"waiting for input"}}, {exit:0}] },
+      {actions:[{text:"continued"}]}],{endRunGraceMs:100});
+    const first = s.run();
+    await recordBatch(first);
+    const cursor = watchCursor(first);
+    const outcome = runOf(s,first);
+    await waitFor(()=>s.fake.prompts().length>0,"the first prompt");
+    first.ports.pushSteer("review the red folder");
+    expect(await outcome).toBe("yielded_waiting");
+    expect(first.ports.log.requeued.flatMap(r=>r.envelopeIds)).toHaveLength(1);
+    const history = first.ports.listEvidence!({});
+    expect(history.some(({record})=>record.kind==="system_note" && record.text.includes("red folder"))).toBe(false);
+    const next = s.run({runId:"next",batch:["review the red folder"]});
+    next.snapshot.historyUptoSeq = history.at(-1)!.seq;
+    next.ports.listEvidence = filter=>history.filter(e=>e.seq>(filter?.afterSeq ?? 0));
+    next.ports.state.set(CLI_SESSION_KEY,{...first.ports.state.get(CLI_SESSION_KEY) as CliSessionRecord,lastDeliveredEvidenceSeq:cursor.at(-1)});
+    expect(await runOf(s,next)).toBe("completed");
+    expect(launches(s).at(-1)?.session?.mode).toBe("resume");
+    expect(s.fake.prompts().at(-1)?.match(/review the red folder/g)).toHaveLength(1);
+  });

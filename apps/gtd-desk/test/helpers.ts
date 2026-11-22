@@ -1,3 +1,5 @@
+import {createScriptSensor} from "@ng/presets";
+import {gtdLifecycle,humanActionDomain} from "@ng/presets";
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -89,15 +91,17 @@ export function requestText(req: ModelRequest): string {
 
 /** Stand-in presets until @ng/presets lands: just enough processor wiring for the API and projections. */
 export function registerTestPresets(registry: Registry): void {
+  registry.codeProcessors.register(createScriptSensor());
   const T = STANDARD_TOOLSETS;
-  registry.presets.register({
-    name: "inline",
+  registry.presets.register({...gtdLifecycle,
+    name: "inline", stateDomain:humanActionDomain,
     description: "test desk",
     defaults: { processor: { kind: "llm", toolsets: [T.context, T.comms, T.schedule, T.cells] }, meta: { role: "desk" } },
   });
-  registry.presets.register({ name: "worker", description: "test worker", defaults: { processor: { kind: "llm", toolsets: [T.context, T.comms] }, meta: { role: "worker" } } });
-  registry.presets.register({ name: "watcher", description: "test watcher", defaults: { processor: { kind: "llm", modelTier: "fast", toolsets: [T.context, T.comms, T.schedule] }, meta: { role: "watcher" } } });
-  registry.presets.register({ name: "sensor", description: "test sensor", defaults: { processor: { kind: "llm", modelTier: "fast", toolsets: [T.context, T.comms] }, meta: { role: "sensor" } } });
+  registry.presets.register({...gtdLifecycle, name:"project", description:"test project", defaults:{lifetime:"persistent",processor:{kind:"llm",toolsets:[T.context,T.comms,T.cells]},meta:{role:"project"}}});
+  registry.presets.register({...gtdLifecycle, name: "worker", description: "test worker", defaults: { processor: { kind: "llm", toolsets: [T.context, T.comms] }, ccParent:true,lifetime:"wakeable",meta: { role: "worker" } } });
+  registry.presets.register({...gtdLifecycle, name: "watcher", description: "test watcher", defaults: { processor: { kind: "llm", modelTier: "fast", toolsets: [T.context, T.comms, T.schedule] }, ccParent:true,lifetime:"one_shot",meta: { role: "watcher" } } });
+  registry.presets.register({...gtdLifecycle, name: "sensor", description: "test sensor", defaults: { processor: { kind: "llm", modelTier: "fast", toolsets: [T.context, T.comms] }, meta: { role: "sensor" } } });
 }
 
 // ==================== a desk server on an in-memory kernel ====================
@@ -206,7 +210,7 @@ export function writeSource(kernel: Kernel, cellId: string, s: Partial<SourceRec
 /** A project root cell under the desk holding `gtd:project`. */
 export function makeProject(kernel: Kernel, title: string, p: Partial<ProjectRecord> = {}): string {
   const id = newId("proj", kernel.clock);
-  kernel.spawnCell("desk", { id, preset: "worker", title, meta: { projectCellId: id }, bounds: { canSendTo: ["channel:memory:*"] } });
+  kernel.spawnCell("desk", { id, preset: "project", title, meta: { projectCellId: id }, bounds: { canSendTo: ["channel:memory:*"] } });
   writeProject(kernel, id, { title, ...p });
   return id;
 }

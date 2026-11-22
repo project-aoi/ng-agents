@@ -1,7 +1,7 @@
 import { BUILTIN_SKILLS } from "@ng/presets";
-import { asClarifyCard, isEnvelopeOfType, type ActionRecord, type Effort, type ReferenceLink } from "@ng/protocol";
+import { asClarifyCard, isEnvelopeOfType, type ActionRecord, type ApprovalRecord, type Effort, type ReferenceLink } from "@ng/protocol";
 import type { EngageDetailDTO, EngageItemDTO, EngageListDTO, ReferenceDTO } from "../../shared/api";
-import { actionKey, cardBackedActions, linkedApprovalId, projectOfAction, readActions, readProjects, type DeskKernel, type Located, type ProjectionInput } from "./common";
+import { actionKey, cardBackedActions, humanItemForAction, linkedApprovalId, projectOfAction, readActions, readProjects, type DeskKernel, type Located, type ProjectionInput } from "./common";
 import { artifactDTO, button, channelLabelOfAddress, effortLabel, enc, post, sourceInfo } from "./format";
 
 const EFFORTS: readonly Effort[] = ["15m", "45m", "low_energy"];
@@ -40,10 +40,7 @@ export function openHumanActions(kernel: DeskKernel): Array<Located<ActionRecord
   return out;
 }
 
-function sendInfo(kernel: DeskKernel, a: ActionRecord): EngageItemDTO["send"] {
-  const id = linkedApprovalId(a);
-  if (!id) return null;
-  const rec = kernel.gate.getApprovalSync(id);
+function sendInfo(rec: ApprovalRecord | undefined): EngageItemDTO["send"] {
   if (!rec || rec.action.type !== "channel.send" || (rec.status !== "pending" && rec.status !== "failed")) return null;
   const card = asClarifyCard(rec.card.data);
   const targetLabel = card?.cardType === "response" ? card.reply.targetLabel : rec.action.target;
@@ -54,25 +51,29 @@ export function engageItem(input: ProjectionInput, a: Located<ActionRecord> & { 
   const { kernel, now } = input;
   const r = a.record;
   const art = r.artifactId ? kernel.context.getArtifactSync(r.artifactId) : null;
-  const send = sendInfo(kernel, r);
+  const linked = linkedApprovalId(r);
+  const linkedRec = linked ? kernel.gate.getApprovalSync(linked) : undefined;
+  const send = sendInfo(linkedRec);
+  const revision = linkedRec?.itemRevision ?? humanItemForAction(kernel,a.cellId,r.id)?.itemRevision;
   const base = `/api/engage/${enc(a.cellId)}/${enc(r.id)}`;
   const deep = art !== null;
   const buttons = [];
-  if (send && art) {
+  if (send && art && linkedRec) {
     buttons.push(
       button({
         id: "send",
         label: send.state === "send_failed" ? "↻ 重新发送定稿" : `✓ 定稿发送给 ${send.targetLabel}`,
         primary: true,
-        endpoint: post(`${base}/send`, { seenVersion: art.version }),
+        endpoint: post(`${base}/send`, { seenVersion: art.version, seenItemRevision: linkedRec.itemRevision }),
       }),
     );
   }
   if (deep) buttons.push(button({ id: "open", label: "打开工作区", primary: !send, client: "open_editor" }));
-  buttons.push(button({ id: "done", label: "✓ 已办完", primary: !deep, endpoint: post(`${base}/done`) }));
+  buttons.push(button({ id: "done", label: "✓ 已办完", primary: !deep, endpoint: post(`${base}/done`, revision !== undefined ? { seenItemRevision: revision, ...(art ? {seenVersion:art.version} : {}) } : undefined) }));
   return {
     cellId: a.cellId,
     actionId: r.id,
+    ...(revision !== undefined ? { itemRevision: revision } : {}),
     title: r.title,
     nextStep: r.nextStep ?? null,
     effort: isEffort(r.effort) ? r.effort : null,

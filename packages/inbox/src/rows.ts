@@ -25,6 +25,7 @@ export interface MessageRow {
   schedule_id: string | null;
   expected_epoch: number | null;
   claim_id: string | null;
+  first_claimed_at: number | null;
   attempts: number;
   created_at: number;
   updated_at: number;
@@ -71,6 +72,7 @@ export function toMessage(r: MessageRow): InboxMessageRecord {
     scheduleId: r.schedule_id,
     expectedEpoch: r.expected_epoch,
     claimId: r.claim_id,
+    firstClaimedAt: r.first_claimed_at,
     attempts: r.attempts,
     statusReason: r.status_reason,
     createdAt: r.created_at,

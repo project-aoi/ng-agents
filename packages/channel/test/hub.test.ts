@@ -421,3 +421,106 @@ describe("ChannelHub ingress", () => {
     await expect(mem.inject({ from: "a", text: "x" })).rejects.toThrow(/no longer registered/);
   });
 });
+
+describe("ChannelHub — 3-step Saga & actionId lookup (BUG-028)", () => {
+  it("pitfall #1: prepareSendAttemptSync + deliverPreparedAttempt actually transmits (unlike hub.send on a pending key) and guards finalize by attemptSeq", async () => {
+    const { hub, mem } = setup();
+    const prep = hub.prepareSendAttemptSync({
+      target: ALICE,
+      content: text("hello saga"),
+      idempotencyKey: "act_saga_1",
+      actionId: "act_saga_1",
+      respectDnd: false,
+    });
+    expect(prep).toMatchObject({ kind: "deliver", idempotencyKey: "act_saga_1", attemptSeq: 1 });
+    expect(hub.getOutboxSync("act_saga_1")).toMatchObject({ status: "pending", attempts: 1, actionId: "act_saga_1" });
+
+    // Pitfall check: calling hub.send on the same pre-written pending row would short-circuit to unknown without delivering!
+    expect(await hub.send({ target: ALICE, content: text("hello saga"), idempotencyKey: "act_saga_1", respectDnd: false })).toBe("unknown");
+    expect(mem.deliveries).toHaveLength(0);
+
+    // deliverPreparedAttempt bypasses the short-circuit and transmits for real.
+    if (prep.kind !== "deliver") throw new Error("expected deliver");
+    const outcome = await hub.deliverPreparedAttempt(prep.rowId, prep.attemptSeq);
+    expect(outcome).toMatchObject({ status: "sent" });
+    expect(mem.deliveries).toHaveLength(1);
+
+    // Finalizing with a mismatched attemptSeq is rejected; matching attemptSeq commits cleanly.
+    expect(hub.finalizePreparedAttemptSync(prep.rowId, 99, { status: "failed", error: "stale" }).applied).toBe(false);
+    expect(hub.finalizePreparedAttemptSync(prep.rowId, prep.attemptSeq, outcome).applied).toBe(true);
+    expect(hub.getOutboxSync("act_saga_1")).toMatchObject({ status: "sent", attempts: 1 });
+  });
+
+  it("stale attempt 1 cannot overwrite newer retry attempt 2; resolveUnknownByActionSync resolves the latest :retry: row", async () => {
+    const { hub, mem } = setup();
+    // 1) Normal retry via prepareSendAttemptSync reuses the failed row in place (attempts 1 -> 2) and blocks late attempt 1.
+    const p1 = hub.prepareSendAttemptSync({ target: ALICE, content: text("v1"), idempotencyKey: "act_r1", actionId: "act_r1", respectDnd: false });
+    if (p1.kind !== "deliver") throw new Error("expected deliver");
+    mem.respondWith("failed");
+    const o1 = await hub.deliverPreparedAttempt(p1.rowId, p1.attemptSeq);
+    expect(hub.finalizePreparedAttemptSync(p1.rowId, p1.attemptSeq, o1).applied).toBe(true);
+    expect(hub.getOutboxSync("act_r1")).toMatchObject({ status: "failed", attempts: 1 });
+
+    const p2 = hub.prepareSendAttemptSync({ target: ALICE, content: text("v1"), idempotencyKey: "act_r1:retry:1", actionId: "act_r1", respectDnd: false });
+    if (p2.kind !== "deliver") throw new Error("expected deliver");
+    expect(p2.attemptSeq).toBe(2);
+    mem.respondWith("unknown");
+    const o2 = await hub.deliverPreparedAttempt(p2.rowId, p2.attemptSeq);
+    expect(hub.finalizePreparedAttemptSync(p2.rowId, p2.attemptSeq, o2).applied).toBe(true);
+    // Late attempt 1 finalizer cannot overwrite attempt 2.
+    expect(hub.finalizePreparedAttemptSync(p2.rowId, 1, { status: "failed", error: "late" }).applied).toBe(false);
+    expect(hub.getLatestOutboxByActionSync("act_r1")).toMatchObject({ status: "unknown", attempts: 2 });
+    expect(hub.resolveUnknownByActionSync("act_r1", "sent")).toBe("resolved");
+    expect(hub.getLatestOutboxByActionSync("act_r1")!.status).toBe("sent");
+
+    // 2) When a separate :retry:1 key row exists for the same actionId (e.g. after a token-refused attempt 1),
+    //    getLatestOutboxByActionSync and resolveUnknownByActionSync resolve the latest :retry:1 row, NOT the old row!
+    const { hub: strictHub, mem: strictMem } = setup({
+      verifyToken: (tok) => (tok === "good" ? { ok: true } : { ok: false, reason: "expired" }),
+      requireToken: true,
+    });
+    expect(await strictHub.send({ target: ALICE, content: text("v1"), idempotencyKey: "act_r2", actionId: "act_r2", actionToken: "bad", respectDnd: false })).toBe("failed");
+    expect(strictHub.getOutboxSync("act_r2")).toMatchObject({ status: "failed", refused: true });
+    // Retry linked to the same actionId after a refused row generates a new :retry: key and goes unknown.
+    const r2 = strictHub.prepareSendAttemptSync({ target: ALICE, content: text("v1"), idempotencyKey: "act_r2", actionId: "act_r2", actionToken: "good", respectDnd: false });
+    if (r2.kind !== "deliver") throw new Error("expected deliver");
+    expect(r2.idempotencyKey).toMatch(/^act_r2:retry:/);
+    strictMem.respondWith("unknown");
+    const out2 = await strictHub.deliverPreparedAttempt(r2.rowId, r2.attemptSeq);
+    expect(strictHub.finalizePreparedAttemptSync(r2.rowId, r2.attemptSeq, out2).applied).toBe(true);
+    expect(strictHub.getLatestOutboxByActionSync("act_r2")).toMatchObject({ idempotencyKey: r2.idempotencyKey, status: "unknown" });
+    expect(strictHub.resolveUnknownByActionSync("act_r2", "sent")).toBe("resolved");
+    expect(strictHub.getOutboxSync(r2.idempotencyKey)!.status).toBe("sent");
+    expect(strictHub.getOutboxSync("act_r2")!.status).toBe("failed");
+  });
+});
+
+it("keeps manual focus and concurrent editor leases independent and expires a crashed tab", async () => {
+  const {hub,clock}=setup();
+  hub.setEditorLeaseSync("first-tab",true);
+  hub.setEditorLeaseSync("other-tab",true);
+  hub.setFocusSync(true);
+  hub.setEditorLeaseSync("first-tab",false);
+  hub.setFocusSync(false);
+  expect(hub.focusInfoSync()).toEqual({manual:false,editors:1});
+  expect(await hub.send({target:ALICE,content:text("held"),idempotencyKey:"lease"})).toBe("buffered_dnd");
+  expect((await hub.flushBuffered(true)).sent).toBe(0);
+  clock.advance(45_001);
+  expect(hub.expireEditorLeasesSync()).toBe(true);
+  expect(hub.isFocusSync()).toBe(false);
+  expect((await hub.flushBuffered(true)).sent).toBe(1);
+});
+
+it("keeps a prepared attempt in flight until the enclosing finalization commits", async () => {
+  const {hub, db} = setup();
+  const attempt = hub.prepareSendAttemptSync({target:ALICE, content:text("reply"), idempotencyKey:"rollback", respectDnd:false});
+  if (attempt.kind !== "deliver") throw Error(attempt.kind);
+  const delivery = await hub.deliverPreparedAttempt(attempt.rowId, attempt.attemptSeq);
+  expect(() => withTx(db, () => {
+    hub.finalizePreparedAttemptSync(attempt.rowId, attempt.attemptSeq, delivery);
+    throw Error("rollback");
+  })).toThrow("rollback");
+  expect(hub.recoverInterruptedSync()).toBe(0);
+  expect(hub.finalizePreparedAttemptSync(attempt.rowId, attempt.attemptSeq, delivery).applied).toBe(true);
+  expect(hub.getOutboxSync("rollback")?.status).toBe("sent");
+});

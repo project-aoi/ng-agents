@@ -64,14 +64,14 @@ export function codexArgs(req: LaunchRequest): string[] {
   ];
   if (mode === "workspace-write") cfg.push("sandbox_workspace_write.network_access=false");
   if (host && req.caps.web) cfg.push(`web_search=${tomlValue("live")}`);
-  if (!req.session && req.system.length <= CODEX_INLINE_INSTRUCTIONS_MAX) cfg.push(`developer_instructions=${tomlValue(req.system)}`);
+  if (req.session?.mode !== "resume" && req.system.length <= CODEX_INLINE_INSTRUCTIONS_MAX) cfg.push(`developer_instructions=${tomlValue(req.system)}`);
   const rules = mode === "danger-full-access" ? [] : ["--ignore-rules"];
   const common = ["--json", "--skip-git-repo-check", ...rules, ...cfg.flatMap((c) => ["-c", c])];
   if (req.model) common.push("-m", req.model);
   if (req.effort) common.push("-c", `model_reasoning_effort=${tomlValue(req.effort)}`);
   if (!req.session) return ["exec", ...common, "-C", req.cwd, "-s", mode, ...req.extraArgs, "-"];
   const sub = req.session.mode === "fork" ? "fork" : "resume";
-  return ["exec", sub, ...common, "-c", `sandbox_mode=${tomlValue(mode)}`, ...req.extraArgs, req.session.id, "-"];
+  return ["exec", sub, ...common, ...(sub === "fork" ? ["-C",req.cwd] : []), "-c", `sandbox_mode=${tomlValue(mode)}`, ...req.extraArgs, req.session.id, "-"];
 }
 
 function describePermissions(caps: CliCapabilities): string {
@@ -100,9 +100,9 @@ class CodexDriver implements CliDriver {
     this.argv = [req.bin, ...codexArgs(req)];
   }
 
-  start(io: { write(line: string): void; end(): void }): void {
+  start(io: { write(line: string): boolean; end(): void }): void {
     const req = this.#req;
-    const inlineSystem = !req.session && req.system.length > CODEX_INLINE_INSTRUCTIONS_MAX;
+    const inlineSystem = req.session?.mode !== "resume" && req.system.length > CODEX_INLINE_INSTRUCTIONS_MAX;
     io.write(inlineSystem ? `<instructions>\n${req.system}\n</instructions>\n\n${req.prompt}` : req.prompt);
     io.end();
   }

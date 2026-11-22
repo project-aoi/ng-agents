@@ -30,6 +30,16 @@ function refusal(fn: () => unknown): string {
 }
 
 describe("approve — version-bound confirmation", () => {
+  it("a new standing rule keeps a reply already on a card subject to that approval", () => {
+    const f = setup();
+    const first = deferDraft(f);
+    f.gate.upsertPolicyRuleSync({ match: { type: "channel.send", target: "channel:feishu:*" }, effect: "allow", createdBy: "owner" });
+    const action = send("channel:feishu:oc_1", { artifactId: "a1", subjectKey: "msg:1" });
+    expect(f.gate.authorizeSync(action, meta("desk"))).toMatchObject({ type: "defer", actionId: first.actionId });
+    expect(f.gate.listPolicyRulesSync()[0]?.uses).toBe(0);
+    expect(f.gate.authorizeSync({ ...action, subjectKey: "msg:2" }, meta("desk")).type).toBe("allow");
+  });
+
   it("approves when the human saw the current version; records approver and emits", () => {
     const f = setup();
     const d = deferDraft(f);
@@ -137,7 +147,7 @@ describe("approve — version-bound confirmation", () => {
 describe("approve — an external main agent (agent:*) orchestrates but is never the owner (docs/05 guard 3)", () => {
   const AGENT = "agent:ops";
 
-  it("may approve project proposals, custom actions and blocked / retry_limit / waiting_timeout escalations", () => {
+  it("may approve custom actions and blocked / retry_limit / waiting_timeout escalations, but NOT project.start cards (BUG-020)", () => {
     const f = setup();
     const project = expectType(
       f.gate.authorizeSync(
@@ -146,13 +156,16 @@ describe("approve — an external main agent (agent:*) orchestrates but is never
       ),
       "defer",
     );
+    expect(refusal(() => f.gate.approveSync(project.actionId, AGENT))).toMatch(/needs the owner \(it starts a new project\); agent:ops may not/);
+    expect(f.gate.getApprovalSync(project.actionId)).toMatchObject({ status: "pending", approverId: null });
+    expect(f.gate.approveSync(project.actionId, "owner")).toBe("approved");
+
     const cards = [
-      project.actionId,
       expectType(f.gate.authorizeSync(custom("merge"), meta("desk")), "defer").actionId,
       expectType(f.gate.authorizeSync(custom("escalation.blocked", { card: escalationCard("blocked") }), meta("desk")), "defer").actionId,
       expectType(f.gate.authorizeSync(custom("escalation.waiting_timeout"), meta("desk")), "defer").actionId,
       expectType(
-        f.gate.authorizeSync(custom("kernel.escalation", { args: { kernel: true, reason: "retry_limit", cellId: "desk" }, card: escalationCard("retry_limit") }), meta("desk")),
+        f.gate.authorizeSync(custom("kernel.escalation", { args: { kernel: true, reason: "retry_limit", cellId: "desk" }, card: escalationCard("retry_limit") }), meta("desk", 0, {principalId:"kernel:escalation"})),
         "defer",
       ).actionId,
     ];
@@ -160,8 +173,8 @@ describe("approve — an external main agent (agent:*) orchestrates but is never
       expect(f.gate.approveSync(id, AGENT)).toBe("approved");
       expect(f.gate.getApprovalSync(id)).toMatchObject({ status: "approved", approverId: AGENT });
     }
-    // trust statistics stay the owner's own judgement
-    expect(f.gate.approvalStatsSync()).toEqual([]);
+    // trust statistics stay the owner's own judgement (only owner-approved project.start could count if applicable)
+    expect(f.gate.approvalStatsSync().filter((s) => s.actionClass.startsWith("custom:"))).toEqual([]);
   });
 
   it("may not approve a send that leaves the owner's own channels; the card stays pending for the owner", () => {
@@ -187,7 +200,7 @@ describe("approve — an external main agent (agent:*) orchestrates but is never
       custom("escalation.budget_exhausted", { card: escalationCard("budget_exhausted") }), // request_approval
       custom("kernel.escalation", { args: kernelArgs }), // the kernel's own card (args only)
       custom("kernel.escalation", { args: { ...kernelArgs, reason: "retry_limit" }, card: escalationCard("budget_exhausted"), subjectKey: "s:card" }), // card only
-    ].map((a) => expectType(f.gate.authorizeSync(a, meta("desk")), "defer").actionId);
+    ].map(a => expectType(f.gate.authorizeSync(a, meta("desk", 0, { principalId: a.type === "custom" && a.name === "kernel.escalation" ? "kernel:escalation" : "cell:desk" })), "defer").actionId);
     for (const id of cards) {
       expect(refusal(() => f.gate.approveSync(id, AGENT))).toMatch(/needs the owner \(it continues past an exhausted budget\); agent:ops may not/);
       expect(f.gate.getApprovalSync(id)!.status).toBe("pending");
@@ -218,13 +231,14 @@ describe("ownerOnlyApproval (shared with the kernel and the control plane)", () 
     expect(ownerOnlyApproval(custom("escalation.budget_exhausted"), owner)).toBe("it continues past an exhausted budget");
     expect(ownerOnlyApproval(custom("kernel.escalation", { args: { reason: "budget_exhausted" } }), owner)).toMatch(/exhausted budget/);
     expect(ownerOnlyApproval(send("channel:ui:owner", { card: escalationCard("budget_exhausted") }), owner)).toMatch(/exhausted budget/);
+    expect(
+      ownerOnlyApproval({ type: "project.start", summary: "", subjectKey: "s", sideEffect: "external", proposal: { title: "x", outcome: "", actions: [] } } as ProposedAction, owner),
+    ).toBe("it starts a new project");
     for (const ok of [
       custom("kernel.escalation", { args: { reason: "retry_limit" } }),
       custom("kernel.escalation"),
       custom("escalation.blocked", { card: escalationCard("blocked") }),
       custom("budget_exhausted"),
-      { type: "project.start", summary: "", subjectKey: "s", sideEffect: "external", proposal: { title: "x", outcome: "", actions: [] } } as ProposedAction,
-      { type: "workspace.exec", summary: "", subjectKey: "s", sideEffect: "external", tool: "bash", args: {} } as ProposedAction,
     ]) {
       expect(ownerOnlyApproval(ok, owner), JSON.stringify(ok)).toBeNull();
     }
@@ -254,6 +268,8 @@ describe("card lifecycle", () => {
     expect(f.gate.withdrawSync(a.actionId, "群里已有人回答")).toBe("cancelled");
     expect(f.gate.withdrawSync(a.actionId, "again")).toBe("not_pending");
     expect(f.gate.getApprovalSync(a.actionId)).toMatchObject({ status: "cancelled", statusReason: "群里已有人回答" });
+    expect(f.gate.approveSync(c.actionId,"owner")).toBe("approved");
+    f.gate.recordOutcomeSync(c.actionId,"failed",{receipt:"failed"});
     expect(f.gate.cancelForCellSync("desk", "project closed")).toBe(2);
     expect([b, c].map((x) => f.gate.getApprovalSync(x.actionId)!.status)).toEqual(["cancelled", "cancelled"]);
     expect(f.events.filter((e) => e.topic === "approval.changed" && (e.data as { status: string }).status === "cancelled")).toHaveLength(3);
@@ -288,6 +304,26 @@ describe("card lifecycle", () => {
     expect(() => f.gate.recordOutcomeSync("act_missing", "failed", {})).toThrow(/not found/);
   });
 
+  it("revises and withdraws the same hidden draft behind an unknown send", () => {
+    const f = setup();
+    const first = deferDraft(f);
+    expect(f.gate.approveSync(first.actionId, "owner", 1)).toBe("approved");
+    f.gate.recordOutcomeSync(first.actionId, "unknown", {receipt:"unknown"});
+    const action = send("channel:feishu:oc_1", {subjectKey:"msg:1", artifactId:"a1"});
+    const hidden = expectType(f.gate.authorizeSync(action, meta("desk")), "defer");
+    expect(hidden.actionId).not.toBe(first.actionId);
+    putArtifact(f.db, {artifactId:"a1", cellId:"desk", version:2, body:"new draft"});
+    expect(f.gate.authorizeSync(action, meta("desk"))).toMatchObject({type:"defer", actionId:hidden.actionId});
+    expect(f.gate.findPendingBySubjectSync("msg:1")).toMatchObject({actionId:hidden.actionId, boundVersion:2, itemRevision:2});
+    expect(f.gate.approveSync(hidden.actionId, "owner", 2)).toBe("not_found");
+    expect(() => f.gate.issueTokenSync(hidden.actionId, action)).toThrow(/not found/);
+    expect(f.gate.withdrawSync(hidden.actionId, "obsolete", {seenItemRevision:1})).toBe("revision_mismatch");
+    expect(f.gate.withdrawSync(hidden.actionId, "obsolete", {seenItemRevision:2})).toBe("cancelled");
+    expect(f.gate.findPendingBySubjectSync("msg:1")).toBeUndefined();
+    f.gate.recordOutcomeSync(first.actionId, "executed", {receipt:"sent"});
+    expect(f.gate.listPendingSync()).toEqual([]);
+  });
+
   it("lists by cell, status, subject and limit", () => {
     const f = setup();
     f.addCell("p", "desk", { canSendTo: ["channel:feishu:*"], maxTokens: 10, maxCents: 10 });
@@ -300,5 +336,52 @@ describe("card lifecycle", () => {
     expect(f.gate.listPendingSync({ limit: 1 })).toHaveLength(1);
     expect(f.gate.listApprovalsSync({ subjectKey: "a" }).map((x) => x.actionId)).toEqual([a.actionId]);
     expect(f.gate.listApprovalsSync().map((x) => x.actionId)).toEqual([b.actionId, a.actionId]);
+  });
+
+  it("BUG-020: itemRevision optimistic locking rejects stale seenItemRevision and bumps on every accepted change (incl. revise)", () => {
+    const f = setup();
+    const d = expectType(f.gate.authorizeSync(send("channel:feishu:oc_1", { subjectKey: "rev:1" }), meta("desk")), "defer");
+    expect(f.gate.getApprovalSync(d.actionId)!.itemRevision).toBe(1);
+
+    // Stale revision rejected across revise / snooze / deny / withdraw / approve.
+    expect(f.gate.reviseSync(d.actionId, "owner", { seenItemRevision: 99 })).toBe("revision_mismatch");
+    expect(f.gate.snoozeSync(d.actionId, f.clock.now() + 60_000, { seenItemRevision: 99 })).toBe("revision_mismatch");
+    expect(f.gate.denySync(d.actionId, "owner", "no", { seenItemRevision: 99 })).toBe("revision_mismatch");
+    expect(f.gate.withdrawSync(d.actionId, "no", { seenItemRevision: 99 })).toBe("revision_mismatch");
+    expect(f.gate.approveSync(d.actionId, "owner", undefined, { seenItemRevision: 99 })).toBe("revision_mismatch");
+
+    // Accepted revise bumps itemRevision: 1 -> 2, and old revision 1 is now stale.
+    expect(f.gate.reviseSync(d.actionId, "owner", { seenItemRevision: 1 })).toBe("revised");
+    expect(f.gate.getApprovalSync(d.actionId)!.itemRevision).toBe(2);
+    expect(f.gate.snoozeSync(d.actionId, f.clock.now() + 60_000, { seenItemRevision: 1 })).toBe("revision_mismatch");
+
+    // Accepted snooze bumps itemRevision: 2 -> 3.
+    expect(f.gate.snoozeSync(d.actionId, f.clock.now() + 60_000, { seenItemRevision: 2 })).toBe("snoozed");
+    expect(f.gate.getApprovalSync(d.actionId)!.itemRevision).toBe(3);
+
+    // Accepted approve bumps itemRevision: 3 -> 4; failed outcome bumps -> 5; retry approve bumps -> 6.
+    expect(f.gate.approveSync(d.actionId, "owner", undefined, { seenItemRevision: 3 })).toBe("approved");
+    expect(f.gate.getApprovalSync(d.actionId)!.itemRevision).toBe(4);
+    f.gate.recordOutcomeSync(d.actionId, "failed", { receipt: "failed", error: "502" });
+    expect(f.gate.getApprovalSync(d.actionId)!.itemRevision).toBe(5);
+    expect(f.gate.approveSync(d.actionId, "owner", undefined, { seenItemRevision: 4 })).toBe("revision_mismatch");
+    expect(f.gate.approveSync(d.actionId, "owner", undefined, { seenItemRevision: 5 })).toBe("approved");
+    expect(f.gate.getApprovalSync(d.actionId)!.itemRevision).toBe(6);
+  });
+
+  it("Review fix: authorizeSync denies standing-rule auto-send while an unresolved unknown send exists for the same subjectKey", () => {
+    const f = setup();
+    const d = expectType(f.gate.authorizeSync(send("channel:feishu:oc_1", { subjectKey: "unk:1" }), meta("desk")), "defer");
+    f.gate.approveSync(d.actionId, "owner");
+    f.gate.recordOutcomeSync(d.actionId, "unknown", { receipt: "unknown", note: "network timeout" });
+    // Even with a standing allow rule, auto-sending on the same subject is blocked until the owner verifies.
+    f.gate.upsertPolicyRuleSync({
+      match: { type: "channel.send", target: "channel:feishu:*" },
+      effect: "allow",
+      createdBy: "owner",
+      note: "trust feishu",
+    });
+    const second = f.gate.authorizeSync(send("channel:feishu:oc_1", { subjectKey: "unk:1" }), meta("desk"));
+    expect(second).toMatchObject({ type: "deny" });
   });
 });

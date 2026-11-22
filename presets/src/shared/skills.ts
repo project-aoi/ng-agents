@@ -126,16 +126,16 @@ A cell wrote to you and is now asleep, waiting for inbox:desk. It stopped before
 It should give: directory, branch, \`git status\` (or the failing job and error), its task, what it needs. If something essential is missing, ask it (send_message to inbox:<id>) — it wakes, answers and waits again.
 
 ## Step 1 — whose problem is it?
-Look at the live note "active workspaces" (who is working in which directory right now, in which project), the in-flight list, and read_state "desk:arbitration" (open blockers). inspect_cell on a cell shows what it was told and what it did.
+Look at the live note "active workspaces" (who is working in which directory right now, in which project), the in-flight list, and [cells waiting on you] (each independent wait and its reference). inspect_cell on a cell shows what it was told and what it did.
 
 ### A. Shared blocker — the cause is outside the reporter's task and hits others too
 Signs: a CI job fails on the main branch as well; several cells report the same error; a shared service or dependency is broken.
-Keep your own note of open blockers in state: set_state { patches: { "desk:arbitration": { "<key>": { title, fixer: <cell id>, waiters: [<cell ids>], openedAt } } } } — a short stable key per cause ("ci-develop-lint"). It is your memory across wake-ups; nothing else reads it.
-- First report of a cause: start one fixer — spawn_cell { preset: "worker", title: "修复公共 CI", cwd: <repo>, instruction: "…" } — and note the blocker with the reporter as its first waiter.
+Use one stable cause ("ci-develop-lint"). Read the waiting cells and each waitId. Reuse an active fixer whose meta.relatedProjectIds match the affected projects.
+- First report: spawn one worker with the affected project ids and a concrete instruction.
   - The repository's checkout is on the reporter's feature branch? Then the fixer should not work in it: instruct "在独立目录修复：\`git -C <repo> worktree add <临时目录> origin/develop\`（或另行 clone），在那里修、提 MR、合入后删除你自己建的这个 worktree；不要动 <repo> 当前检出".
-- Every further report of the same cause: add that reporter to the waiters in your note; no second fixer. Tell it, if useful, that a fix is under way — it keeps waiting.
-- You are told the fixer's turn is over (\`cell.result\`): check that it really is fixed — its summary, and inspect_cell when the summary leaves doubt. Something left to do: send it to the fixer (send_message; it rests between turns and continues where it stopped). Fixed: for each waiter in the note, send_message { to: "inbox:<waiter>", summary: "公共问题已处理", text: "ci已修复（<MR 链接>），可以 rebase develop 然后继续推进" }. A send that comes back "NOT DELIVERED … closed" means that cell was stopped, or its project ended, meanwhile — nothing more for you to do; its project decides whether someone carries on. Then remove the blocker from your note.
-- The fixer failed: tell the waiters what you know and raise it to the owner (request_approval, reason "blocked") — do not leave them waiting on a fix that is not coming.
+- Every further report of the same cause: use the registered wait and the existing fixer. Keep intermediate progress at the desk. Only notify a waiter when it has an actionable answer.
+- You are told the fixer's turn is over (\`cell.result\`): check that it really is fixed — its summary, and inspect_cell when the summary leaves doubt. Something left to do: send it to the fixer (send_message; it rests between turns and continues where it stopped). Fixed: for each registered waiter, call send_message { refId: "<matching waitId or refId>", to: "inbox:<waiter>", summary: "公共问题已处理", text: "ci已修复（<MR 链接>），可以 rebase develop 然后继续推进" }. A send that comes back "NOT DELIVERED … closed" means that cell was stopped, or its project ended, meanwhile — nothing more for you to do; its project decides whether someone carries on. The kernel settles each answered wait.
+- The fixer failed: keep the waiters asleep and raise it to the owner (request_approval, reason "blocked") — do not leave them waiting on a fix that is not coming.
 
 ### B. Somebody else's work in the same place
 Signs: an unexpected branch or uncommitted changes that match what another cell did (inspect_cell on the cells of the project in question; its records: read_state with cellId = the project, prefix "gtd:"; its artifacts; search_history scope "global" for the branch name), or a cell of another project changing the same files right now (the note "active workspaces").
@@ -146,6 +146,7 @@ Signs: an unexpected branch or uncommitted changes that match what another cell 
 Signs: uncommitted changes, no cell has worked in this directory recently, nothing in any project's records explains them.
 - **Never** instruct reset / clean / stash / checkout over it. The owner is mid-edit.
 - request_approval kind "escalation", reason "blocked", title "<目录> 里有你未提交的改动", explanation with the branch and the changed files, and the three choices: "等我提交完再继续 / 我自己 stash，之后继续 / 让它另开目录做".
+- Include relatedProjectIds and a stable arb:<cause> subject. Give each meaningful choice a reply option. Verify that the chosen route works before waking waiters. If only some can proceed, reply to those individually using refId; leave the others waiting.
 - On approval.resolved: send_message to the asker with the owner's choice, in words it can execute ("主人已提交，重新检查 git status 后继续" / "在 <新目录> 用 git worktree 开工，不要碰原目录").
 
 ## Step 2 — make sure nobody is left hanging
@@ -191,5 +192,5 @@ export const SUPERSEDED_SKILL_DIGESTS: Readonly<Record<string, readonly string[]
   // 2026-11-18: one-shot workers, cwdMode read/write, writers queued by the kernel.
   [SKILL_PROJECT_RELAY]: ["862adcc1128d43b0fe9e80a897e16be0eccafa56e3f0c0f828eb248e5c669528"],
   [SKILL_DOMAIN_HUB]: ["ab567185e4c44b045ec9388f8352e6daf44bfecc44d61f91d6758bb0f7d04762"],
-  [SKILL_WORKSPACE_ARBITRATION]: ["2fd6bd61786138935a735117b3f8f23391574330e476cfcad2717c005dc74c3e"],
+  [SKILL_WORKSPACE_ARBITRATION]: ["23a46645c0c73286a8a0c9039668c0dcfbb8466233ece18943ea96af5280f437","39e657a5fecc8fdf1da5b3ad17238fc64e91f2a11262c2a41328126633022870","ec1b4870c4c4cbcba535712f7331837a06000b4b120028ff3919b3a3e98de5d0","2fd6bd61786138935a735117b3f8f23391574330e476cfcad2717c005dc74c3e"],
 };

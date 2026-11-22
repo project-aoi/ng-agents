@@ -200,16 +200,39 @@ describe("escalations", () => {
     const cards = h.kernel.gate.listPendingSync();
     expect(cards).toHaveLength(1);
     const card = asClarifyCard(cards[0]!.card.data)!;
-    expect(card).toMatchObject({ cardType: "escalation", subjectKey: `msg:${msg!.envelope.id}`, escalation: { reason: "retry_limit" } });
+    expect(card).toMatchObject({ cardType: "escalation", subjectKey: "kernel:desk:retry_limit", escalation: { reason: "retry_limit" } });
     expect(card.rawInput).toEqual({ text: "需要你看一下这个", kind: "message" });
     expect(card.source.label).toBe("memory");
 
     h.script.add("desk", { text: "handled at last" });
-    expect(await h.kernel.resolveApproval(cards[0]!.actionId, { decision: "continue" })).toMatchObject({ status: "continued" });
+    const item = h.kernel.humanItems.get(cards[0]!.actionId)!;
+    expect(item.options[0]?.effect).toBe("execute");
+    expect(await h.kernel.humanItems.decide(item.id, {optionId:item.options[0]!.id, seenItemRevision:item.itemRevision, note:"再试一次"}, "agent:helper")).toMatchObject({status:"continued"});
     await h.kernel.idle();
     expect(h.of("run.finished").map((e) => e.outcome)).toEqual(["error", "error", "completed"]);
     expect(h.kernel.gate.getApprovalSync(cards[0]!.actionId)!.status).toBe("executed");
     expect(h.kernel.gate.listPendingSync()).toEqual([]);
+  });
+
+  it("separates a persisted ancestor-held step-limit card from a new dead letter", async () => {
+    const h = await boot({kernel:{maxAttempts:1}});
+    h.kernel.spawnCell("desk", {id:"w", preset:"worker"});
+    const legacy = h.kernel.gate.authorizeSync({
+      type:"custom", name:"kernel.escalation", subjectKey:"kernel:w:retry_limit", sideEffect:"external", summary:"超步",
+      args:{kernel:true, cellId:"w", reason:"retry_limit", stepLimit:true},
+    }, {cellId:"desk", epoch:0, principalId:"kernel:escalation"});
+    if (legacy.type !== "defer") throw Error(legacy.type);
+    h.script.add("worker", {error: Error("dead letter")});
+    h.kernel.sendToCell("w", {text:"重新核查"});
+    await h.kernel.idle();
+    const step = h.kernel.humanItems.get(legacy.actionId)!;
+    expect(step.subjectKey).toBe("kernel:w:step_limit");
+    const dead = h.kernel.humanItems.list().find(i => i.subjectKey === "kernel:w:retry_limit")!;
+    await h.kernel.humanItems.decide(step.id, {optionId:"system.execute", seenItemRevision:step.itemRevision, note:"再走一步"}, "owner");
+    expect(h.kernel.inbox.listMessagesSync({cellId:"w", type:PAYLOAD.approvalResolved}).some(m => (m.envelope.payload as {note?:string}).note === "再走一步")).toBe(true);
+    await h.kernel.humanItems.decide(dead.id, {optionId:"system.execute", seenItemRevision:dead.itemRevision}, "owner");
+    await h.kernel.idle();
+    expect(h.kernel.inbox.listMessagesSync({cellId:"w"}).filter(m => m.envelope.id.includes("#retry:"))).toHaveLength(1);
   });
 
   it("a second dead letter of the same item does not create a second card", async () => {
@@ -222,7 +245,11 @@ describe("escalations", () => {
     expect(h.kernel.inbox.listMessagesSync({ cellId: "w", status: ["dead"] })).toHaveLength(2);
     const cards = h.kernel.gate.listPendingSync();
     expect(cards).toHaveLength(1);
-    expect(cards[0]).toMatchObject({ cellId: "w", subjectKey: "cell:w" });
+    expect(cards[0]).toMatchObject({ cellId: "w", subjectKey: "kernel:w:retry_limit" });
+    const card = h.kernel.humanItems.get(cards[0]!.actionId)!;
+    await h.kernel.humanItems.decide(card.id, {optionId:card.options[0]!.id, seenItemRevision:card.itemRevision}, "owner");
+    await h.kernel.idle();
+    expect(h.kernel.inbox.listMessagesSync({cellId:"w"}).filter(m => m.envelope.id.includes("#retry:"))).toHaveLength(2);
   });
 
   it("budget hard stop → an escalation card even though the budget is gone; raising it lets the cell continue", async () => {
@@ -233,7 +260,7 @@ describe("escalations", () => {
     expect(h.of("run.finished").map((e) => e.outcome)).toEqual(["budget_stopped"]);
     const [pending] = h.kernel.gate.listPendingSync();
     const card = asClarifyCard(pending!.card.data)!;
-    expect(card).toMatchObject({ cardType: "escalation", subjectKey: "cell:w", title: "「修 CI」的预算已用完", escalation: { reason: "budget_exhausted", usage: { limitTokens: 1_000 } } });
+    expect(card).toMatchObject({ cardType: "escalation", subjectKey: "kernel:budget:w", title: "「修 CI」的预算已用完", escalation: { reason: "budget_exhausted", usage: { limitTokens: 1_000 } } });
     expect(pending!.cellId).toBe("w");
 
     // a message to a stopped cell is held, not claimed: no Run starts, it stays pending, and no second card is stacked
@@ -247,7 +274,7 @@ describe("escalations", () => {
       expect(requestText(req)).toContain("poke");
       return { text: "continuing", usage: { inputTokens: 10, outputTokens: 10 } };
     });
-    expect(await h.kernel.resolveApproval(pending!.actionId, { decision: "continue", raise: { tokens: 5_000 } })).toMatchObject({ status: "continued" });
+    expect(await h.kernel.resolveApproval(pending!.actionId, { decision: "continue", approverId: "owner", raise: { tokens: 5_000 } })).toMatchObject({ status: "continued" });
     expect(h.kernel.gate.usageSync("w")).toMatchObject({ raisedTokens: 5_000, state: "ok" });
     await h.kernel.idle();
     // a budget stop is never a result: the worker's turn settled only with the Run after the raise, which took the
@@ -263,19 +290,21 @@ describe("escalations", () => {
     ]);
   });
 
-  it("resolve_offline on an escalation closes the affected cell and withdraws the card", async () => {
+  it("resolving an exhausted budget offline holds the affected cell until a raise", async () => {
     const h = await boot();
     h.script.add("worker", { text: "x", usage: { inputTokens: 2_000, outputTokens: 0 } });
     h.kernel.spawnCell("desk", { id: "w", preset: "worker", bounds: { maxTokens: 1_000 } }, "go");
     await h.kernel.idle();
     const [card] = h.kernel.gate.listPendingSync();
-    expect(await h.kernel.resolveApproval(card!.actionId, { decision: "resolve_offline" })).toEqual({
+    expect(await h.kernel.resolveApproval(card!.actionId, { decision: "resolve_offline", approverId: "owner" })).toEqual({
       status: "resolved_offline",
       actionId: card!.actionId,
-      closedCellIds: ["w"],
+      closedCellIds: [],
     });
-    expect(h.kernel.getCell("w")).toMatchObject({ status: "closed", closeReason: "completed" });
+    expect(h.kernel.getCell("w")).toMatchObject({status:"paused",pauseReason:"budget_declined"});
     expect(h.kernel.gate.getApprovalSync(card!.actionId)!.status).toBe("cancelled");
+    h.kernel.gate.raiseBudgetSync("w",{tokens:2000},"owner");
+    expect(h.kernel.getCell("w")).toMatchObject({status:"active",pauseReason:null});
   });
 });
 

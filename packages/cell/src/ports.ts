@@ -1,7 +1,7 @@
 import { renderEnvelope } from "@ng/context";
 import { deliveryAllowed } from "@ng/gate";
 import {
-  CELL_RESULT_CANDIDATE_KEY,
+  get, asClarifyCard, CELL_RESULT_CANDIDATE_KEY,
   cellPrincipal,
   createEnvelope,
   inboxAddr,
@@ -226,6 +226,7 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
       assertLive("upsertSkillOrNote");
       context.upsertSkillOrNoteSync(cellId, patch);
     },
+    async getArtifactVersion(id,version) { return context.getArtifactVersionSync(id,version); },
     async getArtifact(artifactId) {
       return context.getArtifactSync(artifactId);
     },
@@ -274,6 +275,10 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
       if (scope.cancelGroup !== undefined) core.lifecycle.deactivateWatches(cellId, scope.cancelGroup);
     },
 
+    isDirectChild(id) {
+      const child = cells.get(id);
+      return child?.parentId === cellId && child.status !== "closed";
+    },
     async spawnCell(spec, initialPayload) {
       assertLive("spawnCell");
       return core.lifecycle.spawnCell(cellId, spec, initialPayload, { principalId });
@@ -311,7 +316,46 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
 
     drainSteer() {
       heartbeat();
-      return inbox.drainSteerSync(cellId);
+      return inbox.drainSteerSync(cellId, runId).map((s) => ({ envelopeId: s.envelope.id, message: s.message, envelope: s.envelope }));
+    },
+
+    requeueEnvelopes(envelopeIds, reason) {
+      return inbox.requeueClaimedSync(runId, envelopeIds, reason, { countAttempt: false });
+    },
+
+    createHumanItem(draft) {
+      assertLive("createHumanItem");
+      return core.humanItems.create(draft, cellId);
+    },
+
+    confirmCliInput(sessionId, throughSeq) {
+      assertLive("confirm CLI input");
+      handle.cliInput = { sessionId, throughSeq:Math.max(throughSeq, handle.cliInput?.sessionId === sessionId ? handle.cliInput.throughSeq : 0) };
+    },
+
+    listEvidence(o) {
+      return context.listEvidenceSync(cellId, o);
+    },
+
+    canForkSession(parentId,uptoSeq,sessionId,delivered) {
+      if (parentId !== self.parentId || context.lastEvidenceSeqSync(parentId) !== uptoSeq || core.dispatcher.running().some(r=>r.cellId===parentId)) return false;
+      const current=context.readStateSync<{sessionId:string;lastDeliveredEvidenceSeq?:number}>(parentId,"cli:session");
+      return current?.sessionId===sessionId && current.lastDeliveredEvidenceSeq===delivered &&
+        !get(core.db,"SELECT 1 FROM evidence WHERE cell_id=? AND seq>? AND seq<=? AND kind IN ('system_note','inbound') LIMIT 1",[parentId,delivered,uptoSeq]);
+    },
+    listOwnDecisions() {
+      return core.gate.listApprovalsSync({cellIds:[cellId]}).map(record => {
+        const source = asClarifyCard(record.card.data)?.source.envelopeId;
+        const row = source && get<{envelope:string}>(core.db, "SELECT envelope FROM inbox_messages WHERE envelope_id=? ORDER BY (cell_id=?) DESC, seq LIMIT 1", [source,cellId]);
+        return {record, ...(row ? {envelope:JSON.parse(row.envelope) as Envelope} : {})};
+      });
+    },
+    async submitReply(action, artifactVersion, sourceId) {
+      assertLive("send");
+      if (!deliveryAllowed(liveBounds(), cell.parentId, action.target)) {
+        throw new NgError("bounds_violation", `this cell may not send to ${action.target}`);
+      }
+      return core.approvals.submitReply(action, sourceId, { cellId, principalId, epoch: self.epoch, artifactVersion, ...(handle.wrapUp ? { wrapUp: true } : {}) });
     },
 
     async emitToParent(type, payload, o = {}) {
@@ -391,10 +435,11 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
     async withdrawApproval(ref, reason) {
       assertLive("withdrawApproval");
       const rec =
-        ref.actionId !== undefined ? gate.getApprovalSync(ref.actionId) : ref.subjectKey !== undefined ? gate.findPendingBySubjectSync(ref.subjectKey) : undefined;
+        ref.actionId !== undefined ? gate.getApprovalSync(ref.actionId) : ref.subjectKey !== undefined ? gate.findPendingBySubjectSync(ref.subjectKey, cellId) : undefined;
       // A cell may take down only what it asked the owner itself.
       if (!rec || rec.cellId !== cellId || rec.status !== "pending") return "not_pending";
-      return gate.withdrawSync(rec.actionId, reason);
+      const w = gate.withdrawSync(rec.actionId, reason);
+      return w === "cancelled" ? "cancelled" : "not_pending";
     },
 
     async workspaceAccess() {
@@ -447,7 +492,6 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
           context.appendEvidenceSync(cellId, { kind: "inbound", envelope, runId, at });
           return { envelope, text: renderEnvelope(envelope) };
         });
-        core.waits.answeredBy(cellId, rows.map((r) => r.envelope));
         // Real work arrived: whatever started this Run, it now counts as an anchor.
         handle.stallOnly = false;
         return out;
@@ -456,10 +500,11 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
 
     async registerWait(wait) {
       assertLive("wait");
-      core.waits.register({ id: cellId, epoch: self.epoch }, wait);
+      core.waits.register({ id: cellId, epoch: self.epoch }, wait, runId);
     },
 
     async clearWait(waitingFor) {
+      assertLive("clear_wait");
       return core.waits.clear(cellId, waitingFor);
     },
 

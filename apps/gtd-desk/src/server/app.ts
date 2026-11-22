@@ -85,6 +85,7 @@ const NO_MODELS: ModelsDTO = {
 
 export function createDeskApp(deps: DeskAppDeps): Hono {
   const { desk, events, security } = deps;
+  const ownerActor = { principalId: desk.ownerPrincipal };
   const onError = deps.onError ?? ((err, where) => console.error(`[desk] ${where}:`, err));
   const app = new Hono();
 
@@ -143,10 +144,17 @@ export function createDeskApp(deps: DeskAppDeps): Hono {
     if (!deps.models) throw new DeskError(400, "unsupported", "当前不是由 CLI Agent 驱动，没有可切换的模型");
     return c.json(await deps.models.set(await body<SetModelRequest>(c)));
   });
-  app.post("/api/capture", async (c) => c.json(await desk.capture(await body(c))));
+  app.post("/api/capture", async (c) => c.json(await desk.ingest(await body(c),ownerActor)));
   // The owner's budget-limits switch: an owner route (the agent's credential never opens it, and no tool reaches it).
-  app.put("/api/settings/budget-limits", async (c) => c.json(desk.setBudgetLimits(await body(c))));
-  app.post("/api/focus", async (c) => c.json(await desk.focus(await body(c))));
+  app.put("/api/settings/budget-limits", async (c) => c.json(desk.setBudgetLimits(await body(c), ownerActor)));
+  app.post("/api/focus", async (c) => c.json(await desk.focus(await body(c),ownerActor)));
+
+  app.get("/api/projects/closed", c => c.json({projects:desk.recentlyClosedProjects()}));
+  app.post("/api/editor-leases/:id", async c => c.json(await desk.editorLease(c.req.param("id"),(await body<{active:boolean}>(c)).active,ownerActor)));
+  app.get("/api/human-items", c => c.json({items:desk.listHumanItems()}));
+  app.post("/api/human-items/:id/decide", async c => c.json(await desk.decideHumanItem(c.req.param("id"),await body(c),ownerActor)));
+  app.post("/api/human-activity/:id/undo", async c => c.json(await desk.undoHumanDecision(c.req.param("id"),ownerActor)));
+  app.post("/api/projects/:id/reopen", async c => c.json(await desk.reopenProject(c.req.param("id"),ownerActor)));
 
   // ---------- 📥 Clarify ----------
   app.get("/api/clarify", (c) => c.json(desk.clarify()));
@@ -155,21 +163,20 @@ export function createDeskApp(deps: DeskAppDeps): Hono {
     if (!card) throw new DeskError(404, "not_found", "这张卡不在待确认里");
     return c.json(card);
   });
-  app.post("/api/clarify/:cardId/approve", async (c) => c.json(await desk.approve(c.req.param("cardId"), await body(c))));
-  app.post("/api/clarify/:cardId/revise", async (c) => c.json(await desk.revise(c.req.param("cardId"), await body(c))));
-  app.post("/api/clarify/:cardId/snooze", async (c) => c.json(await desk.snooze(c.req.param("cardId"), await body(c))));
-  app.post("/api/clarify/:cardId/someday", async (c) => c.json(await desk.someday(c.req.param("cardId"), await body(c))));
+  app.post("/api/clarify/:cardId/approve", async (c) => c.json(await desk.approve(c.req.param("cardId"), await body(c), ownerActor)));
+  app.post("/api/clarify/:cardId/revise", async (c) => c.json(await desk.revise(c.req.param("cardId"), await body(c), ownerActor)));
+  app.post("/api/clarify/:cardId/snooze", async (c) => c.json(await desk.snooze(c.req.param("cardId"), await body(c), ownerActor)));
+  app.post("/api/clarify/:cardId/someday", async (c) => c.json(await desk.someday(c.req.param("cardId"), await body(c), ownerActor)));
   app.put("/api/clarify/:cardId/plan", async (c) => {
-    const r = await desk.savePlan(c.req.param("cardId"), await body(c));
+    const r = await desk.savePlan(c.req.param("cardId"), await body(c),ownerActor);
     return c.json(r, r.outcome === "conflict" ? 409 : 200);
   });
-  app.post("/api/clarify/:cardId/extend", async (c) => c.json(await desk.extend(c.req.param("cardId"), await body(c))));
-  app.post("/api/clarify/:cardId/resolve-offline", async (c) => c.json(await desk.resolveOffline(c.req.param("cardId"), await body(c))));
-  app.post("/api/clarify/:cardId/to-human", async (c) => c.json(await desk.toHuman(c.req.param("cardId"), await body(c))));
-  app.post("/api/clarify/:cardId/dismiss", async (c) => c.json(await desk.dismiss(c.req.param("cardId"), await body(c))));
-  app.post("/api/clarify/:cardId/deny", async (c) => c.json(await desk.deny(c.req.param("cardId"), await body(c))));
-  app.post("/api/clarify/:cardId/verify", async (c) => c.json(await desk.verify(c.req.param("cardId"), await body(c))));
-  app.post("/api/clarify/:cardId/abandon", async (c) => c.json(await desk.abandon(c.req.param("cardId"), await body(c))));
+  app.post("/api/clarify/:cardId/extend", async (c) => c.json(await desk.extend(c.req.param("cardId"), await body(c), ownerActor)));
+  app.post("/api/clarify/:cardId/resolve-offline", async (c) => c.json(await desk.resolveOffline(c.req.param("cardId"), await body(c), ownerActor)));
+  app.post("/api/clarify/:cardId/dismiss", async (c) => c.json(await desk.dismiss(c.req.param("cardId"), await body(c), ownerActor)));
+  app.post("/api/clarify/:cardId/deny", async (c) => c.json(await desk.deny(c.req.param("cardId"), await body(c), ownerActor)));
+  app.post("/api/clarify/:cardId/verify", async (c) => c.json(await desk.verify(c.req.param("cardId"), await body(c), ownerActor)));
+  app.post("/api/clarify/:cardId/abandon", async (c) => c.json(await desk.abandon(c.req.param("cardId"), await body(c), ownerActor)));
 
   // ---------- 🎯 Engage ----------
   app.get("/api/engage", (c) => {
@@ -178,23 +185,23 @@ export function createDeskApp(deps: DeskAppDeps): Hono {
     return c.json(desk.engage((effort as Effort | "all" | undefined) ?? "all"));
   });
   app.get("/api/engage/:cellId/:actionId", (c) => c.json(desk.engageDetail(c.req.param("cellId"), c.req.param("actionId"))));
-  app.post("/api/engage/:cellId/:actionId/done", async (c) => c.json(await desk.done(c.req.param("cellId"), c.req.param("actionId"), await body(c))));
-  app.post("/api/engage/:cellId/:actionId/send", async (c) => c.json(await desk.engageSend(c.req.param("cellId"), c.req.param("actionId"), await body(c))));
+  app.post("/api/engage/:cellId/:actionId/done", async (c) => c.json(await desk.done(c.req.param("cellId"), c.req.param("actionId"), await body(c), ownerActor)));
+  app.post("/api/engage/:cellId/:actionId/send", async (c) => c.json(await desk.engageSend(c.req.param("cellId"), c.req.param("actionId"), await body(c), ownerActor)));
 
   // ---------- drafts ----------
   app.get("/api/artifacts/:artifactId", (c) => c.json(desk.artifact(c.req.param("artifactId"))));
   app.put("/api/artifacts/:artifactId", async (c) => {
-    const r = desk.saveArtifact(c.req.param("artifactId"), await body(c));
+    const r = desk.saveArtifact(c.req.param("artifactId"), await body(c),ownerActor);
     return c.json(r, r.ok ? 200 : 409);
   });
-  app.post("/api/artifacts/:artifactId/parked/:parkedId/dismiss", (c) => c.json(desk.dismissParked(c.req.param("artifactId"), c.req.param("parkedId"))));
+  app.post("/api/artifacts/:artifactId/parked/:parkedId/dismiss", (c) => c.json(desk.dismissParked(c.req.param("artifactId"), c.req.param("parkedId"),ownerActor)));
 
   // ---------- 🧭 Radar ----------
   app.get("/api/radar", (c) => c.json(desk.radar()));
   for (const op of ["pause", "resume", "cancel", "complete", "someday", "activate"] as const) {
-    app.post(`/api/projects/:projectId/${op}`, async (c) => c.json(await desk.projectOp(c.req.param("projectId"), op)));
+    app.post(`/api/projects/:projectId/${op}`, async (c) => c.json(await desk.projectOp(c.req.param("projectId"), op, ownerActor)));
   }
-  app.post("/api/projects/:projectId/actions", async (c) => c.json(await desk.addProjectAction(c.req.param("projectId"), await body(c))));
+  app.post("/api/projects/:projectId/actions", async (c) => c.json(await desk.addProjectAction(c.req.param("projectId"), await body(c), ownerActor)));
 
   // ---------- 分身实况 Agents ----------
   app.get("/api/agents/topology", (c) => {
@@ -210,17 +217,17 @@ export function createDeskApp(deps: DeskAppDeps): Hono {
     return c.json(desk.timeline(c.req.param("cellId"), { ...(afterSeq !== undefined ? { afterSeq } : {}), ...(beforeSeq !== undefined ? { beforeSeq } : {}), ...(limit !== undefined ? { limit } : {}) }));
   });
   app.get("/api/resources", (c) => c.json(desk.resource(c.req.query("uri") ?? "", intQuery(c, "offset") ?? 0, intQuery(c, "limit") ?? undefined)));
-  app.post("/api/cells/:cellId/messages", async (c) => c.json(desk.sendCellMessage(c.req.param("cellId"), await body(c))));
-  app.post("/api/cells/:cellId/control", async (c) => c.json(await desk.cellControl(c.req.param("cellId"), await body(c))));
-  app.post("/api/cells/:cellId/trigger", (c) => c.json(desk.cellTrigger(c.req.param("cellId"))));
+  app.post("/api/cells/:cellId/messages", async (c) => c.json(desk.sendCellMessage(c.req.param("cellId"), await body(c), ownerActor)));
+  app.post("/api/cells/:cellId/control", async (c) => c.json(await desk.cellControl(c.req.param("cellId"), await body(c), ownerActor)));
+  app.post("/api/cells/:cellId/trigger", (c) => c.json(desk.cellTrigger(c.req.param("cellId"), ownerActor)));
 
   // ---------- weekly review ----------
   app.get("/api/review", (c) => c.json(desk.review()));
-  app.post("/api/review/skills/:name/accept", (c) => c.json(desk.acceptSkill(c.req.param("name"))));
-  app.post("/api/review/skills/:name/dismiss", (c) => c.json(desk.dismissSkill(c.req.param("name"))));
-  app.post("/api/review/rules", async (c) => c.json(desk.enableRule(await body(c))));
-  app.post("/api/review/rules/dismiss", async (c) => c.json(desk.dismissRule(await body(c))));
-  app.post("/api/review/sensors/:sensorId/code", async (c) => c.json(desk.sensorToCode(c.req.param("sensorId"), await body(c))));
+  app.post("/api/review/skills/:name/accept", (c) => c.json(desk.acceptSkill(c.req.param("name"),ownerActor)));
+  app.post("/api/review/skills/:name/dismiss", (c) => c.json(desk.dismissSkill(c.req.param("name"),ownerActor)));
+  app.post("/api/review/rules", async (c) => c.json(desk.enableRule(await body(c),ownerActor)));
+  app.post("/api/review/rules/dismiss", async (c) => c.json(desk.dismissRule(await body(c),ownerActor)));
+  app.post("/api/review/sensors/:sensorId/code", async (c) => c.json(desk.sensorToCode(c.req.param("sensorId"), await body(c),ownerActor)));
 
   // ---------- activity drawer ----------
   app.get("/api/activity", (c) => {
@@ -228,15 +235,15 @@ export function createDeskApp(deps: DeskAppDeps): Hono {
     if (kind !== undefined && !ACTIVITY_KINDS.has(kind as ActivityKind)) throw new DeskError(400, "invalid_argument", `未知的记录类型 ${kind}`);
     return c.json(desk.activity(kind as ActivityKind | undefined));
   });
-  app.post("/api/activity/:cellId/:activityId/restore", (c) => c.json(desk.restoreActivity(c.req.param("cellId"), c.req.param("activityId"))));
+  app.post("/api/activity/:cellId/:activityId/restore", async (c) => c.json(await desk.restoreActivity(c.req.param("cellId"), c.req.param("activityId"),ownerActor)));
 
   // ---------- ⚡ 信源 ----------
   app.get("/api/sources", (c) => c.json(desk.sources()));
-  app.post("/api/sources", async (c) => c.json(desk.createSource(await body(c))));
-  app.post("/api/sources/:sensorId/pause", (c) => c.json(desk.pauseSource(c.req.param("sensorId"), true)));
-  app.post("/api/sources/:sensorId/resume", (c) => c.json(desk.pauseSource(c.req.param("sensorId"), false)));
-  app.put("/api/sources/:sensorId/mode", async (c) => c.json(desk.setSourceMode(c.req.param("sensorId"), await body(c))));
-  app.delete("/api/sources/:sensorId", async (c) => c.json(await desk.deleteSource(c.req.param("sensorId"))));
+  app.post("/api/sources", async (c) => c.json(desk.createSource(await body(c),ownerActor)));
+  app.post("/api/sources/:sensorId/pause", (c) => c.json(desk.pauseSource(c.req.param("sensorId"), true,ownerActor)));
+  app.post("/api/sources/:sensorId/resume", (c) => c.json(desk.pauseSource(c.req.param("sensorId"), false,ownerActor)));
+  app.put("/api/sources/:sensorId/mode", async (c) => c.json(desk.setSourceMode(c.req.param("sensorId"), await body(c),ownerActor)));
+  app.delete("/api/sources/:sensorId", async (c) => c.json(await desk.deleteSource(c.req.param("sensorId"),ownerActor)));
 
   // ---------- live updates ----------
   app.get("/api/events", (c) =>

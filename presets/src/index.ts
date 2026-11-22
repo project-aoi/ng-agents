@@ -1,3 +1,5 @@
+import {gtdLifecycle} from "./shared/lifecycle";
+export {gtdLifecycle} from "./shared/lifecycle";
 // @ng/presets — the workbench's cell templates (docs/05): the desk (triage + arbitration), persistent projects that keep
 // the records and dispatch workers (they rest between turns and can be woken again), light watchers, sources and hubs,
 // with their prompts, toolsets, playbooks and the few zero-token processors. This is where the GTD product behaviour lives; the records they keep (gtd.ts)
@@ -38,11 +40,11 @@ export interface RegisteredPresets {
 export function registerPresets(registry: Registry, opts: RegisterPresetsOptions = {}): RegisteredPresets {
   const cfg = resolveConfig(opts);
   const books = createDeskBooks(cfg);
-  const presets = [deskPreset(books), projectPreset(cfg), workerPreset(), watcherPreset(), sensorPreset(), hubPreset()];
+  const presets = [deskPreset(books), projectPreset(cfg), workerPreset(), watcherPreset("watcher"), watcherPreset("checker"),watcherPreset("reply_watcher"), sensorPreset(), hubPreset()];
   const prompts = [...promptDefs(cfg), ...legacyPrompts()];
   const toolsets = [deskToolset(cfg, books), projectToolset(cfg), watcherToolset(cfg), sensorToolset(), ...legacyToolsets()];
   const processors = [createWaitMatch(cfg), createScriptSensor(), createCheckProbe(cfg), ...legacyProcessors()];
-  for (const p of presets) registry.presets.register(p);
+  for (const p of presets) registry.presets.register({...gtdLifecycle,...p});
   for (const p of prompts) registry.prompts.register(p);
   for (const t of toolsets) registry.toolsets.register(t);
   for (const c of processors) registry.codeProcessors.register(c);
@@ -59,9 +61,11 @@ export function registerPresets(registry: Registry, opts: RegisterPresetsOptions
 export { PROMPTS, TOOLSETS, PROCESSORS, ROLES, KEYS, LEGACY, RESTORE_REASON } from "./shared/config";
 export { BUILTIN_SKILLS, type BuiltinSkill } from "./shared/skills";
 export { seedBuiltinSkills } from "./shared/seed";
-export { defineSensorCheck, ensureSource, recordCheck, OBSERVATION_NOTE, type SensorHit, type SensorCheckInput, type SourceInit } from "./shared/sensor";
+export { createSensorSpec,sensorProcessor,createScriptSensor,defineSensorCheck, ensureSource, recordCheck, OBSERVATION_NOTE, type SensorHit, type SensorCheckInput, type SourceInit } from "./shared/sensor";
 export { setProjectLifecycleSync, notifyProjectOfOwnerChangeSync } from "./shared/sync";
 export { startProjectSync, projectLaunch, type ProjectInit, type ProjectLaunch, type ProjectTaskInput, type ProjectSeed, type PlannedAction, type RepoRef, type ProjectMode } from "./project/launch";
 export { startApprovedProjectSync, projectIdForApproval, ACKNOWLEDGE_ACTION, type ReplyItem, type ProposalItem } from "./inline-desk/items";
 export type { WatcherState, ReplyParty, ReplyWatchReport } from "./shared/watcher";
 export type { ProbeArgs, ProbeState, ProbeUntil } from "./shared/probe";
+
+export { humanActionDomain } from "./shared/human-actions";

@@ -1,10 +1,9 @@
-# 架构演进提案（2026-11-19）：对话式主台、直连可唤醒 Worker、退场主动 Pull、AI 目录协同与「分身实况」第 4 视图
+# 架构演进记录：对话式主台、可唤醒分身、统一人类收件箱与命令层
 
 > [!NOTE]
-> **状态：已于 2026-11-19 落地。** 本目录四册提案现作为当前架构的设计记录保留，不再随代码修订；现行权威规范是 [`01-principles/`](../01-principles/) 与 [`02-workflows/`](../02-workflows/)（第四节的修订已完成，直连对话见新增的 [`uc08`](../02-workflows/uc08-direct-worker-chat-and-pull-sync.md)），提案原文与之不一致处以它们为准。主要实现差异：`worker` 的生命周期是新值 `lifetime: "wakeable"`，`watcher` 保持 `"one_shot"`（回报即关）；退场通知不是独立的 `cell.turn_settled` 类型，而是携带 `turn` 与 `childState: "dormant"` 的 `cell.result`（幂等键 `${cellId}:${runId}:settled`）；`cwdMode` 仍可存储但处处被忽略，`sensor` 只看是其提示词契约而非内核门禁；Pull 游标是检视者状态里的 `pull:<cellId>`，只在调用 `inspect_cell` 时推进。
+> 分册 01–06 均已落地。当前工作台分为「待我处理」「项目全局」「分身实况」三个视图。`worker` 回合结束转为待命，`checker` 一次核查后排空自关，`reply_watcher` 持续等待回信。退场通过附带 `turn` 与 `childState` 的 `cell.result` 通知父节点。现行规则以 [产品与架构原则](../01-principles/) 和 [工作流与用例](../02-workflows/) 为准。
 
-> [!IMPORTANT]
-> 本目录存放经讨论拍板定稿的**下一代架构与交互演进蓝图（Proposal）**。实际推进编码落地时，按本文件第五节的合流批次依次实施，并在每批落地时同步刷新 [`01-principles/`](../01-principles/)、[`02-workflows/`](../02-workflows/) 与 [`03-bugs/`](../03-bugs/) 台账状态。
+> 第一节记载演进前的问题，末节保留最初四册的实施批次。
 
 ---
 
@@ -23,8 +22,8 @@
    - 事先硬分 `cwdMode: "read" | "write"` 并在内核排队，在“用户半路找只读 `worker` 顺手改代码”时显得僵化；同时现有 `save_note` 不会在唤醒时自动展现给 `project`，会话压缩或重建后容易失忆。
    - **目标**：**取消内核工作树写锁排队与 `cwdMode` 调度**，改由 AI 根据实时目录占用提示自主协调，并为 `worker` 提供清晰的冲突上报停手机制；同时将 `project` 的**非结构化笔记（Note）自动挂载到每次唤醒的动态尾部**，不破缓存、永不失忆。
 5. **Web 工作台缺少俯瞰全局拓扑、检视分身具体做了什么以及直连发话的交互现场**：
-   - 原有三视图（`Clarify / Engage / Radar`）专注决策拍板与结果总览，不适合塞入执行步骤流与聊天窗口，导致后台分身对人类而言像黑盒，也无处直接在网页上给 `desk` 或指定 `worker` 发消息。
-   - **目标**：新增第 4 核心视图 **「分身实况 · Agents」**（左 5 三层确定性拓扑画布 $\times$ 右 7 一体化工作实况流与自适应直连发话框），把全局监督树、同仓协作关系、折叠操作步骤流以及与 `desk` / `worker` 的直连对话统一收口（运行中默认「顺手补充」排队吸收，另设独立「立即打断插话」按钮）。
+   - 演进前的 `Clarify / Engage / Radar`专注决策拍板与结果总览，不适合塞入执行步骤流与聊天窗口，导致后台分身对人类而言像黑盒，也无处直接在网页上给 `desk` 或指定 `worker` 发消息。
+   - **目标**：新增 **「分身实况 · Agents」**，后续由提案 05 将处理入口合并为「待我处理」（左 5 三层确定性拓扑画布 $\times$ 右 7 一体化工作实况流与自适应直连发话框），把全局监督树、同仓协作关系、折叠操作步骤流以及与 `desk` / `worker` 的直连对话统一收口（运行中默认「顺手补充」排队吸收，另设独立「立即打断插话」按钮）。
 
 ---
 
@@ -32,9 +31,9 @@
 
 ```mermaid
 flowchart TB
-    subgraph Entry["1. 双入口与四视图交互层"]
-        AgentsTab["工作台第 4 视图: 分身实况 Agents\n(左栏三层拓扑画布 · 右栏工作实况流 + 智能直连发话框)"]
-        GtdTabs["工作台前 3 视图: Clarify 待确认 · Engage 专注区 · Radar 项目全局"]
+    subgraph Entry["1. 双入口与三视图交互层"]
+        AgentsTab["工作台: 分身实况 Agents\n(左栏三层拓扑画布 · 右栏工作实况流 + 智能直连发话框)"]
+        GtdTabs["工作台: 待我处理 · 项目全局"]
         ExtAgent["外部 CLI 主 Agent (Antigravity / Claude / Codex · 便捷伴随壳)"]
         ExtEvent["无人值守异步入站 (飞书 / Slack / Webhook / 定时 Sensor)"]
     end
@@ -47,10 +46,10 @@ flowchart TB
         Proj["project (项目协调)\n动态尾部常驻非结构化 Note 防失忆\n主动 Pull 子 Worker 足迹 · 派单避让活跃目录"]
     end
 
-    subgraph Leaves["4. 纯叶节点执行层 (maxDepth = 0 · 静默待命可重唤醒)"]
+    subgraph Leaves["4. 纯叶节点执行层 (maxDepth = 0)"]
         W1["worker 1 (干完静默待命 · 发消息即 --resume 续跑 · 遇冲突上报 wait)"]
         W2["worker 2 (放行内部 CLI multi-agent · 不可再派生子 Cell)"]
-        WT["watcher (外部条件探针 · 纯叶节点)"]
+        WT["checker (一次核查) / reply_watcher (持续等回信)"]
     end
 
     AgentsTab <-->|"默认根节点主对话 + SSE 增量流"| Desk
@@ -79,7 +78,14 @@ flowchart TB
 3. **[03-ai-driven-workspace-and-project-notes.md](./03-ai-driven-workspace-and-project-notes.md)**
    - 移除内核读写调度队列、AI 目录感知与 `worker` 冲突上报停手机制、以及 `project` 非结构化 Note 动态尾部常驻防失忆方案。
 4. **[04-agents-topology-and-live-chat-tab.md](./04-agents-topology-and-live-chat-tab.md)**
-   - 工作台新增第 4 视图「分身实况 · Agents」：左 5 三层确定性拓扑画布（含未汇总动态、等待虚线与同仓占用高亮）$\times$ 右 7 三档工作实况流与按状态自适应的直连发话框、SSE `evidence.appended` 增量协议与 HTTP API 契约。
+   - 工作台新增「分身实况 · Agents」：左 5 三层确定性拓扑画布（含未汇总动态、等待虚线与同仓占用高亮）$\times$ 右 7 三档工作实况流与按状态自适应的直连发话框、SSE `evidence.appended` 增量协议与 HTTP API 契约。
+
+### 已实施的后续演进（Phase 0 → 05 → 06）
+
+5. **[05-unified-human-inbox-and-custom-cards.md](./05-unified-human-inbox-and-custom-cards.md)**（状态：已落地 · 方案 A 修订版）
+   - 专注**人机协作层**：合并 `Clarify` 与 `Engage` 为唯一人类处理入口（顶栏精简 3 视图，左列表 + 右详情卡，8/4 专注编辑配租约式 DND）；底层正交拆分为 **`HumanItem`（唯一人类收件箱）× `Gate`（纯权限与信任引擎）** 并彻底解耦 `subjectKey` 与 `relatedProjectIds`；开放 Agent 自定义 `options: CardOption[]`（单行可选输入框空回车直发），以 5+1 封闭效果原语保零死状态；新增受控 **`reopenProject`** 与非外发操作撤销恢复。
+6. **[06-architecture-ssot-cli-sync-and-boundaries.md](./06-architecture-ssot-cli-sync-and-boundaries.md)**（状态：已落地 · 继 05 后实施）
+   - 专注**内核与控制面深度拔根**：真 SSOT 字段归属表（删除影子 KV、`PresetDef.onCellClosed` 解耦假薄内核）；**CLI Session = SQLite Evidence 带游标物化缓存同步协议**（`lastDeliveredEvidenceSeq + systemHash`、macOS 跨平台孤儿清理）；**唯一领域命令层 `DeskService`** 与单事务边界；`watcher`（`checker` / `reply_watcher`）与 `knowledge`（`working_note` / `reference`）正交拆分（并明确除叶节点 `maxDepth: 0` 禁派生子 Cell 外不对宿主机读写/命令工具施加限制）。
 
 ---
 
@@ -87,14 +93,14 @@ flowchart TB
 
 | 规范文件 | 随代码批次同步修订的条款 |
 | :--- | :--- |
-| [01-product-principles.md](../01-principles/01-product-principles.md) | 1. **`P-UX-2` 升级**：常驻 `desk` 成为支持直接双向持久对话的内生主 Agent，外部 CLI 主 Agent 作为轻量伴随入口共存；<br>2. **`P-UX-6` 升级**：从「恒定三视图」升级为**「四视图分工：前三视图（`Clarify / Engage / Radar`）管事与判断，第四视图（`Agents` 分身实况）管人与现场（全局拓扑、操作足迹与直连发话）」**，信源抽屉快捷键顺延为 `5`。 |
-| [02-kernel-principles.md](../01-principles/02-kernel-principles.md) | **`P-KERN-1` 升级**：`worker / watcher` 物理收口为纯叶节点（`maxDepth: 0`）；从“单次排空死关 + 强依赖子主动汇报”演进为“回合排空转静默待命 `Dormant`（可被消息 `--resume` 重唤醒）+ 系统确定性退场通知 + 父节点 `inspect_cell` 主动 Pull 客观足迹”。 |
-| [03-safety-and-boundaries.md](../01-principles/03-safety-and-boundaries.md) | **`P-SAFE-2` 重写**：移除内核按工作树根单写排队与 `cwdMode` 读写门禁（仅保留 `sensor` 只读），改为内核暴露实时活跃目录事实 `[active workspaces]`、AI 自主协调目录分配、`worker` 动刀前验现场遇冲突主动上报并 `wait`。 |
-| [00-system-mechanics.md](../02-workflows/00-system-mechanics.md) & `uc05` / `uc08` | 更新全局拓扑与视图映射表（加入 `Agents` 第 4 视图）、更新 `Worker` 状态机（加入 `Dormant` 可重唤醒态与 `Turn-Settled Pull` 闭环）、将 `uc05` 重写为 AI 驱动目录协同与冲突上报，并新增 **`uc08`（用户通过 `Agents` 视图或控制面直连 `Worker` 对话与退场 Pull 同步）**。 |
+| [01-product-principles.md](../01-principles/01-product-principles.md) | 1. **`P-UX-2` 升级**：常驻 `desk` 成为支持直接双向持久对话的内生主 Agent，外部 CLI 主 Agent 作为轻量伴随入口共存；<br>2. **`P-UX-6` 升级**：三视图分别负责待我处理、项目全局、分身实况。 |
+| [02-kernel-principles.md](../01-principles/02-kernel-principles.md) | **`P-KERN-1` 升级**：`worker / checker / reply_watcher` 物理收口为纯叶节点（`maxDepth: 0`）；从“单次排空死关 + 强依赖子主动汇报”演进为“回合排空转静默待命 `Dormant`（可被消息 `--resume` 重唤醒）+ 系统确定性退场通知 + 父节点 `inspect_cell` 主动 Pull 客观足迹”。 |
+| [03-safety-and-boundaries.md](../01-principles/03-safety-and-boundaries.md) | **`P-SAFE-2` 重写**：移除内核按工作树根单写排队与 `cwdMode` 读写门禁，信源只看由预设提示词约束，改为内核暴露实时活跃目录事实 `[active workspaces]`、AI 自主协调目录分配、`worker` 动刀前验现场遇冲突主动上报并 `wait`。 |
+| [00-system-mechanics.md](../02-workflows/00-system-mechanics.md) & `uc05` / `uc08` | 更新全局拓扑与视图映射表（现行三视图包含「分身实况」）、更新 `Worker` 状态机（加入 `Dormant` 可重唤醒态与 `Turn-Settled Pull` 闭环）、将 `uc05` 重写为 AI 驱动目录协同与冲突上报，并新增 **`uc08`（用户通过 `Agents` 视图或控制面直连 `Worker` 对话与退场 Pull 同步）**。 |
 
 ---
 
-## 五、与 `03-bugs` 去重合并后的全局实施总排期
+## 五、历史实施批次（分册 01–04）
 
 将 [`03-bugs/README.md`](../03-bugs/README.md) 中的 13 条压测缺陷与本目录 4 册提案对齐去重后，整体按 **4 个无返工批次** 推进（其中 `BUG-008` 的 `worker` OS 只读沙箱、`BUG-012` 动态改 `cwdMode` 与 `BUG-013` 写锁槽位测试已被分册三取消 `cwdMode` 排队直接消解，**切勿再去白做旧修补**）：
 

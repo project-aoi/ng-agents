@@ -42,6 +42,7 @@ function nodeState(n: CellNode, activity: KernelActivity): ProjectWorkerDTO["sta
   switch (activity.get(n.cellId)?.state) {
     case "working":
       return "running";
+    case "budget_paused":
     case "paused":
       return "paused";
     case "waiting":
@@ -146,7 +147,7 @@ function mergeWaiting(list: readonly WaitingDTO[]): WaitingDTO | null {
   return { ...list[0]!, parties, replied, total: parties.length, dueAt: due.length ? Math.min(...due) : null, text: `已回 ${replied}/${parties.length}` };
 }
 
-function projectButtons(id: string, record: ProjectRecord, paused: boolean, stalled: boolean): ButtonDTO[] {
+function projectButtons(id: string, record: ProjectRecord, paused: boolean, stalled: boolean, jobs:number): ButtonDTO[] {
   const base = `/api/projects/${enc(id)}`;
   const cancel = button({ id: "cancel", label: "✕ 取消项目", endpoint: post(`${base}/cancel`), confirm: "取消后会立即停止这个项目的全部后台任务，确定吗？" });
   if (record.lifecycle === "someday") {
@@ -167,7 +168,7 @@ function projectButtons(id: string, record: ProjectRecord, paused: boolean, stal
   out.push(
     paused
       ? button({ id: "resume", label: "▶ 继续", primary: !stalled, endpoint: post(`${base}/resume`) })
-      : button({ id: "pause", label: "⏸ 暂停", endpoint: post(`${base}/pause`) }),
+      : button({ id: "pause", label: "⏸ 暂停", ...(jobs ? {confirm:`有 ${jobs} 个长任务仍在运行。确认暂停这个项目？`} : {}), endpoint: post(`${base}/pause`) }),
   );
   out.push(cancel);
   out.push(button({ id: "complete", label: "✓ 完结", group: "more", endpoint: post(`${base}/complete`), confirm: "标记整个项目已完成？进行中的后台任务会一并结束。" }));
@@ -206,6 +207,9 @@ export function radarProjects(input: ProjectionInput): Omit<RadarDTO, "review"> 
     }
   }
 
+  for (const item of kernel.humanItems.list()) {
+    if (item.category==="decision") for (const pid of item.relatedProjectIds) if (!visibleCards.has(pid)) visibleCards.set(pid,{id:item.id,title:item.title});
+  }
   const rows: ProjectRowDTO[] = [];
   for (const p of projects) {
     const r = p.record;
@@ -282,7 +286,7 @@ export function radarProjects(input: ProjectionInput): Omit<RadarDTO, "review"> 
       agents: agentsEntry(p.cellId, subtree, cells, activity),
       createdAt: r.createdAt,
       updatedAt: r.updatedAt,
-      buttons: projectButtons(p.cellId, r, paused, stalled),
+      buttons: projectButtons(p.cellId, r, paused, stalled, kernel.workspace.listJobsSync({state:["running"]}).filter(j=>subtree.includes(j.cellId)).length),
     });
   }
 

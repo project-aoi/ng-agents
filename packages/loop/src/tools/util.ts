@@ -1,9 +1,7 @@
 import {
-  KERNEL_FROM,
+  describeEnvelopeSource,
   isEnvelopeOfType,
-  parseAddress,
   projectCellIdOf,
-  subjectKeys,
   type Envelope,
   type ItemSource,
   type PromptSnapshot,
@@ -25,42 +23,16 @@ export function primaryEnvelope(snapshot: PromptSnapshot): Envelope | undefined 
   return env;
 }
 
-/**
- * One pending card per subject (gtd.ts `subjectKeys`): inside a project everything shares the project's subject;
- * otherwise the item that triggered this Run; otherwise the cell itself.
- */
+/** A default issue is scoped to the current work item. Project membership is recorded independently. */
 export function defaultSubjectKey(ctx: ToolContext): string {
-  const project = projectCellIdOf(ctx.snapshot.spec);
-  if (project) return subjectKeys.project(project);
   const env = primaryEnvelope(ctx.snapshot);
-  if (env && ITEM_TYPES.has(env.type)) return subjectKeys.inbound(env.id);
-  return subjectKeys.cell(selfId(ctx));
+  const id = ctx.snapshot.spec.meta?.actionId;
+  const project = projectCellIdOf(ctx.snapshot.spec) ?? selfId(ctx);
+  return `action:${project}:${typeof id === "string" ? id : env?.id ?? ctx.snapshot.runId}`;
 }
 
-/** Card source labels, in the UI's wording (docs/04 §2.1: "飞书转发 · 12 分钟前"). */
-const CHANNEL_LABELS: Readonly<Record<string, string>> = {
-  ui: "随手记",
-  cli: "命令行",
-  feishu: "飞书",
-  slack: "Slack",
-  github: "GitHub",
-  webhook: "Webhook",
-  email: "邮件",
-  memory: "测试通道",
-};
-
 export function itemSource(snapshot: PromptSnapshot): ItemSource {
-  const env = primaryEnvelope(snapshot);
-  if (!env) return { label: "系统", at: snapshot.createdAt };
-  const base = { principalId: env.principalId, envelopeId: env.id, at: env.createdAt };
-  if (isEnvelopeOfType(env, "source.hit")) return { ...base, label: `信源 · ${env.payload.title}`, ...(env.payload.uri ? { uri: env.payload.uri } : {}) };
-  const from = parseAddress(env.from);
-  if (from?.kind === "channel") return { ...base, label: CHANNEL_LABELS[from.channelId] ?? from.channelId, channelId: from.channelId };
-  if (from?.kind === "inbox") return { ...base, label: "后台分身" };
-  if (env.from.startsWith("timer:")) return { ...base, label: "定时提醒" };
-  // What a person typed into a cell's conversation (the workbench's chat, or their agent passing it on).
-  if (env.from === KERNEL_FROM.control && isEnvelopeOfType(env, "user.message")) return { ...base, label: env.principalId.startsWith("agent:") ? "外部助手" : "对话" };
-  return { ...base, label: "系统" };
+  return describeEnvelopeSource(primaryEnvelope(snapshot), snapshot.createdAt);
 }
 
 export function itemRawInput(snapshot: PromptSnapshot): { text: string; kind: "message" | "voice_transcript" | "monitor_summary" | "system" } {

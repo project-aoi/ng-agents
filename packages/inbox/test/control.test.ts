@@ -80,14 +80,24 @@ describe("control: authorization and refusal", () => {
     expect(() => t.inbox.controlSync("w1", { action: "steer", principalId: "owner" })).toThrow(/steerMessage/);
   });
 
-  it("default authorizer: owner anywhere, a cell only over its strict descendants", () => {
+  it("default authorizer: owner anywhere except pausing/cancelling root, a cell only over its strict descendants", () => {
     const t = setup({ cells: tree });
     expect(t.inbox.controlSync("w1", { action: "pause", principalId: "cell:proj" }).applied).toBe(true);
     expect(t.inbox.controlSync("w1", { action: "resume", principalId: "cell:desk" }).applied).toBe(true);
     expect(t.inbox.controlSync("proj", { action: "pause", principalId: "cell:proj" })).toMatchObject({ applied: false });
     expect(t.inbox.controlSync("proj", { action: "pause", principalId: "cell:w1" })).toMatchObject({ applied: false });
     expect(t.inbox.controlSync("other", { action: "cancel", principalId: "slack:U123" })).toMatchObject({ applied: false });
-    expect(t.inbox.controlSync("desk", { action: "pause", principalId: "owner" }).applied).toBe(true);
+    expect(t.inbox.controlSync("desk", { action: "pause", principalId: "owner" })).toMatchObject({ applied: false });
+    expect(t.inbox.controlSync("desk", { action: "cancel", principalId: "owner" })).toMatchObject({ applied: false });
+    expect(t.inbox.controlSync("other", { action: "pause", principalId: "owner" }).applied).toBe(true);
+  });
+
+  it("BUG-020: physically forbids pausing or cancelling the root cell even with a permissive custom authorizer", () => {
+    const t = setup({ cells: tree, authorizeControl: () => ({ ok: true }) });
+    expect(t.inbox.controlSync("desk", { action: "pause", principalId: "owner" })).toMatchObject({ applied: false, reason: /root cell/ });
+    expect(t.inbox.controlSync("desk", { action: "cancel", principalId: "owner" })).toMatchObject({ applied: false, reason: /root cell/ });
+    expect(t.cells.get("desk")!.status).toBe("active");
+    expect(t.inbox.controlSync("desk", { action: "steer", principalId: "owner", steerMessage: "still ok" }).applied).toBe(true);
   });
 });
 
@@ -132,7 +142,7 @@ describe("control: steer", () => {
 
     t.inbox.enqueueSync("w1", msg({ id: "fix-bug" }));
     const run = t.inbox.claimNextRunSync("w1", "kernel", "serial_coalesce")!;
-    expect(t.inbox.drainSteerSync("w1")).toEqual([]);
+    expect(t.inbox.drainSteerSync("w1", run.claimId)).toEqual([]);
 
     const res = t.inbox.controlSync("w1", { action: "steer", principalId: "owner", steerMessage: "先别改测试，只修实现" });
     expect(res).toEqual({ applied: true, epoch: 0 });
@@ -143,16 +153,19 @@ describe("control: steer", () => {
     expect(t.inbox.claimNextRunSync("w1", "kernel", "serial_coalesce")).toBeNull();
 
     t.inbox.controlSync("w1", { action: "steer", principalId: "owner", steerMessage: "还有，用中文写 commit" });
-    expect(t.inbox.drainSteerSync("w1")).toEqual(["先别改测试，只修实现", "还有，用中文写 commit"]);
-    expect(t.inbox.drainSteerSync("w1")).toEqual([]);
+    const drained = t.inbox.drainSteerSync("w1", run.claimId);
+    expect(drained.map((s) => s.message)).toEqual(["先别改测试，只修实现", "还有，用中文写 commit"]);
+    expect(t.inbox.drainSteerSync("w1", run.claimId)).toEqual([]);
     const steerRows = t.inbox.listMessagesSync({ type: "control.steer" });
+    // BUG-026: claimed by the active run (not prematurely done) until the run finishes cleanly.
     expect(steerRows.map((r) => [r.status, r.claimId])).toEqual([
-      ["done", run.claimId],
-      ["done", run.claimId],
+      ["claimed", run.claimId],
+      ["claimed", run.claimId],
     ]);
     expect(steerRows[0]!.envelope).toMatchObject({ from: "kernel:control", principalId: "owner", expectedEpoch: 0, to: "inbox:w1" });
 
     t.inbox.completeSync(run.claimId);
+    expect(t.inbox.listMessagesSync({ type: "control.steer" }).map((r) => r.status)).toEqual(["done", "done"]);
     expect(t.inbox.claimNextRunSync("w1", "kernel", "serial_coalesce")).toBeNull();
   });
 
@@ -160,7 +173,7 @@ describe("control: steer", () => {
     const t = setup({ cells: tree });
     t.inbox.controlSync("w2", { action: "steer", principalId: "cell:proj", steerMessage: "换个方向：先查日志" });
     expect(t.takeWakes()).toEqual(["w2:enqueued"]);
-    expect(t.inbox.drainSteerSync("w2")).toEqual([]); // no Run in flight: leave it for the normal wake-up
+    expect(t.inbox.drainSteerSync("w2", "no-run")).toEqual([]); // no Run in flight: leave it for the normal wake-up
     const batch = t.inbox.claimNextRunSync("w2", "k", "serial_coalesce")!;
     expect(batch.envelopes.map((e) => [e.type, (e.payload as { message: string }).message])).toEqual([["control.steer", "换个方向：先查日志"]]);
   });
@@ -171,10 +184,27 @@ describe("control: steer", () => {
     const old = t.inbox.claimNextRunSync("w1", "k", "serial_coalesce")!;
     t.inbox.controlSync("w1", { action: "cancel", principalId: "owner" });
     t.inbox.controlSync("w1", { action: "steer", principalId: "owner", steerMessage: "重新开始" });
-    expect(t.inbox.drainSteerSync("w1")).toEqual([]);
+    expect(t.inbox.drainSteerSync("w1", old.claimId)).toEqual([]);
     t.inbox.completeSync(old.claimId);
     const next = t.inbox.claimNextRunSync("w1", "k", "serial_coalesce")!;
     expect(next.epoch).toBe(1);
     expect(next.envelopes.map((e) => e.type)).toEqual(["control.steer"]);
+  });
+
+  it("BUG-026: requeueClaimedSync returns unconfirmed claimed steers to pending without touching confirmed ones", () => {
+    const t = setup({ cells: tree });
+    t.inbox.enqueueSync("w1", msg({ id: "task" }));
+    const run = t.inbox.claimNextRunSync("w1", "k", "serial_coalesce")!;
+    t.inbox.controlSync("w1", { action: "steer", principalId: "owner", steerMessage: "steer-1" });
+    t.inbox.controlSync("w1", { action: "steer", principalId: "owner", steerMessage: "steer-2" });
+    const drained = t.inbox.drainSteerSync("w1", run.claimId);
+    expect(drained).toHaveLength(2);
+    // Suppose steer-1 was confirmed, steer-2 failed to write to stdin and must be requeued.
+    expect(t.inbox.requeueClaimedSync(run.claimId, [drained[1]!.envelope.id], "stdin closed")).toBe(1);
+    t.inbox.completeSync(run.claimId);
+    expect(t.inbox.listMessagesSync({ envelopeId: drained[0]!.envelope.id })[0]!.status).toBe("done");
+    expect(t.inbox.listMessagesSync({ envelopeId: drained[1]!.envelope.id })[0]!.status).toBe("pending");
+    const next = t.inbox.claimNextRunSync("w1", "k", "serial_coalesce")!;
+    expect(next.envelopes.map((e) => e.id)).toEqual([drained[1]!.envelope.id]);
   });
 });

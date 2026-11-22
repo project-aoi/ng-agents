@@ -132,6 +132,7 @@ async function runTurn(turn, emit, mcp, signal) {
       emit.usage?.(a.usage);
     } else if (a.item !== undefined) emit.item?.(a.item);
     else if (a.sleep !== undefined) await sleep(a.sleep, signal);
+    else if (a.exit !== undefined) process.exit(a.exit);
     else if (a.fail !== undefined) return { error: a.fail, usage };
   }
   return { usage, stopped: signal?.aborted === true };
@@ -162,8 +163,10 @@ async function claude() {
   } else sessionId = newSession();
   const mcp = mcpClient(server);
   await mcp.ready;
-  out({ type: "system", subtype: "init", session_id: sessionId, model: argValue("--model") ?? "claude-fake", tools: ["Read"], mcp_servers: [{ name: serverName, status: "connected" }] });
+  const sendInit = () => out({ type: "system", subtype: "init", session_id: sessionId, model: argValue("--model") ?? "claude-fake", tools: ["Read"], mcp_servers: [{ name: serverName, status: "connected" }] });
 
+  let delayedInit = process.env.FAKECLI_DELAY_INIT === "1";
+  if (!delayedInit) sendInit();
   const queue = [];
   let wake = null;
   let eof = false;
@@ -210,26 +213,38 @@ async function claude() {
     const emit = {
       text: (t) => out({ type: "assistant", message: { id: `msg_${++msgN}`, role: "assistant", content: [{ type: "text", text: t }], usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } }, parent_tool_use_id: null, session_id: sessionId }),
       mcpStart: (id, name, args) => out({ type: "assistant", message: { id: `msg_${++msgN}`, role: "assistant", content: [{ type: "tool_use", id, name: `${mcpPrefix}${name}`, input: args }], usage: { input_tokens: 1, output_tokens: 1 } }, parent_tool_use_id: null, session_id: sessionId }),
-      mcpEnd: (id, _name, _args, r) => out({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: [{ type: "text", text: r.text }], is_error: r.isError }] }, parent_tool_use_id: null, session_id: sessionId }),
+      mcpEnd: (id, _name, _args, r) => {
+        out({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: [{ type: "text", text: r.text }], is_error: r.isError }] }, parent_tool_use_id: null, session_id: sessionId });
+        if (delayedInit) {
+          delayedInit = false;
+          sendInit();
+        }
+      },
       native: async (id, a) => {
         out({ type: "assistant", message: { id: `msg_${++msgN}`, role: "assistant", content: [{ type: "tool_use", id, name: a.native, input: a.input ?? {} }], usage: { input_tokens: 1, output_tokens: 1 } }, parent_tool_use_id: null, session_id: sessionId });
         out({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: a.output ?? "ok", is_error: false }] }, parent_tool_use_id: null, session_id: sessionId });
       },
       usage: (u) => out({ type: "assistant", message: { id: `msg_${++msgN}`, role: "assistant", content: [], usage: { input_tokens: (u.tokens ?? 0) - (u.cached ?? 0), output_tokens: 0, cache_read_input_tokens: u.cached ?? 0 } }, parent_tool_use_id: null, session_id: sessionId }),
     };
-    const r = await runTurn(nextTurn(), emit, mcp, current.signal);
+    const turn = nextTurn();
+    const interrupt = () => current.abort();
+    if (turn.acknowledgeInterrupt) process.once("SIGTERM", interrupt);
+    const r = await runTurn(turn, emit, mcp, current.signal);
+    if (turn.acknowledgeInterrupt) process.off("SIGTERM", interrupt);
+    const isError = Boolean(r.error || (r.stopped && !turn.acknowledgeInterrupt));
     const tokens = r.usage.tokens + msgN * 2;
     out({
       type: "result",
-      subtype: r.error || r.stopped ? "error_during_execution" : "success",
-      is_error: Boolean(r.error || r.stopped),
+      subtype: isError ? "error_during_execution" : "success",
+      is_error: isError,
       num_turns: 1,
       result: r.error ?? "done",
       session_id: sessionId,
       total_cost_usd: 999,
-      queued_turn_count: queue.length,
+      ...(turn.omitQueuedTurnCount ? {} : { queued_turn_count: queue.length }),
       model_usage_since_last_result: { "claude-fake": { inputTokens: tokens - r.usage.cached, outputTokens: 0, cacheReadInputTokens: r.usage.cached, cacheCreationInputTokens: 0, costUSD: r.usage.costUsd } },
     });
+    if (r.stopped && !isError) log({ type: "interrupt_ack" });
     msgN = 0;
     current = null;
   }

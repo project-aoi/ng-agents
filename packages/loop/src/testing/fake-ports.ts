@@ -20,10 +20,12 @@ import {
   type CommitResult,
   type CommitTx,
   type ControlAction,
+  type DrainedSteerItem,
   type EmitOptions,
   type Envelope,
   type EnvelopeDraft,
   type EvidenceAppendResult,
+  type EvidenceEntry,
   type ExecResult,
   type InboxAddr,
   type InspectCellOptions,
@@ -139,6 +141,8 @@ export interface FakeLog {
   cellMessages: Array<{ to: InboxAddr; message: CellMessageDraft; result: SendToCellResult }>;
   /** Envelopes drainInbound handed to the Loop (each also appended to `snapshot.batch`). */
   drained: Envelope[];
+  /** Envelopes requeued by `ports.requeueEnvelopes`. */
+  requeued: Array<{ envelopeIds: string[]; reason: string }>;
   /** registerWait calls. */
   waits: Array<{ waitingFor: string; reason: string; timeoutAt?: number }>;
   /** clearWait calls (the party). */
@@ -244,6 +248,7 @@ export function createFakeRun(opts: FakeRunOptions = {}): FakeRun {
     previews: [],
     cellMessages: [],
     drained: [],
+    requeued: [],
     waits: [],
     clearedWaits: [],
     settled: [],
@@ -251,8 +256,11 @@ export function createFakeRun(opts: FakeRunOptions = {}): FakeRun {
   };
   const state = new Map<string, unknown>();
   const artifacts = new Map<string, VersionedArtifact>();
+  const versions = new Map<string,VersionedArtifact>();
   const resources = new Map<string, string>();
-  const steerQueue = [...(opts.steer ?? [])];
+  let steerCounter = 0;
+  const asSteer = (message: string): DrainedSteerItem => ({ envelopeId: `steer_${++steerCounter}`, message });
+  const steerQueue: DrainedSteerItem[] = (opts.steer ?? []).map(asSteer);
   const total: Usage = { tokens: 0, billedCents: 0 };
   const scheduledIds = new Set<string>();
   let counter = 0;
@@ -312,6 +320,7 @@ export function createFakeRun(opts: FakeRunOptions = {}): FakeRun {
         updatedAt: now,
       });
     }
+    if (tx.artifact) versions.set(JSON.stringify([tx.artifact.artifactId,artifactVersion]),artifacts.get(tx.artifact.artifactId)!);
     for (const [k, v] of Object.entries(tx.statePatches ?? {})) {
       if (v === null || v === undefined) state.delete(k);
       else state.set(k, structuredClone(v));
@@ -408,6 +417,7 @@ export function createFakeRun(opts: FakeRunOptions = {}): FakeRun {
       async listState(_cell, prefix) {
         return listStateSync(prefix);
       },
+      async getArtifactVersion(id,version) { return versions.get(JSON.stringify([id,version])) ?? null; },
       async getArtifact(id) {
         return artifacts.get(id) ?? null;
       },
@@ -417,6 +427,11 @@ export function createFakeRun(opts: FakeRunOptions = {}): FakeRun {
     },
     async cancelScheduled(scope) {
       log.cancelled.push(scope);
+    },
+    isDirectChild(id) {
+      if (log.closed.some(c => c.cellId === id)) return false;
+      return !!opts.roster?.some(c => c.cellId === id && c.parentId === cellId && c.status !== "closed") ||
+        log.spawned.some(c => c.addr === `inbox:${id}`);
     },
     async spawnCell(childSpec, initialPayload) {
       const addr = inboxAddr(next("child"));
@@ -444,6 +459,27 @@ export function createFakeRun(opts: FakeRunOptions = {}): FakeRun {
     },
     drainSteer() {
       return steerQueue.splice(0);
+    },
+    requeueEnvelopes(envelopeIds, reason) {
+      const ids = [...envelopeIds];
+      if (ids.length === 0) return 0;
+      log.requeued.push({ envelopeIds: ids, reason });
+      return ids.length;
+    },
+    listEvidence(filter) {
+      const afterSeq = filter?.afterSeq ?? 0;
+      const entries: EvidenceEntry[] = log.evidence
+        .map((record, i) => ({ seq: i + 1, cellId, record }))
+        .filter((e) => e.seq > afterSeq && (filter?.runId === undefined || e.record.runId === filter.runId));
+      return filter?.limit !== undefined ? entries.slice(0, filter.limit) : entries;
+    },
+    canForkSession(){ return true; },
+    listOwnDecisions() { return []; },
+    async submitReply(action, artifactVersion, sourceId) {
+      const decision = await ports.authorize(action, { artifactVersion });
+      if (decision.type !== "allow") return decision;
+      const receipt = await ports.notifyChannel({ target: action.target, content: action.content!, actionToken: decision.actionToken, idempotencyKey: sourceId, respectDnd: false });
+      return { type: "delivery", receipt: receipt === "buffered_dnd" ? "pending" : receipt, actionId: sourceId };
     },
     async emitToParent(type, payload, o) {
       if (!parentId) throw new NgError("invalid_argument", `cell ${cellId} has no parent`);
@@ -478,7 +514,7 @@ export function createFakeRun(opts: FakeRunOptions = {}): FakeRun {
     },
     async registerWait(wait) {
       log.waits.push({ ...wait });
-      openWaits.set(wait.waitingFor, { reason: wait.reason, ...(wait.timeoutAt !== undefined ? { timeoutAt: wait.timeoutAt } : {}) });
+      openWaits.set(wait.waitId ?? wait.refId ?? wait.waitingFor, { reason: wait.reason, ...(wait.timeoutAt !== undefined ? { timeoutAt: wait.timeoutAt } : {}) });
     },
     async clearWait(waitingFor) {
       log.clearedWaits.push(waitingFor);
@@ -502,7 +538,7 @@ export function createFakeRun(opts: FakeRunOptions = {}): FakeRun {
       inboundQueue.push(...messages.map(asInbound));
     },
     pushSteer(...messages) {
-      steerQueue.push(...messages);
+      steerQueue.push(...messages.map(asSteer));
     },
     humanEdit(artifactId, body) {
       const cur = artifacts.get(artifactId);

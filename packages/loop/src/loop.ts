@@ -23,7 +23,6 @@ import {
   type ToolUseBlock,
 } from "@ng/protocol";
 import { Conversation } from "./conversation";
-import { runScriptEntry, SCRIPT_PREFIX } from "./script";
 
 export interface AgentLoopOptions {
   model: ModelClient;
@@ -36,8 +35,6 @@ export interface AgentLoopOptions {
   defaultMaxSteps?: number;
   /** Per-tier output cap; overrides the client's own default. */
   maxOutputTokens?: Partial<Record<ModelTier, number>>;
-  /** Timeout handed to the workspace for `script:` entries. Default 5 minutes. */
-  scriptTimeoutMs?: number;
 }
 
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
@@ -61,7 +58,7 @@ export const BUDGET_STOP_OUTPUT = "Not executed: the budget limit was reached an
  * `step_limit` (maxSteps model calls with work left) and `refused` (the model's stop reason is a refusal).
  * Model/transport errors are rethrown for the kernel to release/retry the claim; tool exceptions become error results.
  *
- * code Runs: `script:<path>` runs through the workspace (see script.ts), anything else is a registered CodeProcessor.
+ * Code runs invoke the registered processor named by the cell spec.
  * No model calls, nothing metered.
  */
 export function createAgentLoop(opts: AgentLoopOptions): AgentLoop {
@@ -81,16 +78,7 @@ export function createAgentLoop(opts: AgentLoopOptions): AgentLoop {
 
   async function runCode(snapshot: PromptSnapshot, ports: RunPorts, signal: AbortSignal, processor: CodeProcessorSpec): Promise<RunOutcome> {
     const args = processor.args ?? {};
-    const outcome = processor.entry.startsWith(SCRIPT_PREFIX)
-      ? await runScriptEntry(processor.entry.slice(SCRIPT_PREFIX.length), {
-          snapshot,
-          ports,
-          signal,
-          args,
-          clock,
-          timeoutMs: opts.scriptTimeoutMs ?? 300_000,
-        })
-      : await raceAbort(opts.registry.codeProcessors.require(processor.entry).run({ snapshot, ports, signal, args, clock }), signal);
+    const outcome = await raceAbort(opts.registry.codeProcessors.require(processor.entry).run({ snapshot, ports, signal, args, clock }),signal);
     return signal.aborted ? "cancelled" : outcome;
   }
 
@@ -114,7 +102,7 @@ export function createAgentLoop(opts: AgentLoopOptions): AgentLoop {
     const injectSteer = async (): Promise<number> => {
       const messages = ports.drainSteer();
       for (const m of messages) {
-        const text = steerNoteText(m);
+        const text = steerNoteText(m.message);
         await append({ kind: "system_note", text });
         conv.appendUserText(text);
       }
@@ -189,7 +177,7 @@ export function createAgentLoop(opts: AgentLoopOptions): AgentLoop {
       }
       if (calls.length === 0) {
         // A steer or a follow-up that arrived while the model was answering gets its reply in this Run.
-        if ((await injectSteer()) + injectInbound() > 0) continue;
+        if (steps < maxSteps && (await injectSteer()) + injectInbound() > 0) continue;
         return finish("completed");
       }
 
@@ -215,8 +203,10 @@ export function createAgentLoop(opts: AgentLoopOptions): AgentLoop {
       }
       conv.appendToolResults(results);
       if (endRun) return finish(endRun);
-      await injectSteer();
-      injectInbound();
+      if (steps < maxSteps) {
+        await injectSteer();
+        injectInbound();
+      }
     }
 
     async function recordUnexecuted(calls: ToolUseBlock[], output: string): Promise<void> {

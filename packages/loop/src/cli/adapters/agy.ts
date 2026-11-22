@@ -114,6 +114,7 @@ class AgyDriver implements CliDriver {
   #nextId = 1;
   #sessionId: string | null = null;
   #promptId: number | null = null;
+  #initialPromptSent = false;
   #queued: string[] = [];
   #text = "";
   #cancelled = false;
@@ -123,16 +124,22 @@ class AgyDriver implements CliDriver {
     this.argv = [req.bin, ...agyArgs(req)];
   }
 
-  #request(io: DriverIO, method: string, params: unknown, kind: Pending): number {
+  #request(io: DriverIO, method: string, params: unknown, kind: Pending): number | null {
     const id = this.#nextId++;
     this.#pending.set(id, kind);
-    io.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
+    if (!io.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }))) {
+      this.#pending.delete(id);
+      return null;
+    }
     return id;
   }
 
-  #prompt(io: DriverIO, text: string): void {
+  #prompt(io: DriverIO, text: string): boolean {
     this.#cancelled = false;
-    this.#promptId = this.#request(io, "session/prompt", { sessionId: this.#sessionId, prompt: [{ type: "text", text }] }, "prompt");
+    const id = this.#request(io, "session/prompt", { sessionId: this.#sessionId, prompt: [{ type: "text", text }] }, "prompt");
+    if (id === null) return false;
+    this.#promptId = id;
+    return true;
   }
 
   start(io: DriverIO): void {
@@ -140,23 +147,29 @@ class AgyDriver implements CliDriver {
   }
 
   steer(text: string, io: DriverIO): boolean {
-    if (!this.#sessionId) {
+    if (!this.#initialPromptSent) {
       this.#queued.push(text);
       return true;
     }
     if (this.#promptId !== null) {
+      const ok = this.#sendCancel(io);
+      if (!ok) return false;
       this.#queued.push(text);
-      this.interrupt(io);
-    } else {
-      this.#prompt(io, text);
+      return true;
     }
-    return true;
+    return this.#prompt(io, text);
+  }
+
+  #sendCancel(io: DriverIO): boolean {
+    if (this.#promptId === null || !this.#sessionId) return false;
+    if (this.#cancelled) return true;
+    const ok = io.write(JSON.stringify({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId: this.#sessionId } }));
+    if (ok) this.#cancelled = true;
+    return ok;
   }
 
   interrupt(io: DriverIO): void {
-    if (this.#promptId === null || !this.#sessionId || this.#cancelled) return;
-    this.#cancelled = true;
-    io.write(JSON.stringify({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId: this.#sessionId } }));
+    this.#sendCancel(io);
   }
 
   finish(io: DriverIO): void {
@@ -208,12 +221,12 @@ class AgyDriver implements CliDriver {
         }
         out.push({ type: "session", sessionId: this.#sessionId, ...(str(asRecord(result["models"])["currentModelId"]) ? { model: str(asRecord(result["models"])["currentModelId"])! } : {}) });
         if (this.#req.model) this.#request(io, "session/set_model", { sessionId: this.#sessionId, modelId: this.#req.model }, "model");
-        else this.#prompt(io, this.#req.prompt);
+        else this.#initialPromptSent = this.#prompt(io, this.#req.prompt);
         break;
       case "model":
         if (error) out.push({ type: "notice", text: `agy: could not select model ${this.#req.model}: ${str(error["message"]) ?? "error"}; using the default` });
         else out.push({ type: "session", sessionId: this.#sessionId!, model: this.#req.model! });
-        this.#prompt(io, this.#req.prompt);
+        this.#initialPromptSent = this.#prompt(io, this.#req.prompt);
         break;
       case "prompt": {
         this.#flushText(out);
@@ -225,13 +238,24 @@ class AgyDriver implements CliDriver {
         const stopped = this.#cancelled || result["stopReason"] === "cancelled";
         const next = this.#queued.shift();
         if (next !== undefined) {
-          this.#prompt(io, next);
-          out.push({ type: "turn_end", ok: true, more: true, ...(stopped ? { stopped } : {}) });
+          const sent = this.#prompt(io, next);
+          if (sent) {
+            if (error) {
+              out.push({ type: "turn_end", ok: false, more: true, ...(stopped ? { stopped } : {}), error: str(error["message"]) ?? "prompt failed" });
+            } else if (result["stopReason"] === "refusal") {
+              out.push({ type: "turn_end", ok: false, more: true, refused: true, ...(stopped ? { stopped } : {}) });
+            } else {
+              out.push({ type: "turn_end", ok: !stopped, more: true, ...(stopped ? { stopped } : {}) });
+            }
+          } else {
+            this.#queued.unshift(next);
+            out.push({ type: "turn_end", ok: false, ...(stopped ? { stopped } : {}), error: "stdin closed before queued prompt could be sent" });
+          }
           break;
         }
         if (error) out.push({ type: "turn_end", ok: false, error: str(error["message"]) ?? "prompt failed" });
         else if (result["stopReason"] === "refusal") out.push({ type: "turn_end", ok: false, refused: true });
-        else out.push({ type: "turn_end", ok: true, ...(stopped ? { stopped } : {}) });
+        else out.push({ type: "turn_end", ok: !stopped, ...(stopped ? { stopped } : {}) });
         break;
       }
     }

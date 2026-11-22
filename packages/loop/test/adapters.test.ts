@@ -216,7 +216,8 @@ describe("codex adapter", () => {
       const cfg = codexConfig(argv);
       expect(cfg).toContain(`sandbox_mode="${row.mode}"`);
       expect(cfg.includes('web_search="live"')).toBe(row.webSearch);
-      expect(cfg.some((c) => c.startsWith("developer_instructions="))).toBe(false);
+      expect(cfg.some((c) => c.startsWith("developer_instructions="))).toBe(mode==="fork");
+      expect(argv.includes("-C")).toBe(mode==="fork");
     }
   });
 
@@ -328,9 +329,9 @@ describe("reasoning effort (the owner's model switch)", () => {
 // ---------- stream parsing: what each driver reports, line by line ----------
 
 /** An io that records what the driver writes to the CLI. */
-function recordingIo(): { written: Array<Record<string, unknown>>; write(line: string): void; end(): void } {
+function recordingIo(): { written: Array<Record<string, unknown>>; write(line: string): boolean; end(): void } {
   const written: Array<Record<string, unknown>> = [];
-  return { written, write: (line) => void written.push(JSON.parse(line) as Record<string, unknown>), end: () => undefined };
+  return { written, write: (line) => (written.push(JSON.parse(line) as Record<string, unknown>), true), end: () => undefined };
 }
 
 function feeder(driver: CliDriver, io = recordingIo()) {
@@ -516,4 +517,12 @@ describe("agy driver: cache reads on usage", () => {
       { type: "turn_end", ok: true },
     ]);
   });
+});
+
+it("keeps a resource in the middle and the final error in a rebuilt tool transcript",async()=>{
+  const {renderTranscript}=await import("../src/cli/render");
+  const text=renderTranscript([{role:"user",content:[{type:"tool_result",toolUseId:"a",content:"start"+"a".repeat(3000)+" res://old-job "+"b".repeat(4000)+"end error"}]}]);
+  expect(text).toContain("res://old-job");
+  expect(text).toContain("end error");
+  expect(text.length).toBeLessThan(4000);
 });

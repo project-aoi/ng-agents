@@ -25,10 +25,27 @@ INSERT INTO state_fts(rowid, key, text) SELECT s.seq, s.key, ${stateText("s")} F
 INSERT INTO resource_fts(resource_fts) VALUES ('rebuild');
 `;
 
+const KNOWLEDGE_TABLE = `CREATE TABLE IF NOT EXISTS knowledge (
+  seq         INTEGER PRIMARY KEY AUTOINCREMENT, -- stable rowid for the external-content FTS table
+  id          TEXT NOT NULL UNIQUE,
+  kind       TEXT NOT NULL CHECK (kind IN ('skill','working_note','reference','preference')),
+  scope       TEXT NOT NULL CHECK (scope IN ('global','cell')),
+  cell_id     TEXT REFERENCES cells(id),       -- set iff scope = 'cell'
+  name        TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  body        TEXT NOT NULL DEFAULT '',
+  tags        TEXT NOT NULL DEFAULT '[]',      -- JSON string[]
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL,
+  applies     TEXT,                            -- v4: JSON KnowledgeApplies (preferences); NULL = every cell
+  CHECK ((scope = 'cell') = (cell_id IS NOT NULL))
+);
+`;
+
 // Owner: @ng/context. Gate/kernel read artifacts through artifactsRepo(db).
 export const contextSchema: SchemaModule = {
   owner: "@ng/context",
-  version: 4,
+  version: 5,
   migrations: [
     {
       version: 2,
@@ -69,6 +86,14 @@ ${SEARCH_FTS_BACKFILL}
 ALTER TABLE knowledge ADD COLUMN applies TEXT;
 `,
     },
+    {version:5,up:`
+      ${KNOWLEDGE_TABLE.replace("IF NOT EXISTS knowledge","knowledge_v5")}
+      INSERT INTO knowledge_v5(seq,id,kind,scope,cell_id,name,description,body,tags,created_at,updated_at,applies)
+      SELECT seq,id,CASE WHEN kind<>'note' THEN kind WHEN description LIKE '%主人随手存下的内容%' OR description LIKE '%观察记录%' OR name='观察笔记' THEN 'reference' ELSE 'working_note' END,
+        scope,cell_id,name,description,body,tags,created_at,updated_at,applies FROM knowledge;
+      DROP TABLE knowledge;
+      ALTER TABLE knowledge_v5 RENAME TO knowledge;
+    `},
   ],
   ddl: /* sql */ `
 -- Layer 1: business state (single writer per cell via the Inbox serial lock).
@@ -211,21 +236,7 @@ BEGIN
 END;
 
 -- Layer 3: SKILL.md bodies, notes and preferences (separate from business state).
-CREATE TABLE IF NOT EXISTS knowledge (
-  seq         INTEGER PRIMARY KEY AUTOINCREMENT, -- stable rowid for the external-content FTS table
-  id          TEXT NOT NULL UNIQUE,
-  kind       TEXT NOT NULL CHECK (kind IN ('skill','note','preference')),
-  scope       TEXT NOT NULL CHECK (scope IN ('global','cell')),
-  cell_id     TEXT REFERENCES cells(id),       -- set iff scope = 'cell'
-  name        TEXT NOT NULL,
-  description TEXT NOT NULL DEFAULT '',
-  body        TEXT NOT NULL DEFAULT '',
-  tags        TEXT NOT NULL DEFAULT '[]',      -- JSON string[]
-  created_at  INTEGER NOT NULL,
-  updated_at  INTEGER NOT NULL,
-  applies     TEXT,                            -- v4: JSON KnowledgeApplies (preferences); NULL = every cell
-  CHECK ((scope = 'cell') = (cell_id IS NOT NULL))
-);
+${KNOWLEDGE_TABLE}
 CREATE UNIQUE INDEX IF NOT EXISTS ux_knowledge_name ON knowledge(kind, scope, COALESCE(cell_id, ''), name);
 CREATE INDEX IF NOT EXISTS idx_knowledge_cell ON knowledge(cell_id) WHERE cell_id IS NOT NULL;
 

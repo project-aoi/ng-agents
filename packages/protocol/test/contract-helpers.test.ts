@@ -80,7 +80,7 @@ describe("hashAction / actionClassOf", () => {
 
   it("classifies actions coarsely", () => {
     expect(actionClassOf(send)).toBe("channel.send|channel:feishu:*");
-    expect(actionClassOf({ type: "job.start", summary: "", subjectKey: "s", sideEffect: "internal", command: "pnpm test" })).toBe("job.start");
+    expect(actionClassOf({ type: "custom", summary: "", subjectKey: "s", sideEffect: "internal", name:"check" })).toBe("custom|check");
   });
 
   it("stableStringify sorts keys and drops undefined", () => {

@@ -70,10 +70,22 @@ export interface Inbox {
    */
   releaseSync(claimId: string, reason: string, opts?: ReleaseOptions): void;
   /**
-   * Take the `control.steer` messages that arrived for this cell since the Run started (marks them done, attached to
-   * the active claim). Returns [] when the cell has no active claim, so an idle cell's steer still wakes it normally.
+   * Take the `control.steer` messages that arrived for this cell since the Run started (marks them `claimed`, attached
+   * to `claimId`, so a crash or unconfirmed CLI write can return them to `pending`). Returns [] when `claimId` is not
+   * an active claim of an active `cellId` at the current epoch.
    */
-  drainSteerSync(cellId: string): string[];
+  drainSteerSync(cellId: string, claimId: string): DrainedSteer[];
+  /**
+   * [ext] Return specific `claimed` envelopes of `claimId` back to `pending` (e.g. a CLI process exited before
+   * confirming a mid-run steer or absorbed follow-up). If the cell is closed or its epoch moved, marks them `cancelled`
+   * instead. Returns the number of rows moved.
+   */
+  requeueClaimedSync(
+    claimId: string,
+    envelopeIds: readonly string[],
+    reason: string,
+    opts?: { countAttempt?: boolean },
+  ): number;
   /**
    * [ext] docs/05 §3.3 — move this cell's due pending messages (wakeup and silent_inject, any type but `control.steer`)
    * into the active serial claim `claimId`: status → claimed, claim_id set, same expected-epoch drop rule as a claim.
@@ -102,6 +114,7 @@ export interface Inbox {
   start(): void;
   stop(): void;
 
+  consumeTimerSync(cellId: string, envelopeId: string, epoch: number, settle: () => void): boolean;
   listMessagesSync(filter?: InboxMessageFilter): InboxMessageRecord[];
   listSchedulesSync(filter?: { cellId?: string; activeOnly?: boolean }): InboxScheduleRecord[];
   /** Count of due-or-future pending messages per cell (UI badges, idle detection). */
@@ -122,6 +135,7 @@ export interface CancelScope {
 }
 export type ControlAction = "cancel" | "pause" | "resume" | "steer";
 export interface ControlCommand {
+  pauseReason?: "manual"|"parked"|"budget_declined";
   action: ControlAction;
   principalId: string;
   steerMessage?: string;
@@ -192,6 +206,7 @@ export interface InboxMessageRecord {
   scheduleId: string | null;
   expectedEpoch: number | null;
   claimId: string | null;
+  firstClaimedAt: number | null;
   attempts: number;
   statusReason: string | null;
   createdAt: number;
@@ -207,6 +222,13 @@ export interface InboxMessageFilter {
   envelopeId?: string;                  // [ext]
   claimId?: string;                     // [ext] messages taken by this claim
   deliverAfter?: number;                // [ext] deliver_at > this (e.g. clock.now() → scheduled future rows)
+}
+
+/** [ext] One steer message drained mid-run into an active claim. */
+export interface DrainedSteer {
+  envelope: Envelope;
+  seq: number;
+  message: string;
 }
 
 /** [ext] Options of `releaseSync`. */

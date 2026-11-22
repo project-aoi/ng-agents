@@ -3,8 +3,11 @@ import type { SchemaModule } from "./types";
 // Owner: @ng/channel.
 export const channelSchema: SchemaModule = {
   owner: "@ng/channel",
-  version: 2,
-  migrations: [{ version: 2, up: "ALTER TABLE outbox ADD COLUMN refused INTEGER NOT NULL DEFAULT 0" }],
+  version: 4,
+  migrations: [
+    { version: 2, up: "ALTER TABLE outbox ADD COLUMN refused INTEGER NOT NULL DEFAULT 0" },
+    { version: 3, up: "CREATE INDEX IF NOT EXISTS idx_outbox_action ON outbox(action_id, created_at) WHERE action_id IS NOT NULL;" },
+  ],
   ddl: /* sql */ `
 CREATE TABLE IF NOT EXISTS outbox (
   id               TEXT PRIMARY KEY,
@@ -27,8 +30,10 @@ CREATE TABLE IF NOT EXISTS outbox (
 CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_outbox_channel ON outbox(channel_id, status);
 CREATE INDEX IF NOT EXISTS idx_outbox_cell ON outbox(cell_id) WHERE cell_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_outbox_action ON outbox(action_id, created_at) WHERE action_id IS NOT NULL;
 
 -- Small per-channel state; channel_id '*' holds global flags such as the Engage focus/DND switch (key 'focus').
+CREATE TABLE IF NOT EXISTS editor_leases (id TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS channel_state (
   channel_id  TEXT NOT NULL,
   key         TEXT NOT NULL,

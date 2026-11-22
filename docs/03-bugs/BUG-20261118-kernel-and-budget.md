@@ -1,6 +1,6 @@
 # 内核调度、算力计量、预算护栏与宿主休眠缺陷单
 
-> **状态**：`fixed（2026-11-19）`（`BUG-013` 子项 2 为 `superseded`；`BUG-009` 与 `BUG-013` 子项 1 仅在 Linux 上开发与测试，尚未在真实 Mac 上验证）  
+> **状态**：`fixed（2026-11-19）`（`BUG-013` 子项 2 为 `superseded`；`BUG-013` 子项 1 已在 macOS 运行进程标记回归，`BUG-009` 的合盖唤醒仍待实机验证）
 > **发现来源**：[2026-11-18 trae-x 真实端到端压测审计](./audits/2026-11-18-traex-live-e2e.md)  
 > **关联设计原则与用例**：[03-safety-and-boundaries.md](../01-principles/03-safety-and-boundaries.md)（`P-SAFE-7`）、[uc07-external-agent-and-overnight-hosting.md](../02-workflows/uc07-external-agent-and-overnight-hosting.md)（`INV-UC07-03` ～ `INV-UC07-05`）
 
@@ -101,5 +101,5 @@
   - **必做**：在 macOS（`process.platform === "darwin"`）上通过 `ps eww -p <pid>`（或持久化进程启动时间比对）实现非 `/proc` 平台的环境变量标记校验，确保跨重启恢复绝不误收编或误杀复用 PID 的无关进程；
   - **已由提案消解（随第 2 批下线）**：[提案分册三](../05-proposals/03-ai-driven-workspace-and-project-notes.md)移除 `Dispatcher` 工作树写锁槽位队列后，`docs05-slots.test.ts` 将整体替换为 AI 目录占用暴露与冲突上报测试，无需单独修补旧写锁测试。
 - **修复结论（子项 1 `fixed（2026-11-19）`；子项 2 `superseded`）**：
-  - **子项 1**：没有 `/proc` 时改用 `ps -E -ww`（darwin）读取进程环境查找任务标记；无法识别身份的进程一律视为「不是我们的」——既不收编、也不发信号，`recover()` 将其记为失败。源码：[packages/workspace/src/util.ts](../../packages/workspace/src/util.ts)、[packages/workspace/src/jobs.ts](../../packages/workspace/src/jobs.ts)。回归测试：[packages/workspace/test/jobs.test.ts](../../packages/workspace/test/jobs.test.ts)（「recover() never trusts a recycled pid: a live process without the job marker is neither adopted nor signalled」及「process identity without /proc (macOS)」组）。其中调用真实 `ps -E` 的 macOS 用例（「macOS: `ps -E` shows a real process's environment」）在 Linux 上跳过，**尚未在真实 Mac 上验证**。
+  - **子项 1**：macOS 已实测进程标记读取与复用 PID 的拒绝路径。环境标记不可读时，先用记录的启动时间和命令核对身份，再决定重附着或结束等待。[进程身份探测](../../packages/protocol/src/process.ts) · [Job 回归](../../packages/workspace/test/jobs.test.ts)
   - **子项 2**：`packages/cell/test/docs05-slots.test.ts` 已随写锁槽位队列一并删除，标为 `superseded`。

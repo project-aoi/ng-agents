@@ -356,7 +356,7 @@ describe("GET /api/cells/:cellId/timeline", () => {
     const d = await boot();
     const k = d.kernel;
     project(d, "proj", "支付重试改造");
-    k.context.upsertSkillOrNoteSync("proj", { kind: "note", scope: "cell", name: "board", description: "白板", body: "- w1：退避已提交 9f2c1", mode: "upsert" });
+    k.context.upsertSkillOrNoteSync("proj", { kind: "working_note", scope: "cell", name: "board", description: "白板", body: "- w1：退避已提交 9f2c1", mode: "upsert" });
     d.script.add("w1", { text: "退避已实现，提交 9f2c1" });
     worker(d, "w1", "proj", "核心退避编码", "实现指数退避");
     await k.idle();

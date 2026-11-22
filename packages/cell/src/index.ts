@@ -28,7 +28,7 @@ export {
   RESURFACE_MARKER,
 } from "./constants";
 export { WAIT_EXTERNAL, WAIT_HUMAN, type WaitRecord } from "./waits";
-export { effectiveCwd, forgetWorkTreeKeys, workTreeKey } from "./workdir";
+export { effectiveCwd, normalizeCwd, forgetWorkTreeKeys, workTreeKey } from "./workdir";
 export { isKernelEscalation, type KernelEscalationArgs } from "./escalations";
 export { createBudgetSwitch, type BudgetSwitch } from "./budget-switch";
 export { scheduleEnvelopeId, watchFilterMatches } from "./spec";

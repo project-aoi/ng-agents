@@ -1,3 +1,4 @@
+import type { createHumanItems } from "./human-items";
 import type { ChannelHubImpl, ChannelHubOptions } from "@ng/channel";
 import type { ContextStoreOptions } from "@ng/context";
 import type { GateOptions, GateService, SecretStore } from "@ng/gate";
@@ -184,13 +185,13 @@ export interface IdleOptions {
  * - dismiss: withdraw the card; the owning cell learns it silently (no wake-up).
  */
 export type ApprovalDecision =
-  | { decision: "approve"; approverId?: string; seenArtifactVersion?: number }
-  | { decision: "deny"; approverId?: string; reason?: string }
-  | { decision: "snooze"; until: number; approverId?: string }
-  | { decision: "revise"; instruction: string; voice?: boolean; approverId?: string }
-  | { decision: "continue"; approverId?: string; raise?: { tokens?: number; cents?: number }; until?: number; note?: string }
-  | { decision: "resolve_offline"; approverId?: string; note?: string }
-  | { decision: "dismiss"; approverId?: string; reason?: string };
+  | { decision: "approve"; approverId: string; seenArtifactVersion?: number; seenItemRevision?: number }
+  | { decision: "deny"; approverId: string; reason?: string; seenItemRevision?: number }
+  | { decision: "snooze"; until: number; approverId: string; seenItemRevision?: number }
+  | { decision: "revise"; instruction: string; voice?: boolean; approverId: string; seenArtifactVersion?: number; seenItemRevision?: number }
+  | { decision: "continue"; approverId: string; seenArtifactVersion?: number; budgetLedgerId?:string; raise?: { tokens?: number; cents?: number }; until?: number; note?: string; seenItemRevision?: number }
+  | { decision: "resolve_offline"; approverId: string; note?: string; seenItemRevision?: number }
+  | { decision: "dismiss"; approverId: string; reason?: string; seenItemRevision?: number };
 
 /**
  * What the UI shows verbatim.
@@ -198,6 +199,7 @@ export type ApprovalDecision =
  *   is never retried automatically ("发送结果未知，请核实"). Approving again after `failed` retries the send.
  * - approved: a non-send action was approved and handed back to the owning cell.
  * - version_mismatch: the draft changed since the owner looked ("草稿已更新，请重看"); `currentVersion` is what to show.
+ * - revision_mismatch: the card changed since the caller looked (card-level optimistic lock); `currentRevision` is what to show.
  * - already_cancelled: the task was cancelled/closed, or the card was withdrawn.
  * - not_pending: the card was already decided (deny/snooze/revise/continue/resolve_offline/dismiss on a decided card).
  */
@@ -205,6 +207,7 @@ export type ResolveApprovalResult =
   | { status: "sent" | "failed" | "unknown"; actionId: string; artifactVersion: number | null; error?: string }
   | { status: "approved"; actionId: string }
   | { status: "version_mismatch"; actionId: string; currentVersion: number | null }
+  | { status: "revision_mismatch"; actionId: string; currentRevision: number }
   | { status: "already_cancelled" | "not_found" | "not_pending"; actionId: string; reason?: string }
   | { status: "denied" | "snoozed" | "revising" | "continued" | "dismissed"; actionId: string }
   | { status: "resolved_offline"; actionId: string; closedCellIds: string[] };
@@ -284,6 +287,7 @@ export interface Kernel {
   readonly inbox: InboxService;
   readonly context: ContextStore;
   readonly gate: GateService;
+  readonly humanItems: ReturnType<typeof createHumanItems>;
   readonly workspace: WorkspaceManager;
   readonly hub: ChannelHubImpl;
   readonly loop: AgentLoop;
@@ -303,7 +307,7 @@ export interface Kernel {
   start(): Promise<void>;
   /** Graceful: abort Runs and release their claims without counting an attempt; Jobs keep running for recover(). */
   stop(): Promise<void>;
-  /** stop(), then close the database (if the kernel opened it) and remove a temp dataDir it created. */
+  /** Stop, close owned storage and release the data directory for the next kernel, removing it if temporary. */
   close(): Promise<void>;
   /** Resolves once no Run is in flight, nothing is due now and no kernel cleanup is pending. */
   idle(opts?: IdleOptions): Promise<void>;
@@ -321,16 +325,17 @@ export interface Kernel {
    */
   closeCell(cellId: string, reason?: CloseReason, opts?: ActorOptions): Promise<CloseResult>;
   /** Inbox.control as the owner (or `opts.principalId`); the kernel aborts Runs / cancels Jobs / closes on cancel. */
-  control(cellId: string, cmd: { action: ControlAction; steerMessage?: string }, opts?: ActorOptions): ControlResult;
+  control(cellId: string, cmd: { action: ControlAction; steerMessage?: string;pauseReason?:"manual"|"parked" }, opts?: ActorOptions): ControlResult;
 
   // ---------- ingress and approvals ----------
   /** The hub's ingress sink: route by watches (thread / filter), else to the desk; durably enqueued before it resolves. */
   ingest(raw: Omit<Envelope, "to">, channelId: string): Promise<IngestResult>;
+  reopenProject(cellId: string, principalId: string): Promise<string[]>;
   resolveApproval(actionId: string, decision: ApprovalDecision): Promise<ResolveApprovalResult>;
   /** Engage focus (DND) on/off. Leaving focus delivers what was held back and returns the receipts' counts. */
   setFocus(on: boolean): Promise<{ sent: number; failed: number; unknown: number } | null>;
   /** The owner checked an `unknown` send on the external side: record it on the outbox row and the approval. */
-  resolveUnknownSend(actionId: string, verdict: "sent" | "failed", note?: string): "resolved" | "not_unknown" | "not_found";
+  resolveUnknownSend(actionId: string, verdict: "sent" | "failed", opts: { approverId: string; seenItemRevision: number; seenAttempt: number; note?: string }): "resolved" | "not_unknown" | "revision_mismatch" | "not_found";
 
   // ---------- read models ----------
   getCell(cellId: string): CellRecord | undefined;
@@ -401,7 +406,7 @@ export interface AnchorReport {
 
 /** What a cell is doing right now (ReadModel.activityOf). `idle` is a coordinator with nothing in flight; `dormant` a leaf. */
 export interface CellActivity {
-  state: "working" | "waiting" | "dormant" | "idle" | "paused" | "closed";
+  state: "working" | "waiting" | "dormant" | "idle" | "paused" | "budget_paused" | "closed";
   /** One plain clause saying why (for refusals and status lines). */
   why: string;
 }

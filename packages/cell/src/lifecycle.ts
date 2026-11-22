@@ -3,10 +3,10 @@ import { CLI_FORK_SESSION_KEY, CLI_SESSION_KEY } from "@ng/loop";
 import {
   afterCommit,
   all,
+  get,
   cellPrincipal,
   createEnvelope,
   finalResultEnvelopeId,
-  gtdKeys,
   inboxAddr,
   isLeafLifetime,
   CELL_TURN_KEY,
@@ -29,7 +29,6 @@ import {
   type ActionRecord,
   type CellTaskPayload,
   type CloseReason,
-  type ProjectRecord,
   type InboxAddr,
   type PolicyBounds,
   type ScheduleRule,
@@ -38,7 +37,7 @@ import {
 import type { KernelCore } from "./core";
 import { jsonSafeBounds, resolveSpec, scheduleEnvelopeId, validateSpec } from "./spec";
 import type { ActorOptions, CellSpecInput, CloseResult, RootCellOptions, SpawnOptions } from "./types";
-import { assertDirectory } from "./workdir";
+import { assertDirectory, normalizeCwd } from "./workdir";
 
 export interface Lifecycle {
   createRootCell(spec: CellSpecInput, opts?: RootCellOptions): CellRecord;
@@ -49,6 +48,7 @@ export interface Lifecycle {
   closeCellSync(cellId: string, reason: CloseReason, opts?: CloseOptions): string[];
   closeCell(cellId: string, reason?: CloseReason, opts?: ActorOptions): Promise<CloseResult>;
   /** Abort Runs and stop the runtime (Jobs, an explicit container) of cells that were just closed. Nothing on disk is touched. */
+  cleaningUp(cellId: string): boolean;
   cleanupClosed(cellIds: readonly string[]): Promise<void>;
   /** Deactivate a cell's watches (all, or one cancelGroup's). */
   deactivateWatches(cellId: string, cancelGroup?: string): number;
@@ -58,6 +58,9 @@ export interface Lifecycle {
    * archived with a finished project stays archived (false). Watches and timers are not restored: the message that
    * prompted this is what wakes it. Call inside the transaction that enqueues that message.
    */
+  reopenProject(cellId: string, principalId: string): Promise<string[]>;
+  waitForClosedProject(id:string):Promise<number>;
+  reopenProjectSync(id:string,principalId:string,epoch:number):string[];
   reopenLeafSync(cellId: string): boolean;
 }
 
@@ -66,9 +69,9 @@ export interface CloseOptions extends ActorOptions {
   internal?: boolean;
 }
 
-const UPDATABLE = new Set(["title", "meta", "processor", "bounds", "watches", "schedules"]);
+const UPDATABLE = new Set(["title", "meta", "processor", "bounds", "watches", "schedules","cwd"]);
 /** What a cell may change about itself (docs/05 §5.1.2): how it is woken and how it is labelled — never what it may do. */
-const SELF_UPDATABLE = new Set(["title", "meta", "watches", "schedules"]);
+const SELF_UPDATABLE = new Set(["title", "meta", "watches", "schedules","cwd"]);
 
 function definedEntries<T extends object>(o: T): Partial<T> {
   const out: Partial<T> = {};
@@ -241,6 +244,7 @@ export function createLifecycle(core: KernelCore): Lifecycle {
       validateSpec(registry, resolved);
       if (resolved.cwd !== undefined) assertDirectory(resolved.cwd, "cwd");
       const bounds = rootBounds(opts.bounds);
+      if (resolved.preset === "worker" || resolved.preset === "checker" || resolved.preset === "reply_watcher") bounds.maxDepth = 0;
       delete resolved.bounds;
       return insertCell({ id, parentId: null, spec: { ...resolved, id }, bounds, principalId });
     });
@@ -309,7 +313,7 @@ export function createLifecycle(core: KernelCore): Lifecycle {
       if (stored.fork) {
         // A CLI-run parent's agent session: the child's CLI loop forks it instead of replaying the inherited history.
         const parentSession = context.readStateSync(parent.id, CLI_SESSION_KEY);
-        if (parentSession) context.commitSync(id, { statePatches: { [CLI_FORK_SESSION_KEY]: parentSession } });
+        if (parentSession && !core.dispatcher.isRunning(parent.id)) context.commitSync(id, { statePatches: { [CLI_FORK_SESSION_KEY]: parentSession } });
       }
       if (initialPayload !== undefined) {
         const task = createEnvelope<CellTaskPayload>(
@@ -351,6 +355,11 @@ export function createLifecycle(core: KernelCore): Lifecycle {
       const isOwner = by === "owner";
       const next: CellSpec = { ...cell.spec };
       let refreshPrefix = false;
+      if (given.cwd !== undefined) {
+        next.cwd = normalizeCwd(given.cwd);
+        assertDirectory(next.cwd, "cwd");
+        refreshPrefix = true;
+      }
       if (given.title !== undefined) next.title = given.title;
       if (given.meta !== undefined) next.meta = given.meta;
       if (given.processor !== undefined) {
@@ -363,6 +372,8 @@ export function createLifecycle(core: KernelCore): Lifecycle {
 
       let bounds = cell.bounds;
       if (given.bounds !== undefined) {
+        if ((cell.preset === "worker" || cell.preset === "checker" || cell.preset === "reply_watcher") && (given.bounds.maxDepth ?? 0) > 0)
+          throw new NgError("bounds_violation", `preset "${cell.preset}" has maxDepth 0`);
         bounds = updatedBounds(cell, given.bounds, isOwner);
         next.bounds = jsonSafeBounds({ ...(cell.spec.bounds ?? {}), ...definedEntries(given.bounds) });
         if (!sameBounds(bounds, cell.bounds)) refreshPrefix = true;
@@ -406,6 +417,8 @@ export function createLifecycle(core: KernelCore): Lifecycle {
     if (reason !== "completed" && reason !== "cancelled") throw new NgError("invalid_argument", `invalid close reason "${String(reason)}"`);
     return withTx(db, () => {
       const target = cells.require(cellId);
+      // Physical guardrail (BUG-020): root cells (parentId === null, e.g. desk) can never be closed.
+      if (target.parentId === null) throw new NgError("bounds_violation", `cannot close root cell "${cellId}"`);
       if (target.status === "closed") return [];
       if (!opts.internal) assertManages(principalId, target, "closeCell");
       const subtree = [target, ...cells.descendants(target.id, { status: ["active", "paused"] })];
@@ -426,7 +439,7 @@ export function createLifecycle(core: KernelCore): Lifecycle {
           parent.id,
           createEnvelope<CellResultPayload>(
             {
-              id: `${target.id}:closed`,
+              id: `${target.id}:${target.epoch}:closed`,
               from: inboxAddr(target.id),
               principalId,
               kind: "result",
@@ -440,9 +453,13 @@ export function createLifecycle(core: KernelCore): Lifecycle {
       }
 
       const closed: Array<{ id: string; epoch: number }> = [];
+      const closureId = newId("close", clock);
       const working = new Set(core.dispatcher.activeRuns().map((r) => r.cellId));
       for (const c of subtree) {
         const epoch = cells.bumpEpoch(c.id);
+        run(db, `INSERT INTO cell_closures(cell_id,epoch,target_id,closure_id,was_revoked)
+          VALUES(?,?,?,?,EXISTS(SELECT 1 FROM ledger WHERE cell_id=? AND revoked_at IS NOT NULL))`,
+          [c.id,epoch,target.id,closureId,c.id]);
         // A worker that had finished its turns and was merely still addressable is archived with its project, not
         // cancelled: nothing of its work was cut short.
         const archived = reason === "completed" && isLeafLifetime(c.spec.lifetime) && !working.has(c.id) && context.readStateSync(c.id, CELL_TURN_KEY) !== null;
@@ -452,51 +469,49 @@ export function createLifecycle(core: KernelCore): Lifecycle {
         closed.push({ id: c.id, epoch });
       }
       core.waits.dropFor(closed.map((c) => c.id));
-      settleGtdRecords(closed.map((c) => c.id), target.id, reason);
+      for (const {id} of closed) {
+        const closedCell=cells.require(id);
+        if (closedCell.preset) registry.presets.get(closedCell.preset)?.onCellClosed?.(closedCell,id===target.id ? reason : "cancelled",context,clock);
+      }
       // Cancels the subtree's pending approvals and unused tokens, permanently.
+      for (const c of closed) {
+        run(db,`UPDATE human_items SET disposition='cancelled',status_reason='issuer_closed',updated_at=?,item_revision=item_revision+1
+          WHERE cell_id=? AND epoch<? AND action_hash='' AND status IN ('pending','snoozed')`, [clock.now(),c.id,c.epoch]);
+      }
       gate.revokeSync(target.id);
       afterCommit(db, () => {
+        void core.track(cleanupClosed(closed.map(c => c.id)));
         for (const c of closed) bus.emit("cell.changed", { cellId: c.id, change: "status", status: "closed", epoch: c.epoch });
       });
       return closed.map((c) => c.id);
     });
   }
 
-  /**
-   * The GTD books follow a close, whoever closed the cell (the project itself, the desk, the owner in Radar, an agent
-   * on the control plane, a cascade): a closed cell can no longer keep its own records, and a project shown as
-   * "active" with nothing behind it is exactly the dangling task docs/05 guard 2 rules out. A project record still
-   * marked active/someday becomes completed (the closed target, reason completed) or cancelled; open actions in the
-   * closed cells become done or cancelled the same way. Records that already say how they ended are left alone.
-   */
-  function settleGtdRecords(closedIds: readonly string[], targetId: string, reason: CloseReason): void {
-    const now = clock.now();
-    for (const id of closedIds) {
-      const finished = id === targetId && reason === "completed";
-      const patches: Record<string, unknown> = {};
-      const project = context.readStateSync<ProjectRecord>(id, gtdKeys.project);
-      if (project && typeof project === "object" && (project.lifecycle === "active" || project.lifecycle === "someday")) {
-        const { stalledSince: _s, stalledNotifiedAt: _n, ...rest } = project;
-        patches[gtdKeys.project] = { ...rest, lifecycle: finished ? "completed" : "cancelled", updatedAt: now, ...(finished ? { completedAt: now } : {}) } satisfies ProjectRecord;
-      }
-      for (const e of context.listStateSync(id, gtdKeys.actionPrefix)) {
-        const a = e.value as ActionRecord;
-        if (!a || typeof a !== "object" || a.status !== "open") continue;
-        patches[e.key] = { ...a, status: finished ? "done" : "cancelled", updatedAt: now, ...(finished ? { completedAt: now } : {}) } satisfies ActionRecord;
-      }
-      if (Object.keys(patches).length > 0) context.commitSync(id, { statePatches: patches });
-    }
-  }
+  const cleanups = new Map<string, { epoch: number; done: Promise<void> }>();
 
   async function cleanupClosed(cellIds: readonly string[]): Promise<void> {
-    if (cellIds.length === 0) return;
-    core.dispatcher.abortCells(cellIds, "close");
-    await core.dispatcher.settled(cellIds);
-    // docs/05 guard 4: runtime only. stopRuntime resolves when each Job's process group is confirmed gone — until
-    // then the Jobs still count as running, and the occupancy view keeps showing them in their directory.
-    await Promise.all(
-      cellIds.map((id) => core.workspace.stopRuntime(id).catch((err: unknown) => core.onError(err, `stop runtime of closed cell ${id}`))),
-    );
+    await Promise.all(cellIds.map(id => {
+      const cell = cells.get(id);
+      if (cell?.status !== "closed") return;
+      const epoch = cell.epoch;
+      const existing = cleanups.get(id);
+      if (existing?.epoch === epoch) return existing.done;
+      const stillClosed = () => {
+        const current = cells.get(id);
+        return current?.epoch === epoch && current.status === "closed" ||
+          current?.epoch === epoch + 1 && current.status === "active" && isLeafLifetime(current.spec.lifetime);
+      };
+      core.dispatcher.abortCells([id], "close");
+      const cleanup = Promise.all([existing?.done, core.dispatcher.settled([id])]).then(async () => {
+        if (stillClosed()) await core.workspace.stopRuntime(id, stillClosed);
+      }).catch((err: unknown) => core.onError(err, `stop runtime of closed cell ${id}`)).finally(() => {
+        if (cleanups.get(id)?.epoch !== epoch) return;
+        cleanups.delete(id);
+        if (cells.get(id)?.status === "active") core.dispatcher.notify(id);
+      });
+      cleanups.set(id, {epoch, done:cleanup});
+      return cleanup;
+    }));
   }
 
   async function closeCell(cellId: string, reason: CloseReason = "completed", opts: ActorOptions = {}): Promise<CloseResult> {
@@ -505,20 +520,82 @@ export function createLifecycle(core: KernelCore): Lifecycle {
     return { closed };
   }
 
+  async function waitForClosedProject(id:string):Promise<number> {
+    const project = cells.require(id);
+    const pending = [project, ...cells.descendants(id)].map(c => cleanups.get(c.id)?.done);
+    await Promise.all(pending);
+    return project.epoch;
+  }
+
+  async function reopenProject(id:string, principalId:string) {
+    const epoch = await waitForClosedProject(id);
+    return reopenProjectSync(id,principalId,epoch);
+  }
+
+  function restoreBounds(cell:CellRecord):void {
+    const parent = cells.require(cell.parentId!);
+    const bounds = meetBounds(cell.bounds, attenuateBounds(parent.bounds,parent.id,cell.bounds));
+    if (!sameBounds(bounds,cell.bounds)) {
+      cells.update(cell.id,{bounds});
+      context.refreshPrefixSync(cell.id);
+    }
+  }
+
+  function reopenProjectSync(id: string, principalId: string, expectedEpoch:number): string[] {
+    if (typeof principalId !== "string" || !principalId.trim()) throw new NgError("invalid_argument","explicit actor required");
+    const actor = parsePrincipal(principalId, core.ownerPrincipal);
+    if (actor.kind !== "owner" && actor.kind !== "agent") throw new NgError("bounds_violation","only a workbench actor may reopen a project");
+    return withTx(db, () => {
+      const project = cells.require(id);
+      if (project.epoch !== expectedEpoch) throw new NgError("conflict","project changed while reopening");
+      if (!project.parentId || project.preset !== "project" || project.status !== "closed") throw new NgError("conflict","the project must be closed");
+      if (cells.ancestors(id).some(c => c.status === "closed")) throw new NgError("conflict","an ancestor is closed");
+      const closure = get<{closure_id:string}>(db,"SELECT closure_id FROM cell_closures WHERE cell_id=? AND epoch=?",[id,project.epoch]);
+      const members = closure ? all<{cell_id:string;epoch:number;was_revoked:number}>(db,
+        "SELECT cell_id,epoch,was_revoked FROM cell_closures WHERE closure_id=? ORDER BY cell_id",[closure.closure_id]) : [];
+      const restored: string[] = [];
+      for (const c of [project,...cells.children(id)]) {
+        const member = members.find(m => m.cell_id===c.id && m.epoch===c.epoch);
+        if (c.id!==id && (!member || c.status!=="closed" || c.spec.lifetime!=="wakeable")) continue;
+        if (member?.was_revoked) {
+          if (c.id===id) throw new NgError("bounds_violation","the project was revoked before closure");
+          continue;
+        }
+        restoreBounds(c);
+        const epoch = cells.bumpEpoch(c.id);
+        cells.setStatus(c.id,"active");
+        gate.reinstateSync(c.id);
+        afterCommit(db, () => bus.emit("cell.changed",{cellId:c.id,change:"status",status:"active",epoch}));
+        restored.push(c.id);
+      }
+      registry.presets.get("project")?.onCellReopened?.(cells.require(id),context,clock);
+      const delivered = inbox.enqueueSync(id,createEnvelope({id:`${id}:reopened:${cells.require(id).epoch}`,from:KERNEL_FROM.control,
+        principalId,kind:"event",type:PAYLOAD.cellMessage,expectedEpoch:cells.require(id).epoch,
+        payload:{fromCellId:core.deskCellId,text:"主人重新打开了这个项目。请核对当前状态，确认下一步。"}},clock));
+      if (delivered !== "accepted") throw new NgError("conflict","project wakeup was not queued");
+      return restored;
+    });
+  }
+
   function reopenLeafSync(cellId: string): boolean {
     return withTx(db, () => {
       const cell = cells.get(cellId);
       if (!cell || cell.status !== "closed" || !cell.parentId || !isLeafLifetime(cell.spec.lifetime)) return false;
       // Every ancestor must still be open: a worker of a finished or cancelled project is history.
       if (cells.ancestors(cellId).some((a) => a.status === "closed")) return false;
+      const closure=get<{was_revoked:number}>(db,"SELECT was_revoked FROM cell_closures WHERE cell_id=? AND epoch=?",[cellId,cell.epoch]);
+      if (closure?.was_revoked) return false;
+      restoreBounds(cell);
+      const epoch = cells.bumpEpoch(cellId);
+      core.waits.dropFor([cellId]);
       cells.setStatus(cellId, "active");
       gate.reinstateSync(cellId);
-      afterCommit(db, () => bus.emit("cell.changed", { cellId, change: "status", status: "active", epoch: cell.epoch }));
+      afterCommit(db, () => bus.emit("cell.changed", { cellId, change: "status", status: "active", epoch }));
       return true;
     });
   }
 
-  return { createRootCell, ensureRootCell, spawnCell, updateCell, closeCellSync, closeCell, cleanupClosed, deactivateWatches, reopenLeafSync };
+  return { createRootCell, ensureRootCell, spawnCell, updateCell, closeCellSync, closeCell, cleaningUp: id => cleanups.has(id), cleanupClosed, deactivateWatches, reopenProject, waitForClosedProject, reopenProjectSync, reopenLeafSync };
 }
 
 /** Active watches as rows (for routing and read models). */

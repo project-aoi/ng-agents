@@ -2,7 +2,6 @@ import {
   CELL_DIRECT_CHAT_KEY,
   createEnvelope,
   inboxAddr,
-  isLeafLifetime,
   KERNEL_FROM,
   newId,
   NgError,
@@ -52,7 +51,7 @@ export function ccDirectChat(
     seen: [...(prev?.seen ?? []), o.messageId].slice(-50),
   };
   core.context.commitSync(target.id, { statePatches: { [CELL_DIRECT_CHAT_KEY]: state } });
-  if (!target.parentId || !isLeafLifetime(target.spec.lifetime)) return null;
+  if (!target.parentId || !target.spec.ccParent) return null;
   const parent = core.cells.get(target.parentId);
   if (!parent || parent.status === "closed") return null;
   const project = projectCellIdOf(target.spec);
@@ -102,7 +101,11 @@ export function sendCellMessage(
     const target = core.cells.get(o.toCellId);
     if (!target) return { status: "not_found" };
     if (target.status === "closed") return { status: "closed", closeReason: target.closeReason };
+    const sender = core.cells.get(o.sender);
+    const projectId = sender && (sender.preset === "project" ? sender.id : projectCellIdOf(sender.spec));
     const payload: CellMessagePayload = {
+      ...(sender?.title ? { fromTitle: sender.title } : {}),
+      ...(projectId ? { fromProjectCellId: projectId } : {}),
       fromCellId: o.sender,
       text: o.message.text,
       ...(o.message.summary ? { summary: o.message.summary } : {}),
@@ -200,7 +203,7 @@ export function directMessage(
         ...(message.notifyParent ? { notifyParent: message.notifyParent } : {}),
       });
       if (r.status !== "delivered") return { status: "refused", reason: "not_allowed", detail: `not delivered (${r.status})` };
-      ccTo = target.parentId && isLeafLifetime(target.spec.lifetime) && core.cells.get(target.parentId)?.status !== "closed" ? target.parentId : null;
+      ccTo = target.parentId && target.spec.ccParent && core.cells.get(target.parentId)?.status !== "closed" ? target.parentId : null;
     }
     return { status: "delivered", envelopeId: id, duplicate: false, reopened, targetStatus: target.status === "paused" ? "paused" : "active", ccTo };
   });

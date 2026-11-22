@@ -154,16 +154,15 @@ class ClaudeDriver implements CliDriver {
     this.argv = [req.bin, ...claudeArgs(req, { mcpConfig, ...(settings ? { settings } : {}) })];
   }
 
-  start(io: { write(line: string): void }): void {
+  start(io: { write(line: string): boolean }): void {
     io.write(userLine(this.#req.prompt));
   }
 
-  steer(text: string, io: { write(line: string): void }): boolean {
-    io.write(userLine(text));
-    return true;
+  steer(text: string, io: { write(line: string): boolean }): boolean {
+    return io.write(userLine(text));
   }
 
-  interrupt(io: { write(line: string): void }): void {
+  interrupt(io: { write(line: string): boolean }): void {
     if (this.#stopping) return;
     this.#stopping = true;
     io.write(JSON.stringify({ type: "control_request", request_id: `ng_interrupt_${++this.#controlSeq}`, request: { subtype: "interrupt" } }));

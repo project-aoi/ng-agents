@@ -27,8 +27,8 @@ export const AGENT_INSTRUCTIONS = `This server is the owner's GTD workbench ("ng
 3. **Anything new, vague, or that might duplicate existing work → \`chat_with_desk\`** with the owner's words unedited. The desk finds what exists, asks what is missing (for code: the absolute path of the repository on this machine) and puts the work in the right place. It answers in the background: read its replies with \`chat_with_desk\` and \`since\` when the owner asks or you have a reason — never in a loop. Relay its questions to the owner, and send the owner's answer with \`replyToId\` = the id of the question it answers (so it lands on the right matter even when several are open).
    When the owner has already given you everything (outcome, complete brief, the absolute path) and \`search\` shows nothing on the subject, you may \`create_project\` yourself — never a second project for the same outcome. An idea only to remember: \`create_project\` with mode "research_then_park".
 4. **Work is asynchronous.** Everything returns at once; results arrive minutes later. Tell the owner it is under way and what will happen; do not poll.
-5. **Things only the owner can do** show up as "human" actions and as cards. Tell the owner plainly what is being asked, and relay their answer: \`complete_action\` when they did the thing ("代码拿到了，在 ~/code/doubao" — where it is goes in the note), \`decide_card\` for a card, \`message_cell\` / \`chat_with_desk\` with \`replyToId\` when a cell asked them a question.
-6. **You are not the owner.** You may decide ordinary cards on their explicit say-so, but two kinds are theirs alone and are refused for you: letting a message go out to another person, and continuing past an exhausted budget. Tell the owner to confirm those in the workbench UI.
+5. Read \`list_human_items\` for decisions and actions waiting on the owner. Submit the displayed option, reviewed versions and the owner’s note with \`decide_human_item\`. \`decide_card\` is a shortcut for standard card decisions. Use \`undo_human_decision\` with the activity ID to undo a reversible decision, and \`reopen_project\` to resume a closed project. For a direct question, send the answer with \`message_cell\` or \`chat_with_desk\` and its \`replyToId\`.
+6. External sends, exhausted budgets and project confirmation cards require the owner to approve execution in the workbench. On the owner’s instruction you can still defer, decline or request revisions using the displayed options.
 7. **Never do the workbench's work around it.** Nothing locks a directory: several cells may work in one repository at once, and \`list_workspaces\` shows which cells are active where right now. Before you change files yourself in such a directory, tell its project (\`message_project\`) or pause it, so nobody's work is overwritten.
 
 ## Answering the owner
@@ -66,7 +66,7 @@ export const AGENT_TOOLS: readonly AgentToolDoc[] = [
     name: "capture",
     description:
       "Drop something into the desk's inbox exactly as 随手记 does (a note or link to save, a reminder, a message that needs a reply) for silent triage, without a conversation. Prefer chat_with_desk when the owner expects an answer or the desk may need to ask something.",
-    inputSchema: obj({ text: str("the owner's words, unedited; add context after them only if it is needed to understand them") }, ["text"]),
+    inputSchema: obj({ clientId:str("optional stable id for a retried capture"),text: str("the owner's words, unedited; add context after them only if it is needed to understand them") }, ["text"]),
   },
   {
     name: "create_project",
@@ -93,7 +93,7 @@ export const AGENT_TOOLS: readonly AgentToolDoc[] = [
   {
     name: "message_project",
     description:
-      'Give a running (or parked) project a new instruction from the owner: a follow-up step ("用 /ship-mr 提 MR"), an addition ("补一个录屏"), a correction or a change of direction. The project reads it at its next turn and acts with a new worker; with urgent it is interrupted now. If the project has already finished, you are told so — create a new project that names the old one\'s results.',
+      'Give a running (or parked) project a new instruction from the owner: a follow-up step ("用 /ship-mr 提 MR"), an addition ("补一个录屏"), a correction or a change of direction. The project reads it at its next turn and acts with a new worker; with urgent it is interrupted now. If the project has already finished, you are told so — use reopen_project to continue the original project when the owner asks to resume it.',
     inputSchema: obj(
       { id: str("project id"), text: str("the owner's instruction, in their words, with any context needed to act on it"), urgent: { type: "boolean", description: "interrupt what it is doing (only when it is going the wrong way)" } },
       ["id", "text"],
@@ -114,23 +114,49 @@ export const AGENT_TOOLS: readonly AgentToolDoc[] = [
     ),
   },
   {
-    name: "complete_action",
-    description:
-      'Tick off an action the owner has done ("代码要到了", "已经跟对方确认了"). The project is told at once and continues with whatever was waiting on it. Put what the project needs to know in the note — e.g. where the files now are.',
-    inputSchema: obj({ projectId: str("project id"), actionId: str("action id from get_project / workbench_overview"), note: str("what happened, and anything the project needs to continue (paths, links, the owner's answer)") }, ["projectId", "actionId"]),
+    name: "list_human_items",
+    description: "查看待主人处理的事项、当前选项和已见版本。草稿编辑和确认使用同一事项。",
+    inputSchema: obj({}),
+  },
+  {
+    name: "decide_human_item",
+    description: "提交所见版本的选项和备注。需要主人授权的选项由主人处理。",
+    inputSchema: obj({
+      id: str("待处理事项的 ID"), optionId: str("所选选项的 ID"),
+      seenItemRevision: {type:"number", description:"列表中看到的事项修订号 itemRevision"},
+      seenVersion: {type:"number", description:"事项带草稿时，填写看到的草稿版本 artifactVersion"},
+      seenAttempt: {type:"number", description:"核实送达结果时，填写看到的发送尝试序号 attempt"},
+      until: {type:"number", description:"推迟到的时间，使用 Unix 毫秒时间戳"}, note: str("选项要求的答复、修改意见或备注"),
+      resumeProjectId: str("明确同意恢复的项目或分身 ID，见 resumeTarget.id"),
+      confirmedTargets: {type:"array", items:{type:"string"}, description:"确认中止的目标项目 ID 列表"},
+      confirmedClosure: {type:"array", items:{type:"string"}, description:"按界面顺序填写确认一并关闭的全部任务 ID"},
+    },["id","optionId","seenItemRevision"]),
+  },
+  {
+    name: "reopen_project", description:"在原会话中重新打开已结束项目。",inputSchema:obj({projectId:str("项目 ID")},["projectId"]),
+  },
+  {
+    name: "undo_human_decision",description:"撤销尚未认领的决定，或通知后台更正已读决定。",inputSchema:obj({activityId:str("操作 ID")},["activityId"]),
   },
   {
     name: "list_cards",
-    description: "The decisions waiting for the owner, each with what is being asked, who asked (which project) and whether only the owner may decide it (ownerOnly: outgoing messages, exhausted budgets).",
+    description: "The decisions waiting for the owner, each with what is being asked, who asked (which project), its current draft version (`artifactVersion`), whether the owner edited the draft (`humanEdited`), its card revision (`itemRevision`), and whether execution requires the owner (ownerOnly: outgoing messages, project proposals, exhausted budgets).",
     inputSchema: obj({}),
   },
   {
     name: "decide_card",
     description:
-      'Answer a card on the owner\'s explicit instruction. approve: yes / go ahead (for a draft: the version as it stands now). deny: no. continue: for a blocked or stuck item — carry on (put the owner\'s answer in the note). snooze: bring it back later (minutes). dismiss: take it down without an answer. Cards marked ownerOnly are refused here — tell the owner to confirm them in the workbench UI.',
+      'Answer a card on the owner\'s explicit instruction. approve: yes / go ahead (for a card with a draft, pass the `artifactVersion` you saw from `list_cards` as `seenVersion` so edited drafts are never approved blindly). deny: no. continue: for a blocked or stuck item — carry on (put the owner\'s answer in the note). snooze: bring it back later (minutes). dismiss: take it down without an answer. Only the owner can approve or execute an ownerOnly card. For a custom choice use decide_human_item with its optionId.',
     inputSchema: obj(
-      { id: str("card id from list_cards"), decision: { type: "string", enum: ["approve", "deny", "continue", "snooze", "dismiss"] }, note: str("the owner's answer or reason, in their words"), minutes: { type: "number", description: "snooze only (default 120)" } },
-      ["id", "decision"],
+      {
+        id: str("card id from list_cards"),
+        decision: { type: "string", enum: ["approve", "deny", "continue", "snooze", "dismiss"] },
+        note: str("the owner's answer or reason, in their words"),
+        minutes: { type: "number", description: "snooze only (default 120)" },
+        seenVersion: { type: "number", description: "the draft version you saw in list_cards (pass for approve on any card with a draft; never guess)" },
+        seenItemRevision: { type: "number", description: "the card's itemRevision from list_cards (required for every decision)" },
+      },
+      ["id", "decision", "seenItemRevision"],
     ),
   },
   {
@@ -178,7 +204,7 @@ export const AGENT_TOOLS: readonly AgentToolDoc[] = [
         roles: {
           type: "array",
           items: { type: "string" },
-          description: 'only agents of these roles see the rule: "worker" (does the hands-on work in a repository), "project" (coordinates a project), "watcher" (waits for an outside event), "desk", "hub", "sensor". Saving again under the same name without it lifts the limit',
+          description: 'only agents of these roles see the rule: "worker" (does the hands-on work in a repository), "project" (coordinates a project), "checker" (one check), "reply_watcher" (waits for a reply), "desk", "hub", "sensor". Saving again under the same name without it lifts the limit',
         },
       },
       ["name", "text"],
@@ -199,7 +225,7 @@ export const AGENT_TOOLS: readonly AgentToolDoc[] = [
   {
     name: "get_cell",
     description:
-      "Low-level: one background cell (a project, worker, watcher, hub or the desk) — its state (at work, waiting, dormant and wakeable, paused, archived), directory, what it waits for, and the tail of what it did. Use it to see why something is stuck when get_project is not enough; inspect_cell reads a longer stretch.",
+      "Low-level: one background cell (a project, worker, checker, reply_watcher, sensor, hub or the desk) — its state (at work, waiting, dormant and wakeable, paused, archived), directory, what it waits for, and the tail of what it did. Use it to see why something is stuck when get_project is not enough; inspect_cell reads a longer stretch.",
     inputSchema: obj({ id: str("cell id"), tail: { type: "number", description: "how many recent records to include (default 12)" } }, ["id"]),
   },
   {
@@ -237,7 +263,7 @@ export const AGENT_TOOLS: readonly AgentToolDoc[] = [
       'Low-level: start a background cell directly. Prefer chat_with_desk or create_project — a bare worker has nobody keeping its results. Useful for a one-off look ("read this repository and tell me X") whose result you will fetch yourself: preset "worker" does the job and then stays dormant (inspect_cell / get_cell read what it did; message_cell asks it more). parentId defaults to the desk. (A hub — a router for a stream of direct messages — needs routing rules: ask the desk for one with chat_with_desk instead.)',
     inputSchema: obj(
       {
-        preset: { type: "string", description: 'a registered preset: "worker" (one piece of work; stays dormant afterwards, wakes on a message), "watcher" (checks one outside condition), "project" (persistent coordinator), "hub", "sensor"' },
+        preset: { type: "string", description: 'a registered preset: "worker" (one piece of work; stays dormant afterwards, wakes on a message), "checker" (checks one outside condition), "reply_watcher" (listens for a reply), "project" (persistent coordinator), "hub", "sensor"' },
         title: str("short name"),
         instruction: str("the complete task: goal, materials, how to verify, what to report"),
         cwd: str("absolute path of the directory it works in"),

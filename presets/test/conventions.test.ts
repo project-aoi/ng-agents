@@ -45,7 +45,7 @@ describe("conventions the workbench app relies on", () => {
     const [card] = h.cards();
     expect(card).toMatchObject({ cellId: "desk", subjectKey: `msg:${env.id}` });
     expect(card!.clarify).toMatchObject({ cardType: "response", confirmVerb: "accept", title: "CI：main 分支构建通过 #812", rawInput: { text: "main 分支构建通过 #812" }, source: { label: "测试通道" } });
-    expect(await h.kernel.resolveApproval(card!.actionId, { decision: "approve", seenArtifactVersion: 1 })).toMatchObject({ status: "approved" });
+    expect(await h.kernel.resolveApproval(card!.actionId, { decision: "approve", approverId: "owner", seenArtifactVersion: 1 })).toMatchObject({ status: "approved" });
   });
 
   it("a reply card the owner took over (\"我来处理\", approvalActionId) closes its Engage item when it is finally sent; other fields stay", async () => {
@@ -69,7 +69,7 @@ describe("conventions the workbench app relies on", () => {
     };
     h.kernel.context.commitSync("desk", { statePatches: { [gtdKeys.action(human.id)]: human } });
 
-    expect(await h.kernel.resolveApproval(card!.actionId, { decision: "approve", seenArtifactVersion: 1 })).toMatchObject({ status: "sent" });
+    expect(await h.kernel.resolveApproval(card!.actionId, { decision: "approve", approverId: "owner", seenArtifactVersion: 1 })).toMatchObject({ status: "sent" });
     await h.kernel.idle();
     expect(h.state<ActionRecord & { appNote: string }>("desk", gtdKeys.action(human.id))).toMatchObject({ status: "done", completedAt: h.clock.now(), appNote: "kept", approvalActionId: card!.actionId });
   });
@@ -81,7 +81,7 @@ describe("conventions the workbench app relies on", () => {
     await h.kernel.idle();
     const [card] = h.cards();
     h.kernel.context.commitSync("desk", { artifact: { artifactId: card!.artifactId!, content: { format: "text", body: "您好，周五可以，但需要加急费 5%，请确认。" }, updatedBy: "human", expectedVersion: 1 } });
-    await h.kernel.resolveApproval(card!.actionId, { decision: "approve", seenArtifactVersion: 2 });
+    await h.kernel.resolveApproval(card!.actionId, { decision: "approve", approverId: "owner", seenArtifactVersion: 2 });
     await h.kernel.idle();
     expect(h.kernel.inbox.listSchedulesSync({ cellId: "desk", activeOnly: true }).map((s) => [s.template.id, s.cron, s.tz])).toEqual([["gtd-weekly-review", "0 16 * * 5", "Asia/Shanghai"]]);
 

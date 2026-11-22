@@ -39,7 +39,10 @@ describe("kernel with CLI engines", () => {
     // CLI cell: kernel tool through the MCP bridge, transcript mirrored, usage on the shared ledger, session persisted
     expect(h.kernel.context.readStateSync("clicell", "seen")).toBe("yes");
     const ev = evidence(h, "clicell");
-    expect(ev.map((e) => e.kind)).toEqual(["run_boundary", "inbound", "assistant_text", "tool_call", "tool_result", "run_boundary"]);
+    const kinds = ev.map(e => e.kind);
+    expect(kinds.slice(0,2)).toEqual(["run_boundary","inbound"]);
+    expect(kinds.slice(2,-1).sort()).toEqual(["assistant_text","tool_call","tool_result"]);
+    expect(kinds.indexOf("tool_call")).toBeLessThan(kinds.indexOf("tool_result"));
     expect(ev.at(-1)).toMatchObject({ kind: "run_boundary", phase: "end", outcome: "completed" });
     const usage = h.kernel.gate.usageSync("clicell");
     expect(usage.ownTokens).toBeGreaterThanOrEqual(700);
@@ -102,11 +105,11 @@ describe("kernel with CLI engines", () => {
     expect(h.kernel.getCell("iso")!.status).toBe("active");
 
     // a CLI-run parent spawning a fork_prefix child: the kernel hands the child the parent's session to fork
-    h.kernel.createRootCell({ id: "lead", processor: { kind: "llm", engine: "claude", toolsets: [TOOLSETS.context, TOOLSETS.comms, TOOLSETS.cells] } });
-    message(h, "lead", "start");
+    h.kernel.createRootCell({ id: "lead", cwd:repo, processor: { kind: "llm", engine: "claude", toolsets: [TOOLSETS.context, TOOLSETS.comms, TOOLSETS.cells] } });
+    message(h, "lead", "unique-parent-start");
     await h.kernel.idle();
     const parentRec = h.kernel.context.readStateSync<CliSessionRecord>("lead", CLI_SESSION_KEY)!;
-    const addr = h.kernel.spawnCell("lead", { contextMode: "fork_prefix", title: "sub", processor: { kind: "llm", engine: "claude", toolsets: [TOOLSETS.context, TOOLSETS.comms] } }, "subtask");
+    const addr = h.kernel.spawnCell("lead", { contextMode: "fork_prefix", title: "sub", cwd:repo, processor: { kind: "llm", engine: "claude", toolsets: [TOOLSETS.context, TOOLSETS.comms] } }, "subtask");
     const childId = addr.slice("inbox:".length);
     await h.kernel.idle();
     const launches = claude.launches();
@@ -118,7 +121,7 @@ describe("kernel with CLI engines", () => {
     expect(launches[2]).toEqual(expect.arrayContaining(["--resume", parentRec.sessionId]));
     expect(launches[2]).not.toContain("--fork-session");
     expect(claude.prompts()[2]).toContain("forked child done");
-    expect(claude.prompts()[2]).not.toContain("start");
+    expect(claude.prompts()[2]).not.toContain("unique-parent-start");
   });
 
   it("needs a model, a loop or an installed CLI; a CLI default backend makes the model optional", async () => {

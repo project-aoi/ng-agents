@@ -22,6 +22,7 @@ interface CellRow {
   epoch: number;
   status: string;
   close_reason: string | null;
+  pause_reason: CellRecord["pauseReason"];
   principal_id: string;
   created_at: number;
   updated_at: number;
@@ -41,6 +42,7 @@ function toCell(r: CellRow): CellRecord {
     bounds: deserializeBounds(r.bounds),
     epoch: r.epoch,
     status: r.status as CellStatus,
+    pauseReason:r.pause_reason,
     closeReason: r.close_reason as CloseReason | null,
     principalId: r.principal_id,
     createdAt: r.created_at,
@@ -83,7 +85,7 @@ export interface CellsRepo {
   /** epoch += 1, returns the new epoch. Throws NgError("not_found"). */
   bumpEpoch(id: string): number;
   /** `closed` also sets closed_at and close_reason (default "completed"). */
-  setStatus(id: string, status: CellStatus, closeReason?: CloseReason): void;
+  setStatus(id: string, status: CellStatus, closeReason?: CloseReason, pauseReason?:"manual"|"parked"|"budget_declined"): void;
   /** root_id/depth are derived from the parent. Throws NgError("not_found") for an unknown parent, NgError("duplicate") for an existing id. */
   insert(init: CellInsert): CellRecord;
   update(id: string, patch: CellPatch): CellRecord;
@@ -177,16 +179,16 @@ export function cellsRepo(db: Db, clock: Clock = systemClock): CellsRepo {
       if (!r) throw new NgError("not_found", `cell "${id}" not found`);
       return r.epoch;
     },
-    setStatus(id, status, closeReason) {
+    setStatus(id, status, closeReason,pauseReason="manual") {
       const now = clock.now();
       const r =
         status === "closed"
           ? run(
               db,
-              "UPDATE cells SET status = 'closed', close_reason = ?, closed_at = COALESCE(closed_at, ?), updated_at = ? WHERE id = ?",
+              "UPDATE cells SET status = 'closed', pause_reason=NULL, close_reason = ?, closed_at = COALESCE(closed_at, ?), updated_at = ? WHERE id = ?",
               [closeReason ?? "completed", now, now, id],
             )
-          : run(db, "UPDATE cells SET status = ?, close_reason = NULL, closed_at = NULL, updated_at = ? WHERE id = ?", [status, now, id]);
+          : run(db, "UPDATE cells SET status = ?, pause_reason=?, close_reason = NULL, closed_at = NULL, updated_at = ? WHERE id = ?", [status,status==="paused" ? pauseReason : null, now, id]);
       if (r.changes === 0) throw new NgError("not_found", `cell "${id}" not found`);
     },
     insert(init) {
@@ -213,6 +215,7 @@ export function cellsRepo(db: Db, clock: Clock = systemClock): CellsRepo {
           now,
         ],
       );
+      if (init.status==="paused") repo.setStatus(init.id,"paused");
       return repo.require(init.id);
     },
     update(id, patch) {

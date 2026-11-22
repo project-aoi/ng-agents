@@ -66,14 +66,6 @@ export const KEYS = {
   watcher: "watch:state",
   /** In a watcher with a check command: ProbeState. */
   probe: "probe:state",
-  /** In the desk: its own notes on the shared blockers it is arbitrating (kept by the model with set_state; no code reads it). */
-  arbitration: "desk:arbitration",
-  reply: (subjectKey: string) => `desk:reply:${subjectKey}`,
-  replyPrefix: "desk:reply:",
-  proposal: (artifactId: string) => `desk:proposal:${artifactId}`,
-  /** A reminder not yet turned into a to-do (removed once it is). */
-  reminder: (id: string) => `desk:reminder:${id}`,
-  reminderPrefix: "desk:reminder:",
   /** Weekly-review suggestions the app lists (shapes owned by apps/gtd-desk). */
   skillSuggestion: (slug: string) => `desk:suggestion:skill:${slug}`,
   sensorSuggestion: (sensorCellId: string) => `desk:suggestion:sensor:${sensorCellId}`,

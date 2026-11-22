@@ -74,7 +74,7 @@ describe("boot with the real presets", () => {
   it("registers @ng/presets before start, seeds the built-in playbooks, creates the desk with the inline preset and takes a capture", async () => {
     const d = await bootDesk({ registerPresets: undefined as never });
     expect(d.kernel.getCell("desk")).toMatchObject({ preset: "inline", status: "active", title: "主台" });
-    expect(d.kernel.registry.presets.list().map((p) => p.name).sort()).toEqual(["hub", "inline", "project", "sensor", "watcher", "worker"]);
+    expect(d.kernel.registry.presets.list().map((p) => p.name).sort()).toEqual(["checker", "hub", "inline", "project", "reply_watcher", "sensor", "watcher", "worker"]);
     // The playbooks the presets' prompts refer to, as global skills (seedBuiltinSkills at boot).
     expect(d.kernel.context.listSkillsSync().map((x) => x.name).sort()).toEqual(BUILTIN_SKILLS.map((x) => x.name).sort());
     await d.post("/api/capture", { text: "把这篇文章存进阅读清单 https://example.com/a" });
@@ -132,7 +132,7 @@ describe("⚡ sources", () => {
     const c = await d.post<SourcesMutationResponse>("/api/sources", { title: "核心指标巡检", schedule: { cron: "0 9 * * 1", tz: "Asia/Shanghai" }, check: { kind: "script", path: "checks/metrics.sh" } });
     expect(c).toMatchObject({ outcome: "created", view: { sensors: [{ title: "核心指标巡检", scheduleText: "每周一 09:00（Asia/Shanghai）", processor: "code", mode: "active" }] } });
     const id = c.sensorId!;
-    expect(d.kernel.getCell(id)!.spec).toMatchObject({ preset: "sensor", processor: { kind: "code", entry: "script:checks/metrics.sh" }, schedules: [{ cron: "0 9 * * 1", tz: "Asia/Shanghai" }] });
+    expect(d.kernel.getCell(id)!.spec).toMatchObject({ preset: "sensor", processor: { kind: "code", entry: "gtd.sensor_script",args:{script:"checks/metrics.sh"} }, schedules: [{ cron: "0 9 * * 1", tz: "Asia/Shanghai" }] });
     expect(d.kernel.inbox.listSchedulesSync({ cellId: id, activeOnly: true })).toHaveLength(1);
     // a script check runs commands in a directory of its own — never given a cwd (so never the owner's repository),
     // no worktree, no sandbox; nothing about read/write modes is asked any more (docs/05 proposal 03)
@@ -175,7 +175,7 @@ describe("weekly review actions", () => {
 
     for (let i = 0; i < 5; i++) {
       const { actionId } = makeReplyCard(d.kernel, { text: `第 ${i} 次回复` });
-      expect((await d.post<ApproveResponse>(`/api/clarify/${actionId}/approve`, { seenVersion: 1 })).outcome).toBe("sent");
+      expect((await d.post<ApproveResponse>(`/api/clarify/${actionId}/approve`, { seenVersion: 1, seenItemRevision: 1 })).outcome).toBe("sent");
     }
     const review = await d.get<WeeklyReviewDTO>("/api/review");
     expect(review.ruleSuggestions).toMatchObject([{ actionClass: "channel.send|channel:memory:*", label: "通过 测试通道 对外发送消息", streak: 5 }]);
@@ -191,7 +191,7 @@ describe("weekly review actions", () => {
     const c = await d.post<SourcesMutationResponse>("/api/sources", { title: "指标", schedule: { cron: "0 9 * * *" }, check: { kind: "llm", instruction: "看指标" } });
     const r = await d.post<ReviewMutationResponse>(`/api/review/sensors/${c.sensorId}/code`, { entry: "script:checks/metrics.sh" });
     expect(r.outcome).toBe("switched_to_code");
-    expect(d.kernel.getCell(c.sensorId!)!.spec.processor).toEqual({ kind: "code", entry: "script:checks/metrics.sh" });
+    expect(d.kernel.getCell(c.sensorId!)!.spec.processor).toEqual({ kind: "code", entry: "gtd.sensor_script",args:{script:"checks/metrics.sh"} });
     expect(d.kernel.context.readStateSync<SourceRecord>(c.sensorId!, gtdKeys.source)!.processor).toBe("code");
     expect((await d.req("POST", `/api/review/sensors/${c.sensorId}/code`, { entry: "not-registered" })).status).toBe(400);
   });
@@ -229,7 +229,7 @@ describe("project proposal card", () => {
     expect(conflict.status).toBe(409);
     expect(conflict.json).toMatchObject({ ok: false, outcome: "conflict", current: { version: 2 } });
 
-    const s = await d.post<ClarifyMutationResponse>(`/api/clarify/${id}/someday`);
+    const s = await d.post<ClarifyMutationResponse>(`/api/clarify/${id}/someday`, { seenItemRevision: saved.json.card!.itemRevision, seenVersion: saved.json.card!.draft!.version });
     expect(s).toMatchObject({ outcome: "someday", view: { remaining: 0 } });
     const projectId = s.projectId!;
     // the real project cell (the id an approval would have given it), paused before it ever ran — not an empty
@@ -275,18 +275,18 @@ describe("escalations and completion", () => {
       { cellId: "desk", principalId: "cell:desk", epoch: d.kernel.getCell("desk")!.epoch },
     );
     if (b.type !== "defer") throw new Error(b.type);
-    const r = await d.post<ClarifyMutationResponse>(`/api/clarify/${b.actionId}/extend`);
+    const r = await d.post<ClarifyMutationResponse>(`/api/clarify/${b.actionId}/extend`, { seenItemRevision: 1 });
     expect(r).toMatchObject({ outcome: "continued", message: "已追加额度，继续推进" });
     expect(d.kernel.gate.usageSync("desk").raisedTokens).toBeGreaterThan(before);
 
     const p = makeProject(d.kernel, "比价");
-    d.kernel.spawnCell(p, { id: "wq", preset: "watcher", title: "等 C", bounds: { canSendTo: ["channel:memory:*"] } });
+    d.kernel.spawnCell(p, { id: "wq", preset: "watcher", lifetime: "persistent", title: "等 C", bounds: { canSendTo: ["channel:memory:*"] } });
     const wait = writeAction(d.kernel, "wq", { title: "等 C 报价", owner: "waiting" });
     const { actionId } = makeReplyCard(d.kernel, { cellId: "wq", target: "channel:memory:supplier-c", subjectKey: "cell:wq" });
-    const off = await d.post<ClarifyMutationResponse>(`/api/clarify/${actionId}/resolve-offline`);
-    expect(off).toMatchObject({ outcome: "resolved_offline", message: "已完结，并结束了 1 项相关后台任务" });
-    expect(d.kernel.getCell("wq")!.status).toBe("closed");
-    expect(d.kernel.context.readStateSync<ActionRecord>("wq", gtdKeys.action(wait.id))).toMatchObject({ status: "done" });
+    const off = await d.post<ClarifyMutationResponse>(`/api/clarify/${actionId}/resolve-offline`, { seenItemRevision: 1 });
+    expect(off).toMatchObject({ outcome: "resolved_offline", message: "已完结" });
+    expect(d.kernel.getCell("wq")!.status).toBe("active");
+    expect(d.kernel.context.readStateSync<ActionRecord>("wq", gtdKeys.action(wait.id))).toMatchObject({ status: "open" });
     expect(d.kernel.getCell(p)!.status).toBe("active");
   });
 
@@ -303,26 +303,26 @@ describe("escalations and completion", () => {
   it("sending from Engage with an unknown receipt finishes the item and leaves the verification in Clarify", async () => {
     const d = await bootDesk();
     const { actionId } = makeReplyCard(d.kernel);
-    const t = await d.post<ClarifyMutationResponse>(`/api/clarify/${actionId}/to-human`);
     d.memory.respondWith("unknown");
-    const r = await d.post<EngageMutationResponse>(`/api/engage/${t.engageItem!.cellId}/${t.engageItem!.actionId}/send`, { seenVersion: 1 });
-    expect(r).toMatchObject({ ok: false, outcome: "unknown", view: { items: [] } });
-    expect(r.message).toContain("发送结果未知，请核实");
-    expect(r.status.clarify.pending).toBe(1);
+    await d.post(`/api/human-items/${actionId}/decide`,{optionId:"system.execute",seenArtifactVersion:1,seenItemRevision:1});
+    const item = d.kernel.humanItems.list()[0]!;
+    expect(item).toMatchObject({id:actionId,status:"unknown"});
+    expect(item.options.map(o=>o.id)).toEqual(["system.sent","system.not_sent","system.defer"]);
+    expect((await d.req("POST",`/api/human-items/${actionId}/decide`,{optionId:"system.deny",seenArtifactVersion:1,seenItemRevision:item.itemRevision})).status).toBe(409);
     expect((await d.get<ClarifyQueueDTO>("/api/clarify")).cards).toMatchObject([{ id: actionId, state: "send_unknown" }]);
   });
 
   it("unknown ids are 404s; a decided card is a 409", async () => {
     const d = await bootDesk();
     expect((await d.req("GET", "/api/clarify/act_nope")).status).toBe(404);
-    expect((await d.req("POST", "/api/clarify/act_nope/snooze", { until: d.clock.now() + DAY })).status).toBe(404);
+    expect((await d.req("POST", "/api/clarify/act_nope/snooze", { seenItemRevision: 1, until: d.clock.now() + DAY })).status).toBe(404);
     expect((await d.req("POST", "/api/engage/desk/nope/done")).status).toBe(404);
     expect((await d.req("GET", "/api/artifacts/nope")).status).toBe(404);
     expect((await d.req("POST", "/api/projects/nope/pause")).status).toBe(404);
     expect((await d.req("GET", "/api/nothing-here")).status).toBe(404);
     const { actionId } = makeReplyCard(d.kernel);
-    await d.post(`/api/clarify/${actionId}/approve`, { seenVersion: 1 });
-    expect((await d.req("POST", `/api/clarify/${actionId}/someday`)).status).toBe(409);
+    await d.post(`/api/clarify/${actionId}/approve`, { seenVersion: 1, seenItemRevision: 1 });
+    expect((await d.req("POST", `/api/clarify/${actionId}/someday`, { seenItemRevision: 1 })).status).toBe(409);
     const malformed = await d.server.app.request("/api/capture", { method: "POST", body: "{not json", headers: { "content-type": "application/json" } });
     expect(malformed.status).toBe(400);
     expect(await malformed.json()).toEqual({ error: { code: "invalid_json", message: "请求体不是合法的 JSON" } });

@@ -55,6 +55,7 @@ export const DEFAULT_LIMITS: ContextLimits = {
 };
 
 export interface ContextStoreOptions {
+  runtimeVersion?: string;
   db: Db;
   bus: Bus;
   clock: Clock;

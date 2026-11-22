@@ -113,7 +113,7 @@ describe("drainInboundSync (absorbing arrivals into the running claim)", () => {
     const run = t.inbox.claimNextRunSync("w", "k", "serial_coalesce")!;
     t.inbox.controlSync("w", { action: "steer", principalId: "owner", steerMessage: "use pnpm" });
     expect(t.inbox.drainInboundSync("w", run.claimId)).toEqual([]);
-    expect(t.inbox.drainSteerSync("w")).toEqual(["use pnpm"]);
+    expect(t.inbox.drainSteerSync("w", run.claimId).map((s) => s.message)).toEqual(["use pnpm"]);
 
     t.inbox.enqueueSync("w", msg({ id: "more" }));
     expect(t.inbox.drainInboundSync("x", run.claimId)).toEqual([]);
@@ -124,7 +124,8 @@ describe("drainInboundSync (absorbing arrivals into the running claim)", () => {
     expect(t.inbox.drainInboundSync("x", xr.claimId)).toEqual([]);
     t.inbox.releaseSync(run.claimId, "stopped");
     expect(t.inbox.drainInboundSync("w", run.claimId)).toEqual([]);
-    expect(texts(t.inbox.claimNextRunSync("w", "k", "serial_coalesce")!.envelopes)).toHaveLength(2);
+    // The claimed steer was not completed before releaseSync, so it returns to pending along with task + more (3).
+    expect(texts(t.inbox.claimNextRunSync("w", "k", "serial_coalesce")!.envelopes)).toHaveLength(3);
   });
 });
 

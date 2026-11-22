@@ -279,6 +279,9 @@ export interface ProposedProjectAction {
 
 /** The plan a project_proposal card carries; approving it = ProposedAction "project.start". */
 export interface ProjectProposal {
+  cwd?: string;
+  repos?: { name: string; cwd: string; defaultBranch?: string }[];
+  phases?: string[];
   title: string;
   outcome: string;
   background?: string;
@@ -288,6 +291,17 @@ export interface ProjectProposal {
 }
 
 /** B. Complex item → project proposal. */
+export function isProjectProposal(value: unknown): value is ProjectProposal {
+  if (!value || typeof value !== "object") return false;
+  const p = value as Partial<ProjectProposal>;
+  const text = (v:unknown): v is string => typeof v==="string" && v.trim().length>0;
+  return text(p.title) && text(p.outcome) && Array.isArray(p.actions) &&
+    p.actions.every(a=>a && text(a.title) && ["human","agent","waiting"].includes(a.owner) && (a.nextStep===undefined || typeof a.nextStep==="string")) &&
+    (p.cwd===undefined || text(p.cwd)) && (p.background===undefined || typeof p.background==="string") &&
+    (p.phases===undefined || Array.isArray(p.phases) && p.phases.every(text)) &&
+    (p.repos===undefined || Array.isArray(p.repos) && p.repos.every(r=>r && text(r.name) && text(r.cwd) && (r.defaultBranch===undefined || text(r.defaultBranch))));
+}
+
 export interface ProjectProposalCard extends ClarifyCardBase {
   cardType: "project_proposal";
   proposal: ProjectProposal;

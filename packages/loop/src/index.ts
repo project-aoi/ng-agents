@@ -3,7 +3,6 @@
 
 export { createAgentLoop, raceAbort, BUDGET_STOP_OUTPUT, TRUNCATED_CALL_OUTPUT, type AgentLoopOptions } from "./loop";
 export { Conversation } from "./conversation";
-export { runScriptEntry, scriptCommand, shellQuote, SCRIPT_PREFIX } from "./script";
 
 export {
   AnthropicModelClient,

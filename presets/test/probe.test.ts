@@ -37,7 +37,7 @@ describe("a watcher with a check command", () => {
     const dir = tempDir("release");
     // A relative path: the command runs in the project's directory.
     const { project, watcher, output } = await probeIn(h, dir, { check: { command: "test -f flag", everySec: 60 } });
-    expect(output).toContain(`Started watcher ${watcher}`);
+    expect(output).toContain(`Started checker ${watcher}`);
     expect(output).toContain("No model runs for it: it runs `test -f flag` now and then every 60s");
     expect(h.kernel.getCell(watcher)).toMatchObject({ status: "active", spec: { lifetime: "one_shot", processor: { kind: "code", entry: "gtd.check_probe" } } });
     expect(h.actions(project)).toEqual([expect.objectContaining({ owner: "waiting", status: "open", cellId: watcher })]);
@@ -177,7 +177,7 @@ describe("dispatch keeps one timer source per watcher", () => {
         return tool("dispatch", { preset: "worker", title: "等", instruction: "等", check: { command: "true" } });
       },
       (req) => {
-        expect(lastToolResult(req)).toContain('check is for a watcher — give preset "watcher"');
+        expect(lastToolResult(req)).toContain('check is for a watcher — give preset "checker"');
         return tool("dispatch", { preset: "watcher", title: "等", instruction: "等", schedules: [{ idleSec: 600 }] });
       },
       (req) => {
@@ -186,7 +186,7 @@ describe("dispatch keeps one timer source per watcher", () => {
         return tool("dispatch", { preset: "watcher", title: "等 MR !9 合入", instruction: "检查 MR !9 是否合入。", schedules: [{ cron: "*/10 * * * *", tz: "Asia/Shanghai" }] });
       },
       (req) => {
-        checker = /^Started watcher (\S+)/.exec(lastToolResult(req))![1]!;
+        checker = /^Started checker (\S+)/.exec(lastToolResult(req))![1]!;
         return {};
       },
     );

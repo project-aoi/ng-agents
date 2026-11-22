@@ -37,6 +37,21 @@ function worker(h: Harness, id: string, parent = "proj", task: string | undefine
 const activity = (h: Harness, id: string) => h.kernel.activityOf([id]).get(id)!.state;
 
 describe("a wakeable worker's turn settles: the parent is told, the worker stays", () => {
+  it("keeps a worker waiting on its custom request_approval until the owner replies", async () => {
+    const h=await boot();
+    project(h); worker(h,"w");
+    h.script.add("w",tool("request_approval",{kind:"escalation",title:"选一份材料",summary:"资料待确认",
+      escalation:{reason:"blocked",explanation:"需要选定原始资料"},options:[{id:"first",label:"第一份",effect:"reply"}]}));
+    await h.kernel.idle();
+    const item=h.kernel.humanItems.list().find(i=>i.cellId==="w")!;
+    expect(item.description).toBe("需要选定原始资料");
+    expect(activity(h,"w")).toBe("waiting");
+    expect(results(h,"proj")).toHaveLength(0);
+    await h.kernel.humanItems.decide(item.id,{optionId:"first",seenItemRevision:item.itemRevision},"owner");
+    await h.kernel.idle();
+    expect(results(h,"proj")).toHaveLength(1);
+  });
+
   it("is not closed when its turn ends; the notice carries the facts of the turn and each later turn is announced again", async () => {
     const h = await boot();
     project(h);
@@ -386,7 +401,7 @@ describe("what a coordinator sees at every wake-up", () => {
   it("its own notes come back in the tail — not in the frozen prefix — and a worker has none", async () => {
     const h = await boot();
     project(h);
-    h.script.add("proj", tool("save_note", { kind: "note", scope: "cell", name: "board", description: "项目白板", body: "- worker_a1（待命，已看到 #42）：核心退避逻辑已提交 9f2c1" }));
+    h.script.add("proj", tool("save_note", { kind: "working_note", scope: "cell", name: "board", description: "项目白板", body: "- worker_a1（待命，已看到 #42）：核心退避逻辑已提交 9f2c1" }));
     h.kernel.sendToCell("proj", { text: "start" }, { principalId: "cell:desk" });
     await h.kernel.idle();
     const prefix = h.count("prompt_prefixes WHERE cell_id = 'proj'");
@@ -466,12 +481,12 @@ describe("the budget stop holds a cell before anything is claimed", () => {
       saw = requestText(req);
       return { text: "continuing", usage: { inputTokens: 10, outputTokens: 10 } };
     });
-    expect(await h.kernel.resolveApproval(cards[0]!.actionId, { decision: "continue" })).toMatchObject({ status: "continued" });
+    expect(await h.kernel.resolveApproval(cards[0]!.actionId, { decision: "continue", approverId: "owner" })).toMatchObject({ status: "continued" });
     await h.kernel.idle();
     // Both reports reached the model, in one Run, after the raise.
     expect(saw).toContain("report r1");
     expect(saw).toContain("report r2");
-    expect(h.kernel.inbox.listMessagesSync({ cellId: "proj", status: ["pending"] })).toEqual([]);
+    expect(h.kernel.inbox.listMessagesSync({ cellId: "proj", status: ["pending"] }).filter(m=>m.envelope.type!==PAYLOAD.stalledCheck)).toEqual([]);
     expect(h.kernel.gate.usageSync("proj").state).not.toBe("hard_stop");
   });
 
@@ -511,7 +526,7 @@ describe("a leaf that was given spawn depth on purpose", () => {
   it("is not dormant, and its turn is not reported, while a cell it started is still at work", async () => {
     const h = await boot();
     project(h);
-    worker(h, "lead", "proj", "split the work", { bounds: { maxDepth: 1 } });
+    worker(h, "lead", "proj", "split the work", {preset:"inline",lifetime:"wakeable", bounds: { maxDepth: 1 } });
     let release!: () => void;
     const held = new Promise<void>((r) => (release = r));
     h.script.add("lead", tool("spawn_cell", { preset: "worker", title: "helper", instruction: "do the part", meta: { role: "helper" } }));

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { ManualClock, PAYLOAD, type CellResultPayload, type CodeProcessor, type JobResultPayload, type Registry } from "@ng/protocol";
+import { get, ManualClock, PAYLOAD, type CellResultPayload, type CodeProcessor, type JobResultPayload, type Registry } from "@ng/protocol";
 import { boot, cleanupAll, HOUR, registerTestPresets, T0, tempDir, tool, waitFor } from "./helpers";
 
 afterEach(cleanupAll);
@@ -43,6 +43,36 @@ function setup(registry: Registry): void {
 }
 
 describe("restart on the same database", () => {
+  it("loads late-registered preset domains and refreshes stored prompts after startup configuration", async () => {
+    const dataDir = tempDir("restart-presets");
+    const first = await boot({
+      dataDir,
+      desk: { id:"desk", preset:"inline", processor:{kind:"llm", prompt:"test.release"} },
+      setup(registry) {
+        registerTestPresets(registry);
+        registry.prompts.register({name:"test.release", text:"first release prompt"});
+      },
+    });
+    await first.ui.capture({text:"materialize the prompt"});
+    await first.kernel.idle();
+    expect(first.count("prompt_prefixes WHERE cell_id = 'desk'")).toBe(1);
+    await first.kernel.close();
+
+    const next = await boot({dataDir, desk:false, start:false});
+    let migrated = false;
+    next.registry.presets.register({
+      name:"sensor", description:"registered after constructing the kernel", defaults:{},
+      stateDomain:() => ({
+        id:"late-domain", migrate() { migrated = true; }, query:() => [], read:() => undefined, write:() => false,
+      }),
+    });
+    const prompt = "updated preset prompt";
+    next.registry.prompts.register({name:"test.release", text:prompt});
+    await next.kernel.start();
+    expect(migrated).toBe(true);
+    expect(get<{text:string}>(next.kernel.db, "SELECT text FROM prompt_prefixes WHERE cell_id = 'desk'")?.text).toContain(prompt);
+  });
+
   it("picks up where it stopped: interrupted Runs, a stale claim, a running Job, timers and cron", async () => {
     const dataDir = tempDir("restart");
     const clock = new ManualClock(T0);

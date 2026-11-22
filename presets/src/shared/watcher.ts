@@ -4,7 +4,6 @@ import {
   defineTool,
   isEnvelopeOfType,
   PAYLOAD,
-  projectCellIdOf,
   subjectKeys,
   type ApprovalResolvedPayload,
   type CellProgressPayload,
@@ -33,7 +32,7 @@ import { clip, formatWhen, type RawInput } from "./records";
 // The reply watcher (await_reply): waits for one party's reply on the project's behalf. Persistent until the reply
 // arrives; then it hands the kernel its result (a CellResultCandidate) and closes itself, so the project receives one
 // plain `cell.result` ("<who>已回复：<gist>"). A timeout drafts a nudge and puts it on the owner's card itself (the
-// project's one card slot is Gate's rule: subject project:<id>); deadlines that move are reported as silent
+// card is scoped to this watcher); deadlines that move are reported as silent
 // `cell.progress` notes the project reads at its next turn.
 
 /** The one party a reply watcher waits for. */
@@ -88,7 +87,7 @@ export interface WatcherState {
 export function replyWatcherSpec(party: ReplyParty, o: Omit<ReplyWatchMeta, "party"> & { interpret?: boolean }): CellSpec {
   const { interpret, ...meta } = o;
   const spec: CellSpec = {
-    preset: "watcher",
+    preset: "reply_watcher",
     title: `等待${party.label}回复`,
     processor: interpret ? REPLY_WATCHER_LLM_PROCESSOR : WAIT_MATCH_PROCESSOR,
     // It lives until the reply comes (or the owner settles it); it never touches a directory.
@@ -196,11 +195,10 @@ class WatcherCore {
     if (this.st.status === "overdue") await this.#progress("overdue", `${party.label}到期还没有回复（${description}），已拟好催问，等主人在待确认里决定是否发出。`);
   }
 
-  /** The nudge card (one per project subject: a newer card of the project replaces an older one). */
+  /** Each watcher keeps its own nudge card while the project owns their common context. */
   async #raiseNudge(): Promise<void> {
     const { party, description } = this.meta;
-    const project = projectCellIdOf(this.ports.self.spec);
-    const subjectKey = project ? subjectKeys.project(project) : subjectKeys.cell(this.self);
+    const subjectKey = subjectKeys.cell(this.self);
     const since = this.st.dueAt !== undefined ? `在 ${formatWhen(this.st.dueAt, this.cfg.timeZone)} 前` : "";
     const explanation = `${party.label}${since}还没有回复（${description}）。已拟好催问，确认后发出并继续跟进。`;
     const base = {
@@ -220,14 +218,17 @@ class WatcherCore {
       const card: EscalationCard = { ...base, cardType: "escalation", escalation: { reason: "waiting_timeout", explanation, waiting } };
       action = { type: "custom", name: "gtd.waiting_timeout", args: { partyId: party.id }, summary: base.title, subjectKey, sideEffect: "external", card: cardDeliverable(card, explanation) };
     }
-    const r = await this.ports.authorize(action, art && action.type === "channel.send" ? { artifactVersion: art.version } : undefined);
+    const r = art && action.type === "channel.send"
+      ? await this.ports.submitReply(action, art.version, `${this.self}:nudge:${this.st.nudges}:${this.st.dueAt}`)
+      : await this.ports.authorize(action);
     if (r.type === "defer") {
       this.st.cardActionId = r.actionId;
       this.outcome = "deferred_for_approval";
-    } else if (r.type === "allow" && action.type === "channel.send") {
-      // A standing rule ("固定模板催问可自动发") allows it: send now and keep following up.
-      const receipt = await this.ports.notifyChannel({ target: action.target, content: action.content!, idempotencyKey: `${this.self}:nudge:${this.st.nudges}`, actionToken: r.actionToken });
-      await this.#followUp(receipt === "sent" ? "nudged" : "nudge_closed", this.now + this.cfg.followUpMs);
+    } else if (r.type === "delivery") {
+      if (r.receipt === "unknown" || r.receipt === "failed" || r.receipt === "pending") {
+        this.st.cardActionId = r.actionId;
+        this.outcome = "deferred_for_approval";
+      } else await this.#followUp(r.receipt === "sent" ? "nudged" : "nudge_closed", this.now + this.cfg.followUpMs);
     } else {
       await this.#followUp("nudge_closed", this.now + this.cfg.followUpMs);
     }
@@ -235,10 +236,10 @@ class WatcherCore {
 
   async onResolved(p: ApprovalResolvedPayload & { decision?: string; until?: number }): Promise<void> {
     if (!this.st.cardActionId || p.actionId !== this.st.cardActionId) return;
-    if (p.status === "pending" || p.status === "superseded") return;
+    if (p.status === "pending" || p.status === "failed" || p.status === "unknown") return;
     delete this.st.cardActionId;
     const later = this.now + this.cfg.followUpMs;
-    if (p.status === "executed") return this.#followUp("nudged", later);
+    if (p.status === "executed" && p.action.type === "channel.send") return this.#followUp("nudged", later);
     if (p.decision === "continue" || p.status === "approved") return this.#followUp("extended", p.until ?? later);
     return this.#followUp("nudge_closed", later);
   }

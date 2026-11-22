@@ -32,7 +32,7 @@ export function matchWatches(core: KernelCore, env: Omit<Envelope, "to">): Watch
       all<WatchRow>(
         core.db,
         `SELECT w.id, w.cell_id, w.filter, w.coalesce_ms FROM cell_watches w JOIN cells c ON c.id = w.cell_id
-         WHERE w.active = 1 AND w.thread = ? AND c.status != 'closed' ORDER BY w.id`,
+         WHERE w.active = 1 AND w.thread = ? AND c.status = 'active' ORDER BY w.id`,
         [thread],
       ),
     );
@@ -41,7 +41,7 @@ export function matchWatches(core: KernelCore, env: Omit<Envelope, "to">): Watch
     all<WatchRow>(
       core.db,
       `SELECT w.id, w.cell_id, w.filter, w.coalesce_ms FROM cell_watches w JOIN cells c ON c.id = w.cell_id
-       WHERE w.active = 1 AND w.thread IS NULL AND c.status != 'closed' ORDER BY w.id`,
+       WHERE w.active = 1 AND w.thread IS NULL AND c.status = 'active' ORDER BY w.id`,
     ),
   );
   return [...hits.values()];

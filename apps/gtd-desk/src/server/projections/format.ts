@@ -1,19 +1,7 @@
-import { BALL_OWNER_LABEL, EFFORT_LABEL, parseAddress, type Effort, type ItemSource, type Progress, type WaitingSet } from "@ng/protocol";
+import { CHANNEL_LABELS, BALL_OWNER_LABEL, EFFORT_LABEL, parseAddress, type Effort, type ItemSource, type Progress, type WaitingSet } from "@ng/protocol";
 import { relativeTimeZh, type ArtifactDTO, type ButtonDTO, type DecisionDTO, type ProgressDTO, type SourceInfoDTO, type WaitingDTO } from "../../shared/api";
 import type { DeskKernel } from "./common";
 import { dueText } from "./time";
-
-export const CHANNEL_LABELS: Readonly<Record<string, string>> = {
-  ui: "随手记",
-  cli: "命令行",
-  feishu: "飞书",
-  slack: "Slack",
-  github: "GitHub",
-  webhook: "Webhook",
-  email: "邮件",
-  memory: "测试通道",
-  demo: "演示 IM",
-};
 
 export function channelLabel(channelId: string): string {
   return CHANNEL_LABELS[channelId] ?? channelId;

@@ -12,10 +12,9 @@ import { ErrorState, Loading } from "./states";
 // ==================== top bar ====================
 
 const TABS: Array<{ key: ViewKey; icon: string; zh: string; en: string; n: string }> = [
-  { key: "clarify", icon: "📥", zh: "待确认", en: "Clarify", n: "1" },
-  { key: "engage", icon: "🎯", zh: "专注工作区", en: "Engage", n: "2" },
-  { key: "radar", icon: "🧭", zh: "项目全局", en: "Radar", n: "3" },
-  { key: "agents", icon: "👥", zh: "分身实况", en: "Agents", n: "4" },
+  { key: "clarify", icon: "📥", zh: "待我处理", en: "", n: "1" },
+  { key: "radar", icon: "🧭", zh: "项目全局", en: "", n: "2" },
+  { key: "agents", icon: "👥", zh: "分身实况", en: "", n: "3" },
 ];
 
 /** "等待外部" — the waiting ball's own words, without its icon (BUG-011: not only replies are waited for). */
@@ -23,11 +22,13 @@ const WAITING_WORDS = stripIcon(BALL_LABEL.waiting);
 
 export function TopBar(props: { view: ViewKey; status: StatusDTO | null; onView(v: ViewKey): void; drawerOpen: boolean; onDrawer(): void }) {
   const { status } = props;
+  const {setStatus} = useStatus();
+  const toast = useToast();
   return (
     <header className="topbar">
       <nav className="tabs" aria-label="视图">
         {TABS.map((t) => {
-          const count = t.key === "clarify" ? status?.clarify.pending : undefined;
+          const count = t.key === "clarify" ? status?.humanPending ?? status?.clarify.pending : undefined;
           // From the status the app already keeps current: no extra request for the live count.
           const live = t.key === "agents" ? (status?.background.running ?? 0) : 0;
           const on = props.view === t.key;
@@ -53,7 +54,7 @@ export function TopBar(props: { view: ViewKey; status: StatusDTO | null; onView(
                   {count}
                 </span>
               )}
-              {t.key === "engage" && status?.focus.on && <span className="focus-dot" title="免打扰已开启" aria-label="免打扰已开启" />}
+              {t.key === "clarify" && status?.focus.on && <span className="focus-dot" title="免打扰已开启" aria-label="免打扰已开启" />}
               {live > 0 && <span className="tab-live">· {live} 在跑</span>}
             </button>
           );
@@ -61,6 +62,7 @@ export function TopBar(props: { view: ViewKey; status: StatusDTO | null; onView(
       </nav>
       <div className="topbar-right">
         {status && (status.demo ? <span className="mode-badge" title={`后端：${status.backend}`}>演示模式</span> : <ModelSwitch status={status} />)}
+        {status && <button className="btn sm" type="button" disabled={!!status.focus.editors && !status.focus.manual} aria-pressed={status.focus.on} title={status.focus.editors ? "编辑期间自动免打扰" : "手动免打扰"} onClick={()=>void api.focus(!status.focus.on).then(r=>setStatus(r.status)).catch(err=>toast({tone:"error",text:toFailure(err).message}))}>免打扰{status.focus.on ? " · 开" : ""}</button>}
         {status && <BudgetSwitch status={status} />}
         <button type="button" className={`drawer-trigger${props.drawerOpen ? " on" : ""}`} aria-expanded={props.drawerOpen} aria-controls="drawer" onClick={props.onDrawer} title="随手记 / 信源（快捷键 5）">
           <span aria-hidden="true">⚡</span> <span className="dt-label">随手记 / 信源</span>
@@ -74,7 +76,7 @@ export function TopBar(props: { view: ViewKey; status: StatusDTO | null; onView(
 
 export function StatusLine(props: { view: ViewKey; status: StatusDTO | null; connected: boolean; open: boolean; onToggle(): void; onClose(): void }) {
   const { status } = props;
-  const text = !status ? "正在连接工作台…" : props.view === "agents" ? agentsLine(status) : status.statusLine[props.view];
+  const text = !status ? "正在连接工作台…" : props.view==="clarify" ? `待我处理 ${status.humanPending ?? status.clarify.pending} 项` : props.view === "agents" ? agentsLine(status) : status.statusLine[props.view];
   const budgetOff = status !== null && !budgetState(status).enforced;
   const wrap = useRef<HTMLDivElement>(null);
   useOutsidePress(props.open, wrap, props.onClose);
@@ -141,12 +143,6 @@ function StatusPanel({ view, status }: { view: ViewKey; status: StatusDTO }) {
               {bg.paused > 0 ? ` · ${bg.paused} 项已暂停` : ""}
               {status.clarify.snoozed > 0 ? ` · ${status.clarify.snoozed} 张卡已推迟` : ""}
             </p>
-          </>
-        )}
-        {view === "engage" && (
-          <>
-            <p>{status.statusLine.engage}</p>
-            <p className="muted">只暂存面向你的非紧急外部通知；后台分身之间的汇报照常进行，不受影响。</p>
           </>
         )}
         {view === "radar" && (
@@ -262,7 +258,7 @@ function StatusPanel({ view, status }: { view: ViewKey; status: StatusDTO }) {
 
 // ==================== bottom bar ====================
 
-export function BottomBar({ view, inputRef, workspace }: { view: ViewKey; inputRef: RefObject<HTMLInputElement | null>; workspace: boolean }) {
+export function BottomBar({ view, inputRef }: { view: ViewKey; inputRef: RefObject<HTMLInputElement | null> }) {
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
   const id = useRef(clientId());
@@ -350,7 +346,7 @@ export function BottomBar({ view, inputRef, workspace }: { view: ViewKey; inputR
           <Kbd>1</Kbd>
           <Kbd>2</Kbd>
           <Kbd>3</Kbd>
-          <Kbd>4</Kbd> 切换视图
+          切换视图
         </span>
         <span>
           <Kbd>/</Kbd> {folded ? "发话" : "随手记"}
@@ -360,27 +356,9 @@ export function BottomBar({ view, inputRef, workspace }: { view: ViewKey; inputR
         </span>
         {view === "clarify" && (
           <>
-            <span>
-              <Kbd>Enter</Kbd> 确认
-            </span>
-            <span>
-              <Kbd>N</Kbd> 下一张
-            </span>
-            <span>
-              <Kbd>E</Kbd> 编辑
-            </span>
-            <span>
-              <Kbd>S</Kbd> 推迟
-            </span>
-            <span>
-              <Kbd>R</Kbd> 修改意见
-            </span>
+            <span><Kbd>N</Kbd> 下一张</span>
+            <span><Kbd>Ctrl/⌘ S</Kbd> 专注编辑时保存</span>
           </>
-        )}
-        {view === "engage" && workspace && (
-          <span>
-            <Kbd>Ctrl/⌘ S</Kbd> 保存
-          </span>
         )}
         {folded && (
           <>

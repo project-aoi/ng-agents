@@ -12,6 +12,7 @@ import {
   isInboxAddr,
   KERNEL_FROM,
   newId,
+  sha256Hex,
   PAYLOAD,
   type AuthorizeResult,
   type CardPrep,
@@ -89,9 +90,15 @@ async function decide(
   action: ProposedAction,
   artifactVersion: number | undefined,
   onAllow: (token: string) => Promise<ToolResult>,
+  sourceId?: string,
 ): Promise<ToolResult> {
-  const r: AuthorizeResult = await ctx.ports.authorize(action, artifactVersion !== undefined ? { artifactVersion } : undefined);
+  const r = action.type === "channel.send" && action.sideEffect === "external" && artifactVersion !== undefined && sourceId !== undefined
+    ? await ctx.ports.submitReply(action, artifactVersion, sourceId)
+    : await ctx.ports.authorize(action, artifactVersion !== undefined ? { artifactVersion } : undefined);
   switch (r.type) {
+    case "delivery":
+      return { output: `${r.receipt === "pending" || r.receipt === "cancelled" ? r.receipt : RECEIPT_TEXT[r.receipt]} Action ${r.actionId}.`,
+        isError:r.receipt === "unknown" || r.receipt === "failed", data:r };
     case "deny":
       return { output: `Not allowed: ${r.feedback}`, isError: true, data: { decision: "deny" } };
     case "defer":
@@ -145,12 +152,12 @@ const settlesItself = ({ spec }: { spec?: CellSpec }) => spec !== undefined && B
 const canReachChannels = (bounds: PolicyBounds) => bounds.canSendTo.some((a) => a.startsWith("channel:"));
 
 /** `inbox:<cellId>` → what to tell the model about a cell-to-cell delivery (docs/05 guard 1: a closed target is said out loud). */
-async function sendToInbox(ctx: ToolContext, to: `inbox:${string}`, args: { text?: string | undefined; summary: string }): Promise<ToolResult> {
+async function sendToInbox(ctx: ToolContext, to: `inbox:${string}`, args: { text?: string | undefined; refId?:string | undefined; summary: string }): Promise<ToolResult> {
   if (!args.text) return { output: "A message to another cell needs text.", isError: true };
   const send = ctx.ports.sendToCell;
   if (!send) return { output: "Cell-to-cell messages are not available in this environment.", isError: true };
   const target = to.slice("inbox:".length);
-  const r = await send.call(ctx.ports, to, { text: args.text, summary: args.summary, id: `${ctx.snapshot.runId}:${ctx.toolUseId}:msg` });
+  const r = await send.call(ctx.ports, to, { text: args.text, summary: args.summary, ...(args.refId ? {data:{refId:args.refId}} : {}), id: `${ctx.snapshot.runId}:${ctx.toolUseId}:msg` });
   switch (r.status) {
     case "delivered":
       return {
@@ -182,6 +189,20 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
   const ownerAddresses = opts.ownerAddresses ?? DEFAULT_OWNER_ADDRESSES;
   const deskCellId = opts.deskCellId ?? DESK_CELL_ID;
 
+  // A retry starts with the same triggering envelope. Distinct inline replies within that turn
+  // keep their own ordinal; repeating the same reply uses its original slot.
+  const inlineReplies = new WeakMap<RunPorts, Map<string, Map<string, number>>>();
+  function inlineDraftId(ports: RunPorts, scope: string, content: Deliverable): string {
+    const turn = inlineReplies.get(ports) ?? new Map<string, Map<string, number>>();
+    inlineReplies.set(ports, turn);
+    const slots = turn.get(scope) ?? new Map<string, number>();
+    turn.set(scope, slots);
+    const body = JSON.stringify(content);
+    const slot = slots.get(body) ?? slots.size;
+    slots.set(body, slot);
+    return "art_" + sha256Hex(JSON.stringify([scope, slot]));
+  }
+
   const sendMessage = defineTool({
     name: "send_message",
     kind: "kernel",
@@ -197,6 +218,7 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
       format: z.enum(["text", "markdown"]).optional(),
       title: z.string().optional(),
       summary: z.string().min(1).describe("one line saying what this message is, for the card and the audit log"),
+      refId:z.string().trim().min(1).optional().describe("inbox only: the reference of the individual wait this answers"),
       targetLabel: z.string().optional().describe('recipient as the owner would name it, e.g. "张三（飞书）"'),
       urgent: z.boolean().optional().describe("deliver even during the owner's focus time"),
       subjectKey: z.string().optional().describe("the item this belongs to (one pending card per item); defaults to the current item"),
@@ -223,7 +245,8 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
         return { output: `Not allowed: ${to} is outside your send permissions (${channels.join(", ") || "no channels"}).`, isError: true };
       }
       const toOwner = anyCovers(ownerAddresses, to);
-      const subjectKey = args.subjectKey ?? defaultSubjectKey(ctx);
+      const source = primaryEnvelope(ctx.snapshot);
+      const subjectKey = args.subjectKey ?? `reply:${to}:${source?.threads?.[0] ?? source?.id ?? args.artifactId ?? selfId(ctx)}`;
 
       let content: Deliverable;
       let draft: DraftRef | undefined;
@@ -236,10 +259,17 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
         content = { format: args.format ?? "text", body: args.text!, ...(args.title ? { title: args.title } : {}) };
         if (!toOwner) {
           // Outward messages always travel as a versioned draft: the human can edit it on the card and Gate binds the approval to that version.
-          const artifactId = newId("art", ctx.clock);
-          const r = await ctx.ports.context.commit(selfId(ctx), { artifact: { artifactId, content, updatedBy: "agent" } });
-          if (!r.ok) return { output: `Could not save the draft: artifact ${artifactId} already exists.`, isError: true };
-          draft = { artifactId, version: r.artifactVersion ?? 1 };
+          const scope = JSON.stringify([selfId(ctx), source?.id, subjectKey, to]);
+          const artifactId = inlineDraftId(ctx.ports, scope, content);
+          const existing = await ctx.ports.context.getArtifact(artifactId);
+          if (existing) {
+            content = existing.content;
+            draft = {artifactId, version:existing.version};
+          } else {
+            const saved = await ctx.ports.context.commit(selfId(ctx), {artifact:{artifactId, content, updatedBy:"agent", expectedVersion:0}});
+            if (!saved.ok) return {output:`Draft ${artifactId} changed; read its current version.`, isError:true};
+            draft = {artifactId, version:saved.artifactVersion ?? 1};
+          }
         }
       }
 
@@ -262,6 +292,7 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
         action.card = cardDeliverable(title, content.body, card);
       }
 
+      const sourceId = JSON.stringify([source?.id, subjectKey, draft?.artifactId]);
       const result = await decide(ctx, action, draft?.version, async (actionToken) => {
         const receipt = await ctx.ports.notifyChannel({
           target: to,
@@ -271,8 +302,11 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
           respectDnd: !args.urgent,
         });
         return { output: RECEIPT_TEXT[receipt], isError: receipt === "failed" || receipt === "unknown", data: { receipt } };
-      });
-      if (draft) result.data = { ...(result.data as object), artifactId: draft.artifactId, version: draft.version };
+      }, sourceId);
+      if (draft) {
+        result.output += ` Draft ${draft.artifactId} v${draft.version}.`;
+        result.data = { ...(result.data as object), artifactId: draft.artifactId, version: draft.version };
+      }
       return result;
     },
   });
@@ -287,6 +321,14 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
     ].join(" "),
     input: z.object({
       kind: z.enum(["project", "escalation", "action"]),
+      options: z.array(z.object({
+        id: z.string().min(1), label: z.string().min(1), effect: z.enum(["reply","revise","execute","defer","terminate","complete"]),
+        primary: z.boolean().optional(), group: z.enum(["main","more"]).optional(), hint: z.string().optional(),
+        input: z.object({ mode: z.enum(["none","optional","required"]), placeholder: z.string().optional() }).optional(),
+        payload: z.record(z.string(), z.unknown()).optional(), terminateMode: z.enum(["deny","cancel_task"]).optional(),
+        targetCellIds: z.array(z.string()).optional(), confirm: z.string().optional(),
+      })).optional(),
+      relatedProjectIds: z.array(z.string().min(1)).optional(),
       title: z.string().min(1),
       summary: z.string().min(1).describe("one line for the card and the audit log"),
       subjectKey: z.string().optional(),
@@ -316,6 +358,15 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
     }),
     async handler(args, ctx) {
       const subjectKey = args.subjectKey ?? defaultSubjectKey(ctx);
+      const protectedAction = args.kind === "project" || args.escalation?.reason === "budget_exhausted";
+      if (!protectedAction && args.kind !== "action" && (args.options || args.relatedProjectIds)) {
+        if (!ctx.ports.createHumanItem) return { output: "Custom cards are unavailable.", isError: true };
+        const item = ctx.ports.createHumanItem({
+          title: args.title, description: args.escalation?.explanation ?? args.summary, prep:prepOf(args.prep), source:itemSource(ctx.snapshot), rawInput:itemRawInput(ctx.snapshot), subjectKey: args.subjectKey ?? `arb:${primaryEnvelope(ctx.snapshot)?.id ?? ctx.snapshot.runId}`,
+          options: args.options ?? [{ id: "reply", label: "回复", effect: "reply" }], relatedProjectIds: args.relatedProjectIds ?? [],
+        });
+        return { output: `Card ${item.id} is waiting for a decision.`, data: item, endRun: "deferred_for_approval" };
+      }
       const base = { subjectKey, title: args.title, source: itemSource(ctx.snapshot), rawInput: itemRawInput(ctx.snapshot), prep: prepOf(args.prep) };
       let action: ProposedAction;
       let artifactVersion: number | undefined;
@@ -369,16 +420,19 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
           card: cardDeliverable(args.title, args.escalation.explanation, card),
         };
       } else {
-        if (!args.action) return { output: "kind action needs action.", isError: true };
+        if (!args.action && !args.options) return { output: "kind action needs action.", isError: true };
         action = {
           type: "custom",
-          name: args.action.name,
-          ...(args.action.args !== undefined ? { args: args.action.args } : {}),
+          name: args.action?.name ?? "request_approval",
+          card: cardDeliverable(args.title, args.summary, base),
+          ...(args.action?.args !== undefined ? { args: args.action.args } : {}),
           summary: args.summary,
           subjectKey,
           sideEffect: "external",
         };
       }
+      if (args.options) action.cardOptions = args.options;
+      if (args.relatedProjectIds) action.relatedProjectIds = args.relatedProjectIds;
       return decide(ctx, action, artifactVersion, async () => ({
         output: "Approved by a standing rule — go ahead.",
         data: { decision: "allow" },
@@ -524,23 +578,36 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
     ].join(" "),
     input: z.object({
       reason: z.string().min(1).describe("what you are waiting for, in one line"),
+      waitId: z.string().trim().min(1).optional(),
+      refId: z.string().trim().min(1).optional(),
       waitingFor: z.string().min(1).optional().describe('"inbox:<cellId>", "human", "external", or a channel address'),
       timeoutMinutes: z.number().positive().max(60 * 24 * 30).optional(),
     }),
     async handler(args, ctx) {
       if (args.waitingFor === undefined) {
-        if (args.timeoutMinutes !== undefined) return { output: "timeoutMinutes needs waitingFor (who are you waiting for?). For a plain reminder use the schedule tools.", isError: true };
+        if (args.timeoutMinutes !== undefined || args.waitId || args.refId) return { output: "timeoutMinutes needs waitingFor (who are you waiting for?). For a plain reminder use the schedule tools.", isError: true };
         return { output: "Waiting.", endRun: "yielded_waiting" };
       }
       const register = ctx.ports.registerWait;
       if (!register) return { output: "Waiting.", endRun: "yielded_waiting" };
       const timeoutAt = args.timeoutMinutes !== undefined ? ctx.clock.now() + Math.round(args.timeoutMinutes * 60_000) : undefined;
-      await register.call(ctx.ports, { waitingFor: args.waitingFor, reason: args.reason, ...(timeoutAt !== undefined ? { timeoutAt } : {}) });
+      await register.call(ctx.ports, { waitingFor: args.waitingFor, reason: args.reason, ...(args.waitId ? { waitId: args.waitId } : {}), ...(args.refId ? { refId: args.refId } : {}), ...(timeoutAt !== undefined ? { timeoutAt } : {}) });
       return {
         output: `Waiting for ${args.waitingFor}${timeoutAt !== undefined ? ` (you are woken at ${new Date(timeoutAt).toISOString()} if nothing came)` : ""}. This run ends now.`,
         endRun: "yielded_waiting",
         data: { waitingFor: args.waitingFor, ...(timeoutAt !== undefined ? { timeoutAt } : {}) },
       };
+    },
+  });
+  const clearWait = defineTool({
+    name: "clear_wait",
+    kind: "kernel",
+    description: "Remove one obsolete wait and its timeout. Supply its waitId, or the party for a legacy wait.",
+    input: z.object({ waitId: z.string().trim().min(1) }),
+    async handler({ waitId }, ctx) {
+      if (!ctx.ports.clearWait) return { output: "Cannot clear waits in this environment.", isError: true };
+      const removed = await ctx.ports.clearWait(waitId);
+      return { output: removed ? "Wait cleared." : "No such open wait.", data: { waitId, removed } };
     },
   });
   const completeSelf = defineTool({
@@ -590,6 +657,6 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
   return {
     name: COMMS_TOOLSET,
     description: "Messages to people (Gate-checked) and to other cells, approval requests, reports to the parent, handback, wait, complete_self / pause_self.",
-    tools: [sendMessage, requestApproval, reportToParent, handback, wait, completeSelf, pauseSelf],
+    tools: [sendMessage, requestApproval, reportToParent, handback, wait, clearWait, completeSelf, pauseSelf],
   };
 }

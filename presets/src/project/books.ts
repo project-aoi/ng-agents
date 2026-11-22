@@ -32,7 +32,7 @@ export async function readActions(ports: RunPorts): Promise<ActionRecord[]> {
   return (await ports.context.listState(ports.self.cellId, gtdKeys.actionPrefix)).map((e) => e.value as ActionRecord).filter((a) => a && typeof a === "object");
 }
 
-const WAITING_PRESETS = new Set(["watcher", "sensor"]);
+const WAITING_PRESETS = new Set(["checker", "reply_watcher", "watcher", "sensor"]);
 
 export function waitingFor(description: string, parties: WaitingSet["parties"] = [], extra: Partial<WaitingSet> = {}): WaitingSet {
   return { description, parties, join: "all", ...extra };
@@ -41,7 +41,7 @@ export function waitingFor(description: string, parties: WaitingSet["parties"] =
 function seedActions(self: string, planned: readonly PlannedAction[], clock: Clock): ActionRecord[] {
   const now = clock.now();
   return planned
-    .filter((p) => p && typeof p.title === "string" && p.title.trim())
+    .filter((p) => p && p.owner !== "human" && typeof p.title === "string" && p.title.trim())
     .map((p) =>
       newAction(
         {

@@ -1,5 +1,7 @@
+import type {CellSpec,ProcessorSpec} from "@ng/protocol";
+import {SENSOR_LLM_PROCESSOR} from "./processors";
 import { z } from "zod";
-import { scriptCommand } from "@ng/loop";
+import { scriptCommand } from "./script-command";
 import {
   defineTool,
   gtdKeys,
@@ -61,7 +63,7 @@ export async function recordCheck(ports: RunPorts, now: number, result: { hit: S
     next.lastHitAt = now;
     if (src.mode === "observe") {
       const line = `- ${new Date(now).toISOString()} ${hit.title ?? src.title}：${clip(hit.summary, 500)}${hit.uri ? ` (${hit.uri})` : ""}\n`;
-      await ports.context.upsertSkillOrNote(ports.self.cellId, { kind: "note", name: OBSERVATION_NOTE, description: `${src.title} 的观察记录（观察模式，不出卡）`, body: line, scope: "cell", mode: "append" });
+      await ports.context.upsertSkillOrNote(ports.self.cellId, { kind: "reference", name: OBSERVATION_NOTE, description: `${src.title} 的观察记录（观察模式，不出卡）`, body: line, scope: "cell", mode: "append" });
     } else {
       const payload: SourceHitPayload = {
         sourceCellId: ports.self.cellId,
@@ -178,4 +180,12 @@ export function sensorToolset(): Toolset {
       }),
     ],
   };
+}
+
+export function sensorProcessor(entry:string): Extract<ProcessorSpec,{kind:"code"}> {
+  return entry.startsWith("script:") ? {kind:"code",entry:PROCESSORS.sensorScript,args:{script:entry.slice(7)}} : {kind:"code",entry};
+}
+export function createSensorSpec(id:string,source:SourceInit,processor:ProcessorSpec = SENSOR_LLM_PROCESSOR,thread?:string): CellSpec {
+  return {id,preset:"sensor",title:source.title,processor,meta:{role:"sensor",gtd:{source}},
+    ...(source.schedule ? {schedules:[source.schedule]} : {}),...(thread ? {watches:[{threadOrFilter:{thread}}]} : {})};
 }

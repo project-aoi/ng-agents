@@ -1,19 +1,21 @@
 import type { PresetDef } from "@ng/protocol";
 import { ROLES } from "../shared/config";
-import { CHECKER_PROCESSOR } from "../shared/processors";
+import { CHECKER_PROCESSOR, WAIT_MATCH_PROCESSOR } from "../shared/processors";
 
-/**
- * The `watcher` preset's default is a light one-shot checker run by a fast model: it looks at one outside condition
- * (with `gh`/`glab`/`git ls-remote`/`test -d`, in the project's directory so its repository and remotes are at hand),
- * keeps looking via its own watches and reminders, and reports once when the condition holds — which closes it, and
- * its timers with it. A leaf: `maxDepth: 0`. The zero-token reply watcher (await_reply) is the same preset with an
- * explicit processor and lifetime "persistent" (replyWatcherSpec).
- */
-export function watcherPreset(): PresetDef {
+/** The historical watcher name remains readable on pre-migration databases. */
+export function watcherPreset(name: "watcher" | "checker" | "reply_watcher" = "checker"): PresetDef {
   return {
-    name: "watcher",
-    description: "Light one-shot checker of one outside condition (MR merged, CI green, a path exists, a reply arrived): looks at the current state first, reports when it holds.",
-    defaults: { processor: CHECKER_PROCESSOR, lifetime: "one_shot", meta: { role: ROLES.checker } },
+    name,
+    description:
+      name === "reply_watcher"
+        ? "Waits for an external reply and delivers it to the coordinator."
+        : "Light one-shot checker of one outside condition (MR merged, CI green, a path exists, a reply arrived): looks at the current state first, reports when it holds.",
+    defaults: {
+      ccParent: true,
+      processor: name === "reply_watcher" ? WAIT_MATCH_PROCESSOR : CHECKER_PROCESSOR,
+      lifetime: name === "reply_watcher" ? "persistent" : "one_shot",
+      meta: { role: name === "reply_watcher" ? ROLES.watcher : ROLES.checker },
+    },
     requestBounds: () => ({ maxDepth: 0 }),
   };
 }

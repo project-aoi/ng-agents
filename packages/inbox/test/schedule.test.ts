@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { cellsRepo, createBus, openDatabase, systemClock, type TimerFiredPayload } from "@ng/protocol";
 import { createInbox } from "../src";
 import { msg, setup, T0, timer } from "./helpers";
@@ -28,6 +28,36 @@ describe("deliverAt", () => {
 
     const batch = t.inbox.claimNextRunSync("desk", "k", "serial_coalesce")!;
     expect(batch.envelopes.map((e) => e.id)).toEqual(["remind-dentist"]);
+  });
+
+  it("announces a timer created after a wall-clock rollback once", () => {
+    let wall = T0;
+    const t = setup();
+    t.clock.now=()=>wall;
+    t.inbox.tickSync();
+    wall-=60_000;
+    t.inbox.enqueueSync("desk",timer("rolled","wake"),{deliverAt:wall+5000});
+    expect(t.inbox.nextWakeAtSync()).toBe(wall+5000);
+    wall+=5000;
+    expect(t.inbox.tickSync().dueCellIds).toEqual(["desk"]);
+    expect(t.inbox.tickSync().dueCellIds).toEqual([]);
+  });
+
+  it.each(["immediate", "retried"])("announces an %s envelope after the clock catches up to its creation time", (mode) => {
+    const t = setup();
+    let wall = T0;
+    t.clock.now = () => wall;
+    t.inbox.tickSync();
+    t.inbox.enqueueSync("desk", msg({ id: mode }));
+    const claim = mode === "retried" && t.inbox.claimNextRunSync("desk", "k", "serial_coalesce");
+    wall -= MIN;
+    if (claim) t.inbox.releaseSync(claim.claimId, "retry", { retryAt: wall + 1000 });
+    expect(t.inbox.dueCellIdsSync()).toEqual([]);
+    expect(t.inbox.nextWakeAtSync()).toBe(T0);
+    wall = T0;
+    expect(t.inbox.tickSync().dueCellIds).toEqual(["desk"]);
+    expect(t.inbox.tickSync().dueCellIds).toEqual([]);
+    expect(t.inbox.claimNextRunSync("desk", "k", "serial_coalesce")?.envelopes[0]?.id).toBe(mode);
   });
 
   it("is cheap and quiet when nothing is due", () => {
@@ -209,6 +239,30 @@ describe("idleSec", () => {
 });
 
 describe("start()/stop() with the system clock", () => {
+  it("re-arms an immediate row when the wall clock rolls back between its announcement and its claim", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    const db = openDatabase(":memory:");
+    const bus = createBus();
+    cellsRepo(db, systemClock).insert({id:"desk"});
+    const inbox = createInbox({db,bus,clock:systemClock});
+    const reasons: string[] = [];
+    bus.on("inbox.enqueued", event => reasons.push(event.reason));
+    try {
+      inbox.start();
+      inbox.enqueueSync("desk", msg({id:"immediate"}));
+      vi.setSystemTime(T0 - MIN);
+      expect(inbox.claimNextRunSync("desk","k","serial_coalesce")).toBeNull();
+      vi.advanceTimersByTime(MIN);
+      expect(reasons.at(-1)).toBe("due");
+      expect(inbox.claimNextRunSync("desk","k","serial_coalesce")?.envelopes[0]?.id).toBe("immediate");
+    } finally {
+      inbox.stop();
+      db.close();
+      vi.useRealTimers();
+    }
+  });
+
   it("sleeps until the next wake-up with one timer and announces the delayed message", async () => {
     const db = openDatabase(":memory:");
     const bus = createBus();

@@ -18,10 +18,6 @@ import {
 
 export const ACTION_TYPES = [
   "channel.send",
-  "workspace.exec",
-  "job.start",
-  "cell.spawn",
-  "cell.control",
   "secret.use",
   "project.start",
   "custom",
@@ -63,17 +59,9 @@ export function derivedSideEffect(action: ProposedAction, _bounds: PolicyBounds,
   switch (action.type) {
     case "channel.send":
       return anyCovers(ownerAddresses, action.target) ? "notify_owner" : "external";
-    case "workspace.exec":
-      // docs/05: host work in the owner's real directories (isolation "none", the default) is guarded by the prompts'
-      // red lines and their look-before-you-change rule, not by a card per command.
-      return MUTATING_TOOLS.has(action.tool) ? "internal" : "none";
-    case "job.start":
-      return "internal";
     case "project.start":
       // docs/04 card B: a project only starts after the human confirms the proposal.
       return "external";
-    case "cell.spawn":
-    case "cell.control":
     case "secret.use":
       return "internal";
     case "custom":
@@ -91,7 +79,7 @@ const BUDGET_EXHAUSTED = "budget_exhausted";
 const LOOP_BUDGET_ESCALATION = `escalation.${BUDGET_EXHAUSTED}`;
 const KERNEL_ESCALATION = "kernel.escalation";
 
-function isBudgetEscalation(action: ProposedAction): boolean {
+export function isBudgetEscalation(action: ProposedAction): boolean {
   // Same precedence as the kernel's escalation handling: the card's own escalation reason first, then the action.
   const data = isObject(action.card) ? action.card["data"] : undefined;
   if (isObject(data) && data["cardType"] === "escalation" && isObject(data["escalation"]) && data["escalation"]["reason"] === BUDGET_EXHAUSTED) {
@@ -104,9 +92,10 @@ function isBudgetEscalation(action: ProposedAction): boolean {
 
 /**
  * Why approving `action` is the owner's decision alone, or null when an external main agent (`agent:*`) may approve it
- * too (docs/05 guard 3): a send that leaves the owner's own channels, and continuing past an exhausted budget.
- * Everything else (project proposals, custom actions, blocked / retry_limit / waiting_timeout escalations) an agent may
- * approve; denying or snoozing is never owner-only. Pass the card too (`{ ...record.action, card: record.card }`):
+ * too (docs/05 guard 3 + BUG-020): a send that leaves the owner's own channels, starting a proposed project from a
+ * confirmation card (`project.start`), and continuing past an exhausted budget.
+ * Everything else (ordinary custom actions, blocked / retry_limit / waiting_timeout escalations) an agent may
+ * approve. Pass the card too (`{ ...record.action, card: record.card }`):
  * a budget escalation may be recognisable only by its card.
  */
 export function ownerOnlyApproval(action: ProposedAction, ownerAddresses: readonly string[]): string | null {
@@ -116,6 +105,7 @@ export function ownerOnlyApproval(action: ProposedAction, ownerAddresses: readon
       return `it sends to ${String(target)}, outside the owner's own channels`;
     }
   }
+  if (action.type === "project.start") return "it starts a new project";
   if (isBudgetEscalation(action)) return "it continues past an exhausted budget";
   return null;
 }
@@ -123,8 +113,7 @@ export function ownerOnlyApproval(action: ProposedAction, ownerAddresses: readon
 export interface BoundsContext {
   cellId: string;
   bounds: PolicyBounds;
-  /** Direct children that are not closed (spawn concurrency). */
-  openChildren: number;
+  /** Direct children currently occupying a concurrency slot. */
   isStrictDescendant(cellId: string): boolean;
   secretConfigured(ref: string): boolean;
 }
@@ -145,37 +134,6 @@ export function boundsFeedback(action: ProposedAction, ctx: BoundsContext): stri
       if (action.content !== undefined && !deliverableSchema.safeParse(action.content).success) {
         return "channel.send content must be a Deliverable {format, body, ...}";
       }
-      return null;
-    }
-    case "workspace.exec": {
-      if (!(TOOL_KINDS as readonly unknown[]).includes(action.tool)) return `unknown tool ${JSON.stringify(action.tool)}`;
-      if (!b.tools.has(action.tool)) return `tool "${action.tool}" is outside this cell's bounds (allowed: ${tools})`;
-      if (b.isolation === "shared_ro" && SHARED_RO_REJECTS.has(action.tool)) {
-        return `tool "${action.tool}" is not available in a read-only workspace`;
-      }
-      return null;
-    }
-    case "job.start": {
-      if (!isNonEmptyString(action.command)) return "job.start command must be a non-empty string";
-      if (!b.tools.has("bash")) return `starting jobs needs the "bash" tool, which is outside this cell's bounds (allowed: ${tools})`;
-      if (b.isolation === "shared_ro") return "jobs cannot run in a read-only workspace";
-      return null;
-    }
-    case "cell.spawn": {
-      if (!isObject(action.spec)) return "cell.spawn spec must be an object";
-      if (action.spec.parentId !== undefined && action.spec.parentId !== ctx.cellId) {
-        return "cell.spawn may only create children of the requesting cell";
-      }
-      if (b.maxDepth < 1) return "this cell may not spawn children (maxDepth 0); do the work yourself or report to your parent";
-      if (ctx.openChildren >= b.maxConcurrentChildren) {
-        return `this cell already has ${ctx.openChildren} open children (max ${b.maxConcurrentChildren}); wait for one to finish or close one`;
-      }
-      return null;
-    }
-    case "cell.control": {
-      if (!isNonEmptyString(action.targetCellId)) return "cell.control targetCellId must be a non-empty string";
-      if (!(CONTROL_ACTIONS as readonly unknown[]).includes(action.action)) return `unknown control action ${JSON.stringify(action.action)}`;
-      if (!ctx.isStrictDescendant(action.targetCellId)) return `cell "${action.targetCellId}" is not a descendant of this cell`;
       return null;
     }
     case "secret.use": {
@@ -248,7 +206,7 @@ export function ruleInputForClass(
   opts: { createdBy: string; maxUses?: number | null; note?: string },
 ): PolicyRuleInput | null {
   const { type, target } = parseActionClass(actionClass);
-  if (!(ACTION_TYPES as readonly string[]).includes(type) || type === "cell.control") return null;
+  if (!(ACTION_TYPES as readonly string[]).includes(type)) return null;
   const match: PolicyRuleInput["match"] = { type: type as ProposedActionType };
   if (target !== null) match.target = target;
   return { match, effect: "allow", createdBy: opts.createdBy, maxUses: opts.maxUses === undefined ? 20 : opts.maxUses, note: opts.note ?? null };

@@ -132,7 +132,7 @@ describe("context schema migrations", () => {
     old.close();
 
     const db = openDatabase(path);
-    expect(schemaVersions(db)["@ng/context"]).toBe(4);
+    expect(schemaVersions(db)["@ng/context"]).toBe(5);
     expect(columns(db, "knowledge")).toContain("applies");
     const store = storeOn(db);
     const tone = store.getKnowledgeSync({ kind: "preference", scope: "global", name: "tone" });

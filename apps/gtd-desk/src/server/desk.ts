@@ -1,20 +1,26 @@
-import type { Kernel, ResolveApprovalResult } from "@ng/cell";
+import { ownerOnlyApproval } from "@ng/gate";
+import type { HumanDecision } from "@ng/protocol";
+import type { ApprovalDecision, Kernel, ResolveApprovalResult } from "@ng/cell";
 import type { UiChannel } from "@ng/channel";
 import { ruleInputForClass } from "@ng/gate";
-import { SCRIPT_PREFIX } from "@ng/loop";
+import {PROCESSORS,createSensorSpec,sensorProcessor} from "@ng/presets";
+const SCRIPT_PREFIX="script:";
 import {
   KEYS,
   LEGACY,
   notifyProjectOfOwnerChangeSync,
   projectIdForApproval,
   setProjectLifecycleSync,
-  startApprovedProjectSync,
+  humanActionDomain,
   startProjectSync,
   type ProjectInit,
   type ProposalItem,
 } from "@ng/presets";
 import {
+  all,
   asClarifyCard,
+  isProjectProposal,
+  get,
   cellPrincipal,
   createEnvelope,
   gtdKeys,
@@ -24,6 +30,7 @@ import {
   newId,
   NgError,
   PAYLOAD,
+  projectCellIdOf,
   subjectKeys,
   withTx,
   type ActionRecord,
@@ -77,7 +84,6 @@ import type {
   SourcesDTO,
   SourcesMutationResponse,
   StatusDTO,
-  ToHumanRequest,
   VerifyRequest,
   WeeklyReviewDTO,
   ActivityListDTO,
@@ -86,7 +92,7 @@ import type {
 import {
   approvalProjectId,
   inputOf,
-  linkedApprovalId,
+  humanItemForAction, linkedApprovalId,
   projectOfAction,
   readActions,
   readActivities,
@@ -138,12 +144,12 @@ export interface DeskDeps {
 }
 
 /**
- * Who presses the button. The web client is the owner (the default); the external main agent's control plane passes
- * its own `agent:<id>` principal, and every kernel call of the operation is made as that principal — the kernel and
- * the Gate decide what it may do, never a fallback to the owner.
+ * Who presses the button. Every mutating desk call requires an explicit `principalId` (the web client passes the
+ * owner principal; the external main agent's control plane passes its own `agent:<id>` principal). Never fall back
+ * silently to the owner when a caller omits identity.
  */
 export interface DeskActor {
-  principalId?: string;
+  principalId: string;
   /** The owner's words that go with the operation (passed on to the project, e.g. on "activate"). */
   note?: string;
 }
@@ -161,6 +167,7 @@ export type Desk = ReturnType<typeof createDesk>;
  * DeskActor: the external main agent's control plane calls them as `agent:<id>`.
  */
 export function createDesk({ kernel, ui, settings, onError = (err, where) => console.error(`[desk] ${where}:`, err) }: DeskDeps) {
+  kernel.context.installStateDomain(humanActionDomain(kernel.db, kernel.clock));
   const { context, gate, clock } = kernel;
   const owner = kernel.ownerPrincipal;
   const desk = kernel.deskCellId;
@@ -210,6 +217,24 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     return full;
   }
 
+  // Older versions recorded a failed send's abandonment only in the activity drawer.
+  // A double-click could create two snapshots. Restore only the latest decision for each explicit action id.
+  const abandonDetail = "发送失败后你选择了不再发送";
+  withTx(kernel.db, () => {
+    const latest = new Map<string, ActivityRecord>();
+    for (const { record } of readActivities(kernel)) {
+      if (record.kind !== "card_withdrawn" || record.detail !== abandonDetail || !record.actionId) continue;
+      const previous = latest.get(record.actionId);
+      if (!previous || record.at >= previous.at) latest.set(record.actionId, record);
+    }
+    for (const [actionId, record] of latest) {
+      const rec = gate.getApprovalSync(actionId);
+      if (!record.restoredAt && rec?.status === "failed" && rec.updatedAt <= record.at) {
+        gate.setSendAbandonedSync(actionId, record.id, true, rec.itemRevision);
+      }
+    }
+  });
+
   function findAction(cellId: string, actionId: string): Located<ActionRecord> {
     const value = context.readStateSync(cellId, gtdKeys.action(actionId));
     const found = readActions(kernel).find((a) => a.cellId === cellId && a.record.id === actionId);
@@ -235,9 +260,19 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     return n;
   }
 
-  const actorOf = (as: DeskActor) => (as.principalId ? { principalId: as.principalId } : {});
-  const principalOf = (as: DeskActor) => as.principalId ?? owner;
-  const byAgent = (as: DeskActor) => as.principalId !== undefined && as.principalId !== owner;
+  function principalOf(as: DeskActor): string {
+    if (!as || typeof as.principalId !== "string" || !as.principalId.trim()) {
+      throw bad("缺少操作者身份（principalId）");
+    }
+    return as.principalId.trim();
+  }
+  const actorOf = (as: DeskActor) => ({ principalId: principalOf(as) });
+  const byAgent = (as: DeskActor) => principalOf(as) !== owner;
+  function seenRevisionOf(v: number | null | undefined): number {
+    if (v == null) throw bad("请提供页面上看到的 seenItemRevision");
+    if (!Number.isInteger(v) || v < 1) throw bad("seenItemRevision 必须是正整数");
+    return v;
+  }
 
   /** The live project an action belongs to (a cell holding `gtd:project` that is not closed), if any. */
   function liveProjectOf(a: Located<ActionRecord>): string | null {
@@ -279,19 +314,20 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
 
   // ==================== top bar ====================
 
-  async function capture(req: CaptureRequest): Promise<CaptureResponse> {
+  async function ingest(req: CaptureRequest, as:DeskActor): Promise<CaptureResponse> {
     const text = typeof req?.text === "string" ? req.text : "";
     const attachments = Array.isArray(req?.attachments)
       ? req.attachments.filter((a) => a && typeof a.label === "string" && typeof a.uri === "string").map((a) => ({ label: a.label, uri: a.uri }))
       : undefined;
     if (!text.trim() && !attachments?.length) throw bad("随手记不能为空");
     if (req.clientId !== undefined && (typeof req.clientId !== "string" || !/^[\w.:-]{1,80}$/.test(req.clientId))) throw bad("clientId 格式不对");
-    const env = await ui.capture({
+    const env = ui.captureEnvelope({
       text,
       ...(attachments?.length ? { attachments } : {}),
       ...(req.voice ? { voice: true } : {}),
       ...(req.clientId ? { clientId: req.clientId } : {}),
-    });
+    },principalOf(as));
+    await kernel.ingest(env,ui.id);
     return { ok: true, id: env.id, acceptedAt: env.createdAt, message: "已收进信箱", status: status() };
   }
 
@@ -300,9 +336,9 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
    * anyone else, and no control-plane tool reaches it. Off: nothing is stopped for its budget — the cells held at their
    * stop go on and the budget cards waiting for the owner are answered.
    */
-  function setBudgetLimits(req: SetBudgetLimitsRequest): SetBudgetLimitsResponse {
+  function setBudgetLimits(req: SetBudgetLimitsRequest, as: DeskActor): SetBudgetLimitsResponse {
     if (typeof req?.enforced !== "boolean") throw bad("enforced 必须是 true 或 false");
-    const r = kernel.setBudgetLimits(req.enforced, { principalId: owner });
+    const r = kernel.setBudgetLimits(req.enforced, actorOf(as));
     let message: string;
     if (!r.changed) message = r.enforced ? "额度限制本来就是开着的" : "额度限制本来就是关着的";
     else if (r.enforced) message = "已开启额度限制";
@@ -314,7 +350,8 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     return { ok: true, enforced: r.enforced, message, status: status() };
   }
 
-  async function focus(req: FocusRequest): Promise<FocusResponse> {
+  async function focus(req: FocusRequest, as: DeskActor): Promise<FocusResponse> {
+    principalOf(as);
     if (typeof req?.on !== "boolean") throw bad("on 必须是 true 或 false");
     const flushed = await kernel.setFocus(req.on);
     const f = { on: kernel.hub.isFocusSync(), buffered: kernel.hub.bufferedCountSync() };
@@ -348,6 +385,9 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
 
   function kernelRefusal(r: ResolveApprovalResult, cardId: string): ClarifyMutationResponse {
     if (r.status === "not_found") return clarifyResult("not_found", false, "找不到这张卡", cardId);
+    if (r.status === "revision_mismatch") {
+      return clarifyResult("revision_mismatch", false, "这张卡刚刚变动过，请刷新后再确认", cardId, { currentRevision: r.currentRevision });
+    }
     return clarifyResult("not_pending", false, "这张卡已经处理过了", cardId);
   }
 
@@ -357,17 +397,26 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     failed: "发送失败，对方没有收到。可以重新发送",
     unknown: "发送结果未知，请核实",
     version_mismatch: "草稿已更新，请重看",
+    revision_mismatch: "这张卡刚刚变动过，请刷新后再确认",
     already_cancelled: "这件事已经取消或撤回了",
     not_found: "找不到这张卡",
   };
 
-  async function runApprove(cardId: string, seenVersion: number | null | undefined, as: DeskActor = {}) {
+  async function runApprove(
+    cardId: string,
+    seenVersion: number | null | undefined,
+    seenItemRevision: number | null | undefined,
+    as: DeskActor,
+  ) {
+    const approverId = principalOf(as);
     if (seenVersion !== undefined && seenVersion !== null && (!Number.isInteger(seenVersion) || seenVersion < 1)) throw bad("seenVersion 必须是正整数");
+    const seenRev = seenRevisionOf(seenItemRevision);
     const before = gate.getApprovalSync(cardId);
     const r = await kernel.resolveApproval(cardId, {
       decision: "approve",
-      ...(as.principalId ? { approverId: as.principalId } : {}),
+      approverId,
       ...(seenVersion != null ? { seenArtifactVersion: seenVersion } : {}),
+      seenItemRevision: seenRev,
     });
     let outcome: ApproveOutcome;
     switch (r.status) {
@@ -376,6 +425,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
       case "unknown":
       case "approved":
       case "version_mismatch":
+      case "revision_mismatch":
       case "already_cancelled":
       case "not_found":
         outcome = r.status;
@@ -393,51 +443,50 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
       outcome,
       message,
       ...(r.status === "version_mismatch" ? { currentVersion: r.currentVersion } : {}),
+      ...(r.status === "revision_mismatch" ? { currentRevision: r.currentRevision } : {}),
       ...("error" in r && r.error ? { error: r.error } : {}),
     };
   }
 
-  async function approve(cardId: string, req: ApproveRequest, as: DeskActor = {}) {
-    const r = await runApprove(cardId, req?.seenVersion, as);
-    // "✓ 确认立项并让 Agent 开工" creates the project cell right here (docs/04 §2.2 B); the desk's own wake-up on the
-    // approval finds it started (same id) and only keeps the books.
-    if (r.outcome === "approved") {
-      try {
-        startApprovedProjectSync(kernel, cardId);
-      } catch (err) {
-        // The approval stands; the desk's own wake-up on it retries the start.
-        onError(err, `start the project of ${cardId}`);
-      }
-    }
+  async function approve(cardId: string, req: ApproveRequest, as: DeskActor) {
+    const r = await runApprove(cardId, req?.seenVersion, req?.seenItemRevision, as);
     const view = clarify();
     const ok = r.outcome === "sent" || r.outcome === "approved";
     return { ok, ...r, view, status: status(), card: view.cards.find((c) => c.id === cardId) ?? null };
   }
 
-  async function revise(cardId: string, req: ReviseRequest): Promise<ClarifyMutationResponse> {
-    const instruction = typeof req?.instruction === "string" ? req.instruction.trim() : "";
-    if (!instruction) throw bad("说说要怎么改");
-    approval(cardId);
-    const r = await kernel.resolveApproval(cardId, { decision: "revise", instruction, ...(req.voice ? { voice: true } : {}) });
-    if (r.status !== "revising") return kernelRefusal(r, cardId);
-    return clarifyResult("revising", true, "收到，正在按你的意见重拟", cardId);
+  type LegacyCommand<T = ApprovalDecision> = T extends ApprovalDecision ? Omit<T,"approverId"|"seenItemRevision"> : never;
+  async function applyCardCommand(id:string, revision:number | undefined, actor:DeskActor, command:LegacyCommand,
+    expected:ClarifyOutcome, message:string):Promise<ClarifyMutationResponse> {
+    const approverId = principalOf(actor);
+    const seenItemRevision = seenRevisionOf(revision);
+    approval(id);
+    const result = await kernel.resolveApproval(id,{
+      ...command, approverId, seenItemRevision
+    });
+    return result.status === expected ? clarifyResult(expected,true,message,id) : kernelRefusal(result,id);
   }
 
-  async function snooze(cardId: string, req: SnoozeRequest, as: DeskActor = {}): Promise<ClarifyMutationResponse> {
+  function revise(cardId: string, req: ReviseRequest, as: DeskActor) {
+    const instruction = typeof req?.instruction === "string" ? req.instruction.trim() : "";
+    if (!instruction) throw bad("说说要怎么改");
+    return applyCardCommand(cardId,req.seenItemRevision,as,{decision:"revise",instruction,...(req.voice ? {voice:true} : {})},
+      "revising","收到，正在按你的意见重拟");
+  }
+
+  function snooze(cardId: string, req: SnoozeRequest, as: DeskActor) {
     const t = now();
     const until = req?.until ?? afternoonSlot(t, settings.snoozeAfternoonHour);
     if (!Number.isFinite(until) || until <= t) throw bad("推迟时间必须在将来");
-    approval(cardId);
-    const r = await kernel.resolveApproval(cardId, { decision: "snooze", until, ...(as.principalId ? { approverId: as.principalId } : {}) });
-    if (r.status !== "snoozed") return kernelRefusal(r, cardId);
-    return clarifyResult("snoozed", true, `已推迟到 ${whenText(until, t)}，到点回到待确认`, cardId);
+    return applyCardCommand(cardId,req?.seenItemRevision,as,{decision:"snooze",until},"snoozed",`已推迟到 ${whenText(until,t)}，到点回到待确认`,);
   }
 
   function proposalOf(rec: ApprovalRecord, card: ClarifyCard | null): ProjectProposal {
     if (card?.cardType !== "project_proposal") throw wrongState("这不是立项卡");
     const draftId = rec.artifactId ?? card.draft?.artifactId;
-    const data = draftId ? (context.getArtifactSync(draftId)?.content.data as Partial<ProjectProposal> | undefined) : undefined;
-    return data && typeof data.outcome === "string" && Array.isArray(data.actions) ? ({ ...card.proposal, ...data } as ProjectProposal) : card.proposal;
+    const proposal = draftId ? context.getArtifactSync(draftId)?.content.data : card.proposal;
+    if (!isProjectProposal(proposal)) throw wrongState("立项方案的内容不完整，请修改后再确认");
+    return proposal;
   }
 
   /**
@@ -446,17 +495,19 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
    * first task stays queued and is its brief when the owner activates it. Its record says someday and keeps the plan.
    * Nothing is closed, nothing runs, and activating it later is the normal "activate".
    */
-  async function someday(cardId: string, _req: NoteRequest, as: DeskActor = {}): Promise<ClarifyMutationResponse> {
+  async function someday(cardId: string, req: NoteRequest, as: DeskActor): Promise<ClarifyMutationResponse> {
+    const approverId = principalOf(as);
+    const seenRev = seenRevisionOf(req?.seenItemRevision);
     const { rec, card } = pendingCard(cardId);
     const proposal = proposalOf(rec, card);
     const draftId = rec.artifactId ?? (card?.cardType === "project_proposal" ? card.draft?.artifactId : undefined);
-    const remembered = draftId ? context.readStateSync<ProposalItem>(rec.cellId, KEYS.proposal(draftId)) : null;
-    const r = await kernel.resolveApproval(cardId, { decision: "dismiss", reason: "someday", ...(as.principalId ? { approverId: as.principalId } : {}) });
-    if (r.status !== "dismissed") return kernelRefusal(r, cardId);
+    if (approverId !== owner) throw wrongState("只有主人可以确认立项");
+    if (draftId && context.getArtifactSync(draftId)?.version !== req.seenVersion) throw wrongState("方案已变动，请重新查看");
     const holder = kernel.getCell(rec.cellId);
-    const parentId = holder && holder.status !== "closed" ? holder.id : desk;
+    const parent = holder && holder.status !== "closed" ? holder : kernel.getCell(desk)!;
+    const parentId = parent.id;
     const t = now();
-    const source = remembered?.source ?? card?.source ?? { label: "以后再说", at: t };
+    const source = card?.source ?? { label: "以后再说", at: t };
     const init: ProjectInit = {
       id: projectIdForApproval(cardId),
       title: proposal.title,
@@ -464,28 +515,34 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
       brief: parkedBrief(proposal),
       proposal,
       source,
-      ...(remembered?.rawInput.text ? { rawInput: remembered.rawInput.text } : card?.rawInput.text ? { rawInput: card.rawInput.text } : {}),
-      ...(remembered?.cwd ? { cwd: remembered.cwd } : {}),
-      ...(remembered?.repos?.length ? { repos: remembered.repos } : {}),
-      ...(remembered?.phases?.length ? { phases: remembered.phases } : {}),
+      ...(card?.rawInput.text ? { rawInput: card.rawInput.text } : {}),
+      ...(proposal.cwd ? { cwd: proposal.cwd! } : {}),
+      ...(proposal.repos ? { repos: proposal.repos! } : {}),
+      ...(proposal.phases ? { phases: proposal.phases! } : {}),
     };
     const record: ProjectRecord = {
       title: proposal.title,
       outcome: proposal.outcome,
       lifecycle: "someday",
       source,
-      ...(remembered?.cwd ? { cwd: remembered.cwd } : {}),
+      ...(proposal.cwd ? { cwd: proposal.cwd! } : {}),
       summary: "主人把这个方案放进了以后再说，还没有开始推进",
       proposal,
       createdAt: t,
       updatedAt: t,
     };
     const projectId = withTx(kernel.db, () => {
+      if (gate.withdrawSync(cardId, "someday", {seenItemRevision:seenRev}) !== "cancelled") throw wrongState("立项卡已变动");
       const started = startProjectSync(kernel, init, { parentId, ...actorOf(as) });
-      const paused = kernel.control(started.projectId, { action: "pause" }, actorOf(as));
+      const paused = kernel.control(started.projectId, { action: "pause",pauseReason:"parked" }, actorOf(as));
       if (!paused.applied) throw new Error(`could not park the new project: ${paused.reason ?? "pause refused"}`);
       // The project's books seed its record on its first run only when there is none: this one is kept as it is.
       commitState(started.projectId, { [gtdKeys.project]: record });
+      const receipt = createEnvelope({id:`${cardId}:parked:${seenRev}`,from:KERNEL_FROM.approval,principalId:approverId,
+        kind:"result",type:PAYLOAD.approvalResolved,delivery:"wakeup",expectedEpoch:parent.epoch,
+        payload:{actionId:cardId,status:"cancelled",decision:"someday",action:rec.action,approverId,projectId:started.projectId}},kernel.clock);
+      kernel.inbox.enqueueSync(parentId,receipt);
+      if (!kernel.inbox.listMessagesSync({cellId:parentId,envelopeId:receipt.id,status:["pending"]}).length) throw wrongState("立项结果无法送达");
       return started.projectId;
     });
     return clarifyResult("someday", true, `「${proposal.title}」已放进以后再说`, cardId, { projectId });
@@ -503,7 +560,8 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
       .join("\n\n");
   }
 
-  async function savePlan(cardId: string, req: PlanSaveRequest): Promise<ClarifyMutationResponse> {
+  async function savePlan(cardId: string, req: PlanSaveRequest, as: DeskActor): Promise<ClarifyMutationResponse> {
+    principalOf(as);
     const { rec, card } = pendingCard(cardId);
     if (card?.cardType !== "project_proposal") throw wrongState("这不是立项卡");
     const draftId = rec.artifactId ?? card.draft?.artifactId;
@@ -539,94 +597,37 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     return clarifyResult("saved", true, `已保存方案 v${r.artifactVersion}`, cardId);
   }
 
-  async function extend(cardId: string, req: ExtendRequest, as: DeskActor = {}): Promise<ClarifyMutationResponse> {
+  async function extend(cardId: string, req: ExtendRequest, as: DeskActor): Promise<ClarifyMutationResponse> {
     const { rec, card } = pendingCard(cardId);
     if (card?.cardType !== "escalation" && rec.action.type !== "custom") throw wrongState("只有受阻 / 超时的卡可以“继续”");
-    const t = now();
     const reason = card?.cardType === "escalation" ? card.escalation.reason : null;
-    const note = typeof req?.note === "string" ? req.note : undefined;
-    let message: string;
-    let r: ResolveApprovalResult;
+    const command = {decision:"continue" as const, ...(req.note ? {note:req.note} : {})};
     if (reason === "waiting_timeout") {
-      const until = req?.until ?? t + DAY;
+      const t = now(), until = req.until ?? t + DAY;
       if (!Number.isFinite(until) || until <= t) throw bad("等待时间必须在将来");
-      r = await kernel.resolveApproval(cardId, { decision: "continue", until, ...(note ? { note } : {}), ...(as.principalId ? { approverId: as.principalId } : {}) });
-      message = `好的，再等到 ${whenText(until, t)}`;
-    } else {
-      const raise = req?.raise;
-      if (raise !== undefined && (typeof raise !== "object" || [raise.tokens, raise.cents].some((v) => v !== undefined && (!Number.isFinite(v) || v < 0)))) {
-        throw bad("raise 需要非负的 tokens / cents");
-      }
-      r = await kernel.resolveApproval(cardId, { decision: "continue", ...(raise ? { raise } : {}), ...(note ? { note } : {}), ...(as.principalId ? { approverId: as.principalId } : {}) });
-      message = reason === "budget_exhausted" ? "已追加额度，继续推进" : reason === "retry_limit" ? "已重新开始处理" : "好的，继续推进";
+      return applyCardCommand(cardId,req.seenItemRevision,as,{...command,until},"continued",`好的，再等到 ${whenText(until,t)}`);
     }
-    if (r.status !== "continued") return kernelRefusal(r, cardId);
-    return clarifyResult("continued", true, message, cardId);
+    const raise = req.raise;
+    if (raise !== undefined && (typeof raise !== "object" || raise === null || [raise.tokens,raise.cents].some(v=>v!==undefined && (!Number.isFinite(v)||v<0))))
+      throw bad("raise 需要非负的 tokens / cents");
+    const message = reason === "budget_exhausted" ? "已追加额度，继续推进" : reason === "retry_limit" ? "已重新开始处理" : "好的，继续推进";
+    return applyCardCommand(cardId,req.seenItemRevision,as,{...command,...(raise ? {raise} : {})},"continued",message);
   }
 
-  async function resolveOffline(cardId: string, req: NoteRequest): Promise<ClarifyMutationResponse> {
-    approval(cardId);
-    const r = await kernel.resolveApproval(cardId, { decision: "resolve_offline", ...(req?.note ? { note: req.note } : {}) });
-    // The kernel settles the records of the cells it closed (their open actions are done).
-    if (r.status !== "resolved_offline") return kernelRefusal(r, cardId);
-    const n = r.closedCellIds.length;
-    return clarifyResult("resolved_offline", true, n > 0 ? `已完结，并结束了 ${n} 项相关后台任务` : "已完结", cardId);
+  function resolveOffline(cardId:string,req:NoteRequest,as:DeskActor) {
+    return applyCardCommand(cardId,req?.seenItemRevision,as,{decision:"resolve_offline",...(req?.note ? {note:req.note} : {})},"resolved_offline","已完结");
   }
 
-  async function toHuman(cardId: string, req: ToHumanRequest, as: DeskActor = {}): Promise<ClarifyMutationResponse> {
+  async function dismiss(cardId: string, req: NoteRequest, as: DeskActor): Promise<ClarifyMutationResponse> {
+    const approverId = principalOf(as);
+    const seenRev = seenRevisionOf(req?.seenItemRevision);
     const { rec, card } = pendingCard(cardId);
-    if (req?.effort !== undefined && !isEffort(req.effort)) throw bad(`未知的精力标签 ${String(req.effort)}`);
-    const t = now();
-    const title = card?.title ?? rec.card.title ?? rec.action.summary;
-    const projectCellId = approvalProjectId(kernel, rec);
-    const isReply = rec.action.type === "channel.send" && card?.cardType === "response";
-    let nextStep = req?.nextStep;
-    let artifactId: string | undefined;
-    if (card?.cardType === "response") {
-      nextStep ??= `改好草稿后发给 ${card.reply.targetLabel}`;
-      artifactId = card.draft.artifactId;
-    } else if (card?.cardType === "project_proposal") {
-      nextStep ??= card.proposal.actions.find((a) => a.owner === "human")?.nextStep ?? `自己推进：${card.proposal.outcome}`;
-      artifactId = rec.artifactId ?? card.draft?.artifactId;
-    } else if (card?.cardType === "escalation") {
-      nextStep ??= card.escalation.explanation.split("\n")[0];
-      artifactId = card.escalation.nudgeDraft?.artifactId;
-    }
-    const action: ActionRecord & { approvalActionId?: string } = {
-      id: newId("act", clock),
-      title,
-      owner: "human",
-      status: "open",
-      ...(projectCellId ? { projectCellId } : {}),
-      ...(nextStep ? { nextStep } : {}),
-      effort: req?.effort ?? (isReply ? "15m" : "45m"),
-      ...(artifactId ? { artifactId } : {}),
-      ...(card?.prep.checked.length ? { references: card.prep.checked } : {}),
-      ...(card?.source ? { source: card.source } : {}),
-      createdAt: t,
-      updatedAt: t,
-      // A reply stays a pending approval behind the Engage item, so "定稿发送" still sends the exact reviewed version.
-      ...(isReply ? { approvalActionId: rec.actionId } : {}),
-    };
-    if (!isReply) {
-      const r = await kernel.resolveApproval(cardId, { decision: "dismiss", reason: "the owner handles it personally", ...(as.principalId ? { approverId: as.principalId } : {}) });
-      if (r.status !== "dismissed") return kernelRefusal(r, cardId);
-    }
-    const live = projectCellId ? kernel.getCell(projectCellId) : undefined;
-    withTx(kernel.db, () => {
-      commitState(rec.cellId, { [gtdKeys.action(action.id)]: action });
-      // A project's card the owner takes over is now their action on its books: the project hears it (its card was
-      // withdrawn silently) and plans around it.
-      if (!isReply && projectCellId && live && live.status !== "closed" && context.readStateSync(projectCellId, gtdKeys.project) !== null) {
-        tellProject(projectCellId, `${whoText(as)}决定亲自处理这件事：${title}${nextStep ? `\n下一步：${nextStep}` : ""}\n这张卡已经撤下；主人办完会勾掉这个动作（${action.id}），你会收到通知。`, as);
-      }
+    const r = await kernel.resolveApproval(cardId, {
+      decision: "dismiss",
+      approverId,
+      reason: req?.note || (byAgent(as) ? "dismissed by the owner's agent" : "dismissed by the owner"),
+      seenItemRevision: seenRev,
     });
-    return clarifyResult("to_human", true, "已转给你处理，在专注工作区里", cardId, { engageItem: { cellId: rec.cellId, actionId: action.id } });
-  }
-
-  async function dismiss(cardId: string, req: NoteRequest, as: DeskActor = {}): Promise<ClarifyMutationResponse> {
-    const { rec, card } = pendingCard(cardId);
-    const r = await kernel.resolveApproval(cardId, { decision: "dismiss", reason: req?.note || (byAgent(as) ? "dismissed by the owner's agent" : "dismissed by the owner"), ...(as.principalId ? { approverId: as.principalId } : {}) });
     if (r.status !== "dismissed") return kernelRefusal(r, cardId);
     const env = originalEnvelope(card?.source.envelopeId);
     addActivity({
@@ -642,34 +643,28 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     return clarifyResult("dismissed", true, env ? "已归档，可在记录里移回待确认" : "已归档", cardId);
   }
 
-  async function deny(cardId: string, req: NoteRequest, as: DeskActor = {}): Promise<ClarifyMutationResponse> {
-    approval(cardId);
-    const r = await kernel.resolveApproval(cardId, { decision: "deny", ...(req?.note ? { reason: req.note } : {}), ...(as.principalId ? { approverId: as.principalId } : {}) });
-    if (r.status !== "denied") return kernelRefusal(r, cardId);
-    return clarifyResult("denied", true, "已拒绝", cardId);
+  function deny(cardId:string,req:NoteRequest,as:DeskActor) {
+    return applyCardCommand(cardId,req?.seenItemRevision,as,{decision:"deny",...(req?.note ? {reason:req.note} : {})},"denied","已拒绝");
   }
 
-  async function verify(cardId: string, req: VerifyRequest): Promise<ClarifyMutationResponse> {
+  async function verify(cardId: string, req: VerifyRequest, as: DeskActor): Promise<ClarifyMutationResponse> {
+    const approverId = principalOf(as);
     if (req?.verdict !== "sent" && req?.verdict !== "failed") throw bad("verdict 必须是 sent 或 failed");
-    const rec = approval(cardId);
-    if (rec.status !== "unknown") throw wrongState("这条消息的发送结果不是“未知”");
-    const r = kernel.resolveUnknownSend(cardId, req.verdict, req.note);
+    const seenItemRevision = seenRevisionOf(req?.seenItemRevision);
+    if (!Number.isSafeInteger(req.seenAttempt) || req.seenAttempt < 1) throw bad("seenAttempt 必须是已查看的发送尝试序号");
+    const r = kernel.resolveUnknownSend(cardId, req.verdict, { approverId, seenItemRevision, seenAttempt: req.seenAttempt, ...(req.note ? { note: req.note } : {}) });
+    if (r === "revision_mismatch") return kernelRefusal({ status: r, actionId: cardId, currentRevision: approval(cardId).itemRevision }, cardId);
     if (r !== "resolved") throw wrongState("这条消息的发送结果不是“未知”");
     return clarifyResult("verified", true, req.verdict === "sent" ? "已记录：对方收到了" : "已记录：对方没收到，可以重新发送", cardId);
   }
 
-  async function abandon(cardId: string, _req: NoteRequest): Promise<ClarifyMutationResponse> {
-    const rec = approval(cardId);
-    if (rec.status !== "failed") throw wrongState("只有发送失败的消息可以放弃");
-    const card = asClarifyCard(rec.card.data);
-    addActivity({
-      kind: "card_withdrawn",
-      title: card?.title ?? rec.card.title ?? rec.action.summary,
-      detail: "发送失败后你选择了不再发送",
-      ...(card?.source ? { source: card.source } : {}),
-      actionId: rec.actionId,
-      restorable: true,
-    });
+  async function abandon(cardId: string, req: NoteRequest, as: DeskActor): Promise<ClarifyMutationResponse> {
+    const item = kernel.humanItems.get(cardId);
+    if (!item) throw missing("找不到这张卡");
+    if (item.itemRevision !== seenRevisionOf(req?.seenItemRevision))
+      return kernelRefusal({status:"revision_mismatch",actionId:cardId,currentRevision:item.itemRevision},cardId);
+    await kernel.humanItems.decide(cardId,{optionId:"system.abandon", seenItemRevision:item.itemRevision,
+      ...(item.artifactVersion !== null ? {seenArtifactVersion:item.artifactVersion} : {})},principalOf(as));
     return clarifyResult("abandoned", true, "已放弃发送", cardId);
   }
 
@@ -693,7 +688,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
    * the project is told what was done (with the owner's note), so it wakes and continues with whatever waited on it.
    * The desk's own quick to-dos tell nobody.
    */
-  async function completeAction(a: Located<ActionRecord>, detail: string, activityId?: string, as: DeskActor = {}, note?: string): Promise<number> {
+  async function completeAction(a: Located<ActionRecord>, detail: string, activityId: string | undefined, as: DeskActor, note?: string): Promise<number> {
     const toClose = dedicatedCells(a);
     const project = liveProjectOf(a);
     withTx(kernel.db, () => {
@@ -708,40 +703,62 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     return closed;
   }
 
-  async function done(cellId: string, actionId: string, req: DoneRequest, as: DeskActor = {}): Promise<EngageMutationResponse> {
+  async function done(cellId: string, actionId: string, req: DoneRequest, as: DeskActor): Promise<EngageMutationResponse> {
+    const approverId = principalOf(as);
+    const personal = humanItemForAction(kernel,cellId,actionId);
+    if (personal?.options.some(o => o.id === "done") && (personal.cellId === cellId || (personal.cellId === null && cellId === desk))) {
+      await kernel.humanItems.decide(personal.id, { optionId: "done", ...(req?.seenVersion === undefined ? {} : {seenArtifactVersion:req.seenVersion}), seenItemRevision: seenRevisionOf(req?.seenItemRevision), ...(req?.note ? { note: req.note } : {}) }, approverId);
+      return engageResult("done", true, "已办完", { closedTasks: 0 });
+    }
     const a = findAction(cellId, actionId);
     if (a.record.status !== "open") return engageResult("already_done", true, "这件事已经办完了");
     const linked = linkedApprovalId(a.record);
-    if (linked && gate.getApprovalSync(linked)?.status === "pending") {
-      await kernel.resolveApproval(linked, { decision: "dismiss", reason: "the owner handled it personally", ...(as.principalId ? { approverId: as.principalId } : {}) });
+    if (linked) {
+      const seen = seenRevisionOf(req?.seenItemRevision);
+      const rec = approval(linked);
+      const stale = (currentRevision: number) => engageResult("revision_mismatch", false, "关联卡片已有更新，请刷新后再确认", { currentRevision });
+      if (rec.itemRevision !== seen) return stale(rec.itemRevision);
+      if (rec.status === "pending") {
+        const result = await kernel.resolveApproval(linked, { decision: "dismiss", approverId, seenItemRevision: seen, reason: "the owner handled it personally" });
+        if (result.status === "revision_mismatch") return stale(result.currentRevision);
+        if (result.status !== "dismissed") throw wrongState("关联卡片正在处理，请刷新");
+      } else if (rec.status === "approved") {
+        throw wrongState("正在发送，请等待回执");
+      } else if (rec.status === "failed") {
+        const result = await abandon(linked, { seenItemRevision: seen }, as);
+        if (!result.ok) return stale(approval(linked).itemRevision);
+      }
     }
     const note = typeof req?.note === "string" ? req.note : undefined;
     const closedTasks = await completeAction(a, note || (byAgent(as) ? "主 Agent 代你勾选了已办完" : "你勾选了已办完"), undefined, as, note);
     return engageResult("done", true, closedTasks > 0 ? `已办完，并结束了 ${closedTasks} 项相关后台任务` : "已办完", { closedTasks });
   }
 
-  async function engageSend(cellId: string, actionId: string, req: EngageSendRequest): Promise<EngageMutationResponse> {
+  async function engageSend(cellId: string, actionId: string, req: EngageSendRequest, as: DeskActor): Promise<EngageMutationResponse> {
+    principalOf(as);
     const a = findAction(cellId, actionId);
     const linked = linkedApprovalId(a.record);
     if (!linked) throw wrongState("这件事没有待发送的草稿");
     if (a.record.status !== "open") return engageResult("already_done", true, "这件事已经办完了");
     if (!Number.isInteger(req?.seenVersion)) throw bad("seenVersion 必须是整数");
-    const r = await runApprove(linked, req.seenVersion);
+    const r = await runApprove(linked, req.seenVersion, req.seenItemRevision, as);
     let closedTasks = 0;
     // An unknown send is the channel's problem to verify (it stays in Clarify); the owner's part is done.
     // Same activity id as the desk's own record of a sent reply, so one send is one entry in the drawer.
-    if (r.outcome === "sent" || r.outcome === "unknown") closedTasks = await completeAction(a, r.outcome === "sent" ? "定稿已发送" : "定稿已发出，结果待核实", `sent-${linked}`);
+    if (r.outcome === "sent" || r.outcome === "unknown") closedTasks = await completeAction(a, r.outcome === "sent" ? "定稿已发送" : "定稿已发出，结果待核实", `sent-${linked}`, as);
     const ok = r.outcome === "sent";
     return engageResult(r.outcome, ok, r.outcome === "unknown" ? `${r.message}（在待确认里核实）` : r.message, {
       closedTasks,
       ...(r.currentVersion !== undefined ? { currentVersion: r.currentVersion } : {}),
+      ...(r.currentRevision !== undefined ? { currentRevision: r.currentRevision } : {}),
       ...(r.error ? { error: r.error } : {}),
     });
   }
 
   // ==================== drafts ====================
 
-  function saveArtifact(artifactId: string, req: ArtifactSaveRequest): ArtifactSaveResponse {
+  function saveArtifact(artifactId: string, req: ArtifactSaveRequest, as: DeskActor): ArtifactSaveResponse {
+    principalOf(as);
     const art = context.getArtifactSync(artifactId);
     if (!art) throw missing(`没有这份草稿 ${artifactId}`);
     if (!Number.isInteger(req?.expectedVersion) || req.expectedVersion < 1) throw bad("expectedVersion 必须是正整数");
@@ -756,6 +773,8 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
         throw bad("JSON 草稿的内容不是合法的 JSON");
       }
     }
+    const boundPlan = get(kernel.db,"SELECT 1 FROM human_items WHERE artifact_id=? AND action_type='project.start' AND status IN ('pending','snoozed') LIMIT 1",[artifactId]);
+    if (boundPlan && (format !== "json" || !isProjectProposal(data))) throw bad("立项方案需要有效的标题、目标、动作、目录和阶段");
     const title = req.title ?? art.content.title;
     const r = context.commitSync(art.cellId, {
       artifact: {
@@ -782,7 +801,8 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     return { ok: true, outcome: "saved", message: `已保存 v${r.artifactVersion}`, artifact: artifact(artifactId) };
   }
 
-  function dismissParked(artifactId: string, parkedId: string): ArtifactDTO {
+  function dismissParked(artifactId: string, parkedId: string, as: DeskActor): ArtifactDTO {
+    principalOf(as);
     if (!context.listParkedSync(artifactId).some((p) => p.id === parkedId)) throw missing("这条补充信息已经移除了");
     context.dismissParkedSync(parkedId);
     return artifact(artifactId);
@@ -807,8 +827,9 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
 
   /** Cards about the project held outside its own cells (e.g. by the desk) go with it. */
   async function withdrawProjectCards(projectId: string, reason: string, as: DeskActor): Promise<void> {
+    const approverId = principalOf(as);
     const rec = gate.findPendingBySubjectSync(subjectKeys.project(projectId));
-    if (rec && kernel.getCell(rec.cellId)?.status !== "closed") await kernel.resolveApproval(rec.actionId, { decision: "dismiss", reason, ...(as.principalId ? { approverId: as.principalId } : {}) });
+    if (rec && kernel.getCell(rec.cellId)?.status !== "closed") await kernel.resolveApproval(rec.actionId, { decision: "dismiss", approverId, reason });
   }
 
   /**
@@ -821,7 +842,8 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
    * - cancel / complete: closeCell — the kernel settles the project's records; the project's actions held elsewhere
    *   (e.g. a card taken over on the desk) and cards about it on the desk follow here.
    */
-  async function projectOp(projectId: string, op: ProjectOp, as: DeskActor = {}): Promise<ProjectMutationResponse> {
+  async function projectOp(projectId: string, op: ProjectOp, as: DeskActor): Promise<ProjectMutationResponse> {
+    principalOf(as);
     const record = projectRecord(projectId);
     const cell = kernel.getCell(projectId);
     const open = cell !== undefined && cell.status !== "closed";
@@ -835,6 +857,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
       }
       case "resume": {
         if (!open) return projectResult("not_applied", false, "这个项目没有可以继续的任务");
+        if (cell.pauseReason === "budget_declined") return projectResult("not_applied", false, "额度已用尽，请先追加额度或关闭预算限额");
         if (record.lifecycle === "someday") return projectResult("not_applied", false, `「${record.title}」在以后再说里：用“重新启动”让它继续`);
         if (cell.status === "active") return projectResult("resumed", true, `「${record.title}」正在推进`);
         const r = control("resume");
@@ -862,7 +885,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
         if (record.lifecycle === "someday") return projectResult("someday", true, "已经在以后再说里了");
         if (!open || record.lifecycle !== "active") return projectResult("not_applied", false, "只有进行中的项目可以移进以后再说");
         if (cell.status === "active") {
-          const r = control("pause");
+          const r = kernel.control(projectId,{action:"pause",pauseReason:"parked"},actorOf(as));
           if (!r.applied) return projectResult("not_applied", false, r.reason ?? "暂停没有生效");
         }
         setProjectLifecycleSync(context, projectId, "someday", now());
@@ -953,7 +976,8 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
    * "补上下一步" (Radar) and add_action (control plane): an open action on the project's books — the owner's own
    * ("human", on their to-do list) or something to wait for ("waiting") — and the project is told.
    */
-  async function addProjectAction(projectId: string, req: AddActionRequest & { owner?: "human" | "waiting" }, as: DeskActor = {}): Promise<ProjectMutationResponse> {
+  async function addProjectAction(projectId: string, req: AddActionRequest & { owner?: "human" | "waiting" }, as: DeskActor): Promise<ProjectMutationResponse> {
+    const actorPrincipal = principalOf(as);
     const record = projectRecord(projectId);
     const title = typeof req?.title === "string" ? req.title.trim() : "";
     if (!title) throw bad("下一步需要一个标题");
@@ -971,7 +995,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
       ...(owner === "human" ? { nextStep: nextStep ?? title } : nextStep ? { nextStep } : {}),
       ...(owner === "waiting" ? { waiting: { description: title, parties: [], join: "all" as const } } : {}),
       ...(req.effort ? { effort: req.effort } : {}),
-      source: { label: byAgent(as) ? "主 Agent" : "项目全局", ...(as.principalId ? { principalId: as.principalId } : {}), at: t },
+      source: { label: byAgent(as) ? "主 Agent" : "项目全局", principalId: actorPrincipal, at: t },
       createdAt: t,
       updatedAt: t,
     };
@@ -997,7 +1021,8 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     return { ok, outcome, message, view: review(), status: status() };
   }
 
-  function acceptSkill(slug: string): ReviewMutationResponse {
+  function acceptSkill(slug: string, as: DeskActor): ReviewMutationResponse {
+    principalOf(as);
     const key = `${SKILL_SUGGESTION_PREFIX}${slug}`;
     const s = context.readStateSync<SkillSuggestion>(desk, key);
     if (!s || typeof s.name !== "string" || typeof s.body !== "string") throw missing("这条技能建议已经不在了");
@@ -1011,17 +1036,20 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     return reviewResult("skill_saved", true, `已保存技能「${s.name}」`);
   }
 
-  function dismissSkill(slug: string): ReviewMutationResponse {
+  function dismissSkill(slug: string, as: DeskActor): ReviewMutationResponse {
+    principalOf(as);
     const key = `${SKILL_SUGGESTION_PREFIX}${slug}`;
     if (context.readStateSync(desk, key) === null) throw missing("这条技能建议已经不在了");
     commitState(desk, { [key]: null });
     return reviewResult("dismissed", true, "好的，不保存");
   }
 
-  function enableRule(req: EnableRuleRequest): ReviewMutationResponse {
+  function enableRule(req: EnableRuleRequest, as: DeskActor): ReviewMutationResponse {
+    principalOf(as);
     if (typeof req?.actionClass !== "string") throw bad("需要 actionClass");
     const maxUses = req.maxUses ?? 20;
     if (!Number.isInteger(maxUses) || maxUses < 1) throw bad("maxUses 必须是正整数");
+    if (principalOf(as)!==owner) throw wrongState("只有主人可以开启常设规则");
     const rule = ruleInputForClass(req.actionClass, { createdBy: owner, maxUses, note: "周回顾中开启的自动执行" });
     if (!rule) throw bad("这类操作不能改成自动执行");
     gate.upsertPolicyRuleSync(rule);
@@ -1029,7 +1057,8 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     return reviewResult("rule_enabled", true, `已改成自动执行（最多 ${maxUses} 次）`);
   }
 
-  function dismissRule(req: EnableRuleRequest): ReviewMutationResponse {
+  function dismissRule(req: EnableRuleRequest, as: DeskActor): ReviewMutationResponse {
+    principalOf(as);
     if (typeof req?.actionClass !== "string") throw bad("需要 actionClass");
     gate.markTrustSuggestedSync([req.actionClass]);
     return reviewResult("dismissed", true, "好的，这类操作仍然每次请你确认");
@@ -1046,12 +1075,13 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     return e;
   }
 
-  function sensorToCode(sensorId: string, req: SensorToCodeRequest): ReviewMutationResponse {
+  function sensorToCode(sensorId: string, req: SensorToCodeRequest, as: DeskActor): ReviewMutationResponse {
+    principalOf(as);
     const src = context.readStateSync<SourceRecord>(sensorId, gtdKeys.source);
     const cell = kernel.getCell(sensorId);
     if (!src || !cell || cell.status === "closed") throw missing("找不到这个信源");
     const entry = checkEntry(req?.entry);
-    kernel.updateCell(sensorId, { processor: { kind: "code", entry } });
+    kernel.updateCell(sensorId, { processor: sensorProcessor(entry) },actorOf(as));
     commitState(sensorId, { [gtdKeys.source]: { ...src, processor: "code", updatedAt: now() } });
     commitState(desk, { [`${SENSOR_SUGGESTION_PREFIX}${sensorId}`]: null });
     return reviewResult("switched_to_code", true, `「${src.title}」已改为零 Token 的脚本检查`);
@@ -1059,7 +1089,12 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
 
   // ==================== activity drawer ====================
 
-  function restoreActivity(cellId: string, activityId: string): ActivityMutationResponse {
+  async function restoreActivity(cellId: string, activityId: string, as: DeskActor): Promise<ActivityMutationResponse> {
+    if (get(kernel.db, "SELECT 1 FROM human_item_activity WHERE id=?", [activityId])) {
+      const undo = await kernel.humanItems.undo(activityId, principalOf(as));
+      return {ok:true,outcome:"restored",message:undo.message,view:activity(),status:status()};
+    }
+    principalOf(as);
     const key = gtdKeys.activity(activityId);
     const found = readActivities(kernel).find((a) => a.cellId === cellId && a.key === key);
     if (!found) throw missing("找不到这条记录");
@@ -1073,6 +1108,17 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     });
     if (!r.restorable || r.restoredAt) return result("not_restorable", false, r.restoredAt ? "已经移回过了" : "这条记录不能移回");
     const restored = { ...r, restoredAt: now() };
+    if (r.actionId && r.kind === "card_withdrawn" && r.detail === abandonDetail) {
+      const rec = gate.getApprovalSync(r.actionId);
+      if (rec?.statusReason === `abandoned:${activityId}`) {
+        withTx(kernel.db, () => {
+          if (!gate.setSendAbandonedSync(rec.actionId, activityId, false, rec.itemRevision)) throw wrongState("这张卡已经变动");
+          commitState(cellId, { [key]: restored });
+        });
+        return result("restored", true, "已移回待确认");
+      }
+      return result("not_restorable", false, "这条发送记录已经有了新的处理结果");
+    }
     const original = r.envelope ?? (r.actionId ? originalEnvelope(asClarifyCard(gate.getApprovalSync(r.actionId)?.card.data)?.source.envelopeId) : null);
     if (original) {
       const handback = createEnvelope<HandbackPayload>(
@@ -1088,11 +1134,6 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
       );
       context.commitSync(cellId, { statePatches: { [key]: restored }, inboxOut: [{ to: inboxAddr(desk), envelope: handback }] });
       return result("restored", true, "已移回待确认，Agent 正在准备卡片");
-    }
-    // An abandoned failed send has no message to re-triage: un-hiding the card is the whole restore.
-    if (r.actionId && gate.getApprovalSync(r.actionId)?.status === "failed") {
-      commitState(cellId, { [key]: restored });
-      return result("restored", true, "已移回待确认");
     }
     return result("not_restorable", false, "原始消息已经找不到了，不能移回");
   }
@@ -1116,19 +1157,20 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     throw bad("everyMinutes 需小于 60，或是 60 的整数倍（最多 1440）");
   }
 
-  function createSource(req: CreateSourceRequest): SourcesMutationResponse {
+  function createSource(req: CreateSourceRequest, as: DeskActor): SourcesMutationResponse {
+    principalOf(as);
     const title = typeof req?.title === "string" ? req.title.trim() : "";
     if (!title) throw bad("信源需要一个名字");
     const schedule = cronOf(req.schedule);
     const check = req.check;
     if (!check || typeof check !== "object") throw bad("需要说明检查方式");
-    let processor: { kind: "code"; entry: string } | undefined;
+    let processor: ReturnType<typeof sensorProcessor> | undefined;
     let instruction = typeof req.description === "string" && req.description.trim() ? req.description.trim() : title;
     if (check.kind === "script") {
       if (typeof check.path !== "string" || !check.path.trim()) throw bad("需要脚本路径");
-      processor = { kind: "code", entry: `${SCRIPT_PREFIX}${check.path.trim()}` };
+      processor = sensorProcessor(`script:${check.path.trim()}`);
     } else if (check.kind === "code") {
-      processor = { kind: "code", entry: checkEntry(check.entry) };
+      processor = sensorProcessor(checkEntry(check.entry));
     } else if (check.kind === "llm") {
       if (typeof check.instruction !== "string" || !check.instruction.trim()) throw bad("需要说明要检查什么");
       instruction = check.instruction.trim();
@@ -1156,17 +1198,8 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
       // Same shape as the desk's own add_source: the first task runs the check once; meta.gtd.source seeds the record.
       kernel.spawnCell(
         desk,
-        {
-          id,
-          preset: "sensor",
-          title,
-          schedules: [schedule],
-          // A script check runs its commands in the source's own directory (sources never inherit a cwd, so never the
-          // owner's repository).
-          ...(processor ? { processor } : {}),
-          meta: { gtd: { source: init } },
-        },
-        { instruction, title },
+        createSensorSpec(id,init,processor ?? kernel.registry.presets.get("sensor")?.defaults?.processor),
+        { instruction, title },actorOf(as),
       );
       commitState(id, { [gtdKeys.source]: record });
     });
@@ -1180,15 +1213,17 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     return src;
   }
 
-  function pauseSource(sensorId: string, pause: boolean): SourcesMutationResponse {
+  function pauseSource(sensorId: string, pause: boolean, as: DeskActor): SourcesMutationResponse {
+    principalOf(as);
     const src = sourceRecord(sensorId);
-    const r = kernel.control(sensorId, { action: pause ? "pause" : "resume" });
+    const r = kernel.control(sensorId, { action: pause ? "pause" : "resume" },actorOf(as));
     if (!r.applied) throw wrongState(r.reason ?? "操作没有生效");
     commitState(sensorId, { [gtdKeys.source]: { ...src, status: pause ? "paused" : "ok", updatedAt: now() } });
     return sourcesResult(pause ? "paused" : "resumed", true, pause ? `已暂停「${src.title}」` : `「${src.title}」恢复运行`, sensorId);
   }
 
-  function setSourceMode(sensorId: string, req: SourceModeRequest): SourcesMutationResponse {
+  function setSourceMode(sensorId: string, req: SourceModeRequest, as: DeskActor): SourcesMutationResponse {
+    principalOf(as);
     if (req?.mode !== "active" && req?.mode !== "observe") throw bad("mode 必须是 active 或 observe");
     const src = sourceRecord(sensorId);
     commitState(sensorId, { [gtdKeys.source]: { ...src, mode: req.mode, updatedAt: now() } });
@@ -1200,7 +1235,8 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     );
   }
 
-  async function deleteSource(sensorId: string): Promise<SourcesMutationResponse> {
+  async function deleteSource(sensorId: string, as: DeskActor): Promise<SourcesMutationResponse> {
+    principalOf(as);
     const src = sourceRecord(sensorId);
     const parentId = kernel.getCell(sensorId)?.parentId;
     // Closed as its parent: a deleted source is not news the desk needs to be woken for.
@@ -1209,6 +1245,14 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
   }
 
   const agents = createAgentsApi({
+    commands:{
+      message:(id,req,as)=>kernel.directMessage(id,req,actorOf(as)),
+      control:(id,cmd,as)=>kernel.control(id,cmd,actorOf(as)),
+      close:(id,as)=>kernel.closeCell(id,"cancelled",actorOf(as)),
+      trigger:(id,epoch,as)=>kernel.inbox.enqueueSync(id,createEnvelope({
+        id:newId("trig",clock),from:"timer:manual",to:inboxAddr(id),principalId:principalOf(as),kind:"event",type:PAYLOAD.timerFired,
+        payload:{label:"主人手动触发了一次检查"},expectedEpoch:epoch},clock)),
+    },
     kernel,
     settings,
     status,
@@ -1216,16 +1260,99 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     errors: { bad, missing },
   });
 
+  function decisionCells(cellId: string | null) {
+    const issuer = cellId ? kernel.getCell(cellId) : undefined;
+    const pid = issuer && (issuer.preset === "project" ? issuer.id : projectCellIdOf(issuer.spec));
+    const project = pid ? kernel.getCell(pid) : undefined;
+    const paused = project?.status === "paused" ? project : issuer?.status === "paused" ? issuer : undefined;
+    return {project, paused};
+  }
+
+  function closureMembers(target: string) {
+    const root = kernel.getCell(target);
+    if (!root || root.preset!=="project" || root.status==="closed") return [];
+    const members = [root];
+    for (const parent of members) members.push(...kernel.listCells({parentId:parent.id}).filter(c=>c.status!=="closed"));
+    return members.map(c=>({id:c.id,title:c.title ?? c.id})).sort((a,b)=>a.id.localeCompare(b.id));
+  }
+
   return {
+    ownerPrincipal: owner,
     status,
     setBudgetLimits,
     topology: agents.topology,
     timeline: agents.timeline,
     resource: agents.resource,
     sendCellMessage: agents.sendMessage,
-    deliverCellMessage: agents.deliver,
+    directMessage: agents.deliver,
+    createProject(init: ProjectInit, as:DeskActor, parentId=desk) {
+      return startProjectSync(kernel,init,{parentId,...actorOf(as)});
+    },
+    spawnCell(parentId:string,spec:import("@ng/cell").CellSpecInput,task:unknown,as:DeskActor) {
+      return kernel.spawnCell(parentId,spec,task,actorOf(as));
+    },
+    savePreference(patch:import("@ng/protocol").KnowledgePatch,as:DeskActor) {
+      principalOf(as);
+      if (patch.kind!=="preference") throw bad("需要偏好设置");
+      context.upsertSkillOrNoteSync(desk,patch);
+    },
     cellControl: agents.control,
     cellTrigger: agents.trigger,
+    async editorLease(id:string, active:boolean, as:DeskActor) {
+      principalOf(as);
+      kernel.hub.setEditorLeaseSync(id,active);
+      if (!kernel.hub.isFocusSync()) await kernel.hub.flushBuffered(true);
+      return status().focus;
+    },
+    recentlyClosedProjects: () => kernel.listCells({status:["closed"],preset:"project"}).sort((a,b)=>b.updatedAt-a.updatedAt)
+      .slice(0,30).map(c=>({id:c.id,title:c.title ?? c.id,reason:c.closeReason})),
+    listHumanItems: (includeSnoozed = false) => kernel.humanItems.list(includeSnoozed).map(item => {
+      const {project, paused} = decisionCells(item.cellId);
+      const actionRefs = all<{cell_id:string; key:string}>(kernel.db, "SELECT cell_id,key FROM human_item_origins WHERE item_id=?", [item.id])
+        .map(row => ({cellId:row.cell_id, actionId:row.key.slice(gtdKeys.actionPrefix.length)}));
+      const rec = kernel.gate.getApprovalSync(item.id);
+      const card = rec ? asClarifyCard(rec.card.data) : null;
+      const attempted = item.status === "unknown" ? kernel.hub.getLatestOutboxByActionSync(item.id) : null;
+      const closeTargets: Record<string,ReturnType<typeof closureMembers>> = {};
+      for (const o of item.options) if (o.terminateMode==="cancel_task") closeTargets[o.id]=closureMembers(o.targetCellIds![0]!);
+      const projects=item.relatedProjectIds.map(id=>kernel.getCell(id)).filter(p=>p!==undefined)
+        .map(p=>({id:p.id,title:p.title ?? p.id}));
+      const plan=item.action?.type==="project.start" ? (item.artifactId ? context.getArtifactSync(item.artifactId)?.content.data : item.action.proposal) : undefined;
+      return {...item, actionRefs, resumeTarget:paused ? {id:paused.id, title:paused.title ?? paused.id} : null, proposal:isProjectProposal(plan) ? plan : null, projects, closeTargets, artifact:item.artifactId ? artifactDTO(kernel,item.artifactId,now()) : null,
+        project:project ? {id:project.id,title:project.title ?? project.id,paused:project.status==="paused",parked:project.pauseReason==="parked"} : null,
+        ownerOnly:rec ? ownerOnlyApproval({...rec.action,card:rec.card},kernel.ownerAddresses)!==null : false,
+        attempted:attempted ? {target:attempted.target,body:attempted.content.body} : null,
+      };
+    }),
+    async decideHumanItem(id: string, decision: HumanDecision, as: DeskActor) {
+      const item = kernel.humanItems.get(id);
+      if (!item) throw missing("找不到这件事项");
+      const option = item.options.find(o => o.id === decision.optionId);
+      if (decision.optionId === "system.someday") {
+        if (!option) throw wrongState("选项已变更");
+        const r = await someday(id,{seenItemRevision:decision.seenItemRevision,...(decision.seenArtifactVersion !== undefined ? {seenVersion:decision.seenArtifactVersion} : {})},as);
+        return {status:r.outcome};
+      }
+      const accept = () => {
+        if (option?.terminateMode==="cancel_task") {
+          const expected=closureMembers(option.targetCellIds![0]!).map(c=>c.id);
+          if (!expected.length || JSON.stringify(expected)!==JSON.stringify(decision.confirmedClosure)) throw wrongState("待关闭的任务清单已变动");
+        }
+        if (option?.effect === "defer" || option?.effect === "terminate") return;
+        const {paused} = decisionCells(item.cellId);
+        if (!paused) return;
+        if (decision.resumeProjectId !== paused.id) throw wrongState(`请先确认恢复「${paused.title ?? paused.id}」`);
+        const r = kernel.control(paused.id, {action:"resume"}, actorOf(as));
+        if (!r.applied) throw wrongState("任务未能恢复");
+        if (paused.preset === "project") setProjectLifecycleSync(context, paused.id, "active", now());
+      };
+      const result = await kernel.humanItems.decide(id,decision,principalOf(as),accept);
+      if (["revision_mismatch","version_mismatch","not_pending","not_unknown","already_cancelled"].includes(result.status)) throw wrongState("事项已变动，请重新查看");
+      if (result.status === "not_found") throw missing("找不到这件事项");
+      return result;
+    },
+    undoHumanDecision: (activityId: string, as: DeskActor) => kernel.humanItems.undo(activityId,principalOf(as)),
+    reopenProject: async (projectId: string, as: DeskActor) => ({restored:await kernel.reopenProject(projectId,principalOf(as))}),
     clarify,
     clarifyCard: (cardId: string) => clarifyCardById(input(), cardId),
     radar,
@@ -1235,7 +1362,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     engage,
     engageDetail,
     artifact,
-    capture,
+    ingest,
     focus,
     approve,
     revise,
@@ -1244,7 +1371,6 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     savePlan,
     extend,
     resolveOffline,
-    toHuman,
     dismiss,
     deny,
     verify,

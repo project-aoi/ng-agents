@@ -22,7 +22,10 @@ export const ALL_SCHEMAS: readonly SchemaModule[] = [
 /** Table → owning package (for docs, tests and the ownership rule). */
 export const TABLE_OWNERS: Readonly<Record<string, string>> = {
   cells: "@ng/cell",
+  cell_stalls: "@ng/cell",
   cell_watches: "@ng/cell",
+  cell_closures: "@ng/cell",
+  stall_incidents: "@ng/cell",
   cell_waits: "@ng/cell",
   inbox_messages: "@ng/inbox",
   inbox_claims: "@ng/inbox",
@@ -40,7 +43,9 @@ export const TABLE_OWNERS: Readonly<Record<string, string>> = {
   knowledge: "@ng/context",
   knowledge_fts: "@ng/context",
   prompt_prefixes: "@ng/context",
-  approvals: "@ng/gate",
+  human_item_activity: "@ng/cell",
+  human_item_origins: "@ng/cell",
+  human_items: "@ng/cell",
   ledger: "@ng/gate",
   usage_log: "@ng/gate",
   budget_raises: "@ng/gate",
@@ -50,5 +55,6 @@ export const TABLE_OWNERS: Readonly<Record<string, string>> = {
   workspaces: "@ng/workspace",
   jobs: "@ng/workspace",
   outbox: "@ng/channel",
+  editor_leases: "@ng/channel",
   channel_state: "@ng/channel",
 };

@@ -22,7 +22,7 @@ describe("read models", () => {
   it("roster, tree and stats describe what is in flight; the roster reaches the parent's snapshot tail", async () => {
     const h = await boot({ setup });
     // a leaf given spawn depth on purpose (a worker has none by default)
-    h.kernel.spawnCell("desk", { id: "proj", preset: "worker", title: "官网改版", processor: { kind: "code", entry: "test.idle" }, meta: { projectCellId: "proj" }, bounds: { maxDepth: 1 } });
+    h.kernel.spawnCell("desk", { id: "proj", preset: "inline", lifetime:"wakeable", title: "官网改版", processor: { kind: "code", entry: "test.idle" }, meta: { projectCellId: "proj" }, bounds: { maxDepth: 1 } });
     h.kernel.spawnCell("proj", { id: "build", preset: "worker", title: "跑测试", processor: { kind: "code", entry: "test.long_job" } }, "go");
     h.kernel.spawnCell("proj", { id: "wait", preset: "watcher", title: "等报价", processor: { kind: "code", entry: "test.idle" }, watches: [{ threadOrFilter: { thread: "memory:q" } }], schedules: [{ deliverAt: T0 + DAY }] });
     h.kernel.context.commitSync("wait", { statePatches: { [CELL_STATUS_KEY]: { text: "已回", at: T0, progress: { done: 2, total: 3, label: "家" } } } });

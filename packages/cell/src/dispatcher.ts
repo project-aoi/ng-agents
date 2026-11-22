@@ -1,4 +1,9 @@
+import { CLI_SESSION_KEY, type CliSessionRecord, probeOrphanCliCell, reapOrphanedCliProcesses } from "@ng/loop";
 import {
+  all,
+  afterCommit,
+  anyCovers,
+  timerFrom,
   CELL_DIRECT_CHAT_KEY,
   CELL_RESULT_CANDIDATE_KEY,
   CELL_TURN_KEY,
@@ -52,6 +57,7 @@ export interface RunHandle {
   stallOnly: boolean;
   /** RunPorts.settleSelf: what to do with the cell once this Run has settled. */
   selfSettle: SelfSettleRequest | null;
+  cliInput?: { sessionId: string; throughSeq: number };
 }
 
 export interface Dispatcher {
@@ -73,9 +79,11 @@ export interface Dispatcher {
    * A budget was raised: cells held back by the budget stop are looked at again. Their messages were never claimed, so
    * they start with everything that arrived while they were held.
    */
-  budgetChanged(): void;
+  budgetChanged(ledgerId?: string): void;
   /** Cells with due work that is not claimed because their budget (or an ancestor's) is used up. */
   heldForBudget(): string[];
+  /** Defer CLI dispatch for a cell whose previous CLI process has unknown identity (`null` on macOS). */
+  holdForUnknownOrphan(cellId: string): void;
   /** Runs in flight with what the stall check and the occupancy view need. */
   running(): Array<{ cellId: string; stallOnly: boolean }>;
 }
@@ -83,7 +91,7 @@ export interface Dispatcher {
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 function isResurface(env: Envelope): boolean {
-  if (env.type !== "timer.fired") return false;
+  if (env.from!==timerFrom("approval") || env.type !== "timer.fired") return false;
   const data = (env.payload as TimerFiredPayload | null)?.data;
   return data !== null && typeof data === "object" && (data as Record<string, unknown>)["kernel"] === RESURFACE_MARKER;
 }
@@ -98,8 +106,64 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
   const runEndWaiters = new Set<() => void>();
   /** Cells whose due work is left unclaimed because the budget is used up; looked at again when a budget is raised. */
   const held = new Set<string>();
+  /** Cells deferred because a previous CLI process is alive with unreadable identity (`null`). */
+  const unknownOrphans = new Set<string>();
+  const reapingOrphans = new Set<string>();
+  let orphanTimer: ReturnType<typeof setInterval> | undefined;
   let started = false;
   let pumpScheduled = false;
+
+  function clearOrphanTimerIfEmpty(): void {
+    if (unknownOrphans.size === 0 && orphanTimer) {
+      clearInterval(orphanTimer);
+      orphanTimer = undefined;
+    }
+  }
+
+  function reapUnknownOrphan(id: string): void {
+    if (reapingOrphans.has(id)) return;
+    reapingOrphans.add(id);
+    // Scope strictly to this cell and never touch CLI children spawned by this live kernel process!
+    void core.track(
+      reapOrphanedCliProcesses(core.cliProcDir, { cellId: id, skipOwnerPid: process.pid })
+        .then(() => {
+          if (probeOrphanCliCell(core.cliProcDir, id, { skipOwnerPid: process.pid }) === "clear") {
+            unknownOrphans.delete(id);
+            clearOrphanTimerIfEmpty();
+            notify(id);
+          }
+        })
+        .finally(() => {
+          reapingOrphans.delete(id);
+        }),
+    );
+  }
+
+  function ensureOrphanPoller(): void {
+    if (orphanTimer || unknownOrphans.size === 0 || !started) return;
+    orphanTimer = setInterval(() => {
+      if (unknownOrphans.size === 0) {
+        clearOrphanTimerIfEmpty();
+        return;
+      }
+      for (const id of [...unknownOrphans]) {
+        const probe = probeOrphanCliCell(core.cliProcDir, id, { skipOwnerPid: process.pid });
+        if (probe === "clear") {
+          unknownOrphans.delete(id);
+          notify(id);
+        } else if (probe === "alive") {
+          reapUnknownOrphan(id);
+        }
+      }
+      clearOrphanTimerIfEmpty();
+    }, 2_000);
+    orphanTimer.unref?.();
+  }
+
+  function holdForUnknownOrphan(cellId: string): void {
+    unknownOrphans.add(cellId);
+    ensureOrphanPoller();
+  }
 
   function wakeWaiters(): void {
     for (const w of [...runEndWaiters]) w();
@@ -169,9 +233,20 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
     }
   }
 
-  function budgetChanged(): void {
-    if (held.size === 0) return;
-    const ids = [...held];
+  function budgetChanged(ledgerId?: string): void {
+    // An exhausted run may have consumed its entire batch. Recover its unfinished work even after a restart.
+    const recent = all<{cell_id:string; seq:number}>(core.db, `SELECT e.cell_id, e.seq FROM evidence e JOIN cells c ON c.id=e.cell_id
+      WHERE e.kind='run_boundary' AND json_extract(e.content,'$.outcome')='budget_stopped' AND c.status='active'
+      AND json_extract(e.content,'$.epoch')=c.epoch AND e.seq=(SELECT MAX(b.seq) FROM evidence b
+        WHERE b.cell_id=e.cell_id AND b.kind='run_boundary')`);
+    for (const {cell_id: id, seq} of recent) {
+      if (ledgerId && id !== ledgerId && !cells.ancestors(id).some(p => p.id===ledgerId)) continue;
+      if (gate.usageSync(id).state === "hard_stop" || inbox.pendingWakeupCountSync(id)>0) continue;
+      inbox.enqueueSync(id, createEnvelope({id:`${id}:budget-resume:${seq}`, from:KERNEL_FROM.dispatcher,
+        principalId:core.ownerPrincipal,kind:"event",type:PAYLOAD.runContinue,expectedEpoch:cells.require(id).epoch,
+        payload:{reason:"budget_raised",count:0}}, clock));
+    }
+    const ids = new Set([...held, ...inbox.dueCellIdsSync()]);
     held.clear();
     for (const id of ids) notify(id);
   }
@@ -188,12 +263,45 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
         held.delete(cellId);
         continue;
       }
-      const mode = cell.spec.claimMode ?? "serial_coalesce";
+      if (core.lifecycle.cleaningUp(cellId)) continue; // The previous epoch notifies us when its runtime has stopped.
+      if (inFlight(cellId) === 0) for (const m of inbox.listMessagesSync({ cellId, type: PAYLOAD.timerFired, status: ["pending"] })) {
+        if (m.deliverAt > clock.now()) continue;
+        const env = m.envelope;
+        const preset = cell.preset && core.registry.presets.get(cell.preset);
+        const reminder = env.from === timerFrom(cellId) && preset ? preset.personalReminder?.(env) : undefined;
+        const resurface = env.from === timerFrom("approval") && isResurface(env);
+        if (!reminder && !resurface) continue;
+        if (inbox.consumeTimerSync(cellId, env.id, cell.epoch, () => {
+          if (reminder) {
+            core.humanItems.create(reminder.draft, null, reminder.id);
+            if (anyCovers(core.ownerAddresses, reminder.notify)) {
+              const content = { format: "text" as const, body: `⏰ 提醒：${reminder.draft.title}` };
+              const auth = gate.authorizeSync({ type:"channel.send", target:reminder.notify, content, summary: content.body, subjectKey: reminder.draft.subjectKey, sideEffect:"notify_owner" }, {cellId, epoch:cell.epoch, principalId:cellPrincipal(cellId)});
+              if (auth.type === "allow") afterCommit(core.db, () => { void core.track(core.hub.send({target:reminder.notify, content, actionToken:auth.actionToken, idempotencyKey:reminder.draft.subjectKey, respectDnd:true})); });
+            }
+          } else core.approvals.resurfaced(env);
+          if (reminder) context.appendEvidenceSync(cellId, {kind:"inbound", envelope:env, runId:`timer:${env.id}`, at:clock.now()});
+        })) dueSet_ = null;
+      }
+      const engine=cell.spec.processor.kind === "llm" && (cell.spec.processor.engine ?? core.defaultEngine);
+      const mode = engine && engine !== "api" ? "serial_coalesce" : cell.spec.claimMode ?? "serial_coalesce";
       // A cell with a Run in flight is re-notified when that Run ends; the claim is the real lock either way.
       if (mode === "serial_coalesce" && inFlight(cellId) > 0) continue;
       if (mode === "competing_workers" && inFlight(cellId) >= (cell.spec.maxParallelRuns ?? core.maxConcurrentRuns)) continue;
       let wrapUp = false;
       if (cell.spec.processor.kind === "llm") {
+        // BUG-027: do not launch a replacement CLI process while an unverified previous process for this cell may still run.
+        if (unknownOrphans.has(cellId)) {
+          const probe = probeOrphanCliCell(core.cliProcDir, cellId, { skipOwnerPid: process.pid });
+          if (probe === "clear") {
+            unknownOrphans.delete(cellId);
+            clearOrphanTimerIfEmpty();
+          } else {
+            if (probe === "alive") reapUnknownOrphan(cellId);
+            ensureOrphanPoller();
+            continue;
+          }
+        }
         try {
           wrapUp = wrapUpEligible(cell, dueNow);
           if (gate.usageSync(cellId, { wrapUp }).state === "hard_stop") {
@@ -431,10 +539,24 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
     let closed: string[] = [];
     const afterwards: Array<() => void> = [];
     withTx(core.db, () => {
+      const consumed = inbox.listMessagesSync({ claimId: handle.claimId, status: ["claimed"] });
       inbox.completeSync(handle.claimId);
       const cur = cells.get(cellId);
       // Closed or cancelled while it ran: the late outcome changes nothing (guard 4).
       if (!cur || cur.status === "closed" || cur.epoch !== handle.epoch) return;
+
+      if (handle.cliInput) {
+        const session = context.readStateSync<CliSessionRecord>(cellId, CLI_SESSION_KEY);
+        if (session?.sessionId === handle.cliInput.sessionId) context.commitSync(cellId, { statePatches: {
+          [CLI_SESSION_KEY]: { ...session, lastDeliveredEvidenceSeq: Math.max(session.lastDeliveredEvidenceSeq ?? 0, handle.cliInput.throughSeq) },
+        } });
+      }
+      if (result === "completed" || result === "yielded_waiting" || result === "step_limit" || result === "deferred_for_approval") {
+        const inputs = consumed.map(row => row.envelope);
+        core.waits.answeredBy(cellId, inputs, handle.claimId);
+        core.stall.afterRun(cellId, inputs);
+
+      }
 
       if (result === "step_limit") {
         const prev = batch.envelopes.reduce((n, e) => (e.type === PAYLOAD.runContinue ? Math.max(n, (e.payload as RunContinuePayload).count) : n), 0);
@@ -470,14 +592,16 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
       // A wakeable leaf that ended its turn "waiting" may have arranged nothing to wait for (a bare `wait`): whether
       // its turn is over is decided below by what is actually out, not by how the Run was labelled.
       const restingLeaf = leaf && !oneShot && result === "yielded_waiting";
-      if (result !== "completed" && !self && !restingLeaf) return;
-      if (self?.action === "pause") {
-        if (cur.status === "active") inbox.controlSync(cellId, { action: "pause", principalId: core.ownerPrincipal });
-        return;
-      }
+      const reported = oneShot && result === "yielded_waiting" && context.readStateSync(cellId, CELL_RESULT_CANDIDATE_KEY);
+      if (result !== "completed" && !self && !restingLeaf && !reported) return;
       if (!leaf && !self) return;
       // Drain first: something that would wake the cell is waiting, so it is not done.
       if (inbox.pendingWakeupCountSync(cellId) > 0 || inbox.activeClaimCountSync(cellId, handle.claimId) > 0) return;
+      if (leaf && !oneShot && context.readStateSync(cellId, CELL_RESULT_CANDIDATE_KEY)) {
+        for (const wait of core.waits.list([cellId])) core.waits.clear(cellId, wait.waitId);
+      }
+      if (oneShot && !self && !context.readStateSync(cellId, CELL_RESULT_CANDIDATE_KEY) &&
+          core.readModel.activityOf([cellId]).get(cellId)?.state !== "dormant") return;
       if (!self && !oneShot) {
         // A wakeable leaf. Its turn is over only when nothing of it is still out — no wait it registered, no Job, no
         // card with the owner, no timer or watch it set for itself: exactly when it is dormant (this Run has already
@@ -500,6 +624,11 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
             text: `[${self.action === "cancel" ? "cancelling" : "closing"} this cell was not carried out: ${open.length} child cell(s) were still at work when the run settled (${open.map((c) => c.id).join(", ")}). Call complete_self again once they are done or closed.]`,
           });
         }
+        return;
+      }
+      if (self?.statePatches) context.commitSync(cellId, { statePatches: self.statePatches });
+      if (self?.action === "pause") {
+        if (cur.status === "active") inbox.controlSync(cellId, { action: "pause", ...(self.pauseReason ? {pauseReason:self.pauseReason} : {}), principalId: core.ownerPrincipal });
         return;
       }
       closed = deliverAndClose(cur, handle, { reason: self?.action === "cancel" ? "cancelled" : "completed", ...(self?.summary ? { summary: self.summary } : {}) });
@@ -552,23 +681,21 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
     // Kernel bookkeeping (a snoozed card coming due) needs no Run of its own.
     const resurfacing = batch.envelopes.filter(isResurface);
     for (const env of resurfacing) core.approvals.resurfaced(env);
-    // The parties this cell was waiting for have answered (docs/05 guard 2): their waits close now, others stay open.
-    try {
-      core.waits.answeredBy(cellId, batch.envelopes);
-    } catch (err) {
-      core.onError(err, `waits of ${cellId}`);
-    }
     // A stalled_check that reaches a project which has found an anchor in the meantime is dropped unseen: the grace
     // period is re-checked at delivery, so a project that merely paused between two steps is never woken for it.
     const stallChecks = batch.envelopes.filter((e) => e.type === PAYLOAD.stalledCheck);
-    const bookkeepingOnly = resurfacing.length + stallChecks.length === batch.envelopes.length;
+    const background = batch.envelopes.filter(e=>e.delivery==="silent_inject" && !isResurface(e) && e.type!==PAYLOAD.stalledCheck);
+    const bookkeepingOnly = resurfacing.length + stallChecks.length + background.length === batch.envelopes.length;
     if (stallChecks.length > 0 && bookkeepingOnly) handle.stallOnly = true;
-    if (resurfacing.length === batch.envelopes.length || (bookkeepingOnly && !core.stall.stillStalled(stallChecks))) {
+    if (bookkeepingOnly && !core.stall.stillStalled(stallChecks)) {
       // No Run happened, so nothing is settled beyond the claim: a one-shot cell must not be "completed" (reported and
       // closed) because a snoozed card of its came back.
       detach(handle);
       try {
-        inbox.completeSync(handle.claimId);
+        withTx(core.db,()=>{
+          if (background.length) inbox.requeueClaimedSync(handle.claimId,background.map(e=>e.id),"waiting for a real wakeup",{countAttempt:false});
+          inbox.completeSync(handle.claimId);
+        });
       } catch (err) {
         if (!isNgError(err, "conflict")) throw err;
         core.onError(err, `settle claim ${handle.claimId}`);
@@ -679,8 +806,8 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
       if (!busy && started) {
         const next = inbox.nextWakeAtSync();
         if (next !== null && next <= clock.now()) inbox.tickSync();
-        // A cell held at its budget stop is not something this loop can move: it starts when the owner raises the budget.
-        const dueNow = inbox.dueCellIdsSync().filter((id) => !held.has(id));
+        // Cells held at budget stop or waiting for an unknown orphan CLI process cannot be moved by idle().
+        const dueNow = inbox.dueCellIdsSync().filter((id) => !held.has(id) && !unknownOrphans.has(id));
         const jobsRunning = o.jobs ? core.workspace.listJobsSync({ state: ["running"] }).length : 0;
         if (dueNow.length === 0 && jobsRunning === 0 && !pumpScheduled && runs.size === 0) return;
         for (const id of dueNow) notify(id);
@@ -707,10 +834,15 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
     start() {
       if (started) return;
       started = true;
+      ensureOrphanPoller();
       schedulePump();
     },
     async stop() {
       started = false;
+      if (orphanTimer) {
+        clearInterval(orphanTimer);
+        orphanTimer = undefined;
+      }
       abortCells([...byCell.keys()], "shutdown");
       await Promise.allSettled([...runs.values()].map((h) => h.done));
     },
@@ -723,6 +855,7 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
     idle,
     budgetChanged,
     heldForBudget: () => [...held],
+    holdForUnknownOrphan,
     running: () => [...runs.values()].map((h) => ({ cellId: h.cellId, stallOnly: h.stallOnly })),
   };
 }
