@@ -19,7 +19,7 @@ export const AGENT_INSTRUCTIONS = `This server is the owner's GTD workbench ("ng
 - **The desk** — the workbench's resident main assistant. Triage is its job: before anything new starts it looks for an existing project, parked idea or report on the same subject, decides where a thing belongs (a note, a reminder, a reply for the owner to confirm, more work for an existing project, a new project), asks what is missing, remembers the owner's standing preferences and coordinates across projects. It keeps one continuous conversation with the owner.
 - **A project** answers for one deliverable ("改掉 TUI 表格复制", "Harness 对比报告"): it keeps the goal, the plan, the record of who owes what, its own notes and the shared report, and hands the real work to workers in the directory it was given. It waits for outside events (an MR merging, a reply) with small watchers.
 - **A worker** does one piece of work (reading or changing code, tests, research). When its turn is over it stays dormant on its record: a message wakes it with everything it knew. Its project is told each time a turn ends and reads what the worker did.
-- **Actions** are the open items of a project, owned by "agent" (a worker is on it), "human" (the owner must do something — their to-do list) or "waiting" (an outside event). **Cards** are decisions waiting for the owner (a message about to go out to someone, a plan to approve, a blocked worker, a budget that ran out). **Parked ("someday")** projects keep their research and cost nothing until activated.
+- **Actions** are the open items of a project, owned by "agent" (a worker is on it), "human" (the owner must do something — their to-do list) or "waiting" (an outside event). **Cards** are decisions waiting for the owner (a plan to approve or a blocked worker). **Parked ("someday")** projects keep their research and cost nothing until activated.
 
 ## How to work with it
 1. **What is going on?** \`workbench_overview\` first — it is cheap. \`get_project\` for one project, including what its workers did or were told that the project has not taken in yet; \`inspect_cell\` / \`get_cell\` for one cell; \`read_artifact\` and \`read_resource\` page through reports and long outputs. Status questions you answer yourself from these.
@@ -28,7 +28,7 @@ export const AGENT_INSTRUCTIONS = `This server is the owner's GTD workbench ("ng
    When the owner has already given you everything (outcome, complete brief, the absolute path) and \`search\` shows nothing on the subject, you may \`create_project\` yourself — never a second project for the same outcome. An idea only to remember: \`create_project\` with mode "research_then_park".
 4. **Work is asynchronous.** Everything returns at once; results arrive minutes later. Tell the owner it is under way and what will happen; do not poll.
 5. Read \`list_human_items\` for decisions and actions waiting on the owner. Submit the displayed option, reviewed versions and the owner’s note with \`decide_human_item\`. \`decide_card\` is a shortcut for standard card decisions. Use \`undo_human_decision\` with the activity ID to undo a reversible decision, and \`reopen_project\` to resume a closed project. For a direct question, send the answer with \`message_cell\` or \`chat_with_desk\` and its \`replyToId\`.
-6. External sends, exhausted budgets and project confirmation cards require the owner to approve execution in the workbench. On the owner’s instruction you can still defer, decline or request revisions using the displayed options.
+6. Project confirmation cards require the owner to approve execution in the workbench. On the owner’s instruction you can still defer, decline or request revisions using the displayed options.
 7. **Never do the workbench's work around it.** Nothing locks a directory: several cells may work in one repository at once, and \`list_workspaces\` shows which cells are active where right now. Before you change files yourself in such a directory, tell its project (\`message_project\`) or pause it, so nobody's work is overwritten.
 
 ## Answering the owner
@@ -125,7 +125,6 @@ export const AGENT_TOOLS: readonly AgentToolDoc[] = [
       id: str("待处理事项的 ID"), optionId: str("所选选项的 ID"),
       seenItemRevision: {type:"number", description:"列表中看到的事项修订号 itemRevision"},
       seenVersion: {type:"number", description:"事项带草稿时，填写看到的草稿版本 artifactVersion"},
-      seenAttempt: {type:"number", description:"核实送达结果时，填写看到的发送尝试序号 attempt"},
       until: {type:"number", description:"推迟到的时间，使用 Unix 毫秒时间戳"}, note: str("选项要求的答复、修改意见或备注"),
       resumeProjectId: str("明确同意恢复的项目或分身 ID，见 resumeTarget.id"),
       confirmedTargets: {type:"array", items:{type:"string"}, description:"确认中止的目标项目 ID 列表"},
@@ -140,7 +139,7 @@ export const AGENT_TOOLS: readonly AgentToolDoc[] = [
   },
   {
     name: "list_cards",
-    description: "The decisions waiting for the owner, each with what is being asked, who asked (which project), its current draft version (`artifactVersion`), whether the owner edited the draft (`humanEdited`), its card revision (`itemRevision`), and whether execution requires the owner (ownerOnly: outgoing messages, project proposals, exhausted budgets).",
+    description: "The decisions waiting for the owner, each with what is being asked, who asked (which project), its current draft version (`artifactVersion`), whether the owner edited the draft (`humanEdited`), its card revision (`itemRevision`), and whether execution requires the owner (ownerOnly: project proposals).",
     inputSchema: obj({}),
   },
   {
@@ -204,7 +203,7 @@ export const AGENT_TOOLS: readonly AgentToolDoc[] = [
         roles: {
           type: "array",
           items: { type: "string" },
-          description: 'only agents of these roles see the rule: "worker" (does the hands-on work in a repository), "project" (coordinates a project), "checker" (one check), "reply_watcher" (waits for a reply), "desk", "hub", "sensor". Saving again under the same name without it lifts the limit',
+          description: 'only agents of these roles see the rule: "worker" (does the hands-on work in a repository), "project" (coordinates a project), "checker" (one check), "desk", "hub", "sensor". Saving again under the same name without it lifts the limit',
         },
       },
       ["name", "text"],
@@ -225,7 +224,7 @@ export const AGENT_TOOLS: readonly AgentToolDoc[] = [
   {
     name: "get_cell",
     description:
-      "Low-level: one background cell (a project, worker, checker, reply_watcher, sensor, hub or the desk) — its state (at work, waiting, dormant and wakeable, paused, archived), directory, what it waits for, and the tail of what it did. Use it to see why something is stuck when get_project is not enough; inspect_cell reads a longer stretch.",
+      "Low-level: one background cell (a project, worker, checker, sensor, hub or the desk) — its state (at work, waiting, dormant and wakeable, paused, archived), directory, what it waits for, and the tail of what it did. Use it to see why something is stuck when get_project is not enough; inspect_cell reads a longer stretch.",
     inputSchema: obj({ id: str("cell id"), tail: { type: "number", description: "how many recent records to include (default 12)" } }, ["id"]),
   },
   {
@@ -263,7 +262,7 @@ export const AGENT_TOOLS: readonly AgentToolDoc[] = [
       'Low-level: start a background cell directly. Prefer chat_with_desk or create_project — a bare worker has nobody keeping its results. Useful for a one-off look ("read this repository and tell me X") whose result you will fetch yourself: preset "worker" does the job and then stays dormant (inspect_cell / get_cell read what it did; message_cell asks it more). parentId defaults to the desk. (A hub — a router for a stream of direct messages — needs routing rules: ask the desk for one with chat_with_desk instead.)',
     inputSchema: obj(
       {
-        preset: { type: "string", description: 'a registered preset: "worker" (one piece of work; stays dormant afterwards, wakes on a message), "checker" (checks one outside condition), "reply_watcher" (listens for a reply), "project" (persistent coordinator), "hub", "sensor"' },
+        preset: { type: "string", description: 'a registered preset: "worker" (one piece of work; stays dormant afterwards, wakes on a message), "checker" (checks one outside condition), "project" (persistent coordinator), "hub", "sensor"' },
         title: str("short name"),
         instruction: str("the complete task: goal, materials, how to verify, what to report"),
         cwd: str("absolute path of the directory it works in"),

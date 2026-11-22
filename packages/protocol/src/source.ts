@@ -4,14 +4,7 @@ import type { ItemSource } from "./gtd";
 import type { Envelope } from "./contract/envelope";
 export const CHANNEL_LABELS: Readonly<Record<string, string>> = {
   ui: "随手记",
-  cli: "命令行",
-  feishu: "飞书",
-  slack: "Slack",
-  github: "GitHub",
-  webhook: "Webhook",
-  email: "邮件",
   memory: "测试通道",
-  demo: "演示 IM",
 };
 
 export function describeEnvelopeSource(env: Envelope | undefined, now: number): ItemSource {

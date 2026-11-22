@@ -9,7 +9,7 @@ if (process.env["NG_DESK_TZ"]) process.env["TZ"] = process.env["NG_DESK_TZ"];
 async function main(): Promise<void> {
   const server = await createDeskServer();
   const { url } = await server.listen();
-  console.log(`[desk] GTD 工作台 ${url}${server.settings.demo ? "（演示模式）" : ` · ${server.settings.backend}`}${server.security.token ? " · bearer token required" : ""}`);
+  console.log(`[desk] GTD 工作台 ${url} · ${server.settings.backend}${server.security.token ? " · bearer token required" : ""}`);
 
   let stopping = false;
   const stop = (signal: string) => {

@@ -1,7 +1,7 @@
 import type { CellStatus } from "./contract/cell";
-import type { OutboxStatus } from "./contract/channel";
+import type { LocalNotification } from "./contract/channel";
 import type { ArtifactAuthor, EvidenceKind, KnowledgeKind, KnowledgeScope } from "./contract/context";
-import type { ApprovalStatus, MeterResult } from "./contract/gate";
+import type { ApprovalStatus } from "./contract/gate";
 import type { ControlAction } from "./contract/inbox";
 import type { RunOutcome } from "./contract/loop";
 import type { JobState } from "./contract/workspace";
@@ -18,12 +18,9 @@ export interface BusTopics {
   "inbox.control": { cellId: string; action: ControlAction; epoch: number; principalId: string };
   "artifact.changed": { cellId: string; artifactId: string; version: number; updatedBy: ArtifactAuthor; parked?: boolean };
   "approval.changed": { actionId: string; cellId: string; subjectKey: string; status: ApprovalStatus };
-  "outbox.changed": { id: string; idempotencyKey: string; channelId: string; status: OutboxStatus };
-  "channel.focus": { on: boolean; buffered: number };
+  "owner.notified": LocalNotification;
   "cell.changed": { cellId: string; change: "created" | "updated" | "status" | "epoch"; status?: CellStatus; epoch?: number };
   "job.changed": { jobId: string; cellId: string; state: JobState };
-  /** Output chunk of a job started with streamPreview; the kernel/app forwards it to Channel.streamPreview or SSE. */
-  "job.output": { jobId: string; cellId: string; chunk: string };
   "run.started": { cellId: string; runId: string; epoch: number };
   "run.finished": { cellId: string; runId: string; epoch: number; outcome: RunOutcome | "error"; error?: string };
   /**
@@ -33,9 +30,6 @@ export interface BusTopics {
   "evidence.appended": { cellId: string; seq: number; kind: EvidenceKind; runId: string | null };
   "state.changed": { cellId: string; keys: string[] };
   "knowledge.changed": { kind: KnowledgeKind; name: string; scope: KnowledgeScope; cellId: string | null };
-  "ledger.alert": { cellId: string; level: Exclude<MeterResult, "ok"> };
-  /** The owner raised this cell's budget: cells below it that were held back by the budget stop can be dispatched again. */
-  "ledger.raised": { cellId: string };
 }
 
 export type BusTopic = keyof BusTopics;

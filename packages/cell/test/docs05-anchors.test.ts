@@ -2,7 +2,6 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   createEnvelope,
   gtdKeys,
-  isNgError,
   run,
   PAYLOAD,
   type ActionRecord,
@@ -11,7 +10,7 @@ import {
   type ProjectRecord,
   type UserMessagePayload,
 } from "@ng/protocol";
-import { boot, cleanupAll, HOUR, requestText, T0, tool, waitFor, type Harness } from "./helpers";
+import { boot, cleanupAll, HOUR, requestText, T0, tool, type Harness } from "./helpers";
 
 afterEach(cleanupAll);
 
@@ -201,8 +200,8 @@ describe("waits (the internal anchor)", () => {
 // docs/05 §3.3 / §5.3 — direct routing with declarative operators and a fixed batching window.
 describe("hub: operator watches, coalescing, absorption", () => {
   let seq = 0;
-  function feishu(text: string, extra: Partial<UserMessagePayload> = {}): Omit<Envelope, "to"> {
-    return createEnvelope({ id: `fs-${++seq}`, from: "channel:feishu:chat-review", principalId: "feishu:ou_mary", kind: "event", type: PAYLOAD.userMessage, payload: { text, ...extra } });
+  function memory(text: string, extra: Partial<UserMessagePayload> = {}): Omit<Envelope, "to"> {
+    return createEnvelope({ id: `fs-${++seq}`, from: "channel:memory:chat-review", principalId: "memory:ou_mary", kind: "event", type: PAYLOAD.userMessage, payload: { text, ...extra } });
   }
 
   it("mentions/keywords route past the desk into the hub, a burst inside the window is one batch, noise is handed back, and what arrives mid-run is absorbed", async () => {
@@ -214,19 +213,19 @@ describe("hub: operator watches, coalescing, absorption", () => {
       meta: { role: "hub" },
       watches: [
         { threadOrFilter: { "payload.mentions": { $contains: "ng-bot" }, "payload.eventKind": { $in: ["mention", "review_requested"] } }, coalesceMs: 60_000 },
-        { threadOrFilter: { from: "channel:feishu:chat-review", "payload.text": { $anyKeyword: ["帮忙排查", "线上报错"] } }, coalesceMs: 60_000 },
+        { threadOrFilter: { from: "channel:memory:chat-review", "payload.text": { $anyKeyword: ["帮忙排查", "线上报错"] } }, coalesceMs: 60_000 },
       ],
     });
 
-    const r1 = await h.kernel.ingest(feishu("@ng-bot 看下 MR !41", { mentions: ["NG-Bot"], eventKind: "mention" }), "feishu");
+    const r1 = await h.kernel.ingest(memory("@ng-bot 看下 MR !41", { mentions: ["NG-Bot"], eventKind: "mention" }), "memory");
     expect(r1).toMatchObject({ routedBy: "watch", cellIds: ["review-hub"], coalesced: ["review-hub"] });
     h.clock.advance(20_000);
-    await h.kernel.ingest(feishu("@ng-bot 还有 MR !42", { mentions: ["ng-bot"], eventKind: "mention" }), "feishu");
+    await h.kernel.ingest(memory("@ng-bot 还有 MR !42", { mentions: ["ng-bot"], eventKind: "mention" }), "memory");
     // Not a mention, not a keyword: the desk's business as before.
-    expect(await h.kernel.ingest(feishu("中午吃什么"), "feishu")).toMatchObject({ routedBy: "desk", cellIds: ["desk"] });
+    expect(await h.kernel.ingest(memory("中午吃什么"), "memory")).toMatchObject({ routedBy: "desk", cellIds: ["desk"] });
     // The second subscription has its own window.
     h.clock.advance(30_000);
-    expect(await h.kernel.ingest(feishu("线上报错了，帮忙排查一下 order-service"), "feishu")).toMatchObject({ routedBy: "watch", coalesced: ["review-hub"] });
+    expect(await h.kernel.ingest(memory("线上报错了，帮忙排查一下 order-service"), "memory")).toMatchObject({ routedBy: "watch", coalesced: ["review-hub"] });
     await h.kernel.idle();
     expect(h.script.callsOf("hub")).toHaveLength(0);
     const at = Object.fromEntries(h.kernel.inbox.listMessagesSync({ cellId: "review-hub" }).map((m) => [m.envelope.id, m.deliverAt - T0]));
@@ -240,7 +239,7 @@ describe("hub: operator watches, coalescing, absorption", () => {
       expect(text).toContain("MR !42");
       expect(text).not.toContain("order-service");
       // While the hub is working, an unrelated mention lands: it is delivered at once and joins this very Run.
-      await h.kernel.ingest(feishu("@ng-bot 帮我订个会议室", { mentions: ["ng-bot"], eventKind: "mention" }), "feishu");
+      await h.kernel.ingest(memory("@ng-bot 帮我订个会议室", { mentions: ["ng-bot"], eventKind: "mention" }), "memory");
       return tool("set_state", { patches: { "hub:topics": ["MR !41", "MR !42"] } });
     });
     h.script.add("hub", (req) => {
@@ -292,45 +291,13 @@ describe("agent principal on the control plane", () => {
     expect(h.kernel.control("proj", { action: "resume" }, { principalId: AGENT })).toMatchObject({ applied: true });
     h.kernel.updateCell("proj", { title: "改 TUI 表格复制（进行中）" }, { principalId: AGENT });
     // Asking for more than the cell has is clamped, as it would be for an ancestor cell.
-    const before = h.kernel.getCell("proj")!.bounds.maxTokens;
-    h.kernel.updateCell("proj", { bounds: { maxTokens: before * 10 } }, { principalId: AGENT });
-    expect(h.kernel.getCell("proj")!.bounds.maxTokens).toBe(before);
+    const before = h.kernel.getCell("proj")!.bounds.maxConcurrentChildren;
+    h.kernel.updateCell("proj", { bounds: { maxConcurrentChildren: before * 10 } }, { principalId: AGENT });
+    expect(h.kernel.getCell("proj")!.bounds.maxConcurrentChildren).toBe(before);
     expect(() => h.kernel.createRootCell({ id: "desk2", preset: "inline" }, { principalId: AGENT })).toThrow(/only the owner/);
     expect((await h.kernel.closeCell("proj", "cancelled", { principalId: AGENT })).closed).toEqual(["proj"]);
   });
 
-  it("cannot approve an outward send or continue past an exhausted budget; can decide ordinary cards", async () => {
-    const h = await boot();
-    // An outward message waiting on its card.
-    h.script.add("desk", tool("send_message", { to: "channel:memory:alice", text: "稍后回复你", summary: "reply to Alice" }));
-    await h.memory.inject({ from: "alice", text: "问个问题" });
-    await h.kernel.idle();
-    const [send] = h.kernel.gate.listPendingSync();
-    await expect(h.kernel.resolveApproval(send!.actionId, { decision: "approve", approverId: AGENT, seenArtifactVersion: 1 })).rejects.toSatisfy((e) => isNgError(e, "bounds_violation"));
-    expect(h.kernel.gate.getApprovalSync(send!.actionId)!.status).toBe("pending");
-    expect(h.memory.sent).toHaveLength(0);
-    // Declining is no escalation of privilege.
-    expect(await h.kernel.resolveApproval(send!.actionId, { decision: "deny", approverId: AGENT, reason: "先别发" })).toMatchObject({ status: "denied" });
-
-    // A cell that ran out of budget.
-    h.kernel.spawnCell("desk", { id: "w", preset: "worker", title: "修 CI", meta: { role: "w" }, bounds: { maxTokens: 1_000 } }, "fix");
-    h.script.add("w", { text: "working", usage: { inputTokens: 900, outputTokens: 200 } });
-    await h.kernel.idle();
-    const budget = h.kernel.gate.listPendingSync().find((c) => c.cellId === "w")!;
-    await expect(h.kernel.resolveApproval(budget.actionId, { decision: "continue", approverId: AGENT })).rejects.toSatisfy((e) => isNgError(e, "bounds_violation"));
-    expect(h.kernel.gate.usageSync("w").limitTokens).toBe(1_000);
-    expect(h.kernel.gate.getApprovalSync(budget.actionId)!.status).toBe("pending");
-    // The owner can.
-    expect(await h.kernel.resolveApproval(budget.actionId, { decision: "continue", approverId: "owner" })).toMatchObject({ status: "continued" });
-
-    // An ordinary blocked card is the agent's to answer on the owner's behalf.
-    h.kernel.spawnCell("desk", { id: "p", preset: "project", meta: { role: "p" } }, "go");
-    h.script.add("p", tool("request_approval", { kind: "escalation", title: "目录里有未提交改动", summary: "blocked", escalation: { reason: "blocked", explanation: "等你提交 / stash / 另开目录" } }));
-    await waitFor(() => h.kernel.gate.listPendingSync().some((c) => c.cellId === "p"), 5_000, "the blocked card");
-    const blocked = h.kernel.gate.listPendingSync().find((c) => c.cellId === "p")!;
-    expect(await h.kernel.resolveApproval(blocked.actionId, { decision: "continue", approverId: AGENT, note: "主人说 stash 后继续" })).toMatchObject({ status: "continued" });
-    expect(h.kernel.gate.getApprovalSync(blocked.actionId)!.approverId).toBe(AGENT);
-  });
 });
 
 describe("preferences reach cells that are already alive", () => {
@@ -371,29 +338,6 @@ it("requires a real source beyond an internal wait chain and rejects cycles of t
   expect(h.kernel.anchorsOf("proj").internal).toBe(true);
   addWait(h, "c", "a");
   expect(h.kernel.anchorsOf("proj").internal).toBe(false);
-});
-
-it("ignores a budget-held target's queued work and excludes waits below a budget-declined project", async () => {
-  const h = await boot();
-  project(h);
-  h.kernel.spawnCell("desk", { id: "held", preset: "worker", bounds: { maxTokens: 100 } });
-  h.kernel.gate.meter("held", { tokens: 101, billedCents: 0 });
-  h.kernel.sendToCell("held", { text: "run when funded" });
-  await h.kernel.idle();
-  expect(h.kernel.activityOf(["held"]).get("held")?.state).toBe("budget_paused");
-  addWait(h,"proj","held");
-  expect(h.kernel.anchorsOf("proj").internal).toBe(false);
-
-  h.kernel.spawnCell("proj", { id: "nested", preset: "project" });
-  h.kernel.checkStalls();
-  expect(checks(h,"nested")).toMatchObject([{status:"pending"}]);
-  h.kernel.gate.declineBudgetSync("proj", "owner");
-  expect(h.kernel.getCell("nested")?.status).toBe("active");
-  h.kernel.checkStalls();
-  expect(checks(h,"nested")).toMatchObject([{status:"cancelled"}]);
-  h.clock.advance(GRACE);
-  await h.kernel.idle();
-  expect(h.script.callsOf("nested")).toHaveLength(0);
 });
 
 it("arbitrates each affected project separately and re-arms a resolved incident for a new wait registration", async () => {
@@ -448,12 +392,10 @@ it("settles multiple waits on an owner's direct answer even when the new run def
   expect(h.kernel.listWaits(["proj"])).toEqual([]);
 });
 
-
-it("shows a coordinator the budget hold and a human edit on a descendant's shared artifact", async () => {
+it("shows a coordinator a human edit on a descendant's shared artifact", async () => {
   const h = await boot();
   project(h);
-  h.kernel.spawnCell("proj", {id:"worker",preset:"worker",bounds:{maxTokens:100}});
-  h.kernel.gate.meter("worker", {tokens:101,billedCents:0});
+  h.kernel.spawnCell("proj", {id:"worker",preset:"worker"});
   h.kernel.sendToCell("worker",{text:"continue"});
   await h.kernel.idle();
   const draft = (body: string) => ({format:"text" as const, body});
@@ -462,7 +404,6 @@ it("shows a coordinator the budget hold and a human edit on a descendant's share
   h.kernel.sendToCell("proj",{text:"查看共享文档"});
   await h.kernel.idle();
   const prompt = requestText(h.script.callsOf("proj").at(-1)!);
-  expect(prompt).toContain("budget exhausted");
   expect(prompt).toContain("[human-edited artifacts]");
   expect(prompt).toContain("art_report v2");
 });

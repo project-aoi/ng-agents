@@ -10,24 +10,18 @@ import {
   type BoundsInit,
   type BusTopic,
   type CellsRepo,
-  type ChannelAddr,
+  type ProjectStartAction,
   type Db,
   type PolicyBounds,
   type ProposedAction,
 } from "@ng/protocol";
-import { createGate, memorySecretStore, type GateOptions, type GateService } from "../src";
-
-export const SECRET_VALUE = "ghp_TOP_SECRET_value_0123456789";
-export const OWNER_UI: ChannelAddr = "channel:ui:owner";
+import { createGate, type GateOptions, type GateService } from "../src";
 
 export const DESK_BOUNDS: BoundsInit = {
-  tools: ["read", "write", "edit", "bash", "code_rpc"],
-  canSendTo: ["inbox:*", "channel:ui:*", "channel:feishu:*"],
-  secretRefs: ["github", "feishu"],
+  tools: ["read", "write", "edit", "bash"],
+  canSendTo: ["inbox:*", "channel:ui:*"],
   isolation: "none",
   maxConcurrentChildren: 3,
-  maxTokens: 1_000_000,
-  maxCents: 10_000,
   maxDepth: 3,
 };
 
@@ -50,8 +44,6 @@ export function setup(over: Partial<GateOptions> = {}): Fixture {
     db,
     bus,
     clock,
-    secrets: memorySecretStore({ github: SECRET_VALUE }),
-    ownerAddresses: ["channel:ui:*"],
     ...over,
   });
   const cells = cellsRepo(db, clock);
@@ -62,15 +54,11 @@ export function setup(over: Partial<GateOptions> = {}): Fixture {
   return { db, clock, gate, cells, events, addCell };
 }
 
-/** desk → w1 (worker, git_worktree, may report to desk only) with bounds from gate.attenuate. */
 export function withWorker(f: Fixture, id = "w1", requested: Partial<PolicyBounds> = {}): PolicyBounds {
   const parent = f.cells.require("desk");
   const bounds = f.gate.attenuate(parent.bounds, "desk", {
     tools: new Set(["read", "write", "edit", "bash"]),
-    secretRefs: new Set(["github"]),
-    isolation: "git_worktree",
-    maxTokens: 100_000,
-    maxCents: 1_000,
+    isolation: "none",
     ...requested,
   });
   f.cells.insert({ id, parentId: "desk", bounds });
@@ -81,24 +69,12 @@ export function meta(cellId: string, epoch = 0, extra: Partial<AuthorizeMeta> = 
   return { cellId, principalId: `cell:${cellId}`, epoch, ...extra };
 }
 
-export function send(target: string, over: Record<string, unknown> = {}): ProposedAction {
-  return {
-    type: "channel.send",
-    summary: "回复张三的报价问题",
-    subjectKey: "msg:env_1",
-    sideEffect: "external",
-    target,
-    content: { format: "text", body: "报价单已附上" },
-    ...over,
-  } as ProposedAction;
+export function proposal(over: Partial<ProjectStartAction> = {}): ProjectStartAction {
+  return { type: "project.start", summary: "立项", proposal: { title: "测试项目", outcome:"交付报告", actions: [] }, subjectKey: "project:one", sideEffect: "external", ...over };
 }
 
 export function exec(tool: string, over: Record<string, unknown> = {}): ProposedAction {
   return { type: "custom", name:tool, summary: `run ${tool}`, subjectKey: "cell:w1", sideEffect: "internal", tool, args: {}, ...over } as ProposedAction;
-}
-
-export function secretUse(secretRef: string, over: Record<string, unknown> = {}): ProposedAction {
-  return { type: "secret.use", summary: "call GitHub API", subjectKey: "cell:w1", sideEffect: "internal", secretRef, ...over } as ProposedAction;
 }
 
 export function putArtifact(

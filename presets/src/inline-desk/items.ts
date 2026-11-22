@@ -3,14 +3,11 @@ import {
   asClarifyCard, cellPrincipal,
   gtdKeys,
   PAYLOAD,
-  isChannelAddr,
   isEnvelopeOfType,
   isNgError,
-  type ActionRecord,
   type ActivityRecord,
   type ApprovalResolvedPayload,
   type CellResultPayload,
-  type ChannelAddr,
   type Clock,
   type Envelope,
   type ItemSource,
@@ -20,34 +17,12 @@ import {
   type ProjectStartAction,
   type RunPorts,
   type ToolContext,
-  type UserMessagePayload,
   type VersionedArtifact,
 } from "@ng/protocol";
 import { projectLaunch, startProjectSync, type ProjectInit, type RepoRef } from "../project/launch";
-import { KEYS, RESTORE_REASON, ROLES, type PresetsConfig } from "../shared/config";
+import { RESTORE_REASON, ROLES, type PresetsConfig } from "../shared/config";
 import { notifyOwner } from "../shared/notify";
-import { newAction, newActivity, patchAction, primaryItem, type RawInput } from "../shared/records";
-
-// Desk-side bookkeeping shared by the desk's tools: what an inbound item is, the reply drafts the desk keeps cards for,
-// and the deterministic follow-ups of background events (a reminder came due, a proposal was approved, a reply was
-// sent, a project finished). The model decides what to do with an item; these keep the books.
-
-/** A reply the desk drafted and keeps one card for (`desk:reply:<subjectKey>`). */
-export interface ReplyItem {
-  subjectKey: string;
-  title: string;
-  target: ChannelAddr;
-  targetLabel: string;
-  artifactId: string;
-  actionId?: string;
-  status: "pending" | "sent" | "withdrawn" | "closed";
-  source: ItemSource;
-  rawInput: RawInput;
-  envelope?: Envelope;
-  threads?: string[];
-  createdAt: number;
-  updatedAt: number;
-}
+import { newAction, newActivity, primaryItem, type RawInput } from "../shared/records";
 
 /** What the desk remembers about a proposal until the owner decides (`desk:proposal:<artifactId>`). */
 export interface ProposalItem {
@@ -76,16 +51,6 @@ export function isRestored(ctx: ToolContext): boolean {
   return ctx.snapshot.batch.envelopes.some((e) => isEnvelopeOfType(e, "handback") && e.payload.reason === RESTORE_REASON);
 }
 
-/** Human actions the app linked to a reply card ("转给我处理" keeps the card pending behind them). */
-export async function closeLinkedActions(ports: RunPorts, approvalActionId: string, status: "done" | "cancelled", now: number): Promise<Record<string, unknown>> {
-  const patches: Record<string, unknown> = {};
-  for (const e of await ports.context.listState(ports.self.cellId, gtdKeys.actionPrefix)) {
-    const a = e.value as ActionRecord;
-    if (a.approvalActionId === approvalActionId && a.status === "open") patches[e.key] = patchAction(a, { status }, now);
-  }
-  return patches;
-}
-
 export const WEEKLY_REVIEW_TIMER = "gtd-weekly-review";
 
 /** Prefix of a settle line that reports a failure (apply_updates then returns an error result). */
@@ -100,17 +65,8 @@ async function ensureWeeklyReview(cfg: PresetsConfig, ports: RunPorts): Promise<
   );
 }
 
-export function replyAddressOf(env: Envelope | undefined): ChannelAddr | undefined {
-  if (!env || !isEnvelopeOfType(env, "user.message")) return undefined;
-  const r = (env.payload as UserMessagePayload).replyTo;
-  return r && isChannelAddr(r) ? r : undefined;
-}
-
 /** The project an approval starts: derived from the approval id, so every path that starts it starts the same cell once. */
 export const projectIdForApproval = (approvalId: string) => `proj_${approvalId.replace(/^act_/, "")}`;
-
-/** `custom` action of present_to_owner cards: confirming only files the item as seen. */
-export const ACKNOWLEDGE_ACTION = "gtd.acknowledge";
 
 /**
  * The project an approved proposal starts: the plan version the owner saw (the json artifact, edits included), the
@@ -175,7 +131,7 @@ export async function launchProject(ports: RunPorts, init: ProjectInit, clock: C
 
 /**
  * The desk's bookkeeping, run by the kernel at the start of every desk Run (PresetDef.prepareRun) — so a reminder that
- * came due, an approved proposal or a sent reply is in the records even when the model does nothing useful with the
+ * came due, an approved proposal  is in the records even when the model does nothing useful with the
  * wake-up. A batch of nothing but such events never reaches the model; a cell's result always does. What it applied
  * is kept for the Run's apply_updates.
  */
@@ -187,7 +143,7 @@ export function createDeskBooks(cfg: PresetsConfig) {
       const data = (env.payload.data as { gtd?: ReminderData } | undefined)?.gtd;
       if (data?.kind !== "reminder" || !data.id || !data.text || env.id !== `gtd-reminder:${data.id}`) return;
       return {
-        id: data.id, notify: cfg.ownerAddress, draft: {
+        id: data.id, draft: {
           title: data.text, subjectKey: `reminder:${data.id}`, category: "action" as const, effort: data.effort ?? "15m",
           ...(data.remindAt !== undefined ? { dueAt: data.remindAt } : {}),
           options: [{ id: "done", label: "已办完", effect: "complete" as const, input: { mode: "optional" as const } }],
@@ -227,7 +183,7 @@ export async function settleDesk(cfg: PresetsConfig, ctx: ToolContext): Promise<
 
 /**
  * settleDesk plus whether every envelope of the batch was pure bookkeeping (nothing left for the model: a reminder that
- * came due, a decided proposal or reply card, a progress note). A `cell.result` is never pure bookkeeping: a fixer's
+ * came due, a decided proposal, a progress note). A `cell.result` is never pure bookkeeping: a fixer's
  * result must reach the model so it can tell the cells that wait on it.
  */
 export async function settleDeskBatch(cfg: PresetsConfig, ctx: ToolContext): Promise<{ lines: string[]; consumedAll: boolean }> {
@@ -246,7 +202,7 @@ export async function settleDeskBatch(cfg: PresetsConfig, ctx: ToolContext): Pro
       now,
     );
     await ports.context.commit(self, { statePatches: { [key]: action } });
-    await notifyOwner(ports, cfg.ownerAddress, `⏰ 提醒：${data.text}`, `reminder:${data.id}`);
+    await notifyOwner(ports, `⏰ 提醒：${data.text}`, `reminder:${data.id}`);
     out.push(`提醒已到：${data.text}（已放进专注工作区，主人已收到提醒）`);
   }
 
@@ -257,7 +213,7 @@ export async function settleDeskBatch(cfg: PresetsConfig, ctx: ToolContext): Pro
     if (!project || project.lifecycle !== "completed") return;
     const id = `done-${p.childCellId}`;
     if (await ports.context.readState(self, gtdKeys.activity(id))) return;
-    await notifyOwner(ports, cfg.ownerAddress, `「${project.title}」已完成：${p.summary.split("\n")[0]!.slice(0, 120)}`, `finished:${p.childCellId}:${id}`);
+    await notifyOwner(ports, `「${project.title}」已完成：${p.summary.split("\n")[0]!.slice(0, 120)}`, `finished:${p.childCellId}:${id}`);
     const a: ActivityRecord = newActivity({ id, kind: "action_completed", title: `已完成：${project.title}`, detail: p.summary, ...(project.source ? { source: project.source } : {}), restorable: false }, now);
     await ports.context.commit(self, { statePatches: { [gtdKeys.activity(id)]: a } });
     out.push(`项目已完成：${project.title}`);
@@ -281,31 +237,10 @@ export async function settleDeskBatch(cfg: PresetsConfig, ctx: ToolContext): Pro
         const init = approvedProjectInit(p.actionId, action, art, null, clock);
         const r = await launchProject(ports, init, clock);
         {
-          await notifyOwner(ports, cfg.ownerAddress, `已立项：${init.title}，后台开始推进`, `project:${p.actionId}`);
+          await notifyOwner(ports, `已立项：${init.title}，后台开始推进`, `project:${p.actionId}`);
           out.push(`项目「${init.title}」已按确认的安排启动（${r.projectId}）`);
         }
         return true;
-      } else if (p.action.type === "custom") {
-        return p.action.name === ACKNOWLEDGE_ACTION;
-      } else if (p.action.type === "channel.send") {
-        if (p.status === "unknown" || p.status === "failed") return false;
-        const item = (await readReplyItems(ports)).find(i => i.actionId === p.actionId);
-        if (!item) return false;
-        if (p.status === "executed") {
-          if (await ports.context.readState(self,gtdKeys.activity(`sent-${p.actionId}`))) return true;
-          const done: ActivityRecord = newActivity(
-            { id: `sent-${p.actionId}`, kind: "action_completed", title: `已回复${item.targetLabel}：${item.title}`, source: item.source, rawInput: item.rawInput.text, actionId: p.actionId, restorable: false },
-            now,
-          );
-          const linked = await closeLinkedActions(ports, p.actionId, "done", now);
-          await ports.context.commit(self, { statePatches: { [gtdKeys.activity(done.id)]: done, ...linked } });
-          out.push(`回复已发出：${item.title}`);
-          return true;
-        } else if (p.status === "denied" || p.status === "cancelled") {
-          return !p.action.relatedProjectIds?.length;
-        }
-        // failed / unknown: never swallow at 0-Token (BUG-032) — hand to the desk model so the failure/unknown is surfaced.
-        return false;
       }
       return false;
     } else if (isEnvelopeOfType(env, "cell.result")) {
@@ -327,15 +262,4 @@ export async function settleDeskBatch(cfg: PresetsConfig, ctx: ToolContext): Pro
     }
   }
   return { lines: out, consumedAll: consumedAll && !out.some((l) => l.startsWith(SETTLE_ERROR)) };
-}
-
-export async function readReplyItems(ports: RunPorts): Promise<ReplyItem[]> {
-  return ports.listOwnDecisions().flatMap(({record, envelope}) => {
-    const card = asClarifyCard(record.card.data);
-    if (record.action.type !== "channel.send" || card?.cardType !== "response" || !record.artifactId) return [];
-    const status: ReplyItem["status"] = record.status === "executed" ? "sent" : record.status === "cancelled" ? "withdrawn" : record.status === "denied" ? "closed" : "pending";
-    return [{subjectKey:record.subjectKey, title:card.title, target:record.action.target, targetLabel:card.reply.targetLabel,
-      status, artifactId:record.artifactId, actionId:record.actionId, source:card.source, rawInput:card.rawInput,
-      ...(envelope ? {envelope, ...(envelope.threads ? {threads:envelope.threads} : {})} : {}),createdAt:record.createdAt,updatedAt:record.updatedAt}];
-  });
 }

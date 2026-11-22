@@ -123,7 +123,7 @@ describe("a refusal is reported as refused by the adapters", () => {
     engine,
     bin: engine,
     cwd: "/tmp",
-    caps: { root: "/tmp", isolation: "none", write: false, edit: false, bash: false, readOnly: true, web: true, access: "host" },
+    caps: { root: "/tmp", write: false, edit: false, bash: false, readOnly: true, web: true },
     model: undefined,
     system: "sys",
     systemFile: join(tempDir("sys"), "system.md"),
@@ -138,11 +138,11 @@ describe("a refusal is reported as refused by the adapters", () => {
   it("claude: an assistant message with stop_reason refusal makes the result a refused turn, not an error", () => {
     const d = cliAdapterFor("claude").createDriver(req("claude"));
     d.onLine(JSON.stringify({ type: "system", subtype: "init", session_id: "s1" }), io);
-    d.onLine(JSON.stringify({ type: "assistant", message: { id: "m1", stop_reason: "refusal", content: [{ type: "text", text: "I can't help with that." }], usage: {} } }), io);
+    d.onLine(JSON.stringify({ type: "assistant", message: { id: "m1", stop_reason: "refusal", content: [{ type: "text", text: "I can't help with that." }] } }), io);
     const out = d.onLine(JSON.stringify({ type: "result", subtype: "success", is_error: false, num_turns: 1, session_id: "s1" }), io);
     expect(turnEnds(out)).toEqual([{ type: "turn_end", ok: false, refused: true }]);
     // The next turn starts clean.
-    d.onLine(JSON.stringify({ type: "assistant", message: { id: "m2", stop_reason: "end_turn", content: [{ type: "text", text: "ok" }], usage: {} } }), io);
+    d.onLine(JSON.stringify({ type: "assistant", message: { id: "m2", stop_reason: "end_turn", content: [{ type: "text", text: "ok" }] } }), io);
     expect(turnEnds(d.onLine(JSON.stringify({ type: "result", subtype: "success", is_error: false, num_turns: 1, session_id: "s1" }), io))).toEqual([{ type: "turn_end", ok: true }]);
   });
 
@@ -190,7 +190,7 @@ describe("BUG-026: CLI steer & follow-up anti-loss and fresh rebuild anti-duplic
       `console.log(JSON.stringify({ type: "system", subtype: "init", session_id: "sess-close" }));`,
       `setTimeout(() => {`,
       `  fs.appendFileSync(logFile, JSON.stringify({ argv: process.argv.slice(2) }) + "\\n");`,
-      `  console.log(JSON.stringify({ type: "assistant", message: { id: "m1", stop_reason: "end_turn", content: [{ type: "text", text: "turn1-only" }], usage: { input_tokens: 1, output_tokens: 1 } } }));`,
+      `  console.log(JSON.stringify({ type: "assistant", message: { id: "m1", stop_reason: "end_turn", content: [{ type: "text", text: "turn1-only" }] } }));`,
       `  console.log(JSON.stringify({ type: "result", subtype: "success", is_error: false, num_turns: 1, session_id: "sess-close" }));`,
       `  process.exit(0);`,
       `}, 200);`,

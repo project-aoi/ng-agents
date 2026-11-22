@@ -1,7 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { serveStatic } from "@hono/node-server/serve-static";
-import type { ChannelHubImpl } from "@ng/channel";
 import { NgError } from "@ng/protocol";
 import type { ModelsDTO, SetModelRequest } from "../shared/api";
 import type { ModelSwitch } from "./models";
@@ -21,7 +20,6 @@ const ACTIVITY_KINDS = new Set<ActivityKind>(["notification_archived", "note_sav
 
 export interface DeskAppDeps {
   desk: Desk;
-  hub: Pick<ChannelHubImpl, "handleHttp">;
   events: EventHub;
   security: SecurityPolicy;
   /** docs/05 §5.3: the external main agent's control plane (`/api/agent/*`, also what the MCP server proxies to). */
@@ -70,7 +68,6 @@ async function body<T>(c: Context): Promise<T> {
 
 /**
  * The HTTP surface: `/api/*` (bearer token when configured, same-site writes only), `/api/events` (SSE),
- * `/hooks/:channelId` (provider webhooks, authenticated by each channel's signature check), and the built web client.
  */
 const NO_MODELS: ModelsDTO = {
   available: false,
@@ -130,7 +127,6 @@ export function createDeskApp(deps: DeskAppDeps): Hono {
   });
   const limit = bodyLimit({ maxSize: MAX_BODY, onError: (c) => apiError(c, 413, "too_large", "请求体太大") });
   app.use("/api/*", limit);
-  app.use("/hooks/*", limit);
 
   // ---------- top bar ----------
   const withModel = <T extends { model?: string }>(status: T): T => {
@@ -145,12 +141,8 @@ export function createDeskApp(deps: DeskAppDeps): Hono {
     return c.json(await deps.models.set(await body<SetModelRequest>(c)));
   });
   app.post("/api/capture", async (c) => c.json(await desk.ingest(await body(c),ownerActor)));
-  // The owner's budget-limits switch: an owner route (the agent's credential never opens it, and no tool reaches it).
-  app.put("/api/settings/budget-limits", async (c) => c.json(desk.setBudgetLimits(await body(c), ownerActor)));
-  app.post("/api/focus", async (c) => c.json(await desk.focus(await body(c),ownerActor)));
 
   app.get("/api/projects/closed", c => c.json({projects:desk.recentlyClosedProjects()}));
-  app.post("/api/editor-leases/:id", async c => c.json(await desk.editorLease(c.req.param("id"),(await body<{active:boolean}>(c)).active,ownerActor)));
   app.get("/api/human-items", c => c.json({items:desk.listHumanItems()}));
   app.post("/api/human-items/:id/decide", async c => c.json(await desk.decideHumanItem(c.req.param("id"),await body(c),ownerActor)));
   app.post("/api/human-activity/:id/undo", async c => c.json(await desk.undoHumanDecision(c.req.param("id"),ownerActor)));
@@ -175,8 +167,6 @@ export function createDeskApp(deps: DeskAppDeps): Hono {
   app.post("/api/clarify/:cardId/resolve-offline", async (c) => c.json(await desk.resolveOffline(c.req.param("cardId"), await body(c), ownerActor)));
   app.post("/api/clarify/:cardId/dismiss", async (c) => c.json(await desk.dismiss(c.req.param("cardId"), await body(c), ownerActor)));
   app.post("/api/clarify/:cardId/deny", async (c) => c.json(await desk.deny(c.req.param("cardId"), await body(c), ownerActor)));
-  app.post("/api/clarify/:cardId/verify", async (c) => c.json(await desk.verify(c.req.param("cardId"), await body(c), ownerActor)));
-  app.post("/api/clarify/:cardId/abandon", async (c) => c.json(await desk.abandon(c.req.param("cardId"), await body(c), ownerActor)));
 
   // ---------- 🎯 Engage ----------
   app.get("/api/engage", (c) => {
@@ -186,7 +176,6 @@ export function createDeskApp(deps: DeskAppDeps): Hono {
   });
   app.get("/api/engage/:cellId/:actionId", (c) => c.json(desk.engageDetail(c.req.param("cellId"), c.req.param("actionId"))));
   app.post("/api/engage/:cellId/:actionId/done", async (c) => c.json(await desk.done(c.req.param("cellId"), c.req.param("actionId"), await body(c), ownerActor)));
-  app.post("/api/engage/:cellId/:actionId/send", async (c) => c.json(await desk.engageSend(c.req.param("cellId"), c.req.param("actionId"), await body(c), ownerActor)));
 
   // ---------- drafts ----------
   app.get("/api/artifacts/:artifactId", (c) => c.json(desk.artifact(c.req.param("artifactId"))));
@@ -225,8 +214,6 @@ export function createDeskApp(deps: DeskAppDeps): Hono {
   app.get("/api/review", (c) => c.json(desk.review()));
   app.post("/api/review/skills/:name/accept", (c) => c.json(desk.acceptSkill(c.req.param("name"),ownerActor)));
   app.post("/api/review/skills/:name/dismiss", (c) => c.json(desk.dismissSkill(c.req.param("name"),ownerActor)));
-  app.post("/api/review/rules", async (c) => c.json(desk.enableRule(await body(c),ownerActor)));
-  app.post("/api/review/rules/dismiss", async (c) => c.json(desk.dismissRule(await body(c),ownerActor)));
   app.post("/api/review/sensors/:sensorId/code", async (c) => c.json(desk.sensorToCode(c.req.param("sensorId"), await body(c),ownerActor)));
 
   // ---------- activity drawer ----------
@@ -270,22 +257,6 @@ export function createDeskApp(deps: DeskAppDeps): Hono {
   if (deps.agent) mountAgentApi(app, deps.agent, (c) => (c.get("agentPrincipal" as never) as `agent:${string}` | undefined) ?? null);
 
   app.all("/api/*", (c) => apiError(c, 404, "not_found", "没有这个接口"));
-
-  // ---------- provider webhooks ----------
-  app.all("/hooks/:channelId", async (c) => {
-    const headers: Record<string, string> = {};
-    c.req.raw.headers.forEach((v, k) => (headers[k] = v));
-    const url = new URL(c.req.url);
-    const query: Record<string, string> = {};
-    url.searchParams.forEach((v, k) => (query[k] = v));
-    const r = await deps.hub.handleHttp(c.req.param("channelId"), {
-      method: c.req.method,
-      headers,
-      rawBody: new Uint8Array(await c.req.arrayBuffer()),
-      query,
-    });
-    return new Response(r.body, { status: r.status, headers: r.headers ?? {} });
-  });
 
   // ---------- web client ----------
   const webDir = deps.webDir && existsSync(join(deps.webDir, "index.html")) ? deps.webDir : null;

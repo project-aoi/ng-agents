@@ -47,7 +47,7 @@ type Args = Record<string, unknown>;
 type Principal = `agent:${string}`;
 type Handler = (args: Args, principalId: Principal) => Promise<AgentToolResult> | AgentToolResult;
 
-/** The `text` an agent reads for an owner-only card (outgoing send, exhausted budget). */
+/** The `text` an agent reads for an owner-only card (project approval). */
 export function ownerOnlyText(cardId: string, why: string): string {
   return `Refused: only the owner can approve card ${cardId} (${why}). You may not approve or continue it on their behalf, even on their say-so. Tell the owner to confirm it themselves in the workbench UI (待我处理). The card is still pending.`;
 }
@@ -96,13 +96,10 @@ const ARG_ALIASES: Readonly<Record<string, readonly string[]>> = {
   brief: ["description", "instruction", "details"],
 };
 
-/** Arguments tools no longer take, still sent by agents that learnt the old schemas: dropped, not refused. */
-const RETIRED_ARGS: readonly string[] = ["cwdMode"];
 
 export function normalizeArgs(doc: AgentToolDoc, args: Args): Args {
   const props = (doc.inputSchema as { properties?: Record<string, unknown> }).properties ?? {};
   const out: Args = { ...args };
-  for (const k of RETIRED_ARGS) if (!(k in props)) delete out[k];
   for (const [real, aliases] of Object.entries(ARG_ALIASES)) {
     if (!(real in props) || out[real] !== undefined) continue;
     for (const alias of aliases) {
@@ -192,7 +189,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
   }
 
   function ownerOnlyOf(rec: ApprovalRecord): string | null {
-    return ownerOnlyApproval({ ...rec.action, card: rec.card }, kernel.ownerAddresses);
+    return ownerOnlyApproval(rec.action);
   }
 
   function cardLine(item: ReturnType<typeof desk.listHumanItems>[number]) {
@@ -255,10 +252,6 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
     return { lines, data: occ };
   }
 
-  /** One plain line when the owner switched budget limits off, so nobody suggests raising a budget. */
-  function budgetLine(): string | null {
-    return kernel.budgetLimits().enforced ? null : "额度限制已关闭：不会因额度暂停（用量照常统计）。";
-  }
 
   /** A cell's state in a few words for a person (and for the agent relaying it). */
   function cellStateText(c: CellRecord): string {
@@ -273,7 +266,6 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         const w = kernel.listWaits([c.id])[0];
         return w ? `等待中（waiting for ${w.waitingFor}：${oneLine(w.reason, 60)}）` : `等待中（${a.why}）`;
       }
-      case "budget_paused": return "额度用尽暂停";
       case "dormant":
         return "待命可唤醒";
       default:
@@ -370,8 +362,6 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         finished = recent.map((p) => ({ id: p.cellId, title: p.record.title, lifecycle: p.record.lifecycle, at: p.record.completedAt ?? p.record.updatedAt, summary: p.record.summary ?? null }));
       }
       if (clarify.snoozed > 0) parts.push(`另有 ${clarify.snoozed} 张卡被推迟，到点会回到待确认。`);
-      const budget = budgetLine();
-      if (budget) parts.push(budget);
       return ok(`工作台概览（${isoMin(now())}）\n\n${parts.join("\n\n")}`, {
         generatedAt: now(),
         humanActions: human.map((h) => h.data),
@@ -381,7 +371,6 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         running: running.data,
         workspaces: ws.data,
         snoozedCards: clarify.snoozed,
-        budgetLimits: kernel.budgetLimits().enforced,
         ...(finished ? { finished } : {}),
       });
     },
@@ -528,8 +517,6 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
             : cell?.status === "paused"
               ? `${record.lifecycle}；已暂停（set_project_state resume 继续）`
               : record.lifecycle;
-      const usage = kernel.gate.usageSync(id);
-      const budget = budgetLine() ?? `已用 ${usage.subtreeTokens} / ${usage.limitTokens} tokens${usage.state === "hard_stop" ? "（已用完：暂停推进，等主人在工作台追加额度）" : usage.state === "warn" ? "（快用完了）" : ""}`;
       const actionLine = (a: Located<ActionRecord>) => {
         const r = a.record;
         const carrier = r.cellId ? `，由 ${r.cellId} 承担` : "";
@@ -553,7 +540,6 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         `目标：${record.outcome ?? "—"}`,
         `摘要：${record.summary ?? "—"}`,
         `目录：${record.cwd ?? cell?.spec.cwd ?? "—"}`,
-        `额度：${budget}`,
         `来源：${record.source?.label ?? "—"}；创建 ${isoMin(record.createdAt)}；更新 ${isoMin(record.updatedAt)}`,
         ...(row?.ball ? [`球在：${OWNER_TEXT[row.ball.owner]} · ${oneLine(row.ball.text, 120)}`] : []),
         ...(ownWaits.length ? [`项目本身在等：${ownWaits.join("；")}`] : []),
@@ -579,7 +565,6 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         stalled: Boolean(row?.stalled),
         stalledSince: record.stalledSince ?? null,
         ball: row?.ball ? { owner: row.ball.owner, text: row.ball.text } : null,
-        usage: { tokens: usage.subtreeTokens, limitTokens: usage.limitTokens, enforced: kernel.budgetLimits().enforced },
         actions: actions.map(({ record, cellId }) => {
           const linked = linkedApprovalId(record);
           return { id: record.id, cellId, title: record.title, owner: record.owner, status: record.status, nextStep: record.nextStep ?? null,
@@ -637,14 +622,12 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const result = await desk.decideHumanItem(str(args.id)!,{
         optionId:str(args.optionId)!, seenItemRevision:args.seenItemRevision as number,
         ...(typeof args.seenVersion==="number" ? {seenArtifactVersion:args.seenVersion} : {}),
-        ...(typeof args.seenAttempt==="number" ? {seenAttempt:args.seenAttempt} : {}),
         ...(typeof args.until==="number" ? {until:args.until} : {}), ...(typeof args.note==="string" ? {note:args.note} : {}),
         ...(typeof args.resumeProjectId==="string" ? {resumeProjectId:args.resumeProjectId} : {}),
         ...(Array.isArray(args.confirmedClosure) ? {confirmedClosure:args.confirmedClosure as string[]} : {}),
         ...(Array.isArray(args.confirmedTargets) ? {confirmedTargets:args.confirmedTargets as string[]} : {}),
       },as(principalId));
-      if (["already_cancelled", "not_found", "not_unknown", "not_pending", "failed", "version_mismatch", "revision_mismatch"].includes(result.status) ||
-        (result.status === "unknown" && args.optionId !== "system.defer")) return fail(JSON.stringify(result), result);
+      if (["already_cancelled", "not_found", "not_pending", "version_mismatch", "revision_mismatch"].includes(result.status)) return fail(JSON.stringify(result), result);
       return ok(JSON.stringify(result),result);
     },
     async reopen_project(args,principalId) {

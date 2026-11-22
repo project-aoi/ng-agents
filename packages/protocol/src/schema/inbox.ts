@@ -16,8 +16,7 @@ CREATE TABLE IF NOT EXISTS inbox_schedules (
   cell_id        TEXT NOT NULL REFERENCES cells(id),
   template_id    TEXT NOT NULL,                -- envelope id of the template (dedupe key)
   envelope       TEXT NOT NULL,                -- JSON Envelope template
-  cron           TEXT,
-  idle_sec       INTEGER,
+  cron           TEXT NOT NULL,
   tz             TEXT,
   cancel_group   TEXT,
   expected_epoch INTEGER,
@@ -26,7 +25,6 @@ CREATE TABLE IF NOT EXISTS inbox_schedules (
   active         INTEGER NOT NULL DEFAULT 1,
   created_at     INTEGER NOT NULL,
   updated_at     INTEGER NOT NULL,
-  CHECK ((cron IS NOT NULL) + (idle_sec IS NOT NULL) = 1),
   UNIQUE (cell_id, template_id)
 );
 CREATE INDEX IF NOT EXISTS idx_sched_next ON inbox_schedules(next_fire_at) WHERE active = 1;
@@ -72,7 +70,6 @@ CREATE TABLE IF NOT EXISTS inbox_claims (
   claim_id         TEXT PRIMARY KEY,
   cell_id          TEXT NOT NULL REFERENCES cells(id),
   worker_id        TEXT NOT NULL,
-  mode             TEXT NOT NULL CHECK (mode IN ('serial_coalesce','competing_workers')),
   epoch            INTEGER NOT NULL,           -- cell epoch at claim time
   status           TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','completed','released','expired')),
   claimed_at       INTEGER NOT NULL,
@@ -81,7 +78,7 @@ CREATE TABLE IF NOT EXISTS inbox_claims (
   release_reason   TEXT
 );
 -- serial lock: at most one active serial claim per cell
-CREATE UNIQUE INDEX IF NOT EXISTS ux_claims_serial ON inbox_claims(cell_id) WHERE status = 'active' AND mode = 'serial_coalesce';
+CREATE UNIQUE INDEX IF NOT EXISTS ux_claims_serial ON inbox_claims(cell_id) WHERE status = 'active';
 CREATE INDEX IF NOT EXISTS idx_claims_lease ON inbox_claims(lease_expires_at) WHERE status = 'active';
 CREATE INDEX IF NOT EXISTS idx_claims_cell ON inbox_claims(cell_id, status);
 `,

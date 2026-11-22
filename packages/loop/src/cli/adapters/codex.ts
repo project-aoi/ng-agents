@@ -13,18 +13,10 @@ import { asRecord, contentText, HOST_UNSANDBOXED, num, str, tomlInlineTable, tom
  *   - read-only cells (both access modes): `read-only` — reads anywhere, no writes, no network for commands.
  *   - host access, writing (docs/05 default): `danger-full-access` — no sandbox: writes, commands and network
  *     anywhere, the owner's execpolicy rules in effect.
- *   - workspace access, writing: `workspace-write` (writes only in the cwd and temp dirs, no network) when write,
- *     edit and bash are all allowed; anything less runs read-only.
  * - `--ignore-rules` whenever a sandbox is on: no user/project execpolicy rules, since a matching allow rule runs its
  *   command outside the sandbox (a read-only cell must not get a write path that way).
  * - Host access: the hosted `web_search` tool in "live" mode when the cell has web (it needs no sandbox network).
  * - Steer: no live input in exec mode — the loop interrupts the process and resumes the session with the steer text.
- * - Usage: `turn.completed.usage` (input incl. cached + output); no cost is reported (cents 0). The figures are the
- *   session's running totals — after `exec resume` they include every earlier turn — so they are passed on as
- *   `sessionTotal` and the loop meters the difference.
- * - Besides commands, patches, MCP calls and web searches, Codex has tools that only show up as generic items (its
- *   code-mode JS `exec` arrives as `custom_tool_call` / `custom_tool_call_output`). Every item that is not plain
- *   conversation is mirrored as a tool call, so nothing the agent did is missing from the record or the step count.
  */
 export function codexAdapter(): CliAdapter {
   return {
@@ -43,15 +35,12 @@ export function codexAdapter(): CliAdapter {
 /** Linux caps one argv string at 128 KiB; larger system texts travel at the top of the first prompt instead. */
 export const CODEX_INLINE_INSTRUCTIONS_MAX = 100_000;
 
-export function codexSandboxMode(caps: CliCapabilities): "read-only" | "workspace-write" | "danger-full-access" {
-  if (caps.readOnly) return "read-only";
-  if (caps.access === "host") return "danger-full-access";
-  return caps.write && caps.edit && caps.bash ? "workspace-write" : "read-only";
+export function codexSandboxMode(caps: CliCapabilities): "read-only" | "danger-full-access" {
+  return caps.readOnly ? "read-only" : "danger-full-access";
 }
 
 export function codexArgs(req: LaunchRequest): string[] {
   const mode = codexSandboxMode(req.caps);
-  const host = req.caps.access === "host";
   const server = req.mcp.serverName;
   const cfg: string[] = [
     `approval_policy=${tomlValue("never")}`,
@@ -62,8 +51,7 @@ export function codexArgs(req: LaunchRequest): string[] {
     `mcp_servers.${server}.tool_timeout_sec=3600`,
     `mcp_servers.${server}.default_tools_approval_mode=${tomlValue("approve")}`,
   ];
-  if (mode === "workspace-write") cfg.push("sandbox_workspace_write.network_access=false");
-  if (host && req.caps.web) cfg.push(`web_search=${tomlValue("live")}`);
+  if (req.caps.web) cfg.push(`web_search=${tomlValue("live")}`);
   if (req.session?.mode !== "resume" && req.system.length <= CODEX_INLINE_INSTRUCTIONS_MAX) cfg.push(`developer_instructions=${tomlValue(req.system)}`);
   const rules = mode === "danger-full-access" ? [] : ["--ignore-rules"];
   const common = ["--json", "--skip-git-repo-check", ...rules, ...cfg.flatMap((c) => ["-c", c])];
@@ -76,18 +64,11 @@ export function codexArgs(req: LaunchRequest): string[] {
 
 function describePermissions(caps: CliCapabilities): string {
   const mode = codexSandboxMode(caps);
-  if (caps.access === "host") {
-    const web = caps.web ? "; live web search on" : "";
-    if (mode === "danger-full-access") {
-      return `codex: host access, writing — sandbox danger-full-access, approval_policy never: reads, writes, commands and network anywhere, the owner's config and execpolicy rules in effect${web}; ${HOST_UNSANDBOXED}.`;
-    }
-    return `codex: host access, read-only — sandbox read-only, enforced by Codex's OS sandbox for shell commands and patches: reads anywhere, no writes, no network for commands${web}; the owner's execpolicy rules are not loaded (an allow rule would run its command outside the sandbox).`;
+  const web = caps.web ? "; live web search on" : "";
+  if (mode === "danger-full-access") {
+    return `codex: host access, writing — sandbox danger-full-access, approval_policy never: reads, writes, commands and network anywhere, the owner's config and execpolicy rules in effect${web}; ${HOST_UNSANDBOXED}.`;
   }
-  if (mode === "read-only") {
-    const note = caps.readOnly ? "" : " (the cell may not use all of write, edit and bash, which Codex cannot separate)";
-    return `codex: sandbox read-only${note} — enforced by Codex's OS sandbox for shell commands and patches; reads are not limited to the workspace.`;
-  }
-  return `codex: sandbox workspace-write — enforced by Codex's OS sandbox: writes only in ${caps.root} and temp dirs, no network; reads are not limited to the workspace.`;
+  return `codex: host access, read-only — sandbox read-only, enforced by Codex's OS sandbox for shell commands and patches: reads anywhere, no writes, no network for commands${web}; the owner's execpolicy rules are not loaded (an allow rule would run its command outside the sandbox).`;
 }
 
 class CodexDriver implements CliDriver {
@@ -138,9 +119,6 @@ class CodexDriver implements CliDriver {
         this.#itemCompleted(asRecord(msg["item"]), out);
         break;
       case "turn.completed": {
-        const u = asRecord(msg["usage"]);
-        const tokens = num(u["input_tokens"]) + num(u["output_tokens"]);
-        if (tokens > 0) out.push({ type: "usage", tokens, cents: 0, cached: Math.min(num(u["cached_input_tokens"]), tokens), sessionTotal: true });
         out.push({ type: "turn_end", ok: true });
         break;
       }

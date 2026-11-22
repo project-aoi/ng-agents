@@ -11,7 +11,6 @@ import {
   detectCli,
   parseAgentBackend,
   resolveAgentBackendFromEnv,
-  UnconfiguredModelClient,
 } from "../src";
 import { createFakeRun, installFakeCli } from "../src/testing";
 
@@ -44,15 +43,12 @@ describe("agent backend resolution", () => {
   const none = () => false;
   it("reads NG_AGENT_BACKEND", () => {
     expect(resolveAgentBackendFromEnv({ NG_AGENT_BACKEND: "codex" }, { detect: none })).toBe("codex");
-    expect(resolveAgentBackendFromEnv({ NG_AGENT_BACKEND: "API" }, { detect: none })).toBe("api");
     expect(() => parseAgentBackend("gpt")).toThrow(/unknown backend/);
   });
 
-  it("auto: first installed of claude, codex, agy; else api with a provider key; else none", () => {
+  it("selects the first installed CLI", () => {
     expect(resolveAgentBackendFromEnv({}, { detect: (e) => e !== "claude" })).toBe("codex");
     expect(resolveAgentBackendFromEnv({ NG_AGENT_BACKEND: "auto" }, { detect: (e) => e === "agy" })).toBe("agy");
-    expect(resolveAgentBackendFromEnv({ ANTHROPIC_API_KEY: "k" }, { detect: none })).toBe("api");
-    expect(resolveAgentBackendFromEnv({ NG_MODEL_PROVIDER: "openai", NG_OPENAI_BASE_URL: "http://x" }, { detect: none })).toBe("api");
     expect(resolveAgentBackendFromEnv({}, { detect: none })).toBeNull();
   });
 
@@ -76,11 +72,11 @@ describe("routing loop", () => {
     };
   }
 
-  it("routes code processors and engine api to the API loop, CLI engines to their (lazily created) loop", async () => {
+  it("routes code locally and creates each CLI loop once", async () => {
     const seen: string[] = [];
     const created: string[] = [];
     const routing = createRoutingLoop({
-      api: stub("api", seen),
+      local: stub("local", seen),
       defaultEngine: "claude",
       cliLoop: (e) => {
         created.push(e);
@@ -92,27 +88,13 @@ describe("routing loop", () => {
       return routing.run(r.snapshot, ports ?? r.ports, r.controller.signal);
     };
     await go("a", { kind: "llm" });
-    await go("b", { kind: "llm", engine: "api" });
     await go("c", { kind: "code", entry: "join" });
     await go("d", { kind: "llm", engine: "agy" });
     await go("e", { kind: "llm" });
-    expect(seen).toEqual(["claude:a", "api:b", "api:c", "agy:d", "claude:e"]);
+    expect(seen).toEqual(["claude:a", "local:c", "agy:d", "claude:e"]);
     expect(created).toEqual(["claude", "agy"]);
     expect(routing.engineFor({ kind: "llm", engine: "codex" })).toBe("codex");
   });
 
-  it("drops a CLI session record when another engine runs the cell", async () => {
-    const routing = createRoutingLoop({ api: stub("api", []), defaultEngine: "api", cliLoop: (e) => stub(e, []) });
-    const r = createFakeRun({ spec: { processor: { kind: "llm" } } });
-    r.ports.state.set(CLI_SESSION_KEY, { engine: "claude", sessionId: "s" });
-    await routing.run(r.snapshot, r.ports, r.controller.signal);
-    expect(r.ports.state.has(CLI_SESSION_KEY)).toBe(false);
-  });
 
-  it("fails clearly without any backend, and an API Run without a configured model", async () => {
-    const routing = createRoutingLoop({ api: stub("api", []), defaultEngine: null, cliLoop: (e) => stub(e, []) });
-    const r = createFakeRun({ spec: { processor: { kind: "llm" } } });
-    await expect(routing.run(r.snapshot, r.ports, r.controller.signal)).rejects.toThrow(/no agent backend/);
-    await expect(new UnconfiguredModelClient().complete()).rejects.toThrow(/no API model/);
-  });
 });

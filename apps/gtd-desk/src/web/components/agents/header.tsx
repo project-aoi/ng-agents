@@ -2,10 +2,9 @@ import { Fragment, useState } from "react";
 import type { ButtonDTO, CellControlResponse, CellTimelineDTO, CellControlRequest, TopologyNodeDTO } from "../../../shared/api";
 import { callButton, request } from "../../api";
 import { toFailure, useNavigate, useOpenReport, useStatus, useToast } from "../../state";
-import { budgetState } from "../budget";
-import { ButtonRow, Chevron, ProgressBar } from "../controls";
+import { ButtonRow, Chevron } from "../controls";
 import { Markdown } from "../markdown";
-import { compactCount, engineText, isCoordinator, tokensText } from "./model";
+import { engineText, isCoordinator } from "./model";
 
 const CONTROL_ACTIONS = new Set<CellControlRequest["action"]>(["pause", "resume", "cancel"]);
 
@@ -15,14 +14,12 @@ export function NodeHeader(props: { head: CellTimelineDTO; onSelect(cellId: stri
   const n = head.node;
   const navigate = useNavigate();
   const openReport = useOpenReport();
-  const { status, setStatus } = useStatus();
+  const { setStatus } = useStatus();
   const toast = useToast();
   const [boardOpen, setBoardOpen] = useState(false);
   const engine = engineText(n);
   const board = isCoordinator(n) || head.notes !== null || head.unpulled.length > 0;
   const unpulledTotal = head.unpulled.reduce((s, u) => s + u.count, 0);
-  // No limit applies (none set, or the owner switched limits off): usage alone, without a bar.
-  const limit = budgetState(status).enforced ? n.tokensLimit : null;
 
   const runControl = async (b: ButtonDTO) => {
     try {
@@ -84,16 +81,6 @@ export function NodeHeader(props: { head: CellTimelineDTO; onSelect(cellId: stri
           </code>
         )}
         {engine && <span className="ag-fact">{engine}</span>}
-        {limit !== null ? (
-          <span className="ag-fact ag-tokens" title="它和它派出的分身一共用掉的额度 / 上限">
-            用量 {tokensText(n.tokensUsed, limit)}
-            <ProgressBar done={Math.min(n.tokensUsed, limit)} total={limit} label={`额度用了 ${tokensText(n.tokensUsed, limit)}`} />
-          </span>
-        ) : (
-          <span className="ag-fact" title="它和它派出的分身一共用掉的额度（没有上限）">
-            已用 {compactCount(n.tokensUsed)}
-          </span>
-        )}
       </div>
       {(n.stateDetail || n.statusLine) && (
         <p className="ag-detail">

@@ -36,7 +36,7 @@ const readState = defineTool({
   name: "read_state",
   kind: "kernel",
   description:
-    "Read saved state: one key, or every key under a prefix. Yours by default; pass cellId to read another cell's (a child's records, a project's `gtd:project` and `gtd:action:` entries, the desk's ledger). Reading is open; writing is always your own.",
+    "Read saved state: one key, or every key under a prefix. Yours by default; pass cellId to read another cell's (a child's records or a project's `gtd:project` entry). Reading is open; writing is always your own.",
   input: z.object({ key: z.string().min(1).optional(), prefix: z.string().optional(), cellId: z.string().min(1).optional().describe("default: this cell") }),
   async handler(args, ctx) {
     const cellId = args.cellId ?? selfId(ctx);
@@ -381,7 +381,7 @@ const saveNote = defineTool({
     roles: z
       .array(z.string().min(1))
       .optional()
-      .describe('preference only: only cells of these roles see it — "worker", "project", "checker", "reply_watcher", "desk", "hub", "sensor" (a cell matches by its role or its preset name)'),
+      .describe('preference only: only cells of these roles see it — "worker", "project", "checker", "desk", "hub", "sensor" (a cell matches by its role or its preset name)'),
   }),
   async handler(args, ctx) {
     const kind = args.kind === "note" ? "working_note" : args.kind ?? "working_note";

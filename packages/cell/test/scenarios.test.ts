@@ -4,8 +4,6 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   CELL_RESULT_CANDIDATE_KEY,
   PAYLOAD,
-  asClarifyCard,
-  gtdKeys,
   subjectKeys,
   type ActivityRecord,
   type CellResultCandidate,
@@ -13,7 +11,7 @@ import {
   type CodeProcessor,
   type Registry,
 } from "@ng/protocol";
-import { boot, cleanupAll, DAY, registerTestPresets, T0, tool } from "./helpers";
+import { boot, cleanupAll, registerTestPresets, T0, tool } from "./helpers";
 
 afterEach(cleanupAll);
 
@@ -24,7 +22,7 @@ describe("docs/03 §四 — five granularities through the real primitives", () 
     h.script.add(
       "desk",
       tool("set_state", { patches: { "memo:a1": activity } }),
-      tool("send_message", { to: "channel:ui:owner", text: "已存入阅读清单", summary: "note saved" }),
+      tool("send_message", { to:"channel:ui:owner", text: "已存入阅读清单", summary: "note saved" }),
       { text: "done" },
     );
     await h.ui.capture({ text: "把这篇链接存进阅读清单 https://example.com/post" });
@@ -32,49 +30,9 @@ describe("docs/03 §四 — five granularities through the real primitives", () 
 
     expect(h.kernel.gate.listPendingSync({ includeSnoozed: true })).toEqual([]);
     expect(h.kernel.context.readStateSync("desk", "memo:a1")).toMatchObject({ kind: "note_saved" });
-    const notices = h.kernel.hub.listOutboxSync({ channelId: "ui" });
-    expect(notices.map((n) => [n.status, n.content.body])).toEqual([["sent", "已存入阅读清单"]]);
+    const notices = h.kernel.hub.listNotificationsSync();
+    expect(notices.map((n) => n.content.body)).toEqual(["已存入阅读清单"]);
     expect(h.of("run.finished").map((e) => e.outcome)).toEqual(["completed"]);
-  });
-
-  it("② an outward reply: draft → one card bound to v1; a stale click is refused, the current version is sent", async () => {
-    const h = await boot();
-    h.script.add("desk", tool("send_message", { to: "channel:memory:alice", text: "议程草稿 v1", summary: "reply to Alice", targetLabel: "Alice" }));
-    await h.memory.inject({ from: "alice", text: "能帮我看下明天会议的议程吗？" });
-    await h.kernel.idle();
-
-    const [card] = h.kernel.gate.listPendingSync();
-    expect(card).toBeDefined();
-    expect(h.kernel.gate.listPendingSync()).toHaveLength(1);
-    expect(asClarifyCard(card!.card.data)?.cardType).toBe("response");
-    expect(card!.boundVersion).toBe(1);
-    expect(h.of("run.finished").map((e) => e.outcome)).toEqual(["deferred_for_approval"]);
-    expect(h.memory.deliveries).toEqual([]);
-
-    // The owner edits the draft (Engage editor) → v2; a click carrying the old version must not send anything.
-    const artifactId = card!.artifactId!;
-    expect(h.kernel.context.commitSync("desk", { artifact: { artifactId, content: { format: "text", body: "议程 v2（我改过）" }, updatedBy: "human", expectedVersion: 1 } })).toEqual({ ok: true, artifactVersion: 2 });
-    expect(await h.kernel.resolveApproval(card!.actionId, { decision: "approve", approverId: "owner", seenArtifactVersion: 1 })).toEqual({
-      status: "version_mismatch",
-      actionId: card!.actionId,
-      currentVersion: 2,
-    });
-    expect(h.memory.deliveries).toEqual([]);
-
-    h.script.add("desk", { text: "noted" });
-    const r = await h.kernel.resolveApproval(card!.actionId, { decision: "approve", approverId: "owner", seenArtifactVersion: 2 });
-    expect(r).toEqual({ status: "sent", actionId: card!.actionId, artifactVersion: 2 });
-    expect(h.memory.sent.map((d) => [d.target, d.content.body])).toEqual([["alice", "议程 v2（我改过）"]]);
-    expect(h.kernel.gate.getApprovalSync(card!.actionId)).toMatchObject({ status: "executed", humanEdited: true, outcome: { receipt: "sent" } });
-
-    // The owning cell learns the outcome and runs once more.
-    await h.kernel.idle();
-    const resolved = h.kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.approvalResolved });
-    expect(resolved.map((m) => [m.status, (m.envelope.payload as { status: string }).status])).toEqual([["done", "executed"]]);
-
-    // A second click is idempotent: same receipt, nothing re-sent.
-    expect(await h.kernel.resolveApproval(card!.actionId, { decision: "approve", approverId: "owner", seenArtifactVersion: 2 })).toMatchObject({ status: "sent" });
-    expect(h.memory.deliveries).toHaveLength(1);
   });
 
   it("③ slow work: the desk spawns a worker at once; its Job outlives the Run; the result wakes it; it reports to the parent", async () => {
@@ -109,7 +67,7 @@ describe("docs/03 §四 — five granularities through the real primitives", () 
     expect(worker.bounds.isolation).toBe("none");
     expect(existsSync(join(h.dataDir, "base-repo"))).toBe(false);
     const ws = h.kernel.workspace.getWorkspaceSync(worker.id)!;
-    expect(ws).toMatchObject({ isolation: "none", status: "active", path: join(h.dataDir, "cells", worker.id) });
+    expect(ws).toMatchObject({ status: "active", path: join(h.dataDir, "cells", worker.id) });
     expect(existsSync(ws.path!)).toBe(true);
 
     const jobs = h.kernel.workspace.listJobsSync({ cellId: worker.id });
@@ -222,50 +180,4 @@ describe("docs/03 §四 — five granularities through the real primitives", () 
     expect(h.script.requests.filter((r) => r.cellId === "proj1")).toEqual([]);
   });
 
-  it("⑤ a watcher: thread reply bypasses the desk, cancels the timeout, reports once; the timeout never fires", async () => {
-    const h = await boot();
-    const watcherId = () => h.kernel.listCells({ parentId: "desk", preset: "watcher" })[0]!.id;
-    h.script.add(
-      "desk",
-      tool("spawn_cell", {
-        preset: "watcher",
-        title: "等 Bob 回复报价",
-        instruction: "wait for Bob's quote; nudge after a day",
-        watches: [{ thread: "memory:thread-42", cancelGroup: "wait" }],
-        schedules: [{ at: new Date(T0 + DAY).toISOString(), cancelGroup: "timeout" }],
-      }),
-      { text: "已安排跟进" },
-    );
-    h.script.add(
-      "watcher",
-      tool("wait", { reason: "waiting for Bob" }),
-      // woken by Bob's reply
-      tool("cancel_scheduled", { cancelGroup: "timeout" }),
-      tool("report_to_parent", { kind: "result", text: "Bob 已回复：明天给报价" }),
-      { text: "done" },
-    );
-    h.script.add("desk", { text: "记下了" });
-
-    await h.ui.capture({ text: "帮我盯一下 Bob 的报价" });
-    await h.kernel.idle();
-    const w = watcherId();
-    expect(h.kernel.inbox.listSchedulesSync({ cellId: w })).toEqual([]);
-    expect(h.kernel.inbox.listMessagesSync({ cellId: w, status: ["pending"] })).toHaveLength(1); // the timeout
-
-    const before = h.of("run.finished").length;
-    await h.memory.inject({ from: "bob", text: "收到，明天给你报价", threads: ["memory:thread-42"] });
-    await h.kernel.idle();
-
-    // routed by the watch: the desk never saw Bob's message
-    expect(h.kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.userMessage })).toHaveLength(1);
-    expect(h.kernel.inbox.listMessagesSync({ cellId: w, type: PAYLOAD.userMessage }).map((m) => m.status)).toEqual(["done"]);
-    expect(h.kernel.inbox.listMessagesSync({ cellId: w, type: PAYLOAD.timerFired }).map((m) => m.status)).toEqual(["cancelled"]);
-    expect(h.kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.cellResult }).map((m) => m.status)).toEqual(["done"]);
-    expect(h.of("run.finished").length - before).toBe(2); // watcher + desk
-
-    const runs = h.of("run.finished").length;
-    h.clock.advance(2 * DAY);
-    await h.kernel.idle();
-    expect(h.of("run.finished").length).toBe(runs);
-  });
 });

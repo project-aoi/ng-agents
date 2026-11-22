@@ -99,7 +99,7 @@ describe("restart on the same database", () => {
     expect(pending.map((m) => [(m.envelope.payload as { text?: string }).text, m.attempts])).toEqual([["interrupted message", 0]]); // graceful stop: no attempt used
     // a claim left behind by a crashed process
     b.kernel.inbox.enqueueSync("sensor", { id: "orphan", from: "inbox:desk", principalId: "cell:desk", kind: "event", type: PAYLOAD.userMessage, payload: { text: "orphaned" }, createdAt: clock.now() });
-    expect(b.kernel.inbox.claimNextRunSync("sensor", "dead-kernel", "serial_coalesce")).not.toBeNull();
+    expect(b.kernel.inbox.claimNextRunSync("sensor", "dead-kernel")).not.toBeNull();
 
     b.script.add("desk", { text: "handled after restart" });
     await b.kernel.start();

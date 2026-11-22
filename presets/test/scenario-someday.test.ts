@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { PAYLOAD, subjectKeys } from "@ng/protocol";
+import { PAYLOAD } from "@ng/protocol";
 import { boot, childrenOf, cleanupAll, lastToolResult, projects, requestText, tool } from "./helpers";
 
 afterEach(cleanupAll);

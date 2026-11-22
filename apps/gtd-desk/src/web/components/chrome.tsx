@@ -4,7 +4,6 @@ import { api } from "../api";
 import { routeHash, toFailure, useDeskId, useNavigate, useNow, useResource, useStatus, useToast, useToasts, type ViewKey } from "../state";
 import { clientId, whenText } from "../text";
 import { SourceText } from "./bits";
-import { BudgetSwitch, budgetState } from "./budget";
 import { ButtonRow, Chevron, Kbd, Spinner, stripIcon, useOutsidePress } from "./controls";
 import { ModelSwitch } from "./models";
 import { ErrorState, Loading } from "./states";
@@ -54,16 +53,13 @@ export function TopBar(props: { view: ViewKey; status: StatusDTO | null; onView(
                   {count}
                 </span>
               )}
-              {t.key === "clarify" && status?.focus.on && <span className="focus-dot" title="免打扰已开启" aria-label="免打扰已开启" />}
               {live > 0 && <span className="tab-live">· {live} 在跑</span>}
             </button>
           );
         })}
       </nav>
       <div className="topbar-right">
-        {status && (status.demo ? <span className="mode-badge" title={`后端：${status.backend}`}>演示模式</span> : <ModelSwitch status={status} />)}
-        {status && <button className="btn sm" type="button" disabled={!!status.focus.editors && !status.focus.manual} aria-pressed={status.focus.on} title={status.focus.editors ? "编辑期间自动免打扰" : "手动免打扰"} onClick={()=>void api.focus(!status.focus.on).then(r=>setStatus(r.status)).catch(err=>toast({tone:"error",text:toFailure(err).message}))}>免打扰{status.focus.on ? " · 开" : ""}</button>}
-        {status && <BudgetSwitch status={status} />}
+        {status && <ModelSwitch status={status} />}
         <button type="button" className={`drawer-trigger${props.drawerOpen ? " on" : ""}`} aria-expanded={props.drawerOpen} aria-controls="drawer" onClick={props.onDrawer} title="随手记 / 信源（快捷键 5）">
           <span aria-hidden="true">⚡</span> <span className="dt-label">随手记 / 信源</span>
         </button>
@@ -76,8 +72,7 @@ export function TopBar(props: { view: ViewKey; status: StatusDTO | null; onView(
 
 export function StatusLine(props: { view: ViewKey; status: StatusDTO | null; connected: boolean; open: boolean; onToggle(): void; onClose(): void }) {
   const { status } = props;
-  const text = !status ? "正在连接工作台…" : props.view==="clarify" ? `待我处理 ${status.humanPending ?? status.clarify.pending} 项` : props.view === "agents" ? agentsLine(status) : status.statusLine[props.view];
-  const budgetOff = status !== null && !budgetState(status).enforced;
+  const text = !status ? "正在连接工作台…" : props.view==="clarify" ? `待我处理 ${status.humanPending ?? status.clarify.pending} 项` : props.view === "agents" ? agentsLine(status) : status.statusLine.radar;
   const wrap = useRef<HTMLDivElement>(null);
   useOutsidePress(props.open, wrap, props.onClose);
 
@@ -87,11 +82,6 @@ export function StatusLine(props: { view: ViewKey; status: StatusDTO | null; con
         <span className="conn" role="status">
           <span className="conn-dot" aria-hidden="true" />
           实时更新已断开，正在重连…
-        </span>
-      )}
-      {budgetOff && (
-        <span className="budget-hint" title="任务不会因额度暂停；在顶栏的额度设置里可以重新开启">
-          额度限制已关闭
         </span>
       )}
       <button type="button" className="status-toggle" aria-expanded={props.open} aria-controls="status-panel" onClick={props.onToggle}>
@@ -125,8 +115,7 @@ function StatusPanel({ view, status }: { view: ViewKey; status: StatusDTO }) {
   const res = useResource<ActivityListDTO>(`activity:${kind}`, () => api.activity(kind === "all" ? undefined : kind), ["activity"]);
   const { setStatus } = useStatus();
   const toast = useToast();
-  const held = status.notifications.filter((n) => n.state === "held");
-  const delivered = status.notifications.filter((n) => n.state === "delivered");
+  const delivered = status.notifications;
   const t = status.today;
   const bg = status.background;
 
@@ -161,20 +150,6 @@ function StatusPanel({ view, status }: { view: ViewKey; status: StatusDTO }) {
         )}
       </div>
 
-      {held.length > 0 && (
-        <section className="sp-section">
-          <h3>暂存的通知 <span className="muted small">（退出专注后统一送达）</span></h3>
-          <ul className="notes">
-            {held.map((n) => (
-              <li key={n.id}>
-                {n.title && <strong>{n.title} </strong>}
-                <span>{n.text}</span>
-                <span className="muted small"> · {relativeTimeZh(n.at, now)}</span>
-              </li>
-            ))}
-          </ul>
-        </section>
-      )}
       {delivered.length > 0 && (
         <section className="sp-section">
           <h3>最近的提示</h3>

@@ -3,8 +3,7 @@
 // the web client (src/web).
 
 export { createDeskServer, DEFAULT_PORT, type DeskServer, type DeskServerOptions } from "./server/boot";
-export { selectBackend, modelConfigured, billReportedCostFromEnv, BackendConfigError, type BackendChoice, type SelectBackendOptions } from "./server/backend";
-export { createDemoMode, placeholderDemoModel, PLACEHOLDER_DEMO, DEMO_NOTICE, type DemoMode, type SeedContext } from "./server/demo";
+export { selectBackend, BackendConfigError, type BackendChoice, type SelectBackendOptions } from "./server/backend";
 export { createDesk, DeskError, type Desk, type DeskActor, type ProjectOp } from "./server/desk";
 export { createAgentControlPlane, type AgentControlPlaneDeps } from "./agent/tools";
 export { AGENT_INSTRUCTIONS, AGENT_SERVER_NAME, AGENT_TOOLS, type AgentToolDoc } from "./agent/guide";

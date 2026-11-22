@@ -1,31 +1,18 @@
 import type { NotificationDTO, StatusDTO } from "../../shared/api";
 import { backgroundText, projectClarify } from "./clarify";
 import { readActivities, readProjects, type DeskKernel, type ProjectionInput } from "./common";
-import { focusText } from "./engage";
 import { radarProjects } from "./radar";
 import { localMidnight, nextWeekly, whenText } from "./time";
 
 const NOTIFICATION_LIMIT = 20;
 
-/** The owner's switch for token/cost limits, ready to display. */
-export function budgetLimitsOf(kernel: Pick<DeskKernel, "budgetLimits">): StatusDTO["budgetLimits"] {
-  const enforced = kernel.budgetLimits().enforced;
-  return { enforced, label: enforced ? "额度限制：开" : "额度限制：已关闭" };
-}
-
-/** Light notices to the owner are the `ui` channel's outbox rows (the workbench itself is the transport). */
 export function notifications(input: ProjectionInput): NotificationDTO[] {
-  const out: NotificationDTO[] = [];
-  for (const row of input.kernel.hub.listOutboxSync({ channelId: "ui", status: ["sent", "buffered_dnd"], limit: NOTIFICATION_LIMIT })) {
-    out.push({
-      id: row.id,
-      ...(row.content.title !== undefined ? { title: row.content.title } : {}),
-      text: row.content.body,
-      at: row.sentAt ?? row.createdAt,
-      state: row.status === "sent" ? "delivered" : "held",
-    });
-  }
-  return out;
+  return input.kernel.hub.listNotificationsSync(NOTIFICATION_LIMIT).map(row => ({
+    id: row.id,
+    ...(row.content.title !== undefined ? { title: row.content.title } : {}),
+    text: row.content.body,
+    at: row.createdAt,
+  }));
 }
 
 /**
@@ -81,7 +68,6 @@ export function projectStatus(input: ProjectionInput): StatusDTO {
   }
   const radar = radarProjects(input);
   const nextReviewAt = nextWeekly(now, settings.weeklyReview.weekday, settings.weeklyReview.hour);
-  const focus = { ...kernel.hub.focusInfoSync(), on: stats.focus, buffered: stats.bufferedNotifications };
 
   const clarifyLine: string[] = [];
   if (today.archivedNotifications > 0) clarifyLine.push(`后台已静默归档 ${today.archivedNotifications} 条通知`);
@@ -95,10 +81,8 @@ export function projectStatus(input: ProjectionInput): StatusDTO {
   return {
     humanPending:kernel.humanItems.list().length,
     generatedAt: now,
-    demo: settings.demo,
     backend: settings.backend,
     auth: { tokenRequired: settings.tokenRequired },
-    focus,
     clarify: { pending: clarify.remaining, snoozed: clarify.snoozed },
     background: {
       running: stats.busyCells,
@@ -111,11 +95,9 @@ export function projectStatus(input: ProjectionInput): StatusDTO {
     radar: { activeProjects: radar.counts.active, stalledProjects: radar.counts.stalled, somedayProjects: radar.counts.someday, nextReviewAt },
     statusLine: {
       clarify: clarifyLine.join(" · "),
-      engage: focusText(focus.on, focus.buffered),
       radar: radarLine.join(" · "),
       agents: agentsLine(kernel),
     },
     notifications: notifications(input),
-    budgetLimits: budgetLimitsOf(kernel),
   };
 }

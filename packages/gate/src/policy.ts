@@ -1,38 +1,7 @@
-import {
-  TOOL_KINDS,
-  actionTargetOf,
-  addressCovers,
-  anyCovers,
-  deliverableSchema,
-  parseAddress,
-  type PolicyBounds,
-  type PolicyRule,
-  type PolicyRuleInput,
-  type ProposedAction,
-  type ProposedActionType,
-  type SideEffect,
-  type ToolKind,
-} from "@ng/protocol";
+import { parseAddress, anyCovers, type PolicyBounds, type ProposedAction } from "@ng/protocol";
 
-// Pure decision helpers. Everything here is a function of the request plus state the caller read from the database.
-
-export const ACTION_TYPES = [
-  "channel.send",
-  "secret.use",
-  "project.start",
-  "custom",
-] as const satisfies readonly ProposedActionType[];
-
-export const SIDE_EFFECTS = ["none", "internal", "notify_owner", "external"] as const satisfies readonly SideEffect[];
-const SIDE_EFFECT_RANK: Readonly<Record<SideEffect, number>> = { none: 0, internal: 1, notify_owner: 2, external: 3 };
-const CONTROL_ACTIONS = ["cancel", "pause", "resume", "steer"] as const;
-const MUTATING_TOOLS: ReadonlySet<ToolKind> = new Set(["write", "edit", "bash", "code_rpc"]);
-const SHARED_RO_REJECTS: ReadonlySet<ToolKind> = new Set(["write", "edit", "bash"]);
-
-export function maxSideEffect(a: SideEffect, b: SideEffect): SideEffect {
-  return SIDE_EFFECT_RANK[a] >= SIDE_EFFECT_RANK[b] ? a : b;
-}
-
+const ACTION_TYPES = ["project.start", "custom"];
+const SIDE_EFFECTS = ["none", "internal", "notify_owner", "external"];
 const isObject = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
 const isNonEmptyString = (v: unknown): v is string => typeof v === "string" && v.length > 0;
 
@@ -46,177 +15,15 @@ export function actionShapeFeedback(action: unknown): string | null {
     return `invalid action: sideEffect must be one of ${SIDE_EFFECTS.join(", ")}`;
   }
   if (action["artifactId"] !== undefined && !isNonEmptyString(action["artifactId"])) return "invalid action: artifactId must be a non-empty string";
-  if (action["urgent"] !== undefined && typeof action["urgent"] !== "boolean") return "invalid action: urgent must be a boolean";
+  if (action["type"] === "project.start" && (!isObject(action["proposal"]) || !isNonEmptyString(action["proposal"]["title"]))) return "project.start proposal needs a title";
+  if (action["type"] === "custom" && !isNonEmptyString(action["name"])) return "custom action needs a name";
   return null;
 }
 
-/**
- * The side effect the Gate attributes to an action regardless of what the caller declared; the effective side effect
- * is the max of the two, so a mislabelled action can only become stricter.
- * `_bounds` is kept for signature stability: no derived side effect depends on the cell's isolation any more.
- */
-export function derivedSideEffect(action: ProposedAction, _bounds: PolicyBounds, ownerAddresses: readonly string[]): SideEffect {
-  switch (action.type) {
-    case "channel.send":
-      return anyCovers(ownerAddresses, action.target) ? "notify_owner" : "external";
-    case "project.start":
-      // docs/04 card B: a project only starts after the human confirms the proposal.
-      return "external";
-    case "secret.use":
-      return "internal";
-    case "custom":
-      return "none";
-  }
+export function ownerOnlyApproval(action: ProposedAction): string | null {
+  return action["type"] === "project.start" ? "it starts a new project" : null;
 }
 
-export function effectiveSideEffect(action: ProposedAction, bounds: PolicyBounds, ownerAddresses: readonly string[]): SideEffect {
-  return maxSideEffect(action.sideEffect, derivedSideEffect(action, bounds, ownerAddresses));
-}
-
-// `custom` names of budget-exhausted escalation cards: the Loop's request_approval, and the kernel's own card
-// (packages/cell constants KERNEL_ESCALATION, with `args.reason`).
-const BUDGET_EXHAUSTED = "budget_exhausted";
-const LOOP_BUDGET_ESCALATION = `escalation.${BUDGET_EXHAUSTED}`;
-const KERNEL_ESCALATION = "kernel.escalation";
-
-export function isBudgetEscalation(action: ProposedAction): boolean {
-  // Same precedence as the kernel's escalation handling: the card's own escalation reason first, then the action.
-  const data = isObject(action.card) ? action.card["data"] : undefined;
-  if (isObject(data) && data["cardType"] === "escalation" && isObject(data["escalation"]) && data["escalation"]["reason"] === BUDGET_EXHAUSTED) {
-    return true;
-  }
-  if (action.type !== "custom") return false;
-  if (action.name === LOOP_BUDGET_ESCALATION) return true;
-  return action.name === KERNEL_ESCALATION && isObject(action.args) && action.args["reason"] === BUDGET_EXHAUSTED;
-}
-
-/**
- * Why approving `action` is the owner's decision alone, or null when an external main agent (`agent:*`) may approve it
- * too (docs/05 guard 3 + BUG-020): a send that leaves the owner's own channels, starting a proposed project from a
- * confirmation card (`project.start`), and continuing past an exhausted budget.
- * Everything else (ordinary custom actions, blocked / retry_limit / waiting_timeout escalations) an agent may
- * approve. Pass the card too (`{ ...record.action, card: record.card }`):
- * a budget escalation may be recognisable only by its card.
- */
-export function ownerOnlyApproval(action: ProposedAction, ownerAddresses: readonly string[]): string | null {
-  if (action.type === "channel.send") {
-    const target: unknown = action.target;
-    if (typeof target !== "string" || !anyCovers(ownerAddresses, target)) {
-      return `it sends to ${String(target)}, outside the owner's own channels`;
-    }
-  }
-  if (action.type === "project.start") return "it starts a new project";
-  if (isBudgetEscalation(action)) return "it continues past an exhausted budget";
-  return null;
-}
-
-export interface BoundsContext {
-  cellId: string;
-  bounds: PolicyBounds;
-  /** Direct children currently occupying a concurrency slot. */
-  isStrictDescendant(cellId: string): boolean;
-  secretConfigured(ref: string): boolean;
-}
-
-/** Type-specific shape + bounds check. Returns model-facing feedback, or null when the action is within bounds. */
-export function boundsFeedback(action: ProposedAction, ctx: BoundsContext): string | null {
-  const b = ctx.bounds;
-  const tools = [...b.tools].sort().join(", ") || "none";
-  switch (action.type) {
-    case "channel.send": {
-      const parsed = typeof action.target === "string" ? parseAddress(action.target) : null;
-      if (!parsed || parsed.kind !== "channel" || action.target.endsWith("*")) {
-        return `channel.send target must be a channel address "channel:<channelId>:<target>", got ${JSON.stringify(action.target)}`;
-      }
-      if (!anyCovers(b.canSendTo, action.target)) {
-        return `this cell may not send to ${action.target} (allowed: ${b.canSendTo.join(", ") || "none"}); report to your parent instead`;
-      }
-      if (action.content !== undefined && !deliverableSchema.safeParse(action.content).success) {
-        return "channel.send content must be a Deliverable {format, body, ...}";
-      }
-      return null;
-    }
-    case "secret.use": {
-      if (!isNonEmptyString(action.secretRef)) return "secret.use secretRef must be a non-empty string";
-      if (!b.secretRefs.has(action.secretRef)) return `secret "${action.secretRef}" is outside this cell's bounds`;
-      if (action.tool !== undefined && !b.tools.has(action.tool)) return `tool "${String(action.tool)}" is outside this cell's bounds (allowed: ${tools})`;
-      if (!ctx.secretConfigured(action.secretRef)) return `secret "${action.secretRef}" is not configured on the host; ask the owner to configure it`;
-      return null;
-    }
-    case "project.start": {
-      if (!isObject(action.proposal) || !isNonEmptyString(action.proposal.title)) return "project.start proposal must have a title";
-      return null;
-    }
-    case "custom": {
-      if (!isNonEmptyString(action.name)) return "custom action name must be a non-empty string";
-      return null;
-    }
-  }
-}
-
-// ==================== policy rules ====================
-
-/** `chain` = [cellId, parentId, …, rootId]. */
-export function ruleApplies(rule: PolicyRule, action: ProposedAction, chain: readonly string[]): boolean {
-  if (!rule.enabled) return false;
-  if (rule.match.type !== "*" && rule.match.type !== action.type) return false;
-  if (rule.scopeCellId !== null && !chain.includes(rule.scopeCellId)) return false;
-  if (rule.match.target !== undefined && rule.match.target !== null) {
-    const target = actionTargetOf(action);
-    if (target === null || !addressCovers(rule.match.target, target)) return false;
-  }
-  if (rule.effect === "allow" && rule.maxUses !== null && rule.uses >= rule.maxUses) return false;
-  return true;
-}
-
-const EFFECT_RANK: Readonly<Record<PolicyRule["effect"], number>> = { allow: 0, defer: 1, deny: 2 };
-
-/** Higher sorts first: nearer scope, exact type, exact/longer target, then the stricter effect. */
-export function ruleSpecificity(rule: PolicyRule, chain: readonly string[]): number[] {
-  const scope = rule.scopeCellId === null ? 0 : chain.length - chain.indexOf(rule.scopeCellId);
-  const target = rule.match.target ?? null;
-  const targetKind = target === null ? 0 : target.endsWith("*") ? 1 : 2;
-  return [scope, rule.match.type === "*" ? 0 : 1, targetKind, target === null ? 0 : target.length, EFFECT_RANK[rule.effect]];
-}
-
-export function pickRule(rules: readonly PolicyRule[], action: ProposedAction, chain: readonly string[]): PolicyRule | undefined {
-  const candidates = rules.filter((r) => ruleApplies(r, action, chain));
-  candidates.sort((a, b) => {
-    const sa = ruleSpecificity(a, chain);
-    const sb = ruleSpecificity(b, chain);
-    for (let i = 0; i < sa.length; i++) if (sa[i] !== sb[i]) return sb[i]! - sa[i]!;
-    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
-  });
-  return candidates[0];
-}
-
-/** Splits `actionClassOf` output: `channel.send|channel:feishu:*` → type + target pattern. */
-export function parseActionClass(actionClass: string): { type: string; target: string | null } {
-  const i = actionClass.indexOf("|");
-  return i < 0 ? { type: actionClass, target: null } : { type: actionClass.slice(0, i), target: actionClass.slice(i + 1) };
-}
-
-/**
- * The auto-allow rule the weekly review offers for a trust candidate ("改成有预算上限的自动执行"): global scope,
- * capped at `maxUses` (default 20). Null when the class cannot be expressed as a rule target without widening it
- * (cell.control classes are keyed by verb, rule targets by cell id).
- */
-export function ruleInputForClass(
-  actionClass: string,
-  opts: { createdBy: string; maxUses?: number | null; note?: string },
-): PolicyRuleInput | null {
-  const { type, target } = parseActionClass(actionClass);
-  if (!(ACTION_TYPES as readonly string[]).includes(type)) return null;
-  const match: PolicyRuleInput["match"] = { type: type as ProposedActionType };
-  if (target !== null) match.target = target;
-  return { match, effect: "allow", createdBy: opts.createdBy, maxUses: opts.maxUses === undefined ? 20 : opts.maxUses, note: opts.note ?? null };
-}
-
-/**
- * Whether a cell with `bounds` (child of `parentCellId`) may deliver to `addr` — for the kernel's inboxOut /
- * emitToParent / notifyChannel checks. The parent's own inbox is always reachable (a child can always report back);
- * other inboxes (e.g. `inbox:desk` for arbitration) through the `inbox:` patterns attenuate passes down the tree.
- */
 export function deliveryAllowed(bounds: Pick<PolicyBounds, "canSendTo">, parentCellId: string | null, addr: string): boolean {
   if (typeof addr !== "string" || addr.endsWith("*") || parseAddress(addr) === null) return false;
   if (parentCellId && addr === `inbox:${parentCellId}`) return true;

@@ -11,7 +11,6 @@ import { itemEnd, mergeItems } from "./model";
 
 const PAGE = 100;
 /** Live output kept per background command (its tail is what matters). */
-const JOB_TAIL_MAX = 12_000;
 
 /**
  * A message typed here that the timeline does not show yet. The server records it on the timeline when the node takes
@@ -74,18 +73,6 @@ function lastOf(items: readonly TimelineItemDTO[]): number {
   return n;
 }
 
-function clipTail(s: string): string {
-  if (s.length <= JOB_TAIL_MAX) return s;
-  const cut = s.slice(-JOB_TAIL_MAX);
-  const nl = cut.indexOf("\n");
-  return nl >= 0 && nl < 400 ? cut.slice(nl + 1) : cut;
-}
-
-/** The server's snapshot of a job's tail wins; a job it no longer lists has finished. */
-function mergeJobs(prev: readonly CellJobDTO[], next: readonly CellJobDTO[]): CellJobDTO[] {
-  return next.map((j) => (j.tail !== null ? j : { ...j, tail: prev.find((p) => p.jobId === j.jobId)?.tail ?? null }));
-}
-
 export function useCellTimeline(cellId: string): CellTimeline {
   const [s, setS] = useState<State>(EMPTY);
   const [manual, setManual] = useState(0);
@@ -136,7 +123,7 @@ export function useCellTimeline(cellId: string): CellTimeline {
         items,
         firstSeq: st.firstSeq || firstSeq.current,
         hasEarlier: st.items.length ? st.hasEarlier : tl.hasEarlier,
-        jobs: mergeJobs(st.jobs, tl.jobs),
+        jobs: tl.jobs,
         pending,
         tailError: null,
       };
@@ -179,15 +166,6 @@ export function useCellTimeline(cellId: string): CellTimeline {
       // Records the timeline leaves out (internal bookkeeping) also move lastSeq: fetch once, not on every echo.
       if (e.lastSeq <= Math.max(lastSeq.current, covered.current)) return;
       void fetchTail();
-    },
-    chunk(e) {
-      setS((st) => {
-        const jobs = st.jobs.slice();
-        const i = jobs.findIndex((j) => j.jobId === e.jobId);
-        if (i >= 0) jobs[i] = { ...jobs[i]!, tail: clipTail((jobs[i]!.tail ?? "") + e.chunk) };
-        else jobs.push({ jobId: e.jobId, command: "", startedAt: serverNow(), tail: clipTail(e.chunk) });
-        return { ...st, jobs };
-      });
     },
   });
 

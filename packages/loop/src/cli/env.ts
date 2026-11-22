@@ -1,4 +1,4 @@
-import { AGENT_ENGINES, CLI_ENGINES, type AgentEngine, type CliEngine, type ModelTier } from "@ng/protocol";
+import { CLI_ENGINES, type AgentEngine, type CliEngine, type ModelTier } from "@ng/protocol";
 import { probeVersion } from "./process";
 import type { CliModels } from "./types";
 
@@ -54,46 +54,29 @@ export function detectCli(engine: CliEngine, opts: { bin?: string; env?: Record<
   return v;
 }
 
-/** An API model provider is configured in this environment (same variables createModelClientFromEnv reads). */
-export function apiProviderConfigured(env: Record<string, string | undefined> = process.env): boolean {
-  const provider = (env["NG_MODEL_PROVIDER"] ?? "anthropic").toLowerCase();
-  if (provider === "openai") return Boolean(env["NG_OPENAI_BASE_URL"]);
-  return Boolean(env["ANTHROPIC_API_KEY"] || env["ANTHROPIC_AUTH_TOKEN"]);
-}
-
 export function parseAgentBackend(value: string | undefined): AgentBackendSetting | undefined {
   if (value === undefined || value.trim() === "") return undefined;
   const v = value.trim().toLowerCase();
-  if (v === "auto" || (AGENT_ENGINES as readonly string[]).includes(v)) return v as AgentBackendSetting;
-  throw new Error(`NG_AGENT_BACKEND: unknown backend "${value}" (expected auto | api | claude | codex | agy)`);
+  if (v === "auto" || (CLI_ENGINES as readonly string[]).includes(v)) return v as AgentBackendSetting;
+  throw new Error(`NG_AGENT_BACKEND: unknown backend "${value}" (expected auto | claude | codex | agy)`);
 }
 
-/**
- * Resolves a backend setting to an engine. `auto`: the first installed of claude, codex, agy; else `api` when
- * `apiAvailable`; else null (nothing can run llm cells). A named CLI is returned as is (a missing binary surfaces
- * when a Run starts, with the CLI's own error).
- */
 export function resolveAgentBackend(
   setting: AgentBackendSetting,
-  opts: { apiAvailable: boolean; env?: Record<string, string | undefined>; bins?: Partial<Record<CliEngine, string>>; detect?: (engine: CliEngine) => boolean },
+  opts: { env?: Record<string, string | undefined>; bins?: Partial<Record<CliEngine, string>>; detect?: (engine: CliEngine) => boolean },
 ): AgentEngine | null {
   if (setting !== "auto") return setting;
   const detect = opts.detect ?? ((e: CliEngine) => detectCli(e, { ...(opts.bins?.[e] ? { bin: opts.bins[e] } : {}), ...(opts.env ? { env: opts.env } : {}) }) !== null);
   for (const engine of CLI_ENGINES) if (detect(engine)) return engine;
-  return opts.apiAvailable ? "api" : null;
+  return null;
 }
 
-/**
- * `NG_AGENT_BACKEND` (default `auto`) resolved against this machine: see resolveAgentBackend. `api` availability is
- * judged from the provider variables (apiProviderConfigured). Binaries come from `NG_CLAUDE_BIN`, `NG_CODEX_BIN`,
- * `NG_AGY_BIN`.
- */
 export function resolveAgentBackendFromEnv(
   env: Record<string, string | undefined> = process.env,
   opts: { detect?: (engine: CliEngine) => boolean } = {},
 ): AgentEngine | null {
   const setting = parseAgentBackend(env["NG_AGENT_BACKEND"]) ?? "auto";
-  return resolveAgentBackend(setting, { apiAvailable: apiProviderConfigured(env), env, bins: cliBinsFromEnv(env), ...(opts.detect ? { detect: opts.detect } : {}) });
+  return resolveAgentBackend(setting, { env, bins: cliBinsFromEnv(env), ...(opts.detect ? { detect: opts.detect } : {}) });
 }
 
 export function cliBinsFromEnv(env: Record<string, string | undefined> = process.env): Partial<Record<CliEngine, string>> {

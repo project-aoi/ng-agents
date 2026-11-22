@@ -1,5 +1,5 @@
 import { afterEach, expect, it } from "vitest";
-import { all, PAYLOAD } from "@ng/protocol";
+import { PAYLOAD } from "@ng/protocol";
 import { boot, cleanupAll, HOUR } from "./helpers";
 
 afterEach(cleanupAll);
@@ -24,7 +24,6 @@ it("commits one of two competing choices with its exact callback and preserves t
   expect(receipts.map((m) => m.envelope.payload)).toEqual([
     expect.objectContaining({ optionId: "first", note: "请保留原稿", payload: { document: "one" } }),
   ]);
-  expect(all(kernel.db, "SELECT * FROM approval_stats")).toEqual([]);
 });
 
 it("resurfaces a snoozed personal reminder on time without a model turn, then completes it without a callback", async () => {
@@ -67,23 +66,6 @@ it("checks callback restrictions and restricts destructive options to the named 
   ).toThrow();
 });
 
-it("a declined root ledger stays held across later messages", async () => {
-  const h = await boot();
-  const ledger = h.kernel.gate.usageSync("desk");
-  h.kernel.gate.meter("desk", { tokens: ledger.limitTokens + 1, billedCents: 0 });
-  await h.ui.capture({ text: "待办一" });
-  await h.kernel.idle();
-  const denied = h.kernel.humanItems.list().find((item) => item.subjectKey === "kernel:budget:desk")!;
-  expect(denied).toBeDefined();
-  await h.kernel.humanItems.decide(denied.id, { optionId: "system.deny", seenItemRevision: denied.itemRevision }, "agent:helper");
-  await h.ui.capture({ text: "待办二" });
-  await h.kernel.idle();
-  expect(h.kernel.humanItems.list().filter((item) => item.subjectKey === denied.subjectKey)).toHaveLength(0);
-  expect(h.kernel.getCell("desk")?.status).toBe("active");
-  expect(h.kernel.inbox.listMessagesSync({ type: PAYLOAD.approvalResolved })).toHaveLength(0);
-  expect(h.kernel.inbox.listMessagesSync({ cellId: "desk", status: ["pending"], type: PAYLOAD.userMessage })).toHaveLength(2);
-});
-
 it("withdraws an unread reply; after a claim and crash release it sends one correction", async () => {
   const { kernel } = await boot({ start: false });
   const create = () =>
@@ -99,7 +81,7 @@ it("withdraws an unread reply; after a claim and crash release it sends one corr
   expect(kernel.inbox.listMessagesSync({ type: PAYLOAD.approvalResolved })[0]).toMatchObject({ status: "cancelled", firstClaimedAt: null });
   const again = await kernel.humanItems.decide(first.id, { optionId: "yes", seenItemRevision: 3 }, "owner");
   if (!("activityId" in again) || !again.activityId) throw new Error("missing correction activity");
-  const claim = kernel.inbox.claimNextRunSync("desk", "test", "serial_coalesce", 10_000)!;
+  const claim = kernel.inbox.claimNextRunSync("desk", "test", 10_000)!;
   kernel.inbox.releaseSync(claim.claimId, "recovered", { countAttempt: false });
   expect((await kernel.humanItems.undo(again.activityId, "owner")).status).toBe("corrected");
   expect(kernel.humanItems.get(first.id)?.status).toBe("resolved");
@@ -130,11 +112,11 @@ it("finishes old epoch cleanup without killing a job started after reopening, th
   const gate = new Promise<void>((r) => {
     unblock = r;
   });
-  const stop = kernel.workspace.stopRuntime.bind(kernel.workspace);
-  kernel.workspace.stopRuntime = async (id, stillClosed) => {
+  const stop = kernel.workspace.cancelJobsForCell.bind(kernel.workspace);
+  kernel.workspace.cancelJobsForCell = async (id) => {
     reached();
     await gate;
-    await stop(id, stillClosed);
+    return stop(id);
   };
   const closing = kernel.closeCell("project", "completed");
   await entered;
@@ -144,14 +126,14 @@ it("finishes old epoch cleanup without killing a job started after reopening, th
     expect(kernel.getCell("project")?.status).toBe("closed");
     unblock();
     await opening;
-    const port = await kernel.workspace.acquire("project", "none", { cwd: dataDir });
+    const port = await kernel.workspace.acquire("project", { cwd: dataDir });
     const job = await port.startJob({ command: "sleep 15" });
     unblock();
     await closing;
     expect(kernel.workspace.getJobSync(job.jobId)?.state).toBe("running");
   } finally {
     unblock();
-    kernel.workspace.stopRuntime = stop;
+    kernel.workspace.cancelJobsForCell = stop;
   }
   await kernel.closeCell("project", "cancelled");
   const ids = kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.cellResult }).map((m) => m.envelope.id);
@@ -159,7 +141,7 @@ it("finishes old epoch cleanup without killing a job started after reopening, th
 });
 
 it("resolves one referenced wait and escalates the unanswered one exactly once across both monitors", async () => {
-  const { kernel, script, ui, clock } = await boot();
+  const { kernel, script, clock } = await boot();
   script.add("project", { toolCalls: [{ name: "wait", input: { reason: "等 A", waitingFor: "inbox:desk", waitId: "a", refId: "ra" } }] });
   kernel.spawnCell("desk", { id: "project", preset: "project" }, "等待材料");
   await kernel.idle();
@@ -213,87 +195,12 @@ it("a direct owner message clears one named wait even when its reference is abse
   expect(kernel.listWaits(["helper"])).toEqual([]);
 });
 
-it("preserves a manual pause when the owner lifts budget limits and releases the declined ledger", async () => {
-  const { kernel } = await boot({ start: false });
-  kernel.spawnCell("desk", { id: "held", preset: "project" });
-  kernel.spawnCell("desk", { id: "manual", preset: "project" });
-  kernel.control("manual", { action: "pause" }, { principalId: "owner" });
-  kernel.gate.declineBudgetSync("held", "owner");
-  expect(kernel.getCell("held")?.pauseReason).toBe("budget_declined");
-  expect(kernel.setBudgetLimits(false, { principalId: "owner" }).releasedCells).toContain("held");
-  expect(kernel.getCell("held")?.status).toBe("active");
-  expect(kernel.gate.budgetDeclinedSync("held")).toBe(false);
-  expect(kernel.getCell("manual")?.pauseReason).toBe("manual");
-});
-
 it("copies a direct message according to ccParent independently of lifetime", async () => {
   const { kernel } = await boot({ start: false });
   kernel.spawnCell("desk", { id: "listener", preset: "inline", ccParent: true, lifetime: "persistent" });
   kernel.spawnCell("desk", { id: "solo", preset: "worker", ccParent: false, lifetime: "wakeable" });
   expect(kernel.directMessage("listener", { text: "保持监听" }, { principalId: "owner" })).toMatchObject({ ccTo: "desk" });
   expect(kernel.directMessage("solo", { text: "收到" }, { principalId: "owner" })).toMatchObject({ ccTo: null });
-});
-
-it("reserves execution for the owner and lets an agent defer, revise and deny an external send", async () => {
-  const { kernel } = await boot({ start: false });
-  const deferred = kernel.gate.authorizeSync(
-    {
-      type: "channel.send",
-      target: "channel:memory:party",
-      content: { format: "text", body: "稿" },
-      sideEffect: "external",
-      summary: "外发草稿",
-      subjectKey: "reply:memory:party",
-      cardOptions:[{id:"execute",label:"发送",effect:"execute"},{id:"revise",label:"修改",effect:"revise"}],
-    },
-    { cellId: "desk", epoch: kernel.getCell("desk")!.epoch, principalId: "cell:desk" },
-  );
-  if (deferred.type !== "defer") throw Error(deferred.type);
-  const item = kernel.humanItems.get(deferred.actionId)!;
-  const decide = (optionId:string, rev:number) => kernel.humanItems.decide(item.id,{optionId,seenItemRevision:rev,note:"请更新"}, "agent:helper");
-  await expect(decide("execute",1)).rejects.toThrow("主人");
-  await expect(decide("system.defer",1)).resolves.toMatchObject({status:"snoozed"});
-  await expect(decide("revise",2)).resolves.toMatchObject({status:"revising"});
-  await expect(decide("system.deny",3)).resolves.toMatchObject({status:"cancelled"});
-});
-
-it("delivers an alternative on a controlled send without approval, and counts owner denials once", async () => {
-  const {kernel}=await boot({start:false});
-  const make = (subjectKey:string) => {
-    const r=kernel.gate.authorizeSync({type:"channel.send",summary:"回复",subjectKey,sideEffect:"external",target:"channel:memory:party",
-      content:{format:"text",body:"对外答复"},cardOptions:[{id:"send",label:"确认发送",effect:"execute"},{id:"research",label:"先调研",effect:"reply"}]},
-      {cellId:"desk",epoch:0,principalId:"cell:desk"});
-    if (r.type!=="defer") throw Error(r.type);
-    return r.actionId;
-  };
-  const id=make("scope");
-  await kernel.humanItems.decide(id,{optionId:"research",seenItemRevision:1},"agent:helper");
-  expect(kernel.inbox.listMessagesSync({type:PAYLOAD.approvalResolved})[0]!.envelope.payload).toMatchObject({optionId:"research",status:"cancelled"});
-  expect(kernel.hub.listOutboxSync({channelId:"memory"})).toEqual([]);
-  await kernel.humanItems.decide(make("deny"),{optionId:"system.deny",seenItemRevision:1},"owner");
-  expect(kernel.gate.approvalStatsSync()).toMatchObject([{approved:0,denied:1}]);
-});
-
-it("shows the exact quota a custom budget option will apply", async () => {
-  const { kernel } = await boot({ start: false });
-  const before = kernel.gate.usageSync("desk");
-  kernel.gate.upsertPolicyRuleSync({ match: { type: "*" }, effect: "allow", createdBy: "owner" });
-  const result = kernel.gate.authorizeSync(
-    {
-      type: "custom",
-      name: "escalation.budget_exhausted",
-      summary: "继续",
-      sideEffect: "external",
-      subjectKey: "manual:budget",
-      cardOptions: [{ id: "small", label: "继续", effect: "execute", payload: { raise: { tokens: 17, cents: 2 } } }],
-    },
-    { cellId: "desk", epoch: kernel.getCell("desk")!.epoch, principalId: "cell:desk" },
-  );
-  if (result.type !== "defer") throw Error(result.type);
-  const item = kernel.humanItems.get(result.actionId)!;
-  expect(item.options[0]!.label).toContain("17 tokens、2 美分");
-  await kernel.humanItems.decide(item.id, { optionId: "small", seenItemRevision: item.itemRevision }, "owner");
-  expect(kernel.gate.usageSync("desk")).toMatchObject({ raisedTokens: before.raisedTokens + 17, raisedCents: before.raisedCents + 2 });
 });
 
 it("routes a subtree's cancel receipt to desk, restores the reopened epoch, and reports a claimed cancel", async () => {
@@ -317,7 +224,7 @@ it("routes a subtree's cancel receipt to desk, restores the reopened epoch, and 
   expect(kernel.getCell("worker")?.status).toBe("active");
   expect(kernel.humanItems.get(item.id)?.epoch).toBe(kernel.getCell("worker")!.epoch);
   const again = await cancel();
-  expect(kernel.inbox.claimNextRunSync("desk", "test", "serial_coalesce", 10_000)).toBeTruthy();
+  expect(kernel.inbox.claimNextRunSync("desk", "test", 10_000)).toBeTruthy();
   await expect(kernel.humanItems.undo(again, "owner")).rejects.toThrow("reopen_project");
   expect(kernel.getCell("project")?.status).toBe("closed");
 });

@@ -27,7 +27,6 @@ export default defineConfig({
       // Anchored patterns: a plain "/api" prefix would also swallow the client's own module "/api.ts".
       // The SSE stream needs no special handling: the proxy streams responses as they arrive.
       "^/api/": { target },
-      "^/hooks/": { target },
     },
   },
   preview: {

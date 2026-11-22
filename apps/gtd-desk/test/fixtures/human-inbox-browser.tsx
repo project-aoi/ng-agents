@@ -9,7 +9,6 @@ let artifact = {artifactId:"draft", body:"初稿", version:1, versionText:"v1", 
   parked:[], decisions:[], save:{method:"PUT", path:"/api/artifacts/draft"}};
 let revision = 1;
 window.fetch = async (url, init) => {
-  if (String(url).startsWith("/api/editor-leases/")) return Response.json({});
   if (url === artifact.save.path && init?.method === "PUT") {
     const {expectedVersion, body} = JSON.parse(String(init.body));
     saves.push(expectedVersion);

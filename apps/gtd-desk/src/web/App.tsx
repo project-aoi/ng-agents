@@ -15,7 +15,6 @@ import {
   dispatchViewKey,
   emitArtifactEvent,
   emitCellTail,
-  emitJobChunk,
   isActivatableTarget,
   isTypingTarget,
   parseRoute,
@@ -101,9 +100,6 @@ function Shell() {
     },
     cellTail(e) {
       emitCellTail(e);
-    },
-    jobChunk(e) {
-      emitJobChunk(e);
     },
   });
 

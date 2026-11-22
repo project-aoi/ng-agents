@@ -1,8 +1,5 @@
 import { CLI_SESSION_KEY, type CliSessionRecord, probeOrphanCliCell, reapOrphanedCliProcesses } from "@ng/loop";
 import {
-  all,
-  afterCommit,
-  anyCovers,
   timerFrom,
   CELL_DIRECT_CHAT_KEY,
   CELL_RESULT_CANDIDATE_KEY,
@@ -46,13 +43,6 @@ export interface RunHandle {
   controller: AbortController;
   stopReason: StopReason | null;
   done: Promise<void>;
-  /**
-   * A coordinator with nothing in flight beneath it started this Run: it reads its budget with the Gate's wrap-up
-   * allowance (LedgerViewOptions.wrapUp), so it can still record a result and park or finish its project.
-   */
-  wrapUp: boolean;
-  /** Tokens this Run has metered so far (a budget stop with nothing spent and nothing said delivered nothing). */
-  spent: number;
   /** docs/05 guard 2: only a `kernel.stalled_check` started this Run — it is not an anchor of its project. */
   stallOnly: boolean;
   /** RunPorts.settleSelf: what to do with the cell once this Run has settled. */
@@ -75,13 +65,6 @@ export interface Dispatcher {
   /** Extend the leases of every live Run (heartbeat; also on every ManualClock step). */
   renewAll(): void;
   idle(opts?: IdleOptions): Promise<void>;
-  /**
-   * A budget was raised: cells held back by the budget stop are looked at again. Their messages were never claimed, so
-   * they start with everything that arrived while they were held.
-   */
-  budgetChanged(ledgerId?: string): void;
-  /** Cells with due work that is not claimed because their budget (or an ancestor's) is used up. */
-  heldForBudget(): string[];
   /** Defer CLI dispatch for a cell whose previous CLI process has unknown identity (`null` on macOS). */
   holdForUnknownOrphan(cellId: string): void;
   /** Runs in flight with what the stall check and the occupancy view need. */
@@ -97,15 +80,13 @@ function isResurface(env: Envelope): boolean {
 }
 
 export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number }): Dispatcher {
-  const { inbox, cells, bus, clock, context, gate } = core;
+  const { inbox, cells, bus, clock, context } = core;
   const workerId = newId("kernel", clock);
   const runs = new Map<string, RunHandle>();
   const byCell = new Map<string, Set<string>>();
   const due: string[] = [];
   const dueSet = new Set<string>();
   const runEndWaiters = new Set<() => void>();
-  /** Cells whose due work is left unclaimed because the budget is used up; looked at again when a budget is raised. */
-  const held = new Set<string>();
   /** Cells deferred because a previous CLI process is alive with unreadable identity (`null`). */
   const unknownOrphans = new Set<string>();
   const reapingOrphans = new Set<string>();
@@ -199,68 +180,13 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
     return byCell.get(cellId)?.size ?? 0;
   }
 
-  // ---------- budget: decided before anything is claimed ----------
-  // A cell at its budget stop is not started, and — the point — its messages are not claimed: they stay pending and
-  // are all there when the owner raises the budget. (Claiming first and stopping at the first metering marked them
-  // done although no model had seen them; a resumed CLI session, which is only ever fed the new batch, lost them for
-  // good.) Only llm cells are held: a code processor spends nothing.
-
-  /**
-   * A coordinator (not a leaf, not the root) with nothing in flight beneath it: whatever it does now is bookkeeping
-   * after its workers — recording a result, parking, finishing — and may use the Gate's wrap-up allowance.
-   */
-  function wrapUpEligible(cell: CellRecord, dueNow: () => Set<string>): boolean {
-    if (cell.parentId === null || isLeafLifetime(cell.spec.lifetime)) return false;
-    const below = cells.descendants(cell.id, { status: ["active", "paused"] });
-    if (below.length === 0) return true;
-    const ids = new Set(below.map((c) => c.id));
-    for (const h of runs.values()) if (ids.has(h.cellId)) return false;
-    const due = dueNow();
-    // A cell held at the budget stop is not in flight: it will not move until the owner raises the budget.
-    for (const c of below) if (c.status === "active" && due.has(c.id) && !held.has(c.id)) return false;
-    return !core.workspace.listJobsSync({ state: ["running"] }).some((j) => ids.has(j.cellId));
-  }
-
-  function hold(cellId: string): void {
-    held.add(cellId);
-    try {
-      // One card per item (the escalation dedups by subject): the owner raises the budget there, or ends the work.
-      // Asked for again whenever new work arrives for a held cell, so a card the owner dismissed comes back instead
-      // of leaving the cell silently stuck.
-      core.escalations.budgetStopped(cellId);
-    } catch (err) {
-      core.onError(err, `budget escalation of ${cellId}`);
-    }
-  }
-
-  function budgetChanged(ledgerId?: string): void {
-    // An exhausted run may have consumed its entire batch. Recover its unfinished work even after a restart.
-    const recent = all<{cell_id:string; seq:number}>(core.db, `SELECT e.cell_id, e.seq FROM evidence e JOIN cells c ON c.id=e.cell_id
-      WHERE e.kind='run_boundary' AND json_extract(e.content,'$.outcome')='budget_stopped' AND c.status='active'
-      AND json_extract(e.content,'$.epoch')=c.epoch AND e.seq=(SELECT MAX(b.seq) FROM evidence b
-        WHERE b.cell_id=e.cell_id AND b.kind='run_boundary')`);
-    for (const {cell_id: id, seq} of recent) {
-      if (ledgerId && id !== ledgerId && !cells.ancestors(id).some(p => p.id===ledgerId)) continue;
-      if (gate.usageSync(id).state === "hard_stop" || inbox.pendingWakeupCountSync(id)>0) continue;
-      inbox.enqueueSync(id, createEnvelope({id:`${id}:budget-resume:${seq}`, from:KERNEL_FROM.dispatcher,
-        principalId:core.ownerPrincipal,kind:"event",type:PAYLOAD.runContinue,expectedEpoch:cells.require(id).epoch,
-        payload:{reason:"budget_raised",count:0}}, clock));
-    }
-    const ids = new Set([...held, ...inbox.dueCellIdsSync()]);
-    held.clear();
-    for (const id of ids) notify(id);
-  }
-
   function pump(): void {
-    let budget = due.length;
-    let dueSet_: Set<string> | null = null;
-    const dueNow = () => (dueSet_ ??= new Set(inbox.dueCellIdsSync()));
-    while (started && budget-- > 0 && runs.size < core.maxConcurrentRuns && due.length > 0) {
+    let remaining = due.length;
+    while (started && remaining-- > 0 && runs.size < core.maxConcurrentRuns && due.length > 0) {
       const cellId = due.shift()!;
       dueSet.delete(cellId);
       const cell = cells.get(cellId);
       if (!cell || cell.status !== "active") {
-        held.delete(cellId);
         continue;
       }
       if (core.lifecycle.cleaningUp(cellId)) continue; // The previous epoch notifies us when its runtime has stopped.
@@ -271,24 +197,20 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
         const reminder = env.from === timerFrom(cellId) && preset ? preset.personalReminder?.(env) : undefined;
         const resurface = env.from === timerFrom("approval") && isResurface(env);
         if (!reminder && !resurface) continue;
-        if (inbox.consumeTimerSync(cellId, env.id, cell.epoch, () => {
+        inbox.consumeTimerSync(cellId, env.id, cell.epoch, () => {
           if (reminder) {
             core.humanItems.create(reminder.draft, null, reminder.id);
-            if (anyCovers(core.ownerAddresses, reminder.notify)) {
-              const content = { format: "text" as const, body: `⏰ 提醒：${reminder.draft.title}` };
-              const auth = gate.authorizeSync({ type:"channel.send", target:reminder.notify, content, summary: content.body, subjectKey: reminder.draft.subjectKey, sideEffect:"notify_owner" }, {cellId, epoch:cell.epoch, principalId:cellPrincipal(cellId)});
-              if (auth.type === "allow") afterCommit(core.db, () => { void core.track(core.hub.send({target:reminder.notify, content, actionToken:auth.actionToken, idempotencyKey:reminder.draft.subjectKey, respectDnd:true})); });
-            }
-          } else core.approvals.resurfaced(env);
+            core.hub.notifyOwner({
+              cellId,
+              content: { format: "text", body: `⏰ 提醒：${reminder.draft.title}` },
+              idempotencyKey: reminder.draft.subjectKey,
+            });
+          } else core.humanItems.resurfaced(env);
           if (reminder) context.appendEvidenceSync(cellId, {kind:"inbound", envelope:env, runId:`timer:${env.id}`, at:clock.now()});
-        })) dueSet_ = null;
+        });
       }
-      const engine=cell.spec.processor.kind === "llm" && (cell.spec.processor.engine ?? core.defaultEngine);
-      const mode = engine && engine !== "api" ? "serial_coalesce" : cell.spec.claimMode ?? "serial_coalesce";
       // A cell with a Run in flight is re-notified when that Run ends; the claim is the real lock either way.
-      if (mode === "serial_coalesce" && inFlight(cellId) > 0) continue;
-      if (mode === "competing_workers" && inFlight(cellId) >= (cell.spec.maxParallelRuns ?? core.maxConcurrentRuns)) continue;
-      let wrapUp = false;
+      if (inFlight(cellId) > 0) continue;
       if (cell.spec.processor.kind === "llm") {
         // BUG-027: do not launch a replacement CLI process while an unverified previous process for this cell may still run.
         if (unknownOrphans.has(cellId)) {
@@ -302,29 +224,16 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
             continue;
           }
         }
-        try {
-          wrapUp = wrapUpEligible(cell, dueNow);
-          if (gate.usageSync(cellId, { wrapUp }).state === "hard_stop") {
-            // Nothing due: nothing to hold (a notify with no work behind it must not raise a card).
-            if (dueNow().has(cellId)) hold(cellId);
-            else held.delete(cellId);
-            continue;
-          }
-        } catch (err) {
-          core.onError(err, `budget check of ${cellId}`);
-        }
       }
-      held.delete(cellId);
       let batch: ClaimedBatch | null;
       try {
-        batch = inbox.claimNextRunSync(cellId, workerId, mode, core.leaseMs);
+        batch = inbox.claimNextRunSync(cellId, workerId, core.leaseMs);
       } catch (err) {
         core.onError(err, `claim ${cellId}`);
         continue;
       }
       if (!batch) continue;
-      launch(batch, cell, wrapUp);
-      if (mode === "competing_workers") notify(cellId);
+      launch(batch, cell);
     }
   }
 
@@ -335,7 +244,7 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
     if (s && s.size === 0) byCell.delete(handle.cellId);
   }
 
-  function launch(batch: ClaimedBatch, cell: CellRecord, wrapUp: boolean): void {
+  function launch(batch: ClaimedBatch, cell: CellRecord): void {
     const handle: RunHandle = {
       claimId: batch.claimId,
       cellId: batch.cellId,
@@ -344,8 +253,6 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
       controller: new AbortController(),
       stopReason: null,
       done: Promise.resolve(),
-      wrapUp,
-      spent: 0,
       stallOnly: false,
       selfSettle: null,
     };
@@ -644,23 +551,8 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
   }
 
   /** Give the batch back or settle it, according to how the Run ended. */
-  /**
-   * A Run that ended `budget_stopped` without having metered a token or left a word did not show its batch to any
-   * model (the stop came before the first call). Completing the claim would mark those messages done unseen.
-   */
-  function stoppedBeforeDelivery(handle: RunHandle): boolean {
-    if (handle.spent > 0) return false;
-    return !context.listEvidenceSync(handle.cellId, { runId: handle.claimId }).some((e) => e.record.kind === "assistant_text" || e.record.kind === "tool_call");
-  }
-
   function settleClaim(handle: RunHandle, batch: ClaimedBatch, result: RunResult, error: string | undefined): void {
     try {
-      if (result === "budget_stopped" && stoppedBeforeDelivery(handle)) {
-        // Back to the queue, uncounted, and held until a budget is raised (the pump checks before it claims again).
-        held.add(handle.cellId);
-        inbox.releaseSync(handle.claimId, "budget stop before the run started", { countAttempt: false });
-        return;
-      }
       if (result === "error") releaseClaim(handle, "error", error);
       else if (result === "cancelled" && handle.controller.signal.aborted) releaseClaim(handle, "cancelled", undefined);
       else settleRun(handle, batch, result);
@@ -680,7 +572,7 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
 
     // Kernel bookkeeping (a snoozed card coming due) needs no Run of its own.
     const resurfacing = batch.envelopes.filter(isResurface);
-    for (const env of resurfacing) core.approvals.resurfaced(env);
+    for (const env of resurfacing) core.humanItems.resurfaced(env);
     // A stalled_check that reaches a project which has found an anchor in the meantime is dropped unseen: the grace
     // period is re-checked at delivery, so a project that merely paused between two steps is never woken for it.
     const stallChecks = batch.envelopes.filter((e) => e.type === PAYLOAD.stalledCheck);
@@ -764,13 +656,6 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
       core.onError(err, `lastRunAt of ${cellId}`);
     }
     bus.emit("run.finished", { cellId, runId, epoch: handle.epoch, outcome: result, ...(error !== undefined ? { error } : {}) });
-    if (result === "budget_stopped") {
-      try {
-        core.escalations.budgetStopped(cellId);
-      } catch (err) {
-        core.onError(err, `budget escalation of ${cellId}`);
-      }
-    }
   }
 
   function abortCells(cellIds: readonly string[], reason: StopReason): void {
@@ -806,8 +691,7 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
       if (!busy && started) {
         const next = inbox.nextWakeAtSync();
         if (next !== null && next <= clock.now()) inbox.tickSync();
-        // Cells held at budget stop or waiting for an unknown orphan CLI process cannot be moved by idle().
-        const dueNow = inbox.dueCellIdsSync().filter((id) => !held.has(id) && !unknownOrphans.has(id));
+        const dueNow = inbox.dueCellIdsSync().filter((id) => !unknownOrphans.has(id));
         const jobsRunning = o.jobs ? core.workspace.listJobsSync({ state: ["running"] }).length : 0;
         if (dueNow.length === 0 && jobsRunning === 0 && !pumpScheduled && runs.size === 0) return;
         for (const id of dueNow) notify(id);
@@ -853,8 +737,6 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
     activeRuns: () => [...runs.values()].map((h) => ({ runId: h.claimId, cellId: h.cellId, epoch: h.epoch, startedAt: h.startedAt })),
     renewAll,
     idle,
-    budgetChanged,
-    heldForBudget: () => [...held],
     holdForUnknownOrphan,
     running: () => [...runs.values()].map((h) => ({ cellId: h.cellId, stallOnly: h.stallOnly })),
   };

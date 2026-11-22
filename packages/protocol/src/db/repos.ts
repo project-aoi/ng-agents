@@ -85,7 +85,7 @@ export interface CellsRepo {
   /** epoch += 1, returns the new epoch. Throws NgError("not_found"). */
   bumpEpoch(id: string): number;
   /** `closed` also sets closed_at and close_reason (default "completed"). */
-  setStatus(id: string, status: CellStatus, closeReason?: CloseReason, pauseReason?:"manual"|"parked"|"budget_declined"): void;
+  setStatus(id: string, status: CellStatus, closeReason?: CloseReason, pauseReason?:"manual"|"parked"): void;
   /** root_id/depth are derived from the parent. Throws NgError("not_found") for an unknown parent, NgError("duplicate") for an existing id. */
   insert(init: CellInsert): CellRecord;
   update(id: string, patch: CellPatch): CellRecord;

@@ -1,12 +1,9 @@
 import { STANDARD_TOOLSETS } from "@ng/loop";
-import type { ChannelAddr } from "@ng/protocol";
 
 /** Registered names. Specs are persisted, so these strings are a storage format: never rename them. */
 export const PROMPTS = {
   desk: "gtd.desk",
   worker: "gtd.worker",
-  /** The reply watcher's model variant (await_reply interpret: true). The name predates docs/05 and is stored in specs. */
-  watcher: "gtd.watcher",
   sensor: "gtd.sensor",
   /** docs/05: the persistent project coordinator. */
   project: "gtd.project",
@@ -18,15 +15,12 @@ export const PROMPTS = {
 
 export const TOOLSETS = {
   desk: "gtd.desk",
-  watcher: "gtd.watcher",
   sensor: "gtd.sensor",
-  /** docs/05: dispatch, track_action, await_reply, update_project, finish_project. */
+  /** docs/05: dispatch, track_action, update_project, finish_project. */
   project: "gtd.project",
 } as const;
 
 export const PROCESSORS = {
-  /** Reply watcher bookkeeping (await_reply): one party, reply/timeout/nudge. */
-  waitMatch: "gtd.wait_match",
   /** Sensor that runs a script through its workspace (args.script). */
   sensorScript: "gtd.sensor_script",
   /** A watcher dispatched with a check command (probe.ts): runs it on a timer, zero tokens until it reports. */
@@ -53,8 +47,6 @@ export const ROLES = {
   worker: "worker",
   /** The one-shot checker (preset `watcher`'s default). */
   checker: "checker",
-  /** The reply watcher (await_reply). */
-  watcher: "watcher",
   sensor: "sensor",
 } as const;
 
@@ -62,8 +54,6 @@ export const STD = STANDARD_TOOLSETS;
 
 /** Internal (non-GTD) state keys. GTD records use `gtdKeys` from @ng/protocol. */
 export const KEYS = {
-  /** In a reply watcher (await_reply): WatcherState. */
-  watcher: "watch:state",
   /** In a watcher with a check command: ProbeState. */
   probe: "probe:state",
   /** Weekly-review suggestions the app lists (shapes owned by apps/gtd-desk). */
@@ -80,14 +70,8 @@ export const RESTORE_REASON = "主人把这条从归档记录里移回了待确�
 export interface RegisterPresetsOptions {
   /** The desk cell id (default "desk"). Must match the kernel's `deskCellId`. */
   deskCellId?: string;
-  /** Where light owner notifications go (default "channel:ui:owner"); must be one of the kernel's ownerAddresses. */
-  ownerAddress?: ChannelAddr;
   /** IANA zone for times shown to the owner ("已设好 11月20日周五 15:00 提醒"). Default "Asia/Shanghai". */
   timeZone?: string;
-  /** How long a reply watcher waits after a nudge before checking again (default 1 day). */
-  followUpMs?: number;
-  /** Default wait before await_reply times out when the project gives no deadline (default 1 day). */
-  defaultWaitMs?: number;
   /**
    * When the desk wakes for its weekly review (skill and code-check suggestions): a 5-field cron in `timeZone`.
    * Default "0 16 * * 5" (Friday 16:00); false = no scheduled review.
@@ -97,10 +81,7 @@ export interface RegisterPresetsOptions {
 
 export interface PresetsConfig {
   deskCellId: string;
-  ownerAddress: ChannelAddr;
   timeZone: string;
-  followUpMs: number;
-  defaultWaitMs: number;
   weeklyReview: string | false;
 }
 
@@ -109,10 +90,7 @@ export const DAY_MS = 24 * 3_600_000;
 export function resolveConfig(opts: RegisterPresetsOptions = {}): PresetsConfig {
   return {
     deskCellId: opts.deskCellId ?? "desk",
-    ownerAddress: opts.ownerAddress ?? "channel:ui:owner",
     timeZone: opts.timeZone ?? "Asia/Shanghai",
-    followUpMs: opts.followUpMs ?? DAY_MS,
-    defaultWaitMs: opts.defaultWaitMs ?? DAY_MS,
     weeklyReview: opts.weeklyReview ?? "0 16 * * 5",
   };
 }

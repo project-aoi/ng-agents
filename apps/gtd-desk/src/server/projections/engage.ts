@@ -12,11 +12,6 @@ export function isEffort(v: unknown): v is Effort {
   return typeof v === "string" && (EFFORTS as readonly string[]).includes(v);
 }
 
-export function focusText(on: boolean, buffered: number): string {
-  if (!on) return buffered > 0 ? `有 ${buffered} 条暂存通知待查看` : "免打扰未开启";
-  return `免打扰已开启：已暂存 ${buffered} 条非紧急外部通知`;
-}
-
 /**
  * Open 🔵 actions the owner can work on now: their project (if any) is active, their task was not cancelled, and they
  * are not just "decide the card in Clarify" (cardBackedActions).
@@ -40,35 +35,17 @@ export function openHumanActions(kernel: DeskKernel): Array<Located<ActionRecord
   return out;
 }
 
-function sendInfo(rec: ApprovalRecord | undefined): EngageItemDTO["send"] {
-  if (!rec || rec.action.type !== "channel.send" || (rec.status !== "pending" && rec.status !== "failed")) return null;
-  const card = asClarifyCard(rec.card.data);
-  const targetLabel = card?.cardType === "response" ? card.reply.targetLabel : rec.action.target;
-  return { targetLabel, channelLabel: channelLabelOfAddress(rec.action.target), state: rec.status === "failed" ? "send_failed" : "ready" };
-}
-
 export function engageItem(input: ProjectionInput, a: Located<ActionRecord> & { projectId: string | null; projectTitle: string | null }): EngageItemDTO {
   const { kernel, now } = input;
   const r = a.record;
   const art = r.artifactId ? kernel.context.getArtifactSync(r.artifactId) : null;
   const linked = linkedApprovalId(r);
   const linkedRec = linked ? kernel.gate.getApprovalSync(linked) : undefined;
-  const send = sendInfo(linkedRec);
   const revision = linkedRec?.itemRevision ?? humanItemForAction(kernel,a.cellId,r.id)?.itemRevision;
   const base = `/api/engage/${enc(a.cellId)}/${enc(r.id)}`;
   const deep = art !== null;
   const buttons = [];
-  if (send && art && linkedRec) {
-    buttons.push(
-      button({
-        id: "send",
-        label: send.state === "send_failed" ? "↻ 重新发送定稿" : `✓ 定稿发送给 ${send.targetLabel}`,
-        primary: true,
-        endpoint: post(`${base}/send`, { seenVersion: art.version, seenItemRevision: linkedRec.itemRevision }),
-      }),
-    );
-  }
-  if (deep) buttons.push(button({ id: "open", label: "打开工作区", primary: !send, client: "open_editor" }));
+  if (deep) buttons.push(button({ id: "open", label: "打开工作区", primary: true, client: "open_editor" }));
   buttons.push(button({ id: "done", label: "✓ 已办完", primary: !deep, endpoint: post(`${base}/done`, revision !== undefined ? { seenItemRevision: revision, ...(art ? {seenVersion:art.version} : {}) } : undefined) }));
   return {
     cellId: a.cellId,
@@ -84,7 +61,6 @@ export function engageItem(input: ProjectionInput, a: Located<ActionRecord> & { 
     source: sourceInfo(r.source),
     kind: deep ? "deep" : "quick",
     artifact: art ? { artifactId: art.artifactId, version: art.version, ...(art.content.title !== undefined ? { title: art.content.title } : {}), updatedBy: art.updatedBy } : null,
-    send,
     createdAt: r.createdAt,
     buttons,
   };
@@ -104,9 +80,7 @@ export function projectEngage(input: ProjectionInput, filter: Effort | "all" = "
       x.createdAt - y.createdAt ||
       x.actionId.localeCompare(y.actionId),
   );
-  const on = kernel.hub.isFocusSync();
-  const buffered = kernel.hub.bufferedCountSync();
-  return { generatedAt: input.now, filter, counts, items, focus: { on, buffered, text: focusText(on, buffered) } };
+  return { generatedAt: input.now, filter, counts, items };
 }
 
 function refs(list: readonly ReferenceLink[] | undefined): ReferenceDTO[] {

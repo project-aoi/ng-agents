@@ -15,12 +15,11 @@ import type {
   WeeklyReviewDTO,
 } from "../src/shared/api";
 import { createDeskServer } from "../src/server/boot";
-import { PLACEHOLDER_DEMO } from "../src/server/demo";
 import { viewsForBusEvent } from "../src/server/events";
 import { SecurityConfigError, isLoopbackHost } from "../src/server/security";
 import { SKILL_SUGGESTION_PREFIX } from "../src/server/projections";
 import { BUILTIN_SKILLS } from "@ng/presets";
-import { bootDesk, bootRealDesk, cellMessages, cleanupAll, DAY, makeProject, makeReplyCard, requestText, tempDir, writeAction } from "./helpers";
+import { bootDesk, bootRealDesk, cellMessages, cleanupAll, DAY, makeProject, makeReviewCard, requestText, tempDir, writeAction } from "./helpers";
 
 afterEach(cleanupAll);
 
@@ -37,7 +36,7 @@ describe("the bearer-token rule (docs/01 坑 1)", () => {
     expect(["0.0.0.0", "::", "10.0.0.2", "example.com"].some(isLoopbackHost)).toBe(false);
   });
 
-  it("enforces the token on /api/* when set; webhooks authenticate by signature instead", async () => {
+  it("enforces the token on /api/* when set", async () => {
     const d = await bootDesk({ host: "0.0.0.0", token: TOKEN });
     const none = await d.req("GET", "/api/status");
     expect(none.status).toBe(401);
@@ -53,9 +52,6 @@ describe("the bearer-token rule (docs/01 坑 1)", () => {
     expect(sse.status).toBe(200);
     expect(sse.headers.get("content-type")).toContain("text/event-stream");
     await sse.body!.cancel();
-    const hook = await d.req("POST", "/hooks/github", { zen: "hi" });
-    expect(hook.status).toBe(404);
-    expect(hook.json).toEqual({ error: "unknown_channel" });
   });
 
   it("on loopback without a token, rejects writes a foreign web page could forge", async () => {
@@ -74,24 +70,18 @@ describe("boot with the real presets", () => {
   it("registers @ng/presets before start, seeds the built-in playbooks, creates the desk with the inline preset and takes a capture", async () => {
     const d = await bootDesk({ registerPresets: undefined as never });
     expect(d.kernel.getCell("desk")).toMatchObject({ preset: "inline", status: "active", title: "主台" });
-    expect(d.kernel.registry.presets.list().map((p) => p.name).sort()).toEqual(["checker", "hub", "inline", "project", "reply_watcher", "sensor", "watcher", "worker"]);
+    expect(d.kernel.registry.presets.list().map((p) => p.name).sort()).toEqual(["checker", "hub", "inline", "project", "sensor", "watcher", "worker"]);
     // The playbooks the presets' prompts refer to, as global skills (seedBuiltinSkills at boot).
     expect(d.kernel.context.listSkillsSync().map((x) => x.name).sort()).toEqual(BUILTIN_SKILLS.map((x) => x.name).sort());
     await d.post("/api/capture", { text: "把这篇文章存进阅读清单 https://example.com/a" });
     await d.kernel.idle();
     expect(d.script.requests.some((r) => r.cellId === "desk")).toBe(true);
-    expect((await d.get<StatusDTO>("/api/status")).demo).toBe(false);
   });
 
-  it("starts in demo mode when no CLI agent is installed and no model is configured", async () => {
-    const server = await createDeskServer({ env: {}, detectCli: () => false, demo: PLACEHOLDER_DEMO, dataDir: tempDir("demo"), kernel: { db: ":memory:" }, webDir: null, log: () => undefined });
-    try {
-      const s = (await (await server.app.request("/api/status")).json()) as StatusDTO;
-      expect(s).toMatchObject({ demo: true, backend: "demo" });
-    } finally {
-      await server.close();
-    }
+  it("requires an installed CLI at startup", async () => {
+    await expect(createDeskServer({ env: {}, detectCli: () => false })).rejects.toThrow(/claude、codex 或 agy/);
   });
+
 });
 
 describe("live updates", () => {
@@ -100,7 +90,6 @@ describe("live updates", () => {
     expect(viewsForBusEvent("state.changed", { cellId: "desk", keys: [gtdKeys.action("x")] })).toEqual(expect.arrayContaining(["engage", "radar"]));
     expect(viewsForBusEvent("state.changed", { cellId: "s", keys: [gtdKeys.source] })).toEqual(["sources", "review"]);
     expect(viewsForBusEvent("state.changed", { cellId: "desk", keys: ["coord:state"] })).toEqual([]);
-    expect(viewsForBusEvent("channel.focus", { on: true, buffered: 0 })).toEqual(["status", "engage"]);
   });
 
   it("streams hello, then refresh events after a change", async () => {
@@ -117,7 +106,7 @@ describe("live updates", () => {
       }
     };
     await until("event: hello");
-    makeReplyCard(d.kernel);
+    makeReviewCard(d.kernel);
     await until("event: refresh");
     expect(text).toMatch(/event: refresh\ndata: \{"views":\[[^\]]*"clarify"/);
     await reader.cancel();
@@ -136,7 +125,6 @@ describe("⚡ sources", () => {
     expect(d.kernel.inbox.listSchedulesSync({ cellId: id, activeOnly: true })).toHaveLength(1);
     // a script check runs commands in a directory of its own — never given a cwd (so never the owner's repository),
     // no worktree, no sandbox; nothing about read/write modes is asked any more (docs/05 proposal 03)
-    expect(d.kernel.getCell(id)!.spec.cwdMode).toBeUndefined();
     expect(d.kernel.getCell(id)!.spec.cwd).toBeUndefined();
     expect(d.kernel.getCell(id)!.bounds.isolation).toBe("none");
 
@@ -162,7 +150,7 @@ describe("⚡ sources", () => {
 });
 
 describe("weekly review actions", () => {
-  it("accepts a suggested skill and enables an auto rule for a class approved unedited five times", async () => {
+  it("accepts a suggested skill", async () => {
     const d = await bootDesk();
     d.kernel.context.commitSync("desk", { statePatches: { [`${SKILL_SUGGESTION_PREFIX}reply-style`]: { name: "reply-style", description: "回复客户的语气", body: "- 先结论" } } });
     const before = d.kernel.context.listSkillsSync().map((x) => x.name);
@@ -173,17 +161,7 @@ describe("weekly review actions", () => {
     expect(d.kernel.context.listSkillsSync().map((x) => x.name).sort()).toEqual([...before, "reply-style"].sort());
     expect(d.kernel.context.getKnowledgeSync({ kind: "skill", name: "reply-style", scope: "global" })).toMatchObject({ description: "回复客户的语气" });
 
-    for (let i = 0; i < 5; i++) {
-      const { actionId } = makeReplyCard(d.kernel, { text: `第 ${i} 次回复` });
-      expect((await d.post<ApproveResponse>(`/api/clarify/${actionId}/approve`, { seenVersion: 1, seenItemRevision: 1 })).outcome).toBe("sent");
-    }
-    const review = await d.get<WeeklyReviewDTO>("/api/review");
-    expect(review.ruleSuggestions).toMatchObject([{ actionClass: "channel.send|channel:memory:*", label: "通过 测试通道 对外发送消息", streak: 5 }]);
-    expect(review.completed.filter((c) => c.kind === "reply")).toHaveLength(5);
-    const enable = review.ruleSuggestions[0]!.buttons[0]!.endpoint!;
-    const r = await d.post<ReviewMutationResponse>(enable.path, enable.body);
-    expect(r).toMatchObject({ outcome: "rule_enabled", view: { ruleSuggestions: [] } });
-    expect(d.kernel.gate.listPolicyRulesSync()).toMatchObject([{ match: { type: "channel.send", target: "channel:memory:*" }, effect: "allow", maxUses: 20 }]);
+
   });
 
   it("switches an llm source to a zero-token script check", async () => {
@@ -263,32 +241,6 @@ describe("project proposal card", () => {
 });
 
 describe("escalations and completion", () => {
-  it("extend on a budget card raises the budget; resolve offline closes the waiting task and finishes its records", async () => {
-    const d = await bootDesk();
-    const before = d.kernel.gate.usageSync("desk").raisedTokens;
-    // "继续" raises the ledgers that are actually stopped (the chain to the root), so the desk has spent its budget.
-    d.kernel.gate.meter("desk", { tokens: d.kernel.gate.usageSync("desk").limitTokens, billedCents: 0 });
-    expect(d.kernel.gate.usageSync("desk").state).toBe("hard_stop");
-    const card = { cardType: "escalation", subjectKey: "cell:desk", title: "主台的预算已用完", source: { label: "系统", at: 0 }, rawInput: { text: "x", kind: "system" }, prep: { summary: "", checked: [] }, escalation: { reason: "budget_exhausted", explanation: "已用完" } };
-    const b = d.kernel.gate.authorizeSync(
-      { type: "custom", name: "escalation.budget_exhausted", summary: "预算", subjectKey: "cell:desk", sideEffect: "external", card: { format: "card", body: "x", data: card } },
-      { cellId: "desk", principalId: "cell:desk", epoch: d.kernel.getCell("desk")!.epoch },
-    );
-    if (b.type !== "defer") throw new Error(b.type);
-    const r = await d.post<ClarifyMutationResponse>(`/api/clarify/${b.actionId}/extend`, { seenItemRevision: 1 });
-    expect(r).toMatchObject({ outcome: "continued", message: "已追加额度，继续推进" });
-    expect(d.kernel.gate.usageSync("desk").raisedTokens).toBeGreaterThan(before);
-
-    const p = makeProject(d.kernel, "比价");
-    d.kernel.spawnCell(p, { id: "wq", preset: "watcher", lifetime: "persistent", title: "等 C", bounds: { canSendTo: ["channel:memory:*"] } });
-    const wait = writeAction(d.kernel, "wq", { title: "等 C 报价", owner: "waiting" });
-    const { actionId } = makeReplyCard(d.kernel, { cellId: "wq", target: "channel:memory:supplier-c", subjectKey: "cell:wq" });
-    const off = await d.post<ClarifyMutationResponse>(`/api/clarify/${actionId}/resolve-offline`, { seenItemRevision: 1 });
-    expect(off).toMatchObject({ outcome: "resolved_offline", message: "已完结" });
-    expect(d.kernel.getCell("wq")!.status).toBe("active");
-    expect(d.kernel.context.readStateSync<ActionRecord>("wq", gtdKeys.action(wait.id))).toMatchObject({ status: "open" });
-    expect(d.kernel.getCell(p)!.status).toBe("active");
-  });
 
   it("project complete closes the tree and shows up in the weekly review", async () => {
     const d = await bootDesk();
@@ -300,17 +252,6 @@ describe("escalations and completion", () => {
     expect(d.kernel.getCell("w")!.status).toBe("closed");
   });
 
-  it("sending from Engage with an unknown receipt finishes the item and leaves the verification in Clarify", async () => {
-    const d = await bootDesk();
-    const { actionId } = makeReplyCard(d.kernel);
-    d.memory.respondWith("unknown");
-    await d.post(`/api/human-items/${actionId}/decide`,{optionId:"system.execute",seenArtifactVersion:1,seenItemRevision:1});
-    const item = d.kernel.humanItems.list()[0]!;
-    expect(item).toMatchObject({id:actionId,status:"unknown"});
-    expect(item.options.map(o=>o.id)).toEqual(["system.sent","system.not_sent","system.defer"]);
-    expect((await d.req("POST",`/api/human-items/${actionId}/decide`,{optionId:"system.deny",seenArtifactVersion:1,seenItemRevision:item.itemRevision})).status).toBe(409);
-    expect((await d.get<ClarifyQueueDTO>("/api/clarify")).cards).toMatchObject([{ id: actionId, state: "send_unknown" }]);
-  });
 
   it("unknown ids are 404s; a decided card is a 409", async () => {
     const d = await bootDesk();
@@ -320,7 +261,7 @@ describe("escalations and completion", () => {
     expect((await d.req("GET", "/api/artifacts/nope")).status).toBe(404);
     expect((await d.req("POST", "/api/projects/nope/pause")).status).toBe(404);
     expect((await d.req("GET", "/api/nothing-here")).status).toBe(404);
-    const { actionId } = makeReplyCard(d.kernel);
+    const { actionId } = makeReviewCard(d.kernel);
     await d.post(`/api/clarify/${actionId}/approve`, { seenVersion: 1, seenItemRevision: 1 });
     expect((await d.req("POST", `/api/clarify/${actionId}/someday`, { seenItemRevision: 1 })).status).toBe(409);
     const malformed = await d.server.app.request("/api/capture", { method: "POST", body: "{not json", headers: { "content-type": "application/json" } });

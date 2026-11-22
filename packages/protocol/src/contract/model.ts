@@ -1,6 +1,3 @@
-// Provider-neutral model messages. Context builds them (history + tail); Loop's ModelClient implementations
-// translate them to a provider's wire format (Anthropic, OpenAI-compatible, scripted).
-
 export interface TextBlock {
   type: "text";
   text: string;
@@ -65,10 +62,6 @@ export function messageText(message: ModelMessage): string {
     .join("\n");
 }
 
-// ==================== [ext] ModelClient: the provider-neutral model call (implemented in @ng/loop) ====================
-// Declared here so other packages (e.g. an injected Context summariser) can type against it without depending on
-// @ng/loop. Implementations: AnthropicModelClient, OpenAICompatibleModelClient, ScriptedModelClient.
-
 export type ModelTier = "fast" | "strong";
 
 /** A tool as the model sees it (name, description, JSON Schema with `type: "object"`). */
@@ -78,28 +71,13 @@ export interface ModelToolSpec {
   inputSchema: { [key: string]: unknown };
 }
 
-/**
- * Provider-native rendering of an assistant turn (e.g. Anthropic content including thinking blocks with signatures).
- * Only the client whose `provider` matches replays it, verbatim; every other client uses the neutral `content`.
- * Lives only in memory for the duration of one Run — never persisted to evidence.
- */
-export interface NativeAssistantContent {
-  provider: string;
-  content: unknown;
-}
-
-export interface ModelTurnMessage extends ModelMessage {
-  native?: NativeAssistantContent;
-}
-
 export interface ModelRequest {
   tier: ModelTier;
   system: string;
   /** Starts with a user message, roles alternate, ends with a user message (no prefill). */
-  messages: ModelTurnMessage[];
+  messages: ModelMessage[];
   /** Same definitions, same order, for every Run of a cell (prefix caching). */
   tools: ModelToolSpec[];
-  maxOutputTokens?: number;
   /**
    * `stablePrefixEnd`: the last block of the part of `messages` that the next Run will reproduce byte-for-byte
    * (the snapshot's history). Clients with explicit prompt caching put a breakpoint there.
@@ -110,34 +88,13 @@ export interface ModelRequest {
 
 export type ModelStopReason = "end_turn" | "tool_use" | "max_tokens" | "refusal" | "other";
 
-/**
- * Dual ledger: `tokens` = every token the provider processed (uncached input + cache reads + cache writes + output),
- * so a subscription/zero-priced provider still counts against maxTokens; `billedCents` from the client's price table.
- * `priced: false` means the model had no price entry (cents reported as 0).
- */
-export interface ModelUsage {
-  inputTokens: number;                  // uncached input
-  outputTokens: number;
-  cacheReadTokens: number;
-  cacheWriteTokens: number;
-  tokens: number;
-  billedCents: number;
-  priced: boolean;
-}
-
 export interface ModelResponse {
   model: string;                        // the model that actually served the response
   content: Array<TextBlock | ToolUseBlock>; // provider-neutral, in output order (what evidence records)
-  native?: NativeAssistantContent;
   stopReason: ModelStopReason;
-  usage: ModelUsage;
 }
 
 export interface ModelClient {
-  /** Matches NativeAssistantContent.provider for the content this client produces. */
-  readonly provider: string;
-  /** The model id a tier maps to (configuration). */
-  modelFor(tier: ModelTier): string;
   /** Rejects on transport/API errors; rejects promptly when `signal` aborts. */
   complete(req: ModelRequest, signal?: AbortSignal): Promise<ModelResponse>;
 }

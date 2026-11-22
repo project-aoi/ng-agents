@@ -1,6 +1,4 @@
 import {
-  ISOLATION_LEVELS,
-  ISOLATION_RANK,
   NgError,
   TOOL_KINDS,
   addressCovers,
@@ -8,7 +6,6 @@ import {
   inboxAddr,
   parseAddress,
   type Address,
-  type IsolationLevel,
   type PolicyBounds,
   type ToolKind,
 } from "@ng/protocol";
@@ -16,7 +13,6 @@ import {
 // Every value that reaches cells.bounds must survive serializeBounds → deserializeBounds (finite, non-negative,
 // valid enum members and address patterns); otherwise the stored cell row could no longer be read back.
 const MAX_LIMIT = Number.MAX_SAFE_INTEGER;
-const STRONGEST_ISOLATION: IsolationLevel = "cow_microvm";
 
 /** Same rule as the protocol's serialized-bounds schema: `inbox:`/`channel:` prefix wildcard, or a parseable address. */
 export function isAddressPattern(value: unknown): value is Address {
@@ -26,10 +22,6 @@ export function isAddressPattern(value: unknown): value is Address {
 
 function isToolKind(value: unknown): value is ToolKind {
   return typeof value === "string" && (TOOL_KINDS as readonly string[]).includes(value);
-}
-
-function isIsolation(value: unknown): value is IsolationLevel {
-  return typeof value === "string" && (ISOLATION_LEVELS as readonly string[]).includes(value);
 }
 
 /**
@@ -50,16 +42,6 @@ function nonNegInt(value: unknown): number {
   if (typeof value !== "number" || Number.isNaN(value)) return 0;
   if (value >= MAX_LIMIT) return MAX_LIMIT;
   return Math.max(0, Math.floor(value));
-}
-
-function nonNegNum(value: unknown): number {
-  if (typeof value !== "number" || Number.isNaN(value)) return 0;
-  if (value >= MAX_LIMIT) return MAX_LIMIT;
-  return Math.max(0, value);
-}
-
-function stronger(a: IsolationLevel, b: IsolationLevel): IsolationLevel {
-  return ISOLATION_RANK[a] >= ISOLATION_RANK[b] ? a : b;
 }
 
 /**
@@ -88,17 +70,11 @@ export function minimizePatterns(patterns: readonly Address[]): Address[] {
 /** Greatest lower bound of two bounds of the same cell (nothing is decremented). */
 export function meetBounds(a: PolicyBounds, b: PolicyBounds): PolicyBounds {
   const bTools = new Set(members(b.tools));
-  const bSecrets = new Set(members(b.secretRefs));
-  const isoA = isIsolation(a.isolation) ? a.isolation : STRONGEST_ISOLATION;
-  const isoB = isIsolation(b.isolation) ? b.isolation : STRONGEST_ISOLATION;
   return {
     tools: new Set(members(a.tools).filter((t): t is ToolKind => isToolKind(t) && bTools.has(t))),
     canSendTo: intersectPatterns(members(a.canSendTo), members(b.canSendTo)),
-    secretRefs: new Set(members(a.secretRefs).filter((s) => bSecrets.has(s))),
-    isolation: stronger(isoA, isoB),
+    isolation: "none",
     maxConcurrentChildren: Math.min(nonNegInt(a.maxConcurrentChildren), nonNegInt(b.maxConcurrentChildren)),
-    maxTokens: Math.min(nonNegInt(a.maxTokens), nonNegInt(b.maxTokens)),
-    maxCents: Math.min(nonNegNum(a.maxCents), nonNegNum(b.maxCents)),
     maxDepth: Math.min(nonNegInt(a.maxDepth), nonNegInt(b.maxDepth)),
   };
 }
@@ -135,26 +111,14 @@ export function attenuateBounds(
     ...(parentInbox ? [parentInbox] : []),
   ]);
 
-  const parentSecrets = members(parent.secretRefs);
-  const reqSecrets = stringList(req.secretRefs);
-  const secretRefs = reqSecrets === null ? [] : parentSecrets.filter((s) => reqSecrets.includes(s));
-
-  const parentIso = isIsolation(parent.isolation) ? parent.isolation : STRONGEST_ISOLATION;
-  const isolation =
-    req.isolation === undefined ? parentIso : stronger(parentIso, isIsolation(req.isolation) ? req.isolation : STRONGEST_ISOLATION);
 
   const clampInt = (value: unknown, cap: number) => (value === undefined ? cap : Math.min(nonNegInt(value), cap));
-  const clampNum = (value: unknown, cap: number) => (value === undefined ? cap : Math.min(nonNegNum(value), cap));
 
   const result: PolicyBounds = {
     tools: new Set(tools),
     canSendTo,
-    secretRefs: new Set(secretRefs),
-    isolation,
+    isolation: "none",
     maxConcurrentChildren: clampInt(req.maxConcurrentChildren, nonNegInt(parent.maxConcurrentChildren)),
-    // Static caps only; the live ledgers of the whole chain govern spending (Gate.meter), see the Gate contract.
-    maxTokens: clampInt(req.maxTokens, nonNegInt(parent.maxTokens)),
-    maxCents: clampNum(req.maxCents, nonNegNum(parent.maxCents)),
     maxDepth: clampInt(req.maxDepth, parentDepth - 1),
   };
 

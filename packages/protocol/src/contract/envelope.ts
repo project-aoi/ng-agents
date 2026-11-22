@@ -7,7 +7,7 @@ import { newId } from "../ids";
 export type InboxAddr = `inbox:${string}`;
 export type ChannelAddr = `channel:${string}:${string}`;
 export type Address = InboxAddr | ChannelAddr;
-export type ToolKind = "read" | "write" | "edit" | "bash" | "code_rpc";
+export type ToolKind = "read" | "write" | "edit" | "bash";
 
 export interface Envelope<T = unknown> {
   id: string;                           // transport idempotency id (stays the same across retries)
@@ -27,22 +27,19 @@ export interface Envelope<T = unknown> {
 export interface PolicyBounds {         // one permission set; deriving a child Cell must strictly satisfy child ⊆ parent
   tools: ReadonlySet<ToolKind>;         // upper bound of authorized tool kinds (the desk can still expose only read + spawn to its model via Loop.allowedTools)
   canSendTo: readonly Address[];        // addresses this Cell may deliver to (worker default: only the parent inbox; a user ChannelAddr can be granted for 1:1 direct reporting)
-  secretRefs: ReadonlySet<string>;      // secrets the out-of-sandbox proxy may inject (child ⊆ parent)
-  isolation: "none" | "shared_ro" | "git_worktree" | "container" | "cow_microvm";
+  isolation: "none";
   maxConcurrentChildren: number;        // cap on simultaneously active children / child sandboxes (prevents unbounded fan-out)
-  maxTokens: number;                    // shared with maxCents along the Cell supervision tree, rolled up, hard stop
-  maxCents: number;
   maxDepth: number;                     // remaining levels of spawnCell allowed (minus 1 per level; 0 forbids further spawning)
 }
 
 // ==================== [ext] ====================
 
-export const TOOL_KINDS = ["read", "write", "edit", "bash", "code_rpc"] as const satisfies readonly ToolKind[];
+export const TOOL_KINDS = ["read", "write", "edit", "bash"] as const satisfies readonly ToolKind[];
 
 export type IsolationLevel = PolicyBounds["isolation"];
-export const ISOLATION_LEVELS = ["none", "shared_ro", "git_worktree", "container", "cow_microvm"] as const satisfies readonly IsolationLevel[];
+export const ISOLATION_LEVELS = ["none"] as const satisfies readonly IsolationLevel[];
 
-/** Thread ids in `Envelope.threads` are namespaced by channel: `${channelId}:${externalThreadId}` (e.g. `github:org/repo#108`). */
+/** Thread ids in `Envelope.threads` are namespaced by channel: `${channelId}:${externalThreadId}` (e.g. `ui:desk`). */
 export function threadId(channelId: string, externalThreadId: string): string {
   return `${channelId}:${externalThreadId}`;
 }

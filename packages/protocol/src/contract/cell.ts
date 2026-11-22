@@ -1,9 +1,9 @@
+import type { Deliverable } from "./deliverable";
 import type { HumanItemDraft } from "../human-item";
 import type { Clock } from "../clock";
-import type { Channel } from "./channel";
 import type { ContextStore, EvidenceEntry, PromptSnapshot } from "./context";
 import type { Envelope, EnvelopeDraft, EnvelopeKind, InboxAddr, IsolationLevel, PolicyBounds, Delivery, ToolKind } from "./envelope";
-import type { AuthorizeResult, ChannelSendAction, MeterResult, ProposedAction, Usage } from "./gate";
+import type { AuthorizeResult, ProposedAction } from "./gate";
 import type { ControlAction, ControlResult, EnqueueResult, Inbox, ScheduleRule } from "./inbox";
 import type { ProcessorSpec } from "./loop";
 import type { WorkspacePort } from "./workspace";
@@ -15,7 +15,7 @@ export interface CellSpec {
   stallPolicy?: "monitor";
   id?: string;
   parentId?: string;                    // forms the supervision tree; closing/cancelling the parent recursively reclaims the subtree
-  preset?: "inline" | "worker" | "checker" | "reply_watcher" | "watcher" | "sensor" | "project" | "hub"; // [ext] project, hub (docs/05)
+  preset?: "inline" | "worker" | "checker" | "watcher" | "sensor" | "project" | "hub"; // [ext] project, hub (docs/05)
   watches?: Array<{ threadOrFilter: Record<string, unknown>; cancelGroup?: string; coalesceMs?: number /* [ext] */ }>;
   schedules?: ScheduleRule[];
   contextMode?: "isolated" | "fork_prefix";
@@ -27,24 +27,11 @@ export interface CellSpec {
   /** Set by the kernel (never trusted from callers) for fork_prefix children: history = parent's up to this seq. */
   fork?: { fromCellId: string; uptoSeq: number };
   /**
-   * [ext] How the dispatcher claims this cell's inbox. Default `serial_coalesce`: one Run at a time, every due message
-   * coalesced into it. `competing_workers`: up to `maxParallelRuns` Runs at once, one wakeup message each (a pool).
-   */
-  claimMode?: "serial_coalesce" | "competing_workers";
-  maxParallelRuns?: number;
-  /**
    * [ext] docs/05 — the directory this cell works in, on the owner's real machine (absolute path). The kernel never
    * creates, snapshots or removes it. A child without `cwd` inherits its parent's. Absent everywhere up the tree = the
    * kernel's `repoPath` (or its process cwd).
    */
   cwd?: string;
-  /**
-   * @deprecated Accepted and stored for specs written before the kernel stopped scheduling by it; it has no effect.
-   * The kernel no longer queues writers per work tree and no longer tells a cell it is "read-only" by this field:
-   * every dispatched cell starts at once, who is active in which directory is shown to the cells
-   * (WorkspaceOccupancy, the "active workspaces" note), and the prompts say how to share a directory.
-   */
-  cwdMode?: "read" | "write";
   /**
    * [ext] How long the cell lives and how its parent hears from it.
    * - `"wakeable"` (the `worker` preset's default): a leaf that is never closed for finishing a turn. When a Run ends
@@ -70,8 +57,7 @@ export interface CellSpec {
 
 export interface CellPorts {            // the controlled capability surface a Loop sees at run time
   workspace: WorkspacePort;
-  notifyChannel: Channel["send"];       // [ext] here `target` is a full ChannelAddr; the kernel routes via ChannelHub
-  streamPreview: NonNullable<Channel["streamPreview"]>;
+  notifyOwner(content: Deliverable, idempotencyKey: string): Promise<void>;
   context: Pick<ContextStore, "readState" | "commit" | "appendEvidence" | "readResource" | "searchHistory" | "upsertSkillOrNote"
     | "listState" | "getArtifact" | "getArtifactVersion" | "listArtifacts">; // [ext] listState/getArtifact/listArtifacts
   cancelScheduled: Inbox["cancelScheduled"];
@@ -106,8 +92,7 @@ export type SpawnSpec = Omit<CellSpec, "processor"> & { processor?: ProcessorSpe
 // - [docs/05] cwd is inherited from the parent when absent; lifetime comes from the preset's defaults.
 
 export type PresetName = NonNullable<CellSpec["preset"]>;
-export const PRESET_NAMES = ["inline", "worker", "checker", "reply_watcher", "watcher", "sensor", "project", "hub"] as const satisfies readonly PresetName[];
-export type CwdMode = NonNullable<CellSpec["cwdMode"]>;
+export const PRESET_NAMES = ["inline", "worker", "checker", "watcher", "sensor", "project", "hub"] as const satisfies readonly PresetName[];
 export type CellLifetime = NonNullable<CellSpec["lifetime"]>;
 /** A leaf executor (wakeable worker or one-shot probe), as opposed to a persistent coordinator. */
 export function isLeafLifetime(lifetime: CellSpec["lifetime"]): lifetime is "one_shot" | "wakeable" {
@@ -129,15 +114,6 @@ export interface RunSelf {
   spec: CellSpec;
 }
 
-export type ReplyDecision = Exclude<AuthorizeResult, { type: "allow" }> |
-  { type: "delivery"; actionId: string; receipt: "sent" | "unknown" | "failed" | "pending" | "cancelled" };
-
-/**
- * What the kernel actually hands a Loop for one Run. Every port is already bound to this cell, epoch and
- * principal; the kernel enforces bounds on workspace exec (tool ∈ bounds.tools), sends (target ∈ canSendTo, valid
- * actionToken) and spawns (attenuate, maxConcurrentChildren). Tools still call `authorize` for anything with a side
- * effect so Gate can defer it.
- */
 export interface RunPorts extends CellPorts {
   isDirectChild(id: string): boolean;
   createHumanItem?(draft: HumanItemDraft): { id: string; itemRevision: number };
@@ -145,8 +121,6 @@ export interface RunPorts extends CellPorts {
   readonly self: RunSelf;
   /** Gate.authorize bound to self (cellId, epoch, principal). */
   authorize(action: ProposedAction, opts?: { artifactVersion?: number }): Promise<AuthorizeResult>;
-  /** Gate.meter for this cell; the Loop calls it after every model call and stops with budget_stopped on hard_stop. */
-  meter(usage: Usage): MeterResult;
   /** Steer messages that arrived since the Run started; the Loop checks between model steps and appends them as user text. */
   drainSteer(): DrainedSteerItem[];
   /**
@@ -160,11 +134,9 @@ export interface RunPorts extends CellPorts {
    */
   confirmCliInput?(sessionId: string, throughSeq: number): void;
   listEvidence?(opts?: { afterSeq?: number; limit?: number; runId?: string }): EvidenceEntry[];
-  /** Authorize a reply, recording a standing-rule send and its outbox intent together before transport. */
   /** Confirm the native parent session still represents exactly the creation-time evidence. */
   canForkSession(parentId:string, uptoSeq:number, sessionId:string, delivered:number): boolean;
   listOwnDecisions(): Array<{ record: import("./gate").ApprovalRecord; envelope?: Envelope }>;
-  submitReply(action: ChannelSendAction, artifactVersion: number, sourceId: string): Promise<ReplyDecision>;
   /**
    * Commit with inboxOut to `inbox:<parentId>` (envelope from `inbox:<selfId>`, expectedEpoch = parent's epoch). Throws
    * for root cells. [docs/05] A `cell.result` from a leaf (`one_shot` / `wakeable`) cell is not sent from here: it is
@@ -182,17 +154,11 @@ export interface RunPorts extends CellPorts {
    */
   handback?(envelopeId: string, reason: string): Promise<void>;
   /**
-   * [ext] Withdraw one of this cell's own pending cards (docs/04 §2.1 rule 3: someone already answered in the group →
-   * the card is taken down and archived): pending → cancelled with `reason`. Cards raised by other cells are never
-   * touched ("not_pending"). Optional in the type only so hand-written fakes stay valid; the kernel always provides it.
-   */
-  withdrawApproval?(ref: { actionId?: string; subjectKey?: string }, reason: string): Promise<"cancelled" | "not_pending">;
-  /**
    * [ext] Acquire the cell's workspace now (idempotent, same isolation and options as `workspace.exec`) and say what an
    * external agent process working directly in it may do. For Loops that hand the directory to another program (CLI
    * agents) instead of going through `workspace.exec`. Optional in the type only so hand-written fakes stay valid.
    */
-  workspaceAccess?(): Promise<WorkspaceAccess>;
+  workspaceAccess(): Promise<WorkspaceAccess>;
 
   // ---------- [ext] docs/05 (optional in the type only so hand-written fakes stay valid; the kernel provides all) ----------
   /**
@@ -358,7 +324,7 @@ export function pullCursorKey(targetCellId: string): string {
  */
 export const CELL_RESULT_CANDIDATE_KEY = "cell:result";
 export interface CellResultCandidate {
-  status: "completed" | "failed" | "cancelled" | "budget_stopped";
+  status: "completed" | "failed" | "cancelled";
   summary: string;
   artifactId?: string;
   data?: unknown;
@@ -372,13 +338,10 @@ export function finalResultEnvelopeId(cellId: string, epoch: number): string {
 
 /** [ext] See RunPorts.workspaceAccess. */
 export interface WorkspaceAccess {
-  /** Absolute host path of the working directory (the cell's `cwd`; a container's mount source). */
+  /** Absolute host path of the working directory. */
   root: string;
   isolation: IsolationLevel;
-  /**
-   * Workspace tool kinds the kernel's own workspace port would allow this Run right now: `bounds.tools`, minus
-   * everything but read on "shared_ro". `processor.allowedTools` is not applied here (the Loop applies it).
-   */
+  /** Native capabilities granted by the current bounds. */
   tools: ToolKind[];
 }
 
@@ -406,8 +369,7 @@ export interface PresetDef {
   approvedSpawn?(record: import("./gate").ApprovalRecord, store: Pick<ContextStore, "getArtifactVersionSync" | "readStateSync">, clock: Clock):
     { spec: CellSpec; task: unknown } | undefined;
 
-  /** Decode only this preset's own scheduled personal reminders. The kernel settles them before any budget check. */
-  personalReminder?(envelope: Envelope): { id: string; draft: HumanItemDraft; notify: import("./envelope").ChannelAddr } | undefined;
+  personalReminder?(envelope: Envelope): { id: string; draft: HumanItemDraft } | undefined;
 
   name: PresetName;
   description: string;
@@ -449,7 +411,7 @@ export interface CellRecord {
   epoch: number;
   status: CellStatus;
   closeReason: CloseReason | null;
-  pauseReason: "manual" | "parked" | "budget_declined" | null;
+  pauseReason: "manual" | "parked" | null;
   principalId: string;                  // principal that created the cell
   createdAt: number;
   updatedAt: number;

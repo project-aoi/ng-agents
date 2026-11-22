@@ -37,19 +37,13 @@ export function viewsForBusEvent<K extends BusTopic>(topic: K, data: BusTopics[K
       return ["status", "radar", "agents", "clarify"];
     case "job.changed":
       return ["status", "radar", "agents"];
-    case "outbox.changed":
-      return (data as BusTopics["outbox.changed"]).channelId === "ui" ? ["status"] : ["status", "clarify", "sources"];
-    case "channel.focus":
-      return ["status", "engage"];
-    case "ledger.alert":
+    case "owner.notified":
       return ["status"];
     case "knowledge.changed":
       return ["review", "engage"];
     case "inbox.enqueued":
       // Any message can wake a cell (the Agents view shows it about to start); a due one can also surface a card.
       return (data as BusTopics["inbox.enqueued"]).reason === "due" ? ["clarify", "status", "radar", "agents"] : ["agents"];
-    case "ledger.raised":
-      return ["status", "agents"];
     default:
       return [];
   }
@@ -65,10 +59,9 @@ export interface EventHub {
 /**
  * One bus subscription for all SSE clients. `refresh` events are coalesced over `debounceMs` so a burst of commits
  * (a Run writing several records) becomes one refetch; drafts and notices are forwarded at once. New records on a
- * cell's timeline become `cell_tail` (coalesced per cell over the same window, the latest seq wins); live output of a
- * previewed background command is forwarded as `job_chunk`.
+ * Timeline changes are coalesced by cell and broadcast with their latest sequence.
  */
-export function createEventHub(kernel: Pick<Kernel, "bus" | "hub">, opts: { debounceMs?: number } = {}): EventHub {
+export function createEventHub(kernel: Pick<Kernel, "bus">, opts: { debounceMs?: number } = {}): EventHub {
   const debounceMs = opts.debounceMs ?? 80;
   const listeners = new Set<(e: DeskEvent) => void>();
   const closers = new Set<() => void>();
@@ -117,30 +110,13 @@ export function createEventHub(kernel: Pick<Kernel, "bus" | "hub">, opts: { debo
       tail(d.cellId, d.seq);
       return;
     }
-    if (topic === "job.output") {
-      const d = data as BusTopics["job.output"];
-      send({ event: "job_chunk", data: { cellId: d.cellId, jobId: d.jobId, chunk: d.chunk } });
-      return;
-    }
     if (topic === "artifact.changed") {
       const d = data as BusTopics["artifact.changed"];
       send({ event: "artifact", data: { artifactId: d.artifactId, version: d.version, updatedBy: d.updatedBy, parked: d.parked === true } });
     }
-    if (topic === "outbox.changed") {
-      const d = data as BusTopics["outbox.changed"];
-      if (d.channelId === "ui" && d.status === "sent") {
-        const row = kernel.hub.getOutboxSync(d.idempotencyKey);
-        if (row) {
-          const n: NotificationDTO = {
-            id: row.id,
-            ...(row.content.title !== undefined ? { title: row.content.title } : {}),
-            text: row.content.body,
-            at: row.sentAt ?? row.updatedAt,
-            state: "delivered",
-          };
-          send({ event: "notification", data: n });
-        }
-      }
+    if (topic === "owner.notified") {
+      const n = data as BusTopics["owner.notified"];
+      send({ event: "notification", data: { id: n.id, ...(n.content.title !== undefined ? { title: n.content.title } : {}), text: n.content.body, at: n.createdAt } });
     }
     const views = viewsForBusEvent(topic, data);
     if (views.length === 0) return;

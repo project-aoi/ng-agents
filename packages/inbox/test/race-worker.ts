@@ -1,12 +1,11 @@
 // Runs in a worker thread (loaded through tsx): one OS thread, one SQLite connection, one Inbox — racing the others.
 import { parentPort, workerData } from "node:worker_threads";
-import { createBus, openDatabase, systemClock, type ClaimMode } from "@ng/protocol";
+import { createBus, openDatabase, systemClock } from "@ng/protocol";
 import { createInbox } from "../src";
 
 interface RaceInput {
   path: string;
   cellId: string;
-  mode: ClaimMode;
   workerId: string;
   /** messages this thread enqueues while racing (producers and consumers interleave) */
   produce: number;
@@ -43,7 +42,7 @@ for (; Atomics.load(flags, 3) < input.total; nap()) {
       createdAt: Date.now(),
     });
   }
-  const batch = inbox.claimNextRunSync(input.cellId, input.workerId, input.mode, 60_000);
+  const batch = inbox.claimNextRunSync(input.cellId, input.workerId, 60_000);
   if (!batch) continue;
   batches++;
   const held = Atomics.add(flags, 1, 1) + 1;

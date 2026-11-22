@@ -1,5 +1,4 @@
 import {
-  anyCovers,
   cellPrincipal,
   createEnvelope,
   DEFAULT_RESOURCE_PAGE_CHARS,
@@ -30,7 +29,6 @@ import {
   type InboxAddr,
   type InspectCellOptions,
   type KnowledgePatch,
-  type MeterResult,
   type ModelMessage,
   type ParkedAddition,
   type PolicyBounds,
@@ -39,18 +37,15 @@ import {
   type RunPorts,
   type ScheduleRule,
   type SelfSettleRequest,
-  type SendReceipt,
   type SendToCellResult,
   type StateEntry,
   type StepOrExternalEvidence,
   type ToolKind,
-  type Usage,
   type VersionedArtifact,
   type WorkspaceOccupancy,
   type WorkspacePort,
 } from "@ng/protocol";
 
-type SendRequest = Parameters<RunPorts["notifyChannel"]>[0];
 
 export interface FakeRunOptions {
   cellId?: string;                      // default "cell1"
@@ -58,7 +53,7 @@ export interface FakeRunOptions {
   runId?: string;                       // default "run_1"
   parentId?: string | null;             // default "desk"
   depth?: number;
-  /** Default: every tool kind, may send to `channel:*` and `inbox:*`, maxDepth 2, generous budget. */
+  /** Default: every tool kind, may send to `channel:*` and `inbox:*`, maxDepth 2. */
   bounds?: PolicyBounds;
   /** Default `{ processor: { kind: "llm" } }`; `parentId` is filled from `parentId`. */
   spec?: Partial<CellSpec>;
@@ -68,16 +63,13 @@ export interface FakeRunOptions {
   /** The claimed batch. Strings become `user.message` envelopes from `channel:ui:owner`. */
   batch?: Array<Envelope | string>;
   roster?: ChildSummary[];
-  /** Gate stand-in. Default: channel.send outside canSendTo → deny; sideEffect external → defer; else allow. */
+  /** Gate stand-in. Explicit decisions defer. */
   authorize?: (action: ProposedAction, opts?: { artifactVersion?: number }) => AuthorizeResult | Promise<AuthorizeResult>;
-  /** Ledger stand-in. Default: hard_stop once the totals reach bounds.maxTokens or bounds.maxCents, warn at 80%. */
-  meter?: (usage: Usage, total: Usage) => MeterResult;
   exec?: (tool: ToolKind, args: unknown, signal?: AbortSignal) => ExecResult | Promise<ExecResult>;
-  notify?: (req: SendRequest) => SendReceipt | Promise<SendReceipt>;
   /** Spill threshold for tool_result/external text (Context's Inline & Spill). Default 4000 chars. */
   inlineLimit?: number;
   steer?: string[];
-  /** Directory the workspace port reports as its root; also enables `ports.workspaceAccess` (CLI loops). */
+  /** Directory the workspace port reports as its root. */
   workspaceRoot?: string;
   /** Tool kinds `workspaceAccess` reports. Default: bounds.tools. */
   workspaceTools?: ToolKind[];
@@ -121,8 +113,7 @@ export function fakeInspection(cellId: string): CellInspection {
 export interface FakeLog {
   evidence: StepOrExternalEvidence[];
   authorizations: Array<{ action: ProposedAction; opts?: { artifactVersion?: number }; result: AuthorizeResult }>;
-  sends: Array<SendRequest & { receipt: SendReceipt }>;
-  metered: Usage[];
+  notifications: Array<{ content: import("@ng/protocol").Deliverable; idempotencyKey: string }>;
   emitted: Array<{ type: string; payload: unknown; opts?: EmitOptions }>;
   scheduled: Array<{ env: EnvelopeDraft; rule: ScheduleRule }>;
   cancelled: CancelScope[];
@@ -136,7 +127,6 @@ export interface FakeLog {
   parked: ParkedAddition[];
   execs: Array<{ tool: ToolKind; args: unknown }>;
   jobs: Array<{ jobId: string; command: string; input: string[]; cancelled: boolean }>;
-  previews: Array<{ target: string; chunk: string }>;
   /** sendToCell calls, with what the (fake) kernel answered. */
   cellMessages: Array<{ to: InboxAddr; message: CellMessageDraft; result: SendToCellResult }>;
   /** Envelopes drainInbound handed to the Loop (each also appended to `snapshot.batch`). */
@@ -166,8 +156,6 @@ export interface FakeRunPorts extends RunPorts {
   readonly openWaits: Map<string, { reason: string; timeoutAt?: number }>;
   /** Simulate the human saving a new version in the Engage editor. */
   humanEdit(artifactId: string, body: string): VersionedArtifact;
-  /** Sum of everything metered so far (`cachedTokens` only once some were metered). */
-  totalUsage(): Usage;
 }
 
 export interface FakeRun {
@@ -181,11 +169,9 @@ export function defaultFakeBounds(): PolicyBounds {
   return makeBounds({
     tools: TOOL_KINDS,
     canSendTo: ["channel:*", "inbox:*"] as Address[],
-    isolation: "git_worktree",
+    isolation: "none",
     maxConcurrentChildren: 4,
     maxDepth: 2,
-    maxTokens: 10_000_000,
-    maxCents: 100_000,
   });
 }
 
@@ -230,8 +216,7 @@ export function createFakeRun(opts: FakeRunOptions = {}): FakeRun {
   const log: FakeLog = {
     evidence: [],
     authorizations: [],
-    sends: [],
-    metered: [],
+    notifications: [],
     emitted: [],
     scheduled: [],
     cancelled: [],
@@ -245,7 +230,6 @@ export function createFakeRun(opts: FakeRunOptions = {}): FakeRun {
     parked: [],
     execs: [],
     jobs: [],
-    previews: [],
     cellMessages: [],
     drained: [],
     requeued: [],
@@ -261,7 +245,6 @@ export function createFakeRun(opts: FakeRunOptions = {}): FakeRun {
   let steerCounter = 0;
   const asSteer = (message: string): DrainedSteerItem => ({ envelopeId: `steer_${++steerCounter}`, message });
   const steerQueue: DrainedSteerItem[] = (opts.steer ?? []).map(asSteer);
-  const total: Usage = { tokens: 0, billedCents: 0 };
   const scheduledIds = new Set<string>();
   let counter = 0;
   const next = (prefix: string) => `${prefix}_${++counter}`;
@@ -272,9 +255,6 @@ export function createFakeRun(opts: FakeRunOptions = {}): FakeRun {
   const openWaits = new Map<string, { reason: string; timeoutAt?: number }>();
 
   const defaultAuthorize = (action: ProposedAction, o?: { artifactVersion?: number }): AuthorizeResult => {
-    if (action.type === "channel.send" && !anyCovers(bounds.canSendTo, action.target)) {
-      return { type: "deny", feedback: `${action.target} is not in this cell's canSendTo` };
-    }
     if (action.sideEffect === "external") {
       return {
         type: "defer",
@@ -283,13 +263,7 @@ export function createFakeRun(opts: FakeRunOptions = {}): FakeRun {
         approvalCard: action.card ?? { format: "card", body: action.summary },
       };
     }
-    return { type: "allow", actionToken: next("tok") };
-  };
-
-  const defaultMeter = (_u: Usage, t: Usage): MeterResult => {
-    if (t.tokens >= bounds.maxTokens || t.billedCents >= bounds.maxCents) return "hard_stop";
-    if (t.tokens >= bounds.maxTokens * 0.8 || t.billedCents >= bounds.maxCents * 0.8) return "warn";
-    return "ok";
+    return { type: "allow" };
   };
 
   function commitSync(tx: CommitTx): CommitResult {
@@ -343,12 +317,11 @@ export function createFakeRun(opts: FakeRunOptions = {}): FakeRun {
 
   const workspace: WorkspacePort = {
     cellId,
-    isolation: bounds.isolation,
     root: opts.workspaceRoot ?? `/fake/workspaces/${cellId}`,
     async exec(tool, args, signal) {
       log.execs.push({ tool, args });
       if (opts.exec) return opts.exec(tool, args, signal);
-      return { output: `${tool} ok`, ...(tool === "bash" || tool === "code_rpc" ? { exitCode: 0 } : {}) };
+      return { output: `${tool} ok`, exitCode: 0 };
     },
     async startJob(s) {
       const jobId = next("job");
@@ -379,13 +352,8 @@ export function createFakeRun(opts: FakeRunOptions = {}): FakeRun {
     resources,
     self: { cellId, epoch, runId, principalId: cellPrincipal(cellId), parentId, depth: opts.depth ?? (parentId ? 1 : 0), bounds, spec },
     workspace,
-    async notifyChannel(req) {
-      const receipt = opts.notify ? await opts.notify(req) : "sent";
-      log.sends.push({ ...req, receipt });
-      return receipt;
-    },
-    async streamPreview(target, chunk) {
-      log.previews.push({ target, chunk });
+    async notifyOwner(content, idempotencyKey) {
+      log.notifications.push({ content, idempotencyKey });
     },
     context: {
       async readState<T>(_cell: string, key: string) {
@@ -450,13 +418,6 @@ export function createFakeRun(opts: FakeRunOptions = {}): FakeRun {
       log.authorizations.push({ action, ...(o ? { opts: o } : {}), result });
       return result;
     },
-    meter(usage) {
-      log.metered.push({ ...usage });
-      total.tokens += usage.tokens;
-      total.billedCents += usage.billedCents;
-      if (usage.cachedTokens) total.cachedTokens = (total.cachedTokens ?? 0) + usage.cachedTokens;
-      return (opts.meter ?? defaultMeter)(usage, { ...total });
-    },
     drainSteer() {
       return steerQueue.splice(0);
     },
@@ -475,12 +436,6 @@ export function createFakeRun(opts: FakeRunOptions = {}): FakeRun {
     },
     canForkSession(){ return true; },
     listOwnDecisions() { return []; },
-    async submitReply(action, artifactVersion, sourceId) {
-      const decision = await ports.authorize(action, { artifactVersion });
-      if (decision.type !== "allow") return decision;
-      const receipt = await ports.notifyChannel({ target: action.target, content: action.content!, actionToken: decision.actionToken, idempotencyKey: sourceId, respectDnd: false });
-      return { type: "delivery", receipt: receipt === "buffered_dnd" ? "pending" : receipt, actionId: sourceId };
-    },
     async emitToParent(type, payload, o) {
       if (!parentId) throw new NgError("invalid_argument", `cell ${cellId} has no parent`);
       log.emitted.push({ type, payload, ...(o ? { opts: o } : {}) });
@@ -547,16 +502,9 @@ export function createFakeRun(opts: FakeRunOptions = {}): FakeRun {
       if (!r.ok) throw new Error("unreachable");
       return artifacts.get(artifactId)!;
     },
-    totalUsage() {
-      return { ...total };
+    async workspaceAccess() {
+      return { root: workspace.root, isolation: bounds.isolation, tools: opts.workspaceTools ?? [...bounds.tools] };
     },
-    ...(opts.workspaceRoot !== undefined
-      ? {
-          async workspaceAccess() {
-            return { root: opts.workspaceRoot!, isolation: bounds.isolation, tools: opts.workspaceTools ?? [...bounds.tools] };
-          },
-        }
-      : {}),
   };
 
   const envelopes = (opts.batch ?? []).map((e, i) => (typeof e === "string" ? userMessage(e, { id: `env_${i + 1}`, at: clock.now() }) : e));
@@ -575,7 +523,6 @@ export function createFakeRun(opts: FakeRunOptions = {}): FakeRun {
       cellId,
       epoch,
       workerId: "worker_1",
-      mode: "serial_coalesce",
       envelopes,
       seqs: envelopes.map((_, i) => i + 1),
       claimedAt: clock.now(),

@@ -1,7 +1,5 @@
 import { createHash } from "node:crypto";
-import { isAbsolute, relative, sep } from "node:path";
 import {
-  NgError,
   groupAlive,
   killGroup,
   markedAlive,
@@ -23,32 +21,6 @@ export function slugify(id: string, max = 48): string {
   return s;
 }
 
-/** `p` is `root` or lies below it (both absolute, already normalized). */
-export function isInside(root: string, p: string): boolean {
-  const r = relative(root, p);
-  return r === "" || (r !== ".." && !r.startsWith(".." + sep) && !isAbsolute(r));
-}
-
-/** Serializes async work per key (per cell, per repository). */
-export class KeyedMutex {
-  readonly #tails = new Map<string, Promise<void>>();
-
-  async run<T>(key: string, fn: () => Promise<T>): Promise<T> {
-    const prev = this.#tails.get(key) ?? Promise.resolve();
-    let release!: () => void;
-    const mine = new Promise<void>((r) => (release = r));
-    const tail = prev.then(() => mine);
-    this.#tails.set(key, tail);
-    try {
-      await prev;
-      return await fn();
-    } finally {
-      release();
-      if (this.#tails.get(key) === tail) this.#tails.delete(key);
-    }
-  }
-}
-
 export function abortError(signal?: AbortSignal): Error {
   const reason: unknown = signal?.reason;
   if (reason instanceof Error) return reason;
@@ -67,7 +39,3 @@ export function errorMessage(err: unknown): string {
 }
 
 export const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
-
-export function assertNever(x: never, what: string): never {
-  throw new NgError("invalid_argument", `unexpected ${what}: ${String(x)}`);
-}

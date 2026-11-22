@@ -2,7 +2,7 @@ import { NgError } from "./errors";
 import type { ProposedAction } from "./contract/gate";
 
 export type CardEffect = "reply" | "revise" | "execute" | "defer" | "terminate" | "complete";
-export type HumanItemStatus = "pending" | "snoozed" | "unknown" | "resolved" | "cancelled";
+export type HumanItemStatus = "pending" | "snoozed" | "resolved" | "cancelled";
 
 export interface CardOption {
   id: string;
@@ -44,7 +44,6 @@ export interface HumanItem extends HumanItemDraft {
   artifactId: string | null;
   artifactVersion: number | null;
   humanEdited: boolean;
-  attempt: number | null;
   action: ProposedAction | null;
 }
 
@@ -52,7 +51,6 @@ export interface HumanDecision {
   optionId: string;
   seenItemRevision: number;
   seenArtifactVersion?: number;
-  seenAttempt?: number;
   note?: string;
   until?: number;
   confirmedTargets?: string[];

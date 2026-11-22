@@ -19,8 +19,7 @@ import { legacyProcessors, legacyPrompts, legacyToolsets } from "./shared/legacy
 import { createCheckProbe } from "./shared/probe";
 import { promptDefs } from "./shared/prompts";
 import { createScriptSensor, sensorToolset } from "./shared/sensor";
-import { createWaitMatch, watcherToolset } from "./shared/watcher";
-import { watcherPreset } from "./thread-watcher/preset";
+import { checkerPreset } from "./thread-watcher/preset";
 
 export type { RegisterPresetsOptions, PresetsConfig } from "./shared/config";
 
@@ -40,10 +39,10 @@ export interface RegisteredPresets {
 export function registerPresets(registry: Registry, opts: RegisterPresetsOptions = {}): RegisteredPresets {
   const cfg = resolveConfig(opts);
   const books = createDeskBooks(cfg);
-  const presets = [deskPreset(books), projectPreset(cfg), workerPreset(), watcherPreset("watcher"), watcherPreset("checker"),watcherPreset("reply_watcher"), sensorPreset(), hubPreset()];
+  const presets = [deskPreset(books), projectPreset(), workerPreset(), checkerPreset("watcher"), checkerPreset("checker"), sensorPreset(), hubPreset()];
   const prompts = [...promptDefs(cfg), ...legacyPrompts()];
-  const toolsets = [deskToolset(cfg, books), projectToolset(cfg), watcherToolset(cfg), sensorToolset(), ...legacyToolsets()];
-  const processors = [createWaitMatch(cfg), createScriptSensor(), createCheckProbe(cfg), ...legacyProcessors()];
+  const toolsets = [deskToolset(cfg, books), projectToolset(), sensorToolset(), ...legacyToolsets()];
+  const processors = [createScriptSensor(), createCheckProbe(cfg), ...legacyProcessors()];
   for (const p of presets) registry.presets.register({...gtdLifecycle,...p});
   for (const p of prompts) registry.prompts.register(p);
   for (const t of toolsets) registry.toolsets.register(t);
@@ -56,7 +55,7 @@ export function registerPresets(registry: Registry, opts: RegisterPresetsOptions
   };
 }
 
-// ---------- for the app, the control plane, the demo seed and custom sensors ----------
+// ---------- for the app, the control plane, custom sensors ----------
 
 export { PROMPTS, TOOLSETS, PROCESSORS, ROLES, KEYS, LEGACY, RESTORE_REASON } from "./shared/config";
 export { BUILTIN_SKILLS, type BuiltinSkill } from "./shared/skills";
@@ -64,8 +63,7 @@ export { seedBuiltinSkills } from "./shared/seed";
 export { createSensorSpec,sensorProcessor,createScriptSensor,defineSensorCheck, ensureSource, recordCheck, OBSERVATION_NOTE, type SensorHit, type SensorCheckInput, type SourceInit } from "./shared/sensor";
 export { setProjectLifecycleSync, notifyProjectOfOwnerChangeSync } from "./shared/sync";
 export { startProjectSync, projectLaunch, type ProjectInit, type ProjectLaunch, type ProjectTaskInput, type ProjectSeed, type PlannedAction, type RepoRef, type ProjectMode } from "./project/launch";
-export { startApprovedProjectSync, projectIdForApproval, ACKNOWLEDGE_ACTION, type ReplyItem, type ProposalItem } from "./inline-desk/items";
-export type { WatcherState, ReplyParty, ReplyWatchReport } from "./shared/watcher";
+export { startApprovedProjectSync, projectIdForApproval, type ProposalItem } from "./inline-desk/items";
 export type { ProbeArgs, ProbeState, ProbeUntil } from "./shared/probe";
 
 export { humanActionDomain } from "./shared/human-actions";

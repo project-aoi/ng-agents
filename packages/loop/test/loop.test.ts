@@ -7,7 +7,7 @@ import {
   type ModelRequest,
   type ToolResultBlock,
 } from "@ng/protocol";
-import { BUDGET_STOP_OUTPUT, createAgentLoop, TRUNCATED_CALL_OUTPUT } from "../src";
+import { createAgentLoop, TRUNCATED_CALL_OUTPUT } from "../src";
 import { call, createFakeRun, say, ScriptedModelClient } from "../src/testing";
 import { clock, makeRegistry } from "./helpers";
 
@@ -36,9 +36,6 @@ describe("llm run", () => {
     expect(ports.state.get("plan:step")).toBe(1);
     expect(toolResultsOf(model.calls[2]!)[0]!.content).toBe("plan:step = 1");
     expect(ports.log.evidence.map((e) => e.kind)).toEqual(["tool_call", "tool_result", "tool_call", "tool_result", "assistant_text"]);
-    // one zero-usage pre-check + one meter per model call
-    expect(ports.log.metered).toHaveLength(4);
-    expect(ports.log.metered[0]).toEqual({ tokens: 0, billedCents: 0 });
     // the request keeps the frozen system prompt and the batch as the first user message
     expect(model.calls[0]!.system).toBe("You are a test cell.");
     expect(model.calls[0]!.messages[0]!.role).toBe("user");
@@ -63,13 +60,12 @@ describe("llm run", () => {
     const model = new ScriptedModelClient([say("ok"), say("ok")]);
     const loop = createAgentLoop({ model, registry });
     const toolsets = ["workspace", "kernel.cells", "kernel.comms", "kernel.context", "probe"];
-    const bounds = makeBounds({ tools: ["read", "bash"], canSendTo: ["inbox:desk"], maxDepth: 0, maxTokens: 1e9, maxCents: 1e9 });
+    const bounds = makeBounds({ tools: ["read", "bash"], canSendTo: ["inbox:desk"], maxDepth: 0 });
     for (let i = 0; i < 2; i++) {
       const { ports, snapshot, controller } = createFakeRun({ bounds, parentId: null, spec: llm(toolsets, { allowedTools: ["read"] }), batch: ["hi"] });
       await loop.run(snapshot, ports, controller.signal);
     }
     const names = model.calls[0]!.tools.map((t) => t.name);
-    expect(names).toContain("read");
     expect(names).toContain("peek");
     // complete_self / pause_self need a parent too (and a persistent cell)
     for (const hidden of ["bash", "write", "edit", "job_start", "shell", "spawn_cell", "inspect_cell", "close_cell", "control_cell", "report_to_parent", "handback", "complete_self", "pause_self"]) {
@@ -84,26 +80,13 @@ describe("llm run", () => {
     expect(model.calls[1]!.tools).toEqual(model.calls[0]!.tools);
 
     // a child with depth left and a channel grant sees spawn, inspect, send and the mutating workspace tools (here with
-    // the deprecated cwdMode "write" still on its spec, which changes nothing)
     const model2 = new ScriptedModelClient([say("ok")]);
-    const run2 = createFakeRun({ spec: { ...llm(toolsets), cwdMode: "write" }, batch: ["hi"] });
+    const run2 = createFakeRun({ spec: llm(toolsets), batch: ["hi"] });
     await createAgentLoop({ model: model2, registry }).run(run2.snapshot, run2.ports, run2.controller.signal);
     const names2 = model2.calls[0]!.tools.map((t) => t.name);
-    for (const shown of ["bash", "write", "edit", "code_rpc", "job_start", "spawn_cell", "inspect_cell", "send_message", "report_to_parent", "handback", "shell", "complete_self", "pause_self"]) {
+    for (const shown of ["job_start", "spawn_cell", "inspect_cell", "send_message", "report_to_parent", "handback", "shell", "complete_self", "pause_self"]) {
       expect(names2).toContain(shown);
     }
-
-    // the same cell without cwdMode is shown exactly the same tools: the field is deprecated and has no effect; what a
-    // cell does with its tools is the prompt's business, not a filter's
-    const model3 = new ScriptedModelClient([say("ok")]);
-    const run3 = createFakeRun({ spec: llm(toolsets), batch: ["hi"] });
-    await createAgentLoop({ model: model3, registry }).run(run3.snapshot, run3.ports, run3.controller.signal);
-    const names3 = model3.calls[0]!.tools.map((t) => t.name);
-    for (const shown of ["read", "peek", "spawn_cell", "send_message", "report_to_parent", "bash", "write", "edit", "code_rpc", "job_start", "job_observe", "job_input", "job_cancel", "shell"]) {
-      expect(names3).toContain(shown);
-    }
-    expect(names3).toEqual(names2);
-    expect(model3.calls[0]!.tools).toEqual(model2.calls[0]!.tools);
 
     // a leaf child (one-shot or wakeable) reports a result instead of closing itself
     for (const lifetime of ["one_shot", "wakeable"] as const) {
@@ -123,59 +106,18 @@ describe("llm run", () => {
       (req) => {
         expect(toolResultsOf(req)[0]).toMatchObject({
           isError: true,
-          content: "This cell has no channel it may send to. Report to your parent (report_to_parent) or ask the desk (send_message to inbox:desk) instead.",
+          content: "This cell cannot notify the owner. Send to your parent or to the desk.",
         });
         return say("ok");
       },
     ]);
-    const bounds = makeBounds({ tools: ["read"], canSendTo: ["inbox:desk"], maxDepth: 0, maxTokens: 1e9, maxCents: 1e9 });
+    const bounds = makeBounds({ tools: ["read"], canSendTo: ["inbox:desk"], maxDepth: 0 });
     const { ports, snapshot, controller } = createFakeRun({ bounds, spec: llm(["kernel.comms"]), batch: ["告诉主人进展"] });
     expect(await createAgentLoop({ model, registry: makeRegistry() }).run(snapshot, ports, controller.signal)).toBe("completed");
     expect(model.calls).toHaveLength(2);
     expect(ports.log.authorizations).toHaveLength(0);
-    expect(ports.log.sends).toHaveLength(0);
+    expect(ports.log.notifications).toHaveLength(0);
     expect(ports.artifacts.size).toBe(0);
-  });
-
-  it("feeds a Gate deny back to the model, which can correct course", async () => {
-    const model = new ScriptedModelClient([
-      call("send_message", { to: "channel:feishu:oc_team", text: "上线了", summary: "通知群" }),
-      (req) => {
-        const denied = toolResultsOf(req)[0]!;
-        expect(denied.isError).toBe(true);
-        expect(denied.content).toContain("Not allowed: 群消息额度已用完，请转告主人");
-        expect(denied.content).toMatch(/Draft art_\w+ v1/);
-        return call("send_message", { to: "channel:ui:owner", text: "群里发不了，转告你：上线了", summary: "转告主人" });
-      },
-      say("已告知主人。"),
-    ]);
-    const { ports, snapshot, controller } = createFakeRun({
-      spec: llm(["kernel.comms"]),
-      batch: ["告诉群里上线了"],
-      authorize: (action) =>
-        action.sideEffect === "external" ? { type: "deny", feedback: "群消息额度已用完，请转告主人" } : { type: "allow", actionToken: "tok_ok" },
-    });
-    const outcome = await createAgentLoop({ model, registry: makeRegistry() }).run(snapshot, ports, controller.signal);
-
-    expect(outcome).toBe("completed");
-    expect(ports.log.authorizations.map((a) => a.result.type)).toEqual(["deny", "allow"]);
-    expect(ports.log.sends).toHaveLength(1);
-    expect(ports.log.sends[0]).toMatchObject({ target: "channel:ui:owner", actionToken: "tok_ok" });
-  });
-
-  it("refuses a send outside canSendTo before saving any draft", async () => {
-    const model = new ScriptedModelClient([
-      call("send_message", { to: "channel:feishu:oc_team", text: "上线了", summary: "通知群" }),
-      (req) => {
-        expect(toolResultsOf(req)[0]!.content).toBe("Not allowed: channel:feishu:oc_team is outside your send permissions (channel:ui:*).");
-        return say("ok");
-      },
-    ]);
-    const bounds = makeBounds({ tools: [], canSendTo: ["channel:ui:*"] as Address[], maxTokens: 1e9, maxCents: 1e9 });
-    const { ports, snapshot, controller } = createFakeRun({ bounds, spec: llm(["kernel.comms"]), batch: ["告诉群里上线了"] });
-    await createAgentLoop({ model, registry: makeRegistry() }).run(snapshot, ports, controller.signal);
-    expect(ports.artifacts.size).toBe(0);
-    expect(ports.log.authorizations).toHaveLength(0);
   });
 
   it("takes the parent from RunSelf when the stored spec omits it", async () => {
@@ -190,7 +132,7 @@ describe("llm run", () => {
     const model = new ScriptedModelClient([
       {
         toolCalls: [
-          { name: "send_message", input: { to: "channel:feishu:ou_zhang", text: "周五前给你", summary: "回复张三" } },
+          { name: "request_approval", input: { kind: "action", action: { name: "merge" }, title: "合并修改", summary: "确认合并" } },
           { name: "echo", input: { text: "after" } },
         ],
       },
@@ -201,9 +143,9 @@ describe("llm run", () => {
 
     expect(outcome).toBe("deferred_for_approval");
     expect(model.calls).toHaveLength(1);
-    expect(ports.log.sends).toHaveLength(0);
+    expect(ports.log.notifications).toHaveLength(0);
     const results = ports.log.evidence.filter((e) => e.kind === "tool_result");
-    expect(results.map((r) => r.kind === "tool_result" && r.name)).toEqual(["send_message", "echo"]);
+    expect(results.map((r) => r.kind === "tool_result" && r.name)).toEqual(["request_approval", "echo"]);
   });
 
   it("an abort during the model call or a tool returns cancelled promptly", async () => {
@@ -225,26 +167,6 @@ describe("llm run", () => {
     const pre = createFakeRun({ spec: llm([]), batch: ["hi"] });
     pre.controller.abort();
     expect(await createAgentLoop({ model: slow, registry }).run(pre.snapshot, pre.ports, pre.controller.signal)).toBe("cancelled");
-  });
-
-  it("stops with budget_stopped on hard_stop, recording the unexecuted calls; tokens count even at $0", async () => {
-    const model = new ScriptedModelClient([{ toolCalls: [{ name: "echo", input: { text: "x" } }], usage: { inputTokens: 900, outputTokens: 200 } }]);
-    const bounds = makeBounds({ tools: [], maxTokens: 1000, maxCents: 1e9 });
-    const { ports, snapshot, controller } = createFakeRun({ bounds, spec: llm(["probe"]), batch: ["hi"] });
-    const outcome = await createAgentLoop({ model, registry: makeRegistry() }).run(snapshot, ports, controller.signal);
-
-    expect(outcome).toBe("budget_stopped");
-    expect(ports.totalUsage()).toEqual({ tokens: 1100, billedCents: 0 });
-    const result = ports.log.evidence.find((e) => e.kind === "tool_result");
-    expect(result).toMatchObject({ kind: "tool_result", isError: true, output: BUDGET_STOP_OUTPUT });
-
-    // already exhausted: no model call at all
-    const none = new ScriptedModelClient([say("x")]);
-    const spent = createFakeRun({ bounds: makeBounds({ maxTokens: 0, maxCents: 1e9 }), spec: llm([]), batch: ["hi"] });
-    expect(await createAgentLoop({ model: none, registry: makeRegistry() }).run(spent.snapshot, spent.ports, spent.controller.signal)).toBe(
-      "budget_stopped",
-    );
-    expect(none.calls).toHaveLength(0);
   });
 
   it("injects steer messages between steps as user text and system_note evidence", async () => {
@@ -449,9 +371,8 @@ describe("llm run", () => {
   it("uses the processor's tier and the configured output cap", async () => {
     const model = new ScriptedModelClient([say("ok")], { models: { fast: "m-fast", strong: "m-strong" } });
     const { ports, snapshot, controller } = createFakeRun({ spec: llm([], { modelTier: "fast" }), batch: ["hi"] });
-    await createAgentLoop({ model, registry: makeRegistry(), maxOutputTokens: { fast: 2048 } }).run(snapshot, ports, controller.signal);
+    await createAgentLoop({ model, registry: makeRegistry() }).run(snapshot, ports, controller.signal);
     expect(model.calls[0]!.tier).toBe("fast");
-    expect(model.calls[0]!.maxOutputTokens).toBe(2048);
     expect(ports.log.evidence[0]).toMatchObject({ kind: "assistant_text", text: "ok", model: "m-fast" });
   });
 });

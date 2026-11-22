@@ -78,7 +78,7 @@ function formatStatus(s: CellStatusLine | null): string | null {
 const ROSTER_LIMIT = 60;
 
 export function createReadModel(core: KernelCore): ReadModel {
-  const { cells, context, gate, inbox, clock, db } = core;
+  const { cells, context, inbox, clock, db } = core;
 
   /** Everything per cell the views need, gathered in a few queries instead of one per cell. */
   function facts(cellIds?: readonly string[]): Facts {
@@ -117,7 +117,7 @@ export function createReadModel(core: KernelCore): ReadModel {
     const schedules = perCell ? cellIds.flatMap((cellId) => inbox.listSchedulesSync({ cellId, activeOnly: true })) : inbox.listSchedulesSync({ activeOnly: true });
     for (const s of schedules) timer(s.cellId, s.nextFireAt);
     const pending = all<{cell_id:string; count:number}>(db, `SELECT cell_id, COUNT(*) AS count FROM human_items
-      WHERE cell_id IS NOT NULL AND status IN ('pending','snoozed','unknown') GROUP BY cell_id`);
+      WHERE cell_id IS NOT NULL AND status IN ('pending','snoozed') GROUP BY cell_id`);
     for (const a of pending) if (keep(a.cell_id)) f.pending.set(a.cell_id, a.count);
     return f;
   }
@@ -127,7 +127,6 @@ export function createReadModel(core: KernelCore): ReadModel {
     if (core.dispatcher.isRunning(c.id)) return { state: "working", why: "a run is in flight" };
     const jobs = f.jobs.get(c.id);
     if (jobs?.length) return { state: "working", why: `a background job is running (${jobs[0]!.command.slice(0, 60)})` };
-    if (c.pauseReason === "budget_declined" || core.dispatcher.heldForBudget().includes(c.id)) return { state: "budget_paused", why: "budget exhausted; queued work is held" };
     if (c.status === "paused") return { state: "paused", why: "paused" };
     if (f.due.has(c.id)) return { state: "working", why: "a message is waiting to start its next run" };
     if (f.pending.get(c.id)) return { state: "waiting", why: "a card of its awaits the owner" };
@@ -250,7 +249,6 @@ export function createReadModel(core: KernelCore): ReadModel {
       const child = cells.get(r.cellId);
       if (r.statusLine) parts.push(r.statusLine);
       if (r.running) parts.push("working now");
-      else if (a?.state === "budget_paused") parts.push("budget exhausted — paused until the owner changes the budget");
       else if (a?.state === "dormant") parts.push("dormant — its turn is over; send_message to it wakes it with everything it knows");
       for (const j of r.jobs) parts.push(`job running: ${j.command.length > 80 ? `${j.command.slice(0, 80)}…` : j.command}`);
       for (const w of waits.get(r.cellId) ?? []) parts.push(w);
@@ -387,16 +385,14 @@ export function createReadModel(core: KernelCore): ReadModel {
       JOIN cells c ON c.id=w.cell_id AND c.epoch=w.epoch AND c.status='active' WHERE w.waiting_for=? ORDER BY w.created_at`, [`inbox:${cellId}`]);
     if (waiting.length) notes.push("[cells waiting on you]\n" + waiting.map(w => `${w.cell_id} [${w.wait_id}] ${w.reason}`).join("\n"));
     const cards = all<{action_id: string; subject_key: string; status: string}>(db, `SELECT action_id,subject_key,status FROM human_items
-      WHERE cell_id=? AND status IN ('pending','snoozed','unknown') AND blocked_by IS NULL`, [cellId]);
+      WHERE cell_id=? AND status IN ('pending','snoozed')`, [cellId]);
     if (cards.length) notes.push("[your open cards]\n" + cards.map(c => `${c.action_id} ${c.subject_key} (${c.status})`).join("\n"));
-    const budget = gate.usageSync(cellId);
-    if (budget.state !== "ok") notes.push(`[budget warning] ${budget.state}, ${budget.subtreeTokens}/${budget.limitTokens} tokens, ${budget.subtreeCents}/${budget.limitCents} cents`);
     const jobs = core.workspace.listJobsSync({ cellId, state: ["running"] });
     if (jobs.length) notes.push("[your running jobs]\n" + jobs.map(j => `${j.jobId} ${j.command.slice(0,120)}`).join("\n"));
     const authors = leaf ? [cellId] : [cellId, ...cells.descendants(cellId).map(c => c.id)];
     const edits = all<{artifact_id:string; version:number}>(db, `SELECT a.artifact_id,a.version FROM artifacts a
       WHERE a.cell_id IN (SELECT value FROM json_each(?)) AND a.updated_by='human'
-      AND (EXISTS(SELECT 1 FROM human_items h WHERE h.artifact_id=a.artifact_id AND h.status IN ('pending','snoozed','unknown'))
+      AND (EXISTS(SELECT 1 FROM human_items h WHERE h.artifact_id=a.artifact_id AND h.status IN ('pending','snoozed'))
       OR (a.updated_at>=? AND NOT EXISTS(SELECT 1 FROM evidence e WHERE e.cell_id=? AND e.kind='run_boundary'
         AND json_extract(e.content,'$.phase')='start' AND e.at>a.updated_at)))
       ORDER BY a.updated_at DESC LIMIT 12`, [JSON.stringify(authors), clock.now()-86_400_000, cellId]);
@@ -421,10 +417,8 @@ export function createReadModel(core: KernelCore): ReadModel {
   function groundedWaits(waits: readonly WaitRecord[], localCells: ReadonlySet<string>, cachedFacts?: Facts): WaitRecord[] {
     const internal = waits.filter(w => waitTargetCell(w.waitingFor) !== null);
     if (!internal.length) return [];
-    const held = new Set(core.dispatcher.heldForBudget());
     const allCells = new Map(cells.list().map(c => [c.id, c]));
     function available(cell: CellRecord): boolean {
-      if (held.has(cell.id)) return false;
       for (let c: CellRecord | undefined = cell; c; c = c.parentId ? allCells.get(c.parentId) : undefined) {
         if (c.status !== "active") return false;
       }
@@ -457,7 +451,7 @@ export function createReadModel(core: KernelCore): ReadModel {
     const f = cachedFacts ?? facts();
     const working = new Set(core.dispatcher.running().filter(r => !r.stallOnly).map(r => r.cellId));
     const cards = all<{cell_id:string; category:string; related_project_ids:string}>(db, `SELECT cell_id, category, related_project_ids FROM human_items
-      WHERE cell_id IS NOT NULL AND blocked_by IS NULL AND status IN ('pending','snoozed','unknown')`);
+      WHERE cell_id IS NOT NULL AND status IN ('pending','snoozed')`);
     const cardOwners = new Set(cards.map(card => card.cell_id));
     const hasSource = (id: string) => working.has(id) || f.jobs.has(id) || f.due.has(id) || f.watching.has(id) || f.nextTimer.has(id) || cardOwners.has(id);
     const requests = inbox.listMessagesSync({status:["pending","claimed"]}).filter(m => m.envelope.delivery !== "silent_inject" &&
@@ -495,13 +489,12 @@ export function createReadModel(core: KernelCore): ReadModel {
     const parked = root.status !== "active" || cells.ancestors(cellId).some(c => c.status === "paused");
     if (parked) why.push("cell or ancestor is parked");
 
-    const held = new Set(core.dispatcher.heldForBudget());
     // Descendants are ordered by depth. A manually parked ancestor suspends its whole branch.
     const active = new Set<string>();
     for (const cell of subtree) {
       if (!parked && cell.status === "active" && (cell.id === cellId || active.has(cell.parentId!))) active.add(cell.id);
     }
-    const available = [...active].filter(id => !held.has(id));
+    const available = [...active];
     const waits = core.waits.list(ids);
     const f = facts(waits.some(w => waitTargetCell(w.waitingFor) !== null) ? undefined : available);
     const working = new Set(core.dispatcher.running().filter(r => !r.stallOnly).map(r => r.cellId));
@@ -518,7 +511,7 @@ export function createReadModel(core: KernelCore): ReadModel {
     // 4. @Human — a card, or an open action that is the owner's to do.
     // A card about this project is the owner's ball whoever holds it (the desk raises some on a project's behalf).
     const open=all<{action_id:string;cell_id:string|null;related_project_ids:string;subject_key:string}>(db,
-      "SELECT action_id,cell_id,related_project_ids,subject_key FROM human_items WHERE blocked_by IS NULL AND status IN ('pending','unknown','snoozed')");
+      "SELECT action_id,cell_id,related_project_ids,subject_key FROM human_items WHERE status IN ('pending','snoozed')");
     const cards=open.filter(h=>(h.cell_id && idSet.has(h.cell_id)) || (JSON.parse(h.related_project_ids) as string[]).includes(projectId ?? cellId));
     const human = cards.length > 0;
     if (human) why.push(`${cards.length} card(s) await the owner`);
@@ -579,7 +572,7 @@ export function createReadModel(core: KernelCore): ReadModel {
     }
     const counts = get<{ total:number; snoozed:number }>(db,`
       SELECT count(*) AS total, count(*) FILTER (WHERE snoozed_until > ?) AS snoozed FROM human_items
-      WHERE category='decision' AND blocked_by IS NULL AND status IN ('pending','unknown','snoozed')`,[now])!;
+      WHERE category='decision' AND status IN ('pending','snoozed')`,[now])!;
     return {
       backgroundCells: live.filter((c) => c.parentId !== null).length,
       pausedCells: live.filter((c) => c.status === "paused").length,
@@ -589,8 +582,6 @@ export function createReadModel(core: KernelCore): ReadModel {
       waitingCells: waiting,
       pendingApprovals: counts.total-counts.snoozed,
       snoozedApprovals: counts.snoozed,
-      bufferedNotifications: core.hub.bufferedCountSync(),
-      focus: core.hub.isFocusSync(),
     };
   }
 

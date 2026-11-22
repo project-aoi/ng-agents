@@ -47,7 +47,6 @@ async function bootCliDesk() {
   const src = catalogueSource(clock);
   const d = await bootDesk({
     clock,
-    model: undefined,
     env: { NG_AGENT_BACKEND: "claude", NG_CLAUDE_BIN: "/nonexistent/ng-test-claude" },
     detectCli: () => true,
     kernel: { modelSwitch: { fetch: src.fetch } },
@@ -77,7 +76,7 @@ describe("GET/PUT /api/models on a CLI backend", () => {
     // fetched once (at kernel start); a plain GET uses the cached list
     expect(src.calls).toEqual(["claude"]);
     const status = await d.get<StatusDTO>("/api/status");
-    expect(status).toMatchObject({ backend: "claude", demo: false, model: "Opus 5.5 · xhigh" });
+    expect(status).toMatchObject({ backend: "claude", model: "Opus 5.5 · xhigh" });
   });
 
   it("PUT a fixed model and effort: the answer, a later GET and the top bar reflect it, and it is saved", async () => {
@@ -164,7 +163,7 @@ describe("GET/PUT /api/models on a CLI backend", () => {
 describe("without a CLI backend", () => {
   it("GET answers available:false, PUT is refused, and the top bar has no model", async () => {
     const d = await bootDesk();
-    expect(d.kernel.agentBackend).toBe("api");
+    expect(d.kernel.agentBackend).toBeNull();
     expect(await d.get<ModelsDTO>("/api/models")).toEqual({
       available: false,
       engine: null,

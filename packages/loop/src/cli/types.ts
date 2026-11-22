@@ -1,4 +1,4 @@
-import type { CliEngine, IsolationLevel, ModelTier } from "@ng/protocol";
+import type { CliEngine, ModelTier } from "@ng/protocol";
 import type { McpServerLaunch } from "./bridge";
 
 /** Model per tier; `""` = the CLI's own default model (from the owner's CLI configuration). */
@@ -10,7 +10,6 @@ export type CliModels = Partial<Record<ModelTier, string>>;
  */
 export interface CliCapabilities {
   root: string;
-  isolation: IsolationLevel;
   write: boolean;
   edit: boolean;
   bash: boolean;
@@ -18,16 +17,7 @@ export interface CliCapabilities {
   readOnly: boolean;
   /** Native web tools (fetch/search) offered to the agent. */
   web: boolean;
-  /**
-   * docs/05 — how far the CLI's own tools reach.
-   * - `"host"` (isolation "none", the default): the owner's real machine as the owner uses it. Reads anywhere the user
-   *   can read, network on, the user's own CLI configuration in effect (login, skills, slash commands, MCP servers).
-   *   A writing cell (`readOnly` false) may also write and run commands anywhere — no OS sandbox, no cwd confinement;
-   *   the irreversible-operation red lines live in the prompts. A read-only cell still gets no write/shell tool.
-   * - `"workspace"` (an explicitly isolated cell: shared_ro / git_worktree): the pre-docs/05 confinement — file tools
-   *   and shell limited to `root`, no network, the user's settings files ignored.
-   */
-  access: "host" | "workspace";
+
 }
 
 /** Normalized events parsed from a CLI's output stream. MCP calls to the kernel bridge are not reported here (the bridge records them). */
@@ -36,13 +26,6 @@ export type CliEvent =
   | { type: "text"; text: string }
   | { type: "tool_start"; id: string; name: string; input: unknown }
   | { type: "tool_end"; id: string; name: string; output: string; isError?: boolean }
-  /**
-   * Usage not yet reported, as an increment (adapters reconcile partial and final figures themselves). `cached`: how
-   * many of `tokens` were prompt-cache reads. `sessionTotal`: this CLI reports running totals of the whole session,
-   * not of the turn (Codex: a resumed session's `turn.completed.usage` counts everything since the session was
-   * created) — the loop meters only what was added since the total it last saw (CliSessionRecord.reported).
-   */
-  | { type: "usage"; tokens: number; cents: number; cached?: number; sessionTotal?: boolean }
   /**
    * The CLI finished processing its input. `more`: it has further queued input of ours to answer (another turn_end
    * follows). `stopped`: the turn was interrupted on our request.
@@ -136,6 +119,4 @@ export interface CliSessionRecord {
   updatedAt: number;
   runs: number;
   forkedFrom?: string;
-  /** Session totals already metered, for CLIs whose usage events are running totals (CliEvent usage.sessionTotal). */
-  reported?: { tokens: number; cached: number };
 }

@@ -84,7 +84,7 @@ const domainHub: BuiltinSkill = {
 ## The ledger (state key "hub:topics")
 \`\`\`json
 {
-  "mr-41": { "about": "Review MR !41 限流阈值", "repo": "gateway", "worker": "cell_…", "state": "reviewing", "thread": "feishu:chat-review", "updatedAt": "…" },
+  "mr-41": { "about": "Review MR !41 限流阈值", "repo": "gateway", "worker": "cell_…", "state": "reviewing", "thread": "ui:reviews", "updatedAt": "…" },
   "inc-order-5xx": { "about": "order-service 线上 5xx", "repo": "order", "worker": null, "state": "done" }
 }
 \`\`\`
@@ -108,7 +108,6 @@ You are told (\`cell.result\`, with its summary). The summary is its own account
 - Nothing queues for a repository and nothing locks it: every worker starts the moment you spawn it. Reviewing and investigating only read — say "只做查阅，不要改文件、不要切分支" in the instruction — so they can run beside anyone.
 - A fix changes files. Look at the note "active workspaces" first: nobody is changing code in that repository → start the worker there; someone is → tell it "用 \`git worktree add <新目录> <默认分支>\` 建独立工作树，在那里改，不要动 <目录> 的检出". A fix that belongs to a topic whose worker already knows the code goes to that worker instead.
 - A worker that asks you what to do about a directory that is not as expected is waiting for your answer: answer it, or pass the question to the desk and tell the worker so.
-- A reply to the people in the thread is the owner's to approve: send_message to the thread creates the draft and the card. Say in the summary which topic it answers.
 - You never close a topic by silence: either its worker's turn brought the outcome, or you handed it back.
 `,
 };
@@ -182,15 +181,3 @@ A correction the owner makes twice ("报告先写结论", "提 MR 后贴录屏")
 };
 
 export const BUILTIN_SKILLS: readonly BuiltinSkill[] = [projectRelay, domainHub, workspaceArbitration, habitDiscovery];
-
-/**
- * Per playbook, the digests (seed.ts skillDigest) of every text an earlier version shipped. An installed playbook that
- * is still exactly one of them was never touched by the owner, so seeding replaces it with the current text; anything
- * else is theirs and stays. When you change a playbook, add the digest of the text it had before to its list.
- */
-export const SUPERSEDED_SKILL_DIGESTS: Readonly<Record<string, readonly string[]>> = {
-  // 2026-11-18: one-shot workers, cwdMode read/write, writers queued by the kernel.
-  [SKILL_PROJECT_RELAY]: ["862adcc1128d43b0fe9e80a897e16be0eccafa56e3f0c0f828eb248e5c669528"],
-  [SKILL_DOMAIN_HUB]: ["ab567185e4c44b045ec9388f8352e6daf44bfecc44d61f91d6758bb0f7d04762"],
-  [SKILL_WORKSPACE_ARBITRATION]: ["23a46645c0c73286a8a0c9039668c0dcfbb8466233ece18943ea96af5280f437","39e657a5fecc8fdf1da5b3ad17238fc64e91f2a11262c2a41328126633022870","ec1b4870c4c4cbcba535712f7331837a06000b4b120028ff3919b3a3e98de5d0","2fd6bd61786138935a735117b3f8f23391574330e476cfcad2717c005dc74c3e"],
-};

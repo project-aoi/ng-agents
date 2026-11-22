@@ -49,7 +49,7 @@ export function ago(at: number | null | undefined, now: number): string {
 }
 
 /**
- * Some labels fall back to a raw delivery address ("channel:feishu:wang-lei"); the owner only needs the person or
+ * Some labels fall back to a raw delivery address ("channel:memory:wang-lei"); the owner only needs the person or
  * group part, never the address syntax (docs/03 铁律 1).
  */
 export function prettyTarget(label: string): string {

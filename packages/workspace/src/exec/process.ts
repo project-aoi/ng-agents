@@ -15,18 +15,6 @@ export const defaultCommandRunner: CommandRunner = {
   },
 };
 
-export const DEFAULT_ENV_ALLOWLIST = ["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ"] as const;
-
-/** Copies only the allow-listed variables of the kernel's environment (which may hold NG_SECRET_* values). */
-export function pickHostEnv(allowlist: readonly string[]): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const k of allowlist) {
-    const v = process.env[k];
-    if (v !== undefined) out[k] = v;
-  }
-  return out;
-}
-
 /** Bounded capture: keeps the first and last halves of the budget and records how much was elided in between. */
 export class OutputCollector {
   #head = "";
@@ -71,8 +59,6 @@ export interface SuperviseOptions {
   killGraceMs: number;
   signal?: AbortSignal | undefined;
   onData(chunk: string, stream: "stdout" | "stderr"): void;
-  /** Extra termination for processes that live outside the host process group (inside a container). */
-  killInside?(sig: "TERM" | "KILL"): void;
 }
 
 export interface SuperviseResult {
@@ -103,13 +89,11 @@ export function supervise(child: ChildProcess, opts: SuperviseOptions): Promise<
     child.stdout?.on("data", (b: Buffer) => opts.onData(decOut.write(b), "stdout"));
     child.stderr?.on("data", (b: Buffer) => opts.onData(decErr.write(b), "stderr"));
 
-    const terminate = (inside: boolean) => {
+    const terminate = () => {
       if (pid !== undefined) killGroup(pid, "SIGTERM");
-      if (inside) opts.killInside?.("TERM");
       timers.push(
         setTimeout(() => {
           if (pid !== undefined && groupAlive(pid)) killGroup(pid, "SIGKILL");
-          if (inside) opts.killInside?.("KILL");
         }, opts.killGraceMs),
       );
     };
@@ -127,14 +111,14 @@ export function supervise(child: ChildProcess, opts: SuperviseOptions): Promise<
     const onAbort = () => {
       if (exited || aborted) return;
       aborted = true;
-      terminate(true);
+      terminate();
     };
 
     timers.push(
       setTimeout(() => {
         if (exited) return;
         timedOut = true;
-        terminate(true);
+        terminate();
       }, opts.timeoutMs),
     );
     if (opts.signal?.aborted) onAbort();
@@ -145,7 +129,7 @@ export function supervise(child: ChildProcess, opts: SuperviseOptions): Promise<
     });
     child.once("exit", (code, signal) => {
       exited = { code, signal };
-      if (pid !== undefined && groupAlive(pid)) terminate(false);
+      if (pid !== undefined && groupAlive(pid)) terminate();
       // Pipes normally close right after exit; the deadline covers a straggler that ignores SIGTERM.
       timers.push(
         setTimeout(() => {
@@ -157,31 +141,4 @@ export function supervise(child: ChildProcess, opts: SuperviseOptions): Promise<
     });
     child.once("close", () => finish());
   });
-}
-
-/** Runs a short host command to completion (git, docker lifecycle). Never throws for a non-zero exit. */
-export async function runCapture(
-  runner: CommandRunner,
-  req: Omit<SpawnRequest, "stdio" | "detached">,
-  opts: { timeoutMs?: number; input?: string } = {},
-): Promise<{ code: number | null; stdout: string; stderr: string; error?: Error }> {
-  let child: ChildProcess;
-  try {
-    child = runner.spawn({ ...req, detached: true, stdio: [opts.input === undefined ? "ignore" : "pipe", "pipe", "pipe"] });
-  } catch (err) {
-    return { code: null, stdout: "", stderr: "", error: err as Error };
-  }
-  let stdout = "";
-  let stderr = "";
-  const decOut = new StringDecoder("utf8");
-  const decErr = new StringDecoder("utf8");
-  child.stdout?.on("data", (b: Buffer) => (stdout += decOut.write(b)));
-  child.stderr?.on("data", (b: Buffer) => (stderr += decErr.write(b)));
-  if (opts.input !== undefined) child.stdin?.end(opts.input);
-  const r = await supervise(child, { timeoutMs: opts.timeoutMs ?? 120_000, killGraceMs: 2000, onData: () => {} });
-  stdout += decOut.end();
-  stderr += decErr.end();
-  if (r.spawnError) return { code: null, stdout, stderr, error: r.spawnError };
-  if (r.timedOut) return { code: r.code, stdout, stderr, error: new Error(`${req.file} timed out`) };
-  return { code: r.code, stdout, stderr };
 }

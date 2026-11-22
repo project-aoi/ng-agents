@@ -2,12 +2,7 @@ import type { PresetDef } from "@ng/protocol";
 import { ROLES } from "../shared/config";
 import { WORKER_PROCESSOR } from "../shared/processors";
 
-/**
- * One piece of work in one directory of the owner's real machine (isolation "none" is inherited: no worktree, no
- * sandbox). A leaf: `maxDepth: 0`, so it cannot start cells (what its own CLI does with sub-agents is the CLI's
- * business). `wakeable`: when its turn is over the kernel tells its parent and it rests — any later message, from its
- * project or straight from the owner, continues it on the same session.
- */
+/** A worker runs in its assigned host directory and resumes the same session on follow-up. */
 export function workerPreset(): PresetDef {
   return {
     name: "worker",

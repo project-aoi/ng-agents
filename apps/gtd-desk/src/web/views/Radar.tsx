@@ -233,7 +233,7 @@ const COMPLETED_KIND: Record<WeeklyReviewDTO["completed"][number]["kind"], strin
 
 function WeeklyReview({ review, now, completedProjects, onRun }: { review: WeeklyReviewDTO; now: number; completedProjects: number; onRun(b: ButtonDTO, input?: Record<string, unknown>): Promise<void> }) {
   const navigate = useNavigate();
-  const suggestions = review.skillSuggestions.length + review.ruleSuggestions.length + review.sensorSuggestions.length;
+  const suggestions = review.skillSuggestions.length + review.sensorSuggestions.length;
   return (
     <section className="review">
       <div className="section-head">
@@ -314,17 +314,6 @@ function WeeklyReview({ review, now, completedProjects, onRun }: { review: Weekl
               <pre>{s.body}</pre>
             </details>
             <ButtonRow buttons={s.buttons} onRun={onRun} size="sm" />
-          </article>
-        ))}
-
-        {review.ruleSuggestions.map((r) => (
-          <article key={`rule-${r.actionClass}`} className="suggestion">
-            <p className="suggestion-kind">改成自动执行</p>
-            <h4>{r.label}</h4>
-            <p className="muted small">
-              你已经连续 {r.streak} 次原样确认（共确认 {r.approved} 次）。要不要改成有次数上限的自动执行？
-            </p>
-            <ButtonRow buttons={r.buttons} onRun={onRun} size="sm" />
           </article>
         ))}
 

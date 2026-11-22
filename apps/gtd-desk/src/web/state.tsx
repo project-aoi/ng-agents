@@ -227,7 +227,7 @@ export function useArtifactEvents(artifactId: string | null | undefined, onChang
   }, [artifactId]);
 }
 
-// ==================== live cell records (SSE `cell_tail`, `job_chunk`) ====================
+// ==================== live cell records (SSE `cell_tail`) ====================
 // Only the open Agents pane listens; everyone else ignores them, so they go straight to listeners (no refresh tick).
 
 export interface CellTailEvent {
@@ -235,25 +235,14 @@ export interface CellTailEvent {
   lastSeq: number;
 }
 
-export interface JobChunkEvent {
-  cellId: string;
-  jobId: string;
-  chunk: string;
-}
-
 const tailListeners = new Set<(e: CellTailEvent) => void>();
-const chunkListeners = new Set<(e: JobChunkEvent) => void>();
 
 export function emitCellTail(e: CellTailEvent): void {
   for (const l of [...tailListeners]) l(e);
 }
 
-export function emitJobChunk(e: JobChunkEvent): void {
-  for (const l of [...chunkListeners]) l(e);
-}
-
 /** Calls the handlers for events about this one cell. */
-export function useCellLive(cellId: string | null, handlers: { tail(e: CellTailEvent): void; chunk(e: JobChunkEvent): void }): void {
+export function useCellLive(cellId: string | null, handlers: { tail(e: CellTailEvent): void }): void {
   const ref = useRef(handlers);
   ref.current = handlers;
   useEffect(() => {
@@ -261,14 +250,9 @@ export function useCellLive(cellId: string | null, handlers: { tail(e: CellTailE
     const onTail = (e: CellTailEvent) => {
       if (e.cellId === cellId) ref.current.tail(e);
     };
-    const onChunk = (e: JobChunkEvent) => {
-      if (e.cellId === cellId) ref.current.chunk(e);
-    };
     tailListeners.add(onTail);
-    chunkListeners.add(onChunk);
     return () => {
       tailListeners.delete(onTail);
-      chunkListeners.delete(onChunk);
     };
   }, [cellId]);
 }

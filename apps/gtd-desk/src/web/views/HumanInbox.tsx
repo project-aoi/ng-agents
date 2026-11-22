@@ -12,33 +12,6 @@ import { toFailure, useNavigate, useNow, useResource, useToast, useViewKeys } fr
 
 const pool = () => request<{ items: Item[] }>("GET", "/api/human-items");
 
-function useEditorLease(open: boolean) {
-  const toast = useToast();
-  useEffect(() => {
-    if (!open) return;
-    const id = clientId();
-    let pending = Promise.resolve();
-    const send = (active: boolean) => {
-      pending = pending.then(async () => {
-        try {
-          await request("POST", `/api/editor-leases/${id}`, { active }, { keepalive: !active });
-        } catch (err) {
-          if (active) toast({ tone: "warn", text: toFailure(err).message });
-        }
-      });
-    };
-    send(true);
-    const timer = window.setInterval(() => send(true), 12_000);
-    const leave = () => send(false);
-    window.addEventListener("pagehide", leave);
-    return () => {
-      window.removeEventListener("pagehide", leave);
-      window.clearInterval(timer);
-      send(false);
-    };
-  }, [open, toast]);
-}
-
 export function HumanInbox({ cardId, actionRef }: { cardId?: string | undefined; actionRef?: Item["actionRefs"][number] | undefined }) {
   const res = useResource("human-inbox", pool, ["clarify", "engage", "radar", "status"]);
   const navigate = useNavigate();
@@ -52,7 +25,6 @@ export function HumanInbox({ cardId, actionRef }: { cardId?: string | undefined;
   const item = editingChoice ?? linked ?? items.find(i => i.id === (cardId ?? actionRef?.actionId)) ?? items[0];
   useEffect(() => setEditingChoice(null), [cardId, actionRef?.cellId, actionRef?.actionId]);
   const focused = !!item && editing === item.id;
-  useEditorLease(focused);
   const choose = (id: string) => {
     setEditing(null);
     setEditingChoice(null);
@@ -98,7 +70,6 @@ export function HumanInbox({ cardId, actionRef }: { cardId?: string | undefined;
                           {i.project.paused && " · 已暂停"}
                         </small>
                       )}
-                      {i.status === "unknown" && <small>需要核实发送结果</small>}
                     </button>
                   ))}
                 </section>
@@ -197,7 +168,6 @@ function Detail({
         optionId: o.id,
         seenItemRevision: item.itemRevision,
         ...(draft ? { seenArtifactVersion: draft.base.version } : {}),
-        ...(item.attempt !== null ? { seenAttempt: item.attempt } : {}),
         note,
         ...(o.effect === "defer" && postponeTo ? { until: new Date(postponeTo).getTime() } : {}),
         ...(resume && item.resumeTarget ? { resumeProjectId: item.resumeTarget.id } : {}),
@@ -208,15 +178,8 @@ function Detail({
       forgetUnsaved(item.artifactId);
       const id = result.activityId;
       toast({
-        tone: result.status === "failed" || result.status === "unknown" ? "warn" : "success",
-        text:
-          result.status === "failed"
-            ? "发送失败，请检查后重试"
-            : result.status === "unknown"
-              ? "请核实对方是否收到"
-              : result.status === "revising"
-                ? "修改意见已送达"
-                : "已处理",
+        tone: "success",
+        text: result.status === "revising" ? "修改意见已送达" : "已处理",
         ...(id
           ? {
               action: {
@@ -343,17 +306,6 @@ function Detail({
             </p>
           ))}
         {item.description && item.description !== item.title && <p className="preserve-lines">{item.description}</p>}
-        {item.action?.type === "channel.send" && (
-          <p>
-            <strong>收件地址</strong> {prettyTarget(item.action.target)}
-          </p>
-        )}
-        {item.attempted && (
-          <blockquote>
-            上次尝试发送至 {prettyTarget(item.attempted.target)}
-            <p>{item.attempted.body}</p>
-          </blockquote>
-        )}
         {plan && (
           <section>
             <p>{plan.outcome}</p>

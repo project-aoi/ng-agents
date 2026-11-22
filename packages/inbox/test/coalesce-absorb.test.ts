@@ -15,10 +15,10 @@ describe("coalescing window (ScheduleRule.coalesce)", () => {
     t.inbox.enqueueSync("hub", msg({ id: "c" }), coalesce);
     // 59 s after the first one: nothing is due, and the stream has not pushed the edge out.
     expect(t.inbox.listMessagesSync({ cellId: "hub" }).map((m) => m.deliverAt)).toEqual([T0 + WIN, T0 + WIN, T0 + WIN]);
-    expect(t.inbox.claimNextRunSync("hub", "k", "serial_coalesce")).toBeNull();
+    expect(t.inbox.claimNextRunSync("hub", "k")).toBeNull();
     t.clock.advance(1_000);
     t.inbox.tickSync();
-    const batch = t.inbox.claimNextRunSync("hub", "k", "serial_coalesce")!;
+    const batch = t.inbox.claimNextRunSync("hub", "k")!;
     expect(batch.envelopes.map((e) => e.id)).toEqual(["a", "b", "c"]);
   });
 
@@ -37,7 +37,7 @@ describe("coalescing window (ScheduleRule.coalesce)", () => {
     t.inbox.enqueueSync("hub", msg({ id: "a" }), coalesce);
     t.clock.advance(WIN);
     t.inbox.tickSync();
-    const first = t.inbox.claimNextRunSync("hub", "k", "serial_coalesce")!;
+    const first = t.inbox.claimNextRunSync("hub", "k")!;
     t.inbox.completeSync(first.claimId);
     t.clock.advance(5_000);
     t.inbox.enqueueSync("hub", msg({ id: "b" }), coalesce);
@@ -47,7 +47,7 @@ describe("coalescing window (ScheduleRule.coalesce)", () => {
   it("while a Run is active the message is due at once; a bucket that is due but unclaimed is joined, not restarted", () => {
     const t = setup({ cells: [{ id: "desk" }, { id: "hub", parentId: "desk" }] });
     t.inbox.enqueueSync("hub", msg({ id: "a" }));
-    const run = t.inbox.claimNextRunSync("hub", "k", "serial_coalesce")!;
+    const run = t.inbox.claimNextRunSync("hub", "k")!;
     t.inbox.enqueueSync("hub", msg({ id: "during" }), coalesce);
     expect(t.inbox.listMessagesSync({ envelopeId: "during" })[0]!.deliverAt).toBe(T0);
     t.inbox.completeSync(run.claimId);
@@ -56,7 +56,7 @@ describe("coalescing window (ScheduleRule.coalesce)", () => {
     t.clock.advance(1_000);
     t.inbox.enqueueSync("hub", msg({ id: "late" }), coalesce);
     expect(t.inbox.listMessagesSync({ envelopeId: "late" })[0]!.deliverAt).toBe(T0 + 1_000);
-    expect(t.inbox.claimNextRunSync("hub", "k", "serial_coalesce")!.envelopes.map((e) => e.id)).toEqual(["during", "late"]);
+    expect(t.inbox.claimNextRunSync("hub", "k")!.envelopes.map((e) => e.id)).toEqual(["during", "late"]);
   });
 
   it("cannot be combined with another rule or a different cancel group", () => {
@@ -71,7 +71,7 @@ describe("drainInboundSync (absorbing arrivals into the running claim)", () => {
   it("moves due rows into the claim, in order; they complete with it", () => {
     const t = setup({ cells: [{ id: "desk" }, { id: "w", parentId: "desk" }] });
     t.inbox.enqueueSync("w", msg({ id: "task" }));
-    const run = t.inbox.claimNextRunSync("w", "k", "serial_coalesce")!;
+    const run = t.inbox.claimNextRunSync("w", "k")!;
     expect(t.inbox.drainInboundSync("w", run.claimId)).toEqual([]);
 
     t.inbox.enqueueSync("w", msg({ id: "note", delivery: "silent_inject" }));
@@ -94,7 +94,7 @@ describe("drainInboundSync (absorbing arrivals into the running claim)", () => {
   it("an absorbed message can be handed back, and a crash gives everything back to the queue", () => {
     const t = setup({ cells: [{ id: "desk" }, { id: "hub", parentId: "desk" }] });
     t.inbox.enqueueSync("hub", msg({ id: "a" }));
-    const run = t.inbox.claimNextRunSync("hub", "k", "serial_coalesce")!;
+    const run = t.inbox.claimNextRunSync("hub", "k")!;
     t.inbox.enqueueSync("hub", msg({ id: "off-topic" }));
     t.inbox.enqueueSync("hub", msg({ id: "b" }));
     t.inbox.drainInboundSync("hub", run.claimId);
@@ -103,14 +103,14 @@ describe("drainInboundSync (absorbing arrivals into the running claim)", () => {
     expect(t.inbox.listMessagesSync({ cellId: "desk" }).map((m) => m.envelope.type)).toEqual(["handback"]);
 
     expect(t.inbox.releaseSync(run.claimId, "crashed")).toMatchObject({ requeued: 2 });
-    const again = t.inbox.claimNextRunSync("hub", "k", "serial_coalesce")!;
+    const again = t.inbox.claimNextRunSync("hub", "k")!;
     expect(again.envelopes.map((e) => e.id)).toEqual(["a", "b"]);
   });
 
   it("leaves steer messages to drainSteerSync, and takes nothing for a dead or foreign claim", () => {
     const t = setup({ cells: [{ id: "desk" }, { id: "w", parentId: "desk" }, { id: "x", parentId: "desk" }] });
     t.inbox.enqueueSync("w", msg({ id: "task" }));
-    const run = t.inbox.claimNextRunSync("w", "k", "serial_coalesce")!;
+    const run = t.inbox.claimNextRunSync("w", "k")!;
     t.inbox.controlSync("w", { action: "steer", principalId: "owner", steerMessage: "use pnpm" });
     expect(t.inbox.drainInboundSync("w", run.claimId)).toEqual([]);
     expect(t.inbox.drainSteerSync("w", run.claimId).map((s) => s.message)).toEqual(["use pnpm"]);
@@ -119,13 +119,13 @@ describe("drainInboundSync (absorbing arrivals into the running claim)", () => {
     expect(t.inbox.drainInboundSync("x", run.claimId)).toEqual([]);
     // Cancelled mid-run: the epoch moved, so the old Run takes nothing more.
     t.inbox.enqueueSync("x", msg({ id: "x-task" }));
-    const xr = t.inbox.claimNextRunSync("x", "k", "serial_coalesce")!;
+    const xr = t.inbox.claimNextRunSync("x", "k")!;
     t.inbox.controlSync("x", { action: "cancel", principalId: "owner" });
     expect(t.inbox.drainInboundSync("x", xr.claimId)).toEqual([]);
     t.inbox.releaseSync(run.claimId, "stopped");
     expect(t.inbox.drainInboundSync("w", run.claimId)).toEqual([]);
     // The claimed steer was not completed before releaseSync, so it returns to pending along with task + more (3).
-    expect(texts(t.inbox.claimNextRunSync("w", "k", "serial_coalesce")!.envelopes)).toHaveLength(3);
+    expect(texts(t.inbox.claimNextRunSync("w", "k")!.envelopes)).toHaveLength(3);
   });
 });
 
@@ -149,12 +149,8 @@ describe("settle-time counts", () => {
   it("activeClaimCountSync can leave out the settling Run's own claim", () => {
     const t = setup({ cells: [{ id: "desk" }, { id: "pool", parentId: "desk" }] });
     t.inbox.enqueueSync("pool", msg({ id: "a" }));
-    t.inbox.enqueueSync("pool", msg({ id: "b" }));
-    const a = t.inbox.claimNextRunSync("pool", "k", "competing_workers")!;
-    const b = t.inbox.claimNextRunSync("pool", "k", "competing_workers")!;
-    expect(t.inbox.activeClaimCountSync("pool")).toBe(2);
-    expect(t.inbox.activeClaimCountSync("pool", a.claimId)).toBe(1);
-    t.inbox.completeSync(b.claimId);
+    const a = t.inbox.claimNextRunSync("pool", "k")!;
+    expect(t.inbox.activeClaimCountSync("pool")).toBe(1);
     expect(t.inbox.activeClaimCountSync("pool", a.claimId)).toBe(0);
   });
 });

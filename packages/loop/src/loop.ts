@@ -25,7 +25,7 @@ import {
 import { Conversation } from "./conversation";
 
 export interface AgentLoopOptions {
-  model: ModelClient;
+  model?: ModelClient;
   /** The shared registry: toolsets (processor.toolsets) and code processors (processor.entry). */
   registry: Registry;
   clock?: Clock;
@@ -33,8 +33,6 @@ export interface AgentLoopOptions {
   defaultTier?: ModelTier;
   /** Model calls per Run when `processor.maxSteps` is absent. Default 32. */
   defaultMaxSteps?: number;
-  /** Per-tier output cap; overrides the client's own default. */
-  maxOutputTokens?: Partial<Record<ModelTier, number>>;
 }
 
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
@@ -42,24 +40,22 @@ type EvidenceInput = DistributiveOmit<StepOrExternalEvidence, "runId" | "at">;
 
 export const TRUNCATED_CALL_OUTPUT =
   "Not executed: your output hit the output-token limit before this call was complete. Retry with a smaller input (for example, write the file in parts).";
-export const BUDGET_STOP_OUTPUT = "Not executed: the budget limit was reached and the run stopped.";
 
 /**
  * ④ Loop. Stateless: one call to `run` is one bounded Run; everything durable goes through `ports`.
  *
  * llm Runs: tools = registry.resolveTools(processor.toolsets) filtered by selectRunTools (allowedTools ∩ bounds,
- * `availableFor`), so the list is the same on every Run of the cell. Each step: drain steer → model call → meter →
+ * `availableFor`), so the list is the same on every Run of the cell. Each step: drain steer → model call →
  * evidence (assistant_text / tool_call) → tools in order (tool_result evidence; the model sees Context's `modelText`,
- * i.e. the spilled form) → stop on `endRun`, on a reply without tool calls, at maxSteps, on abort, or on hard_stop.
+ * i.e. the spilled form) → stop on `endRun`, on a reply without tool calls, at maxSteps, on abort.
  *
  * Outcomes: `completed` (also: no tool call, maxSteps reached), `yielded_waiting` (a tool said endRun
  * yielded_waiting, or `awaitsWakeup` on a Run that would otherwise complete), `deferred_for_approval`, `cancelled`
- * (signal), `budget_stopped` (meter → hard_stop, checked once before the first call and after every call),
  * `step_limit` (maxSteps model calls with work left) and `refused` (the model's stop reason is a refusal).
  * Model/transport errors are rethrown for the kernel to release/retry the claim; tool exceptions become error results.
  *
  * Code runs invoke the registered processor named by the cell spec.
- * No model calls, nothing metered.
+ * No model calls.
  */
 export function createAgentLoop(opts: AgentLoopOptions): AgentLoop {
   const clock = opts.clock ?? systemClock;
@@ -83,6 +79,8 @@ export function createAgentLoop(opts: AgentLoopOptions): AgentLoop {
   }
 
   async function runLlm(snapshot: PromptSnapshot, ports: RunPorts, signal: AbortSignal, processor: LlmProcessorSpec): Promise<RunOutcome> {
+    const model = opts.model;
+    if (!model) throw new Error("No model supplied for in-memory execution");
     const cellId = snapshot.cellId;
     const runId = snapshot.runId;
     // RunSelf.parentId is authoritative (the stored spec may omit it); both are fixed for the cell's life.
@@ -93,7 +91,6 @@ export function createAgentLoop(opts: AgentLoopOptions): AgentLoop {
     const toolSpecs = tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema }));
     const tier = processor.modelTier ?? opts.defaultTier ?? "strong";
     const maxSteps = processor.maxSteps ?? defaultMaxSteps;
-    const maxOutputTokens = opts.maxOutputTokens?.[tier];
     const conv = Conversation.fromSnapshot(snapshot);
 
     const append = (rec: EvidenceInput) =>
@@ -120,7 +117,6 @@ export function createAgentLoop(opts: AgentLoopOptions): AgentLoop {
       return arrived.length;
     };
 
-    if (ports.meter({ tokens: 0, billedCents: 0 }) === "hard_stop") return "budget_stopped";
 
     let steps = 0;
     let awaitsWakeup = false;
@@ -140,13 +136,12 @@ export function createAgentLoop(opts: AgentLoopOptions): AgentLoop {
       }
 
       const response: ModelResponse = await raceAbort(
-        opts.model.complete(
+        model.complete(
           {
             tier,
             system: snapshot.system.text,
             messages: conv.forRequest(),
             tools: toolSpecs,
-            ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
             ...(conv.stablePrefixEnd ? { cacheHints: { stablePrefixEnd: conv.stablePrefixEnd } } : {}),
             metadata: { cellId, runId },
           },
@@ -155,19 +150,14 @@ export function createAgentLoop(opts: AgentLoopOptions): AgentLoop {
         signal,
       );
       steps++;
-      const meter = ports.meter({ tokens: response.usage.tokens, billedCents: response.usage.billedCents });
 
       for (const block of response.content) {
         if (block.type === "text") await append({ kind: "assistant_text", text: block.text, model: response.model });
         else await append({ kind: "tool_call", toolUseId: block.id, name: block.name, input: block.input });
       }
-      conv.appendAssistant(response.content, response.native);
+      conv.appendAssistant(response.content);
       const calls = response.content.filter((b): b is ToolUseBlock => b.type === "tool_use");
 
-      if (meter === "hard_stop") {
-        await recordUnexecuted(calls, BUDGET_STOP_OUTPUT);
-        return "budget_stopped";
-      }
       if (signal.aborted) return "cancelled";
 
       if (response.stopReason === "refusal") {

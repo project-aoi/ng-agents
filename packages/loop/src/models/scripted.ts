@@ -5,22 +5,19 @@ import {
   type ModelResponse,
   type ModelStopReason,
   type ModelTier,
-  type ModelUsage,
   type TextBlock,
   type ToolResultBlock,
   type ToolUseBlock,
 } from "@ng/protocol";
-import { toModelUsage, type ModelPrice } from "./pricing";
 
-/** One model turn: text and/or tool calls. Omitted usage is estimated (≈ 4 chars per token). */
+/** One model turn: text and/or tool calls. */
 export interface ScriptTurn {
   text?: string;
   toolCalls?: Array<{ name: string; input?: unknown; id?: string }>;
   stopReason?: ModelStopReason;
-  usage?: Partial<Pick<ModelUsage, "inputTokens" | "outputTokens" | "cacheReadTokens" | "cacheWriteTokens" | "billedCents">>;
   /** Simulated latency; aborting the signal during it rejects like a real transport. */
   delayMs?: number;
-  /** Reject instead of answering (transport/API failure). */
+  /** Reject instead of answering with the supplied error. */
   error?: Error;
 }
 
@@ -41,18 +38,15 @@ export type Script = ReadonlyArray<ScriptTurn | ScriptResponder> | ScriptRespond
 
 export interface ScriptedModelClientOptions {
   models?: Partial<Record<ModelTier, string>>;
-  /** Prices the fake usage (USD per MTok). Default: free (0 cents, tokens still counted). */
-  price?: ModelPrice;
   /** What to do when a fixed script runs out: throw (default) or answer with an empty end_turn. */
   onExhausted?: "throw" | "end_turn";
 }
 
 /**
- * Deterministic ModelClient for tests and the demo mode. Records every request in `calls`. Tool call ids default to
+ * Deterministic ModelClient for tests. Records every request in `calls`. Tool call ids default to
  * `toolu_<runId>_<call>_<n>` so they stay unique across Runs of a cell.
  */
 export class ScriptedModelClient implements ModelClient {
-  readonly provider = "scripted";
   readonly calls: ModelRequest[] = [];
   readonly #script: Script;
   readonly #opts: ScriptedModelClientOptions;
@@ -99,20 +93,10 @@ export class ScriptedModelClient implements ModelClient {
         input: c.input ?? {},
       });
     });
-    const outputChars = (turn.text ?? "").length + JSON.stringify(turn.toolCalls ?? []).length;
-    const counts = {
-      inputTokens: turn.usage?.inputTokens ?? estimateTokens(JSON.stringify([req.system, req.messages, req.tools]).length),
-      outputTokens: turn.usage?.outputTokens ?? estimateTokens(outputChars),
-      cacheReadTokens: turn.usage?.cacheReadTokens ?? 0,
-      cacheWriteTokens: turn.usage?.cacheWriteTokens ?? 0,
-    };
-    const usage = toModelUsage(counts, this.#opts.price ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
-    if (turn.usage?.billedCents !== undefined) usage.billedCents = turn.usage.billedCents;
     return {
       model: this.modelFor(req.tier),
       content,
       stopReason: turn.stopReason ?? (content.some((b) => b.type === "tool_use") ? "tool_use" : "end_turn"),
-      usage,
     };
   }
 }
@@ -132,10 +116,6 @@ export function scriptContext(req: ModelRequest, callIndex: number): ScriptConte
     toolResults: lastUser ? lastUser.content.filter((b): b is ToolResultBlock => b.type === "tool_result") : [],
     toolNames: req.tools.map((t) => t.name),
   };
-}
-
-function estimateTokens(chars: number): number {
-  return Math.ceil(chars / 4);
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {

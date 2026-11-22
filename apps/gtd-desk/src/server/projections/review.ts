@@ -1,5 +1,3 @@
-import { parseActionClass, ruleInputForClass } from "@ng/gate";
-import { asClarifyCard, parseAddress } from "@ng/protocol";
 import type { WeeklyReviewDTO } from "../../shared/api";
 import {
   linkedApprovalId,
@@ -19,33 +17,6 @@ import { dueText, nextWeekly, weekStart } from "./time";
 const WEEK = 7 * 24 * 3_600_000;
 /** An llm source that ran this often is worth a zero-token check (docs/04 §4.2). */
 export const SENSOR_SUGGEST_MIN_RUNS = 4;
-export const DEFAULT_RULE_MAX_USES = 20;
-
-/** "通过 飞书 对外发送消息" — the action class in the owner's words. */
-export function actionClassLabel(actionClass: string): string {
-  const { type, target } = parseActionClass(actionClass);
-  switch (type) {
-    case "channel.send": {
-      const addr = target ? parseAddress(target.replace(/\*$/, "x")) : null;
-      return `通过${addr?.kind === "channel" ? ` ${channelLabel(addr.channelId)} ` : ""}对外发送消息`;
-    }
-    case "project.start":
-      return "确认立项";
-    case "workspace.exec":
-      return `在工作区执行 ${target ?? "命令"}`;
-    case "job.start":
-      return "启动后台命令";
-    case "secret.use":
-      return `使用密钥 ${target ?? ""}`.trim();
-    case "cell.spawn":
-      return "派生后台分身";
-    case "custom":
-      return `执行 ${target ?? "操作"}`;
-    default:
-      return actionClass;
-  }
-}
-
 function isSkillSuggestion(v: unknown): v is SkillSuggestion {
   const s = v as Partial<SkillSuggestion> | null;
   return !!s && typeof s.name === "string" && typeof s.description === "string" && typeof s.body === "string";
@@ -60,10 +31,7 @@ export function projectReview(input: ProjectionInput): WeeklyReviewDTO {
   const actions = readActions(kernel);
 
   const completed: WeeklyReviewDTO["completed"] = [];
-  const linkedSends = new Set<string>();
   for (const a of actions) {
-    const linked = linkedApprovalId(a.record);
-    if (linked) linkedSends.add(linked);
     if (a.record.status !== "done" || (a.record.completedAt ?? a.record.updatedAt) < ws) continue;
     // BUG-011.2: "本周完结" is what was delivered — whole projects (below) and what the owner did themselves; the
     // agent and waiting steps inside a project are the project's own detail, not the owner's week.
@@ -80,9 +48,6 @@ export function projectReview(input: ProjectionInput): WeeklyReviewDTO {
   for (const r of kernel.gate.listApprovalsSync({ status: ["executed", "approved"] })) {
     if ((r.resolvedAt ?? r.updatedAt) < ws) continue;
     if (r.humanEdited) editedDrafts++;
-    if (r.status !== "executed" || r.action.type !== "channel.send" || linkedSends.has(r.actionId)) continue;
-    const card = asClarifyCard(r.card.data);
-    completed.push({ kind: "reply", title: card?.title ?? r.card.title ?? r.action.summary, at: r.resolvedAt ?? r.updatedAt, project: null });
   }
   completed.sort((a, b) => b.at - a.at);
 
@@ -118,27 +83,6 @@ export function projectReview(input: ProjectionInput): WeeklyReviewDTO {
       buttons: [
         button({ id: "accept_skill", label: "一键保存为技能", primary: true, endpoint: post(`${base}/accept`) }),
         button({ id: "dismiss_skill", label: "不用了", endpoint: post(`${base}/dismiss`) }),
-      ],
-    });
-  }
-
-  const ruleSuggestions: WeeklyReviewDTO["ruleSuggestions"] = [];
-  for (const s of kernel.gate.trustCandidatesSync()) {
-    if (ruleInputForClass(s.actionClass, { createdBy: kernel.ownerPrincipal }) === null) continue;
-    if (s.suggestedAt !== null && now - s.suggestedAt < WEEK) continue;
-    ruleSuggestions.push({
-      actionClass: s.actionClass,
-      label: actionClassLabel(s.actionClass),
-      streak: s.uneditedStreak,
-      approved: s.approved,
-      buttons: [
-        button({
-          id: "enable_rule",
-          label: `改成自动执行（最多 ${DEFAULT_RULE_MAX_USES} 次）`,
-          primary: true,
-          endpoint: post("/api/review/rules", { actionClass: s.actionClass, maxUses: DEFAULT_RULE_MAX_USES }),
-        }),
-        button({ id: "dismiss_rule", label: "先不用", endpoint: post("/api/review/rules/dismiss", { actionClass: s.actionClass }) }),
       ],
     });
   }
@@ -184,7 +128,6 @@ export function projectReview(input: ProjectionInput): WeeklyReviewDTO {
     overdueWaits,
     editedDrafts,
     skillSuggestions,
-    ruleSuggestions,
     sensorSuggestions,
   };
 }

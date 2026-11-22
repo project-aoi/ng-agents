@@ -111,7 +111,7 @@ export function batchOf(cellId: string, envelopes: Envelope[], epoch = 0, clock?
     cellId,
     epoch,
     workerId: "w1",
-    mode: "serial_coalesce",
+
     envelopes,
     seqs: envelopes.map((_, i) => i + 1),
     claimedAt: now,

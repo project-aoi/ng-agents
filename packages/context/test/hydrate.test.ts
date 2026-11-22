@@ -17,7 +17,7 @@ import {
 import { FORK_PENDING_TEXT, NO_RESULT_TEXT, renderEnvelope } from "../src";
 import { assertWireInvariants, batchOf, json, prng, setup, simulateRun, userEnvelope, type Harness } from "./helpers";
 
-const deskBounds = makeBounds({ tools: ["read"], canSendTo: ["inbox:*"], maxConcurrentChildren: 3, maxDepth: 2, maxTokens: 1_000_000, maxCents: 500 });
+const deskBounds = makeBounds({ tools: ["read"], canSendTo: ["inbox:*"], maxConcurrentChildren: 3, maxDepth: 2 });
 
 function deskHarness(extra: Parameters<typeof setup>[0] = {}): Harness {
   const h = setup({
@@ -81,7 +81,7 @@ describe("hydrate: frozen system prefix", () => {
         "You are the desk. Triage every inbound item.",
         '# Skills\nPlaybooks you can load on demand. Before doing one of these kinds of task, read its full instructions with read_resource("skill://<name>").\n- weekly-review: 周回顾',
         "# Skill: triage\n先判断是否零副作用",
-        "# Your bounds\nTools: read.\nMay send to: inbox:*.\nSecrets (injected by proxy, never visible): none.\nIsolation: none.\nChildren: up to 3 concurrent, 2 more level(s) of spawning.\nBudget (shared with subtree): 1000000 tokens, 500 cents.",
+        "# Your bounds\nTools: read.\nMay send to: inbox:*.\nIsolation: none.\nChildren: up to 3 concurrent, 2 more level(s) of spawning.",
         "# Long-term preferences\n- language: Always answer in Chinese.",
       ].join("\n\n"),
     );
@@ -268,13 +268,13 @@ describe("hydrate: preferences limited to a directory or a role", () => {
 describe("hydrate: history and tail", () => {
   it("renders the batch in the tail exactly as its inbound evidence renders in the next history", () => {
     const h = deskHarness();
-    const env: Envelope = userEnvelope(h.clock, "帮我回一下供应商", { threads: ["feishu:oc_1"], from: "channel:feishu:oc_1", principalId: "owner" });
+    const env: Envelope = userEnvelope(h.clock, "帮我回一下供应商", { threads: ["memory:oc_1"], from: "channel:memory:oc_1", principalId: "owner" });
     const silent = userEnvelope(h.clock, "背景：上周已付定金", { delivery: "silent_inject" });
     const s1 = simulateRun(h, "desk", [env, silent], reply("好的"));
     expect(s1.tail.messages.map((m) => (m.content[0] as { text: string }).text)).toEqual([renderEnvelope(env), renderEnvelope(silent)]);
     // A user.message from a channel carries its envelope id after the time, so it can be handed back or answered by id.
     expect(renderEnvelope(env)).toBe(
-      `[user.message · from channel:feishu:oc_1 · principal owner · thread feishu:oc_1 · at 2025-11-17T08:00:00.000Z · id ${env.id}]\n帮我回一下供应商`,
+      `[user.message · from channel:memory:oc_1 · principal owner · thread memory:oc_1 · at 2025-11-17T08:00:00.000Z · id ${env.id}]\n帮我回一下供应商`,
     );
     expect(renderEnvelope(silent)).toContain("· background ·");
     expect(renderEnvelope(silent)).toMatch(new RegExp(`· at [^·\\]]+ · id ${silent.id}\\]\\n背景：上周已付定金$`));
@@ -315,8 +315,8 @@ describe("hydrate: history and tail", () => {
     const h = deskHarness({
       store: {
         rosterProvider: () => [
-          { ...base, cellId: "proj", preset: "project", title: "Harness 对比", depth: 1, parentId: "desk", cwd: "/src/trae", cwdMode: "read" },
-          { ...base, cellId: "w1", depth: 2, parentId: "proj", cwd: "/src/trae/docs", cwdMode: "write", statusLine: "写报告 (1/3)" },
+          { ...base, cellId: "proj", preset: "project", title: "Harness 对比", depth: 1, parentId: "desk", cwd: "/src/trae" },
+          { ...base, cellId: "w1", depth: 2, parentId: "proj", cwd: "/src/trae/docs", statusLine: "写报告 (1/3)" },
           { ...base, cellId: "w1a", preset: null, depth: 3, parentId: "w1" },
           { ...base, cellId: "watch", preset: "watcher", status: "paused", depth: 1, cwd: "/tmp/probe" },
           { ...base, cellId: "plain" },
@@ -327,8 +327,8 @@ describe("hydrate: history and tail", () => {
     expect((snap.tail.messages[0]!.content[0] as { text: string }).text).toBe(
       [
         "[in-flight child cells: live status, not part of the conversation]",
-        '- proj · "Harness 对比" · project · active · cwd /src/trae (read)',
-        "  - w1 · worker · active · cwd /src/trae/docs (write): 写报告 (1/3)",
+        '- proj · "Harness 对比" · project · active · cwd /src/trae',
+        "  - w1 · worker · active · cwd /src/trae/docs: 写报告 (1/3)",
         "    - w1a · active",
         "- watch · watcher · paused · cwd /tmp/probe",
         "- plain · worker · active",
@@ -479,7 +479,7 @@ describe("hydrate: fork_prefix", () => {
       preset: "worker",
       title: "修支付回调",
       spec: { preset: "worker", contextMode: "fork_prefix", fork: { fromCellId: "desk", uptoSeq }, processor: { kind: "llm", prompt: "worker" } },
-      bounds: makeBounds({ tools: ["read", "edit", "bash"], canSendTo: ["inbox:desk"], isolation: "git_worktree", maxTokens: 1000, maxCents: 10 }),
+      bounds: makeBounds({ tools: ["read", "edit", "bash"], canSendTo: ["inbox:desk"], isolation: "none" }),
     });
     h.store.appendEvidenceSync("desk", { kind: "tool_result", toolUseId: "spawn1", name: "spawn_cell", output: "inbox:fixer", runId, at: 4 });
     h.store.appendEvidenceSync("desk", { kind: "run_boundary", phase: "end", epoch: 0, outcome: "completed", runId, at: 5 });

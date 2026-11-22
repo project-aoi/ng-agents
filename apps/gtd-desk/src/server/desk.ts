@@ -2,7 +2,6 @@ import { ownerOnlyApproval } from "@ng/gate";
 import type { HumanDecision } from "@ng/protocol";
 import type { ApprovalDecision, Kernel, ResolveApprovalResult } from "@ng/cell";
 import type { UiChannel } from "@ng/channel";
-import { ruleInputForClass } from "@ng/gate";
 import {PROCESSORS,createSensorSpec,sensorProcessor} from "@ng/presets";
 const SCRIPT_PREFIX="script:";
 import {
@@ -56,21 +55,15 @@ import type {
   ArtifactSaveResponse,
   CaptureRequest,
   CaptureResponse,
-  SetBudgetLimitsRequest,
-  SetBudgetLimitsResponse,
   ClarifyMutationResponse,
   ClarifyOutcome,
   ClarifyQueueDTO,
   CreateSourceRequest,
   DoneRequest,
-  EnableRuleRequest,
   EngageDetailDTO,
   EngageListDTO,
   EngageMutationResponse,
-  EngageSendRequest,
   ExtendRequest,
-  FocusRequest,
-  FocusResponse,
   NoteRequest,
   PlanSaveRequest,
   ProjectMutationResponse,
@@ -84,7 +77,6 @@ import type {
   SourcesDTO,
   SourcesMutationResponse,
   StatusDTO,
-  VerifyRequest,
   WeeklyReviewDTO,
   ActivityListDTO,
   EngageOutcome,
@@ -217,24 +209,6 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     return full;
   }
 
-  // Older versions recorded a failed send's abandonment only in the activity drawer.
-  // A double-click could create two snapshots. Restore only the latest decision for each explicit action id.
-  const abandonDetail = "发送失败后你选择了不再发送";
-  withTx(kernel.db, () => {
-    const latest = new Map<string, ActivityRecord>();
-    for (const { record } of readActivities(kernel)) {
-      if (record.kind !== "card_withdrawn" || record.detail !== abandonDetail || !record.actionId) continue;
-      const previous = latest.get(record.actionId);
-      if (!previous || record.at >= previous.at) latest.set(record.actionId, record);
-    }
-    for (const [actionId, record] of latest) {
-      const rec = gate.getApprovalSync(actionId);
-      if (!record.restoredAt && rec?.status === "failed" && rec.updatedAt <= record.at) {
-        gate.setSendAbandonedSync(actionId, record.id, true, rec.itemRevision);
-      }
-    }
-  });
-
   function findAction(cellId: string, actionId: string): Located<ActionRecord> {
     const value = context.readStateSync(cellId, gtdKeys.action(actionId));
     const found = readActions(kernel).find((a) => a.cellId === cellId && a.record.id === actionId);
@@ -331,41 +305,6 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     return { ok: true, id: env.id, acceptedAt: env.createdAt, message: "已收进信箱", status: status() };
   }
 
-  /**
-   * The owner's switch for token/cost limits (PUT /api/settings/budget-limits). The owner's alone: the kernel refuses
-   * anyone else, and no control-plane tool reaches it. Off: nothing is stopped for its budget — the cells held at their
-   * stop go on and the budget cards waiting for the owner are answered.
-   */
-  function setBudgetLimits(req: SetBudgetLimitsRequest, as: DeskActor): SetBudgetLimitsResponse {
-    if (typeof req?.enforced !== "boolean") throw bad("enforced 必须是 true 或 false");
-    const r = kernel.setBudgetLimits(req.enforced, actorOf(as));
-    let message: string;
-    if (!r.changed) message = r.enforced ? "额度限制本来就是开着的" : "额度限制本来就是关着的";
-    else if (r.enforced) message = "已开启额度限制";
-    else {
-      // A held cell and the card about it are one stopped task.
-      const went = Math.max(r.releasedCells.length, r.continuedCards.length);
-      message = went > 0 ? `已关闭额度限制：${went} 个因额度暂停的任务已继续` : "已关闭额度限制";
-    }
-    return { ok: true, enforced: r.enforced, message, status: status() };
-  }
-
-  async function focus(req: FocusRequest, as: DeskActor): Promise<FocusResponse> {
-    principalOf(as);
-    if (typeof req?.on !== "boolean") throw bad("on 必须是 true 或 false");
-    const flushed = await kernel.setFocus(req.on);
-    const f = { on: kernel.hub.isFocusSync(), buffered: kernel.hub.bufferedCountSync() };
-    const delivered = flushed ? flushed.sent + flushed.failed + flushed.unknown : 0;
-    const message = req.on
-      ? "已开启免打扰：非紧急通知先暂存，退出专注后再看"
-      : delivered > 0
-        ? `已退出专注，送达 ${flushed!.sent} 条暂存通知${flushed!.failed + flushed!.unknown > 0 ? `（${flushed!.failed + flushed!.unknown} 条未确认送达）` : ""}`
-        : "已退出专注";
-    return { ok: true, focus: f, flushed, message, status: status() };
-  }
-
-  // ==================== 📥 Clarify ====================
-
   function approval(cardId: string): ApprovalRecord {
     const rec = gate.getApprovalSync(cardId);
     if (!rec) throw missing("找不到这张卡");
@@ -392,10 +331,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
   }
 
   const APPROVE_MESSAGE: Readonly<Record<ApproveOutcome, string>> = {
-    sent: "已发送",
     approved: "已确认，Agent 继续推进",
-    failed: "发送失败，对方没有收到。可以重新发送",
-    unknown: "发送结果未知，请核实",
     version_mismatch: "草稿已更新，请重看",
     revision_mismatch: "这张卡刚刚变动过，请刷新后再确认",
     already_cancelled: "这件事已经取消或撤回了",
@@ -420,9 +356,6 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     });
     let outcome: ApproveOutcome;
     switch (r.status) {
-      case "sent":
-      case "failed":
-      case "unknown":
       case "approved":
       case "version_mismatch":
       case "revision_mismatch":
@@ -434,11 +367,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
         outcome = "already_cancelled";
     }
     let message = APPROVE_MESSAGE[outcome];
-    const beforeCard = asClarifyCard(before?.card.data);
     if (outcome === "approved" && before?.action.type === "project.start") message = "已确认立项，Agent 开始推进";
-    if (outcome === "approved" && beforeCard?.cardType === "response" && beforeCard.confirmVerb === "accept") message = "已收下";
-    if (outcome === "approved" && beforeCard?.cardType === "response" && beforeCard.confirmVerb === "merge") message = "已确认合入，Agent 继续推进";
-    if (outcome === "sent" && beforeCard?.cardType === "escalation") message = "已发送催问，继续跟进";
     return {
       outcome,
       message,
@@ -451,7 +380,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
   async function approve(cardId: string, req: ApproveRequest, as: DeskActor) {
     const r = await runApprove(cardId, req?.seenVersion, req?.seenItemRevision, as);
     const view = clarify();
-    const ok = r.outcome === "sent" || r.outcome === "approved";
+    const ok = r.outcome === "approved";
     return { ok, ...r, view, status: status(), card: view.cards.find((c) => c.id === cardId) ?? null };
   }
 
@@ -607,11 +536,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
       if (!Number.isFinite(until) || until <= t) throw bad("等待时间必须在将来");
       return applyCardCommand(cardId,req.seenItemRevision,as,{...command,until},"continued",`好的，再等到 ${whenText(until,t)}`);
     }
-    const raise = req.raise;
-    if (raise !== undefined && (typeof raise !== "object" || raise === null || [raise.tokens,raise.cents].some(v=>v!==undefined && (!Number.isFinite(v)||v<0))))
-      throw bad("raise 需要非负的 tokens / cents");
-    const message = reason === "budget_exhausted" ? "已追加额度，继续推进" : reason === "retry_limit" ? "已重新开始处理" : "好的，继续推进";
-    return applyCardCommand(cardId,req.seenItemRevision,as,{...command,...(raise ? {raise} : {})},"continued",message);
+    return applyCardCommand(cardId,req.seenItemRevision,as,command,"continued","继续推进");
   }
 
   function resolveOffline(cardId:string,req:NoteRequest,as:DeskActor) {
@@ -645,27 +570,6 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
 
   function deny(cardId:string,req:NoteRequest,as:DeskActor) {
     return applyCardCommand(cardId,req?.seenItemRevision,as,{decision:"deny",...(req?.note ? {reason:req.note} : {})},"denied","已拒绝");
-  }
-
-  async function verify(cardId: string, req: VerifyRequest, as: DeskActor): Promise<ClarifyMutationResponse> {
-    const approverId = principalOf(as);
-    if (req?.verdict !== "sent" && req?.verdict !== "failed") throw bad("verdict 必须是 sent 或 failed");
-    const seenItemRevision = seenRevisionOf(req?.seenItemRevision);
-    if (!Number.isSafeInteger(req.seenAttempt) || req.seenAttempt < 1) throw bad("seenAttempt 必须是已查看的发送尝试序号");
-    const r = kernel.resolveUnknownSend(cardId, req.verdict, { approverId, seenItemRevision, seenAttempt: req.seenAttempt, ...(req.note ? { note: req.note } : {}) });
-    if (r === "revision_mismatch") return kernelRefusal({ status: r, actionId: cardId, currentRevision: approval(cardId).itemRevision }, cardId);
-    if (r !== "resolved") throw wrongState("这条消息的发送结果不是“未知”");
-    return clarifyResult("verified", true, req.verdict === "sent" ? "已记录：对方收到了" : "已记录：对方没收到，可以重新发送", cardId);
-  }
-
-  async function abandon(cardId: string, req: NoteRequest, as: DeskActor): Promise<ClarifyMutationResponse> {
-    const item = kernel.humanItems.get(cardId);
-    if (!item) throw missing("找不到这张卡");
-    if (item.itemRevision !== seenRevisionOf(req?.seenItemRevision))
-      return kernelRefusal({status:"revision_mismatch",actionId:cardId,currentRevision:item.itemRevision},cardId);
-    await kernel.humanItems.decide(cardId,{optionId:"system.abandon", seenItemRevision:item.itemRevision,
-      ...(item.artifactVersion !== null ? {seenArtifactVersion:item.artifactVersion} : {})},principalOf(as));
-    return clarifyResult("abandoned", true, "已放弃发送", cardId);
   }
 
   // ==================== 🎯 Engage ====================
@@ -722,37 +626,11 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
         const result = await kernel.resolveApproval(linked, { decision: "dismiss", approverId, seenItemRevision: seen, reason: "the owner handled it personally" });
         if (result.status === "revision_mismatch") return stale(result.currentRevision);
         if (result.status !== "dismissed") throw wrongState("关联卡片正在处理，请刷新");
-      } else if (rec.status === "approved") {
-        throw wrongState("正在发送，请等待回执");
-      } else if (rec.status === "failed") {
-        const result = await abandon(linked, { seenItemRevision: seen }, as);
-        if (!result.ok) return stale(approval(linked).itemRevision);
       }
     }
     const note = typeof req?.note === "string" ? req.note : undefined;
     const closedTasks = await completeAction(a, note || (byAgent(as) ? "主 Agent 代你勾选了已办完" : "你勾选了已办完"), undefined, as, note);
     return engageResult("done", true, closedTasks > 0 ? `已办完，并结束了 ${closedTasks} 项相关后台任务` : "已办完", { closedTasks });
-  }
-
-  async function engageSend(cellId: string, actionId: string, req: EngageSendRequest, as: DeskActor): Promise<EngageMutationResponse> {
-    principalOf(as);
-    const a = findAction(cellId, actionId);
-    const linked = linkedApprovalId(a.record);
-    if (!linked) throw wrongState("这件事没有待发送的草稿");
-    if (a.record.status !== "open") return engageResult("already_done", true, "这件事已经办完了");
-    if (!Number.isInteger(req?.seenVersion)) throw bad("seenVersion 必须是整数");
-    const r = await runApprove(linked, req.seenVersion, req.seenItemRevision, as);
-    let closedTasks = 0;
-    // An unknown send is the channel's problem to verify (it stays in Clarify); the owner's part is done.
-    // Same activity id as the desk's own record of a sent reply, so one send is one entry in the drawer.
-    if (r.outcome === "sent" || r.outcome === "unknown") closedTasks = await completeAction(a, r.outcome === "sent" ? "定稿已发送" : "定稿已发出，结果待核实", `sent-${linked}`, as);
-    const ok = r.outcome === "sent";
-    return engageResult(r.outcome, ok, r.outcome === "unknown" ? `${r.message}（在待确认里核实）` : r.message, {
-      closedTasks,
-      ...(r.currentVersion !== undefined ? { currentVersion: r.currentVersion } : {}),
-      ...(r.currentRevision !== undefined ? { currentRevision: r.currentRevision } : {}),
-      ...(r.error ? { error: r.error } : {}),
-    });
   }
 
   // ==================== drafts ====================
@@ -857,7 +735,6 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
       }
       case "resume": {
         if (!open) return projectResult("not_applied", false, "这个项目没有可以继续的任务");
-        if (cell.pauseReason === "budget_declined") return projectResult("not_applied", false, "额度已用尽，请先追加额度或关闭预算限额");
         if (record.lifecycle === "someday") return projectResult("not_applied", false, `「${record.title}」在以后再说里：用“重新启动”让它继续`);
         if (cell.status === "active") return projectResult("resumed", true, `「${record.title}」正在推进`);
         const r = control("resume");
@@ -1044,26 +921,6 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     return reviewResult("dismissed", true, "好的，不保存");
   }
 
-  function enableRule(req: EnableRuleRequest, as: DeskActor): ReviewMutationResponse {
-    principalOf(as);
-    if (typeof req?.actionClass !== "string") throw bad("需要 actionClass");
-    const maxUses = req.maxUses ?? 20;
-    if (!Number.isInteger(maxUses) || maxUses < 1) throw bad("maxUses 必须是正整数");
-    if (principalOf(as)!==owner) throw wrongState("只有主人可以开启常设规则");
-    const rule = ruleInputForClass(req.actionClass, { createdBy: owner, maxUses, note: "周回顾中开启的自动执行" });
-    if (!rule) throw bad("这类操作不能改成自动执行");
-    gate.upsertPolicyRuleSync(rule);
-    gate.markTrustSuggestedSync([req.actionClass]);
-    return reviewResult("rule_enabled", true, `已改成自动执行（最多 ${maxUses} 次）`);
-  }
-
-  function dismissRule(req: EnableRuleRequest, as: DeskActor): ReviewMutationResponse {
-    principalOf(as);
-    if (typeof req?.actionClass !== "string") throw bad("需要 actionClass");
-    gate.markTrustSuggestedSync([req.actionClass]);
-    return reviewResult("dismissed", true, "好的，这类操作仍然每次请你确认");
-  }
-
   function checkEntry(entry: unknown): string {
     if (typeof entry !== "string" || !entry.trim()) throw bad("需要脚本路径或检查名");
     const e = entry.trim();
@@ -1108,17 +965,6 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     });
     if (!r.restorable || r.restoredAt) return result("not_restorable", false, r.restoredAt ? "已经移回过了" : "这条记录不能移回");
     const restored = { ...r, restoredAt: now() };
-    if (r.actionId && r.kind === "card_withdrawn" && r.detail === abandonDetail) {
-      const rec = gate.getApprovalSync(r.actionId);
-      if (rec?.statusReason === `abandoned:${activityId}`) {
-        withTx(kernel.db, () => {
-          if (!gate.setSendAbandonedSync(rec.actionId, activityId, false, rec.itemRevision)) throw wrongState("这张卡已经变动");
-          commitState(cellId, { [key]: restored });
-        });
-        return result("restored", true, "已移回待确认");
-      }
-      return result("not_restorable", false, "这条发送记录已经有了新的处理结果");
-    }
     const original = r.envelope ?? (r.actionId ? originalEnvelope(asClarifyCard(gate.getApprovalSync(r.actionId)?.card.data)?.source.envelopeId) : null);
     if (original) {
       const handback = createEnvelope<HandbackPayload>(
@@ -1279,7 +1125,6 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
   return {
     ownerPrincipal: owner,
     status,
-    setBudgetLimits,
     topology: agents.topology,
     timeline: agents.timeline,
     resource: agents.resource,
@@ -1298,12 +1143,6 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     },
     cellControl: agents.control,
     cellTrigger: agents.trigger,
-    async editorLease(id:string, active:boolean, as:DeskActor) {
-      principalOf(as);
-      kernel.hub.setEditorLeaseSync(id,active);
-      if (!kernel.hub.isFocusSync()) await kernel.hub.flushBuffered(true);
-      return status().focus;
-    },
     recentlyClosedProjects: () => kernel.listCells({status:["closed"],preset:"project"}).sort((a,b)=>b.updatedAt-a.updatedAt)
       .slice(0,30).map(c=>({id:c.id,title:c.title ?? c.id,reason:c.closeReason})),
     listHumanItems: (includeSnoozed = false) => kernel.humanItems.list(includeSnoozed).map(item => {
@@ -1312,7 +1151,6 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
         .map(row => ({cellId:row.cell_id, actionId:row.key.slice(gtdKeys.actionPrefix.length)}));
       const rec = kernel.gate.getApprovalSync(item.id);
       const card = rec ? asClarifyCard(rec.card.data) : null;
-      const attempted = item.status === "unknown" ? kernel.hub.getLatestOutboxByActionSync(item.id) : null;
       const closeTargets: Record<string,ReturnType<typeof closureMembers>> = {};
       for (const o of item.options) if (o.terminateMode==="cancel_task") closeTargets[o.id]=closureMembers(o.targetCellIds![0]!);
       const projects=item.relatedProjectIds.map(id=>kernel.getCell(id)).filter(p=>p!==undefined)
@@ -1320,8 +1158,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
       const plan=item.action?.type==="project.start" ? (item.artifactId ? context.getArtifactSync(item.artifactId)?.content.data : item.action.proposal) : undefined;
       return {...item, actionRefs, resumeTarget:paused ? {id:paused.id, title:paused.title ?? paused.id} : null, proposal:isProjectProposal(plan) ? plan : null, projects, closeTargets, artifact:item.artifactId ? artifactDTO(kernel,item.artifactId,now()) : null,
         project:project ? {id:project.id,title:project.title ?? project.id,paused:project.status==="paused",parked:project.pauseReason==="parked"} : null,
-        ownerOnly:rec ? ownerOnlyApproval({...rec.action,card:rec.card},kernel.ownerAddresses)!==null : false,
-        attempted:attempted ? {target:attempted.target,body:attempted.content.body} : null,
+        ownerOnly:rec ? ownerOnlyApproval(rec.action)!==null : false,
       };
     }),
     async decideHumanItem(id: string, decision: HumanDecision, as: DeskActor) {
@@ -1363,7 +1200,6 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     engageDetail,
     artifact,
     ingest,
-    focus,
     approve,
     revise,
     snooze,
@@ -1373,18 +1209,13 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     resolveOffline,
     dismiss,
     deny,
-    verify,
-    abandon,
     done,
-    engageSend,
     saveArtifact,
     dismissParked,
     projectOp,
     addProjectAction,
     acceptSkill,
     dismissSkill,
-    enableRule,
-    dismissRule,
     sensorToCode,
     restoreActivity,
     createSource,

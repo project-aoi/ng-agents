@@ -61,17 +61,16 @@ function payloadText(env: Envelope): string {
     const ar = p as Partial<ApprovalResolvedPayload> & { decision?: string };
     const act = ar.action as { type?: string; summary?: string } | undefined;
     const summary = act?.summary ? ` "${one(act.summary, 100)}"` : "";
-    const receipt = ar.outcome?.receipt ? ` (${ar.outcome.receipt})` : "";
     const err = ar.outcome?.error ? ` — ${one(ar.outcome.error, 120)}` : "";
     const note = ar.note ? ` · note: ${one(ar.note, 100)}` : "";
-    return `approval ${ar.actionId ?? "?"} ${ar.decision ?? ar.status ?? "?"}${receipt}${summary}${err}${note}`;
+    return `approval ${ar.actionId ?? "?"} ${ar.decision ?? ar.status ?? "?"}${summary}${err}${note}`;
   }
   for (const k of ["text", "instruction", "message", "summary", "label", "reason", "detail"]) if (typeof p[k] === "string" && p[k]) return p[k] as string;
   return "";
 }
 
 /** What a tool call was about, in a few words: the command, the path, the patch's files. */
-function callBrief(name: string, input: unknown): string {
+function callBrief(input: unknown): string {
   if (input === null || typeof input !== "object") return typeof input === "string" ? one(input, 160) : "";
   const o = input as Record<string, unknown>;
   for (const k of ["command", "cmd", "file_path", "path", "filePath", "pattern", "query", "url", "title", "to", "artifactId", "cellId"]) {
@@ -137,7 +136,7 @@ export function inspectCell(
       case "tool_call": {
         const id = (r.input as { artifactId?: unknown } | null)?.artifactId;
         if ((r.name === "save_artifact" || r.name === "patch_artifact") && typeof id === "string") artifactIds.add(id);
-        const brief = detail === "full" ? JSON.stringify(r.input ?? {}) : callBrief(r.name, r.input);
+        const brief = detail === "full" ? JSON.stringify(r.input ?? {}) : callBrief(r.input);
         line = `#${seq} · ${r.name}${brief ? `: ${detail === "full" ? brief : one(brief, 240)}` : ""}`;
         openCalls.set(r.toolUseId, formatted.length);
         break;

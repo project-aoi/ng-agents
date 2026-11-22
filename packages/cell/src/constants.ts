@@ -1,23 +1,19 @@
-import { TOOL_KINDS, type Address, type BoundsInit, type ToolKind } from "@ng/protocol";
+import { TOOL_KINDS, type Address, type BoundsInit } from "@ng/protocol";
 
 /**
  * What a root cell (the desk) holds when its creator does not say otherwise. The desk delegates, so it holds the
- * top-level authority (every tool, any channel with Gate approval, every inbox) and by its prompt only reads;
- * isolation "none" (docs/05: the owner's real machine) is a floor a child may raise explicitly. Budgets are
- * cumulative and must be positive: a zero budget is exhausted from the start (the owner raises them from a card).
+ * top-level authority over its tools and delivery addresses.
  * maxConcurrentChildren counts leaf children that are at work only, so parked projects and dormant workers never fill it.
  */
-export const DEFAULT_ROOT_BOUNDS: Readonly<Required<Omit<BoundsInit, "secretRefs">>> & Pick<BoundsInit, "secretRefs"> = {
+export const DEFAULT_ROOT_BOUNDS: Readonly<Required<BoundsInit>> = {
   tools: [...TOOL_KINDS],
   canSendTo: ["channel:*", "inbox:*"] as Address[],
   isolation: "none",
   maxConcurrentChildren: 16,
-  maxTokens: 20_000_000,
-  maxCents: 5_000,
   maxDepth: 4,
 };
 
-/** `ProposedAction.custom.name` of the escalation cards the kernel itself raises (dead letters, budget stops). */
+/** `ProposedAction.custom.name` of the escalation cards the kernel itself raises (dead letters). */
 export const KERNEL_ESCALATION = "kernel.escalation";
 /** Principal recorded on kernel-raised escalation approvals. */
 export const KERNEL_ESCALATION_PRINCIPAL = "kernel:escalation";

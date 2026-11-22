@@ -10,7 +10,6 @@ import {
   PAYLOAD,
   selectRunTools,
   type CellInspection,
-  type ChannelSendAction,
   type Envelope,
   type ProposedAction,
   type SendToCellResult,
@@ -40,104 +39,32 @@ async function invoke(run: FakeRun, name: string, input: unknown) {
 const c = clock();
 const fakeRun = (o: FakeRunOptions = {}) => createFakeRun({ clock: c, ...o });
 
-const feishuMessage: Envelope = createEnvelope(
+const message: Envelope = createEnvelope(
   {
-    id: "env_feishu_1",
-    from: "channel:feishu:oc_group",
-    principalId: "feishu:ou_zhang",
+    id: "env_local_1",
+    from: "channel:memory:team",
+    principalId: "memory:zhang",
     kind: "event",
     type: "user.message",
     payload: { text: "方案什么时候能好？" },
-    threads: ["feishu:oc_group"],
+    threads: ["memory:team"],
   },
   c,
 );
 
 describe("kernel.comms send_message", () => {
-  it("notifies the owner directly (notify_owner, token, idempotency key) without creating a draft", async () => {
-    const run = fakeRun({ batch: ["提醒我下午三点开会"] });
-    const r = await invoke(run, "send_message", { to: "channel:ui:owner", text: "三点有会", summary: "会议提醒" });
-    expect(r.output).toBe("Sent.");
-    const action = run.ports.log.authorizations[0]!.action as ChannelSendAction;
-    expect(action).toMatchObject({ type: "channel.send", sideEffect: "notify_owner", target: "channel:ui:owner", subjectKey: "reply:channel:ui:owner:env_1" });
-    expect(action.card).toBeUndefined();
-    expect(run.ports.artifacts.size).toBe(0);
-    const send = run.ports.log.sends[0]!;
-    expect(send).toMatchObject({ target: "channel:ui:owner", actionToken: "tok_1", respectDnd: true, content: { format: "text", body: "三点有会" } });
-    expect(send.idempotencyKey).toMatch(/^run_1:tu_/);
-  });
-
-  it("sends outward as a versioned draft with a response card bound to that version", async () => {
-    const run = fakeRun({ batch: [feishuMessage] });
-    const r = await invoke(run, "send_message", {
-      to: "channel:feishu:oc_group",
-      text: "周五前给你初稿。",
-      summary: "回复张三方案进度",
-      targetLabel: "研发群（飞书）",
-      prep: { summary: "查了排期表", checked: [{ label: "排期", uri: "note://schedule" }] },
-    });
-    expect(r.endRun).toBe("deferred_for_approval");
-    const { action, opts } = run.ports.log.authorizations[0]!;
-    const send = action as ChannelSendAction;
-    expect(send.sideEffect).toBe("external");
-    expect(send.artifactId).toMatch(/^art_/);
-    expect(opts).toEqual({ artifactVersion: 1 });
-    expect(run.ports.artifacts.get(send.artifactId!)!.content.body).toBe("周五前给你初稿。");
-    const card = asClarifyCard(send.card?.data);
-    expect(card).toMatchObject({
-      cardType: "response",
-      subjectKey: "reply:channel:feishu:oc_group:feishu:oc_group",
-      source: { label: "飞书", channelId: "feishu", principalId: "feishu:ou_zhang", envelopeId: "env_feishu_1" },
-      rawInput: { text: "方案什么时候能好？", kind: "message" },
-      prep: { summary: "查了排期表", checked: [{ label: "排期", uri: "note://schedule" }] },
-      draft: { artifactId: send.artifactId, version: 1 },
-      reply: { target: "channel:feishu:oc_group", targetLabel: "研发群（飞书）" },
-      confirmVerb: "send",
-    });
-    expect(run.ports.log.sends).toHaveLength(0);
-  });
-
-  it("sends the current (human-edited) version of an existing draft and binds the approval to it", async () => {
-    const run = fakeRun({ batch: [feishuMessage] });
-    await invoke(run, "save_artifact", { artifactId: "art_reply", body: "初稿" });
-    run.ports.humanEdit("art_reply", "人工改过的稿");
-    await invoke(run, "send_message", { to: "channel:feishu:oc_group", artifactId: "art_reply", summary: "回复" });
-    const { action, opts } = run.ports.log.authorizations[0]!;
-    expect((action as ChannelSendAction).content!.body).toBe("人工改过的稿");
-    expect(opts).toEqual({ artifactVersion: 2 });
-  });
-
-  it("builds an escalation card for a timeout nudge and reports receipts honestly when allowed", async () => {
-    const run = fakeRun({
-      batch: [feishuMessage],
-      authorize: () => ({ type: "allow", actionToken: "tok_rule" }),
-      notify: () => "unknown",
-    });
-    const r = await invoke(run, "send_message", {
-      to: "channel:feishu:ou_c",
-      text: "您好，报价方便今天发一下吗？",
-      summary: "催供应商 C",
-      nudge: { explanation: "供应商 C 已超时 1 天未回" },
-    });
-    const send = run.ports.log.authorizations[0]!.action as ChannelSendAction;
-    expect(asClarifyCard(send.card?.data)).toMatchObject({
-      cardType: "escalation",
-      escalation: { reason: "waiting_timeout", nudgeTarget: "channel:feishu:ou_c", nudgeDraft: { version: 1 } },
-    });
-    expect(r.isError).toBe(true);
-    expect(r.output).toContain("Do not resend");
-  });
-
-  it("rejects non-addresses and ambiguous content", async () => {
+  it("writes the owner's workbench notification with a stable key", async () => {
     const run = fakeRun();
-    expect(await invoke(run, "send_message", { to: "desk", text: "x", summary: "s" })).toEqual({
-      output: '"desk" is not an address. Use channel:<channelId>:<target> for a person or inbox:<cellId> for a cell.',
-      isError: true,
-    });
-    expect((await invoke(run, "send_message", { to: "channel:ui:owner", summary: "s" })).isError).toBe(true);
-    expect((await invoke(run, "send_message", { to: "inbox:desk", summary: "s" })).isError).toBe(true); // a cell message needs text
+    await invoke(run, "send_message", { to: "channel:ui:owner", text: "三点有会", summary: "会议提醒" });
+    expect(run.ports.log.notifications).toEqual([{ idempotencyKey: `run_1:tu_${callCounter}`, content: { format: "text", body: "三点有会" } }]);
+    expect(run.ports.artifacts.size).toBe(0);
+  });
+
+  it("rejects an invalid address before writing a message", async () => {
+    const run = fakeRun();
+    expect((await invoke(run, "send_message", { to: "desk", text: "x", summary: "s" })).isError).toBe(true);
     expect(run.ports.log.cellMessages).toEqual([]);
-    expect(run.ports.log.authorizations).toEqual([]);
+    expect(run.ports.log.notifications).toEqual([]);
   });
 
   it("delivers to another cell's inbox without an approval, and says so out loud when the target is closed", async () => {
@@ -172,19 +99,14 @@ describe("kernel.comms send_message", () => {
     expect(ghost).toMatchObject({ isError: true, output: expect.stringMatching(/^NOT DELIVERED — there is no cell "ghost"/) });
     // cell-to-cell messages never go through the Gate or a channel
     expect(run.ports.log.authorizations).toEqual([]);
-    expect(run.ports.log.sends).toEqual([]);
+    expect(run.ports.log.notifications).toEqual([]);
   });
 
-  it("keeps the reply scoped to its recipient and thread inside a project", async () => {
-    const run = fakeRun({ spec: { meta: { projectCellId: "proj_1" } }, batch: [feishuMessage] });
-    await invoke(run, "send_message", { to: "channel:ui:owner", text: "进度 2/3", summary: "进度" });
-    expect(run.ports.log.authorizations[0]!.action.subjectKey).toBe(`reply:channel:ui:owner:${feishuMessage.threads?.[0] ?? feishuMessage.id}`);
-  });
 });
 
 describe("kernel.comms request_approval / report_to_parent / handback / wait", () => {
   it("proposes a project as a project.start action with a json draft and a proposal card", async () => {
-    const run = fakeRun({ batch: [feishuMessage] });
+    const run = fakeRun({ batch: [message] });
     const r = await invoke(run, "request_approval", {
       kind: "project",
       title: "支付报错排查",
@@ -208,13 +130,6 @@ describe("kernel.comms request_approval / report_to_parent / handback / wait", (
     expect(action.artifactId).toBe(draftId);
   });
 
-  it("goes ahead immediately when a standing rule allows the request", async () => {
-    const run = fakeRun({ authorize: () => ({ type: "allow", actionToken: "tok" }) });
-    const r = await invoke(run, "request_approval", { kind: "action", title: "合并 PR #108", summary: "merge #108", action: { name: "merge_pr", args: { pr: 108 } }, options: [{id:"investigate",label:"先核对",effect:"reply"}] });
-    expect(r.output).toContain("go ahead");
-    expect(r.endRun).toBeUndefined();
-    expect(run.ports.log.authorizations[0]!.action).toMatchObject({ type: "custom", name: "merge_pr", args: { pr: 108 }, sideEffect: "external" });
-  });
 
   it("escalates as a custom action with an escalation card", async () => {
     const run = fakeRun();
@@ -291,34 +206,34 @@ describe("kernel.comms request_approval / report_to_parent / handback / wait", (
   });
 
   it("hands back through the kernel port when present, else commits the handback envelope to the desk", async () => {
-    const withPort = fakeRun({ cellId: "watch1", batch: [feishuMessage] });
+    const withPort = fakeRun({ cellId: "watch1", batch: [message] });
     const calls: Array<[string, string]> = [];
     Object.assign(withPort.ports, { handback: async (id: string, reason: string) => void calls.push([id, reason]) });
     await invoke(withPort, "handback", { reason: "新问题，与报价无关" });
-    expect(calls).toEqual([["env_feishu_1", "新问题，与报价无关"]]);
+    expect(calls).toEqual([["env_local_1", "新问题，与报价无关"]]);
 
-    const fallback = fakeRun({ cellId: "watch1", batch: [feishuMessage] });
+    const fallback = fakeRun({ cellId: "watch1", batch: [message] });
     await invoke(fallback, "handback", { reason: "新问题" });
     const out = fallback.ports.log.inboxOut[0]!;
     expect(out.to).toBe("inbox:desk");
     expect(out.envelope).toMatchObject({
-      id: "env_feishu_1#handback#watch1",
+      id: "env_local_1#handback#watch1",
       type: "handback",
-      principalId: "feishu:ou_zhang",
-      payload: { fromCellId: "watch1", reason: "新问题", original: { id: "env_feishu_1" } },
+      principalId: "memory:zhang",
+      payload: { fromCellId: "watch1", reason: "新问题", original: { id: "env_local_1" } },
     });
   });
 
   describe("handback picks the message by envelopeId when a wake-up holds several", () => {
     const secondMessage: Envelope = createEnvelope(
       {
-        id: "env_feishu_2",
-        from: "channel:feishu:oc_group",
-        principalId: "feishu:ou_li",
+        id: "env_local_2",
+        from: "channel:memory:team",
+        principalId: "memory:li",
         kind: "event",
         type: "user.message",
         payload: { text: "顺便问一下：\n下周的团建定了吗？", sender: { id: "ou_li", name: "李四" } },
-        threads: ["feishu:oc_group"],
+        threads: ["memory:team"],
       },
       c,
     );
@@ -333,57 +248,57 @@ describe("kernel.comms request_approval / report_to_parent / handback / wait", (
       return { run, calls };
     };
     const listing = [
-      `- envelopeId "env_feishu_1" — channel:feishu:oc_group: 方案什么时候能好？`,
-      `- envelopeId "env_feishu_2" — 李四: 顺便问一下： 下周的团建定了吗？`,
+      `- envelopeId "env_local_1" — channel:memory:team: 方案什么时候能好？`,
+      `- envelopeId "env_local_2" — 李四: 顺便问一下： 下周的团建定了吗？`,
     ].join("\n");
 
     it("one message: no id needed, also next to envelopes that are not messages", async () => {
       const { run, calls } = withPort([timer, secondMessage]);
-      expect(await invoke(run, "handback", { reason: "团建不归我管" })).toMatchObject({ output: "Handed back to the desk.", data: { envelopeId: "env_feishu_2" } });
-      expect(calls).toEqual([["env_feishu_2", "团建不归我管"]]);
+      expect(await invoke(run, "handback", { reason: "团建不归我管" })).toMatchObject({ output: "Handed back to the desk.", data: { envelopeId: "env_local_2" } });
+      expect(calls).toEqual([["env_local_2", "团建不归我管"]]);
     });
 
     it("several messages and no id: an error listing each message with its id; nothing is handed back", async () => {
-      const { run, calls } = withPort([feishuMessage, timer, secondMessage]);
+      const { run, calls } = withPort([message, timer, secondMessage]);
       const r = await invoke(run, "handback", { reason: "团建不归我管" });
       expect(r.isError).toBe(true);
       expect(r.output).toBe(`This wake-up holds 2 messages; say which one to hand back with envelopeId (once per message):\n${listing}`);
       expect(calls).toEqual([]);
       // the fallback path hands nothing to the desk either
-      const fallback = fakeRun({ cellId: "watch1", batch: [feishuMessage, secondMessage] });
+      const fallback = fakeRun({ cellId: "watch1", batch: [message, secondMessage] });
       expect((await invoke(fallback, "handback", { reason: "x" })).isError).toBe(true);
       expect(fallback.ports.log.inboxOut).toEqual([]);
     });
 
     it("an explicit id hands back exactly that message (once per message)", async () => {
-      const { run, calls } = withPort([feishuMessage, secondMessage]);
-      expect(await invoke(run, "handback", { reason: "团建不归我管", envelopeId: "env_feishu_2" })).toMatchObject({ data: { envelopeId: "env_feishu_2" } });
-      expect(await invoke(run, "handback", { reason: "方案另有人跟", envelopeId: " env_feishu_1 " })).toMatchObject({ data: { envelopeId: "env_feishu_1" } });
+      const { run, calls } = withPort([message, secondMessage]);
+      expect(await invoke(run, "handback", { reason: "团建不归我管", envelopeId: "env_local_2" })).toMatchObject({ data: { envelopeId: "env_local_2" } });
+      expect(await invoke(run, "handback", { reason: "方案另有人跟", envelopeId: " env_local_1 " })).toMatchObject({ data: { envelopeId: "env_local_1" } });
       expect(calls).toEqual([
-        ["env_feishu_2", "团建不归我管"],
-        ["env_feishu_1", "方案另有人跟"],
+        ["env_local_2", "团建不归我管"],
+        ["env_local_1", "方案另有人跟"],
       ]);
       // without the kernel port the handback envelope for that message goes to the desk
-      const fallback = fakeRun({ cellId: "watch1", batch: [feishuMessage, secondMessage] });
-      await invoke(fallback, "handback", { reason: "团建不归我管", envelopeId: "env_feishu_2" });
-      expect(fallback.ports.log.inboxOut.map((o) => [o.to, o.envelope.id])).toEqual([["inbox:desk", "env_feishu_2#handback#watch1"]]);
+      const fallback = fakeRun({ cellId: "watch1", batch: [message, secondMessage] });
+      await invoke(fallback, "handback", { reason: "团建不归我管", envelopeId: "env_local_2" });
+      expect(fallback.ports.log.inboxOut.map((o) => [o.to, o.envelope.id])).toEqual([["inbox:desk", "env_local_2#handback#watch1"]]);
     });
 
     it("a unique suffix or fragment of the id is enough; an ambiguous one is not", async () => {
-      const { run, calls } = withPort([feishuMessage, secondMessage]);
-      expect(await invoke(run, "handback", { reason: "团建", envelopeId: "_2" })).toMatchObject({ data: { envelopeId: "env_feishu_2" } });
-      expect(await invoke(run, "handback", { reason: "方案", envelopeId: "feishu_1" })).toMatchObject({ data: { envelopeId: "env_feishu_1" } });
+      const { run, calls } = withPort([message, secondMessage]);
+      expect(await invoke(run, "handback", { reason: "团建", envelopeId: "_2" })).toMatchObject({ data: { envelopeId: "env_local_2" } });
+      expect(await invoke(run, "handback", { reason: "方案", envelopeId: "local_1" })).toMatchObject({ data: { envelopeId: "env_local_1" } });
       expect(calls).toEqual([
-        ["env_feishu_2", "团建"],
-        ["env_feishu_1", "方案"],
+        ["env_local_2", "团建"],
+        ["env_local_1", "方案"],
       ]);
-      const ambiguous = await invoke(run, "handback", { reason: "?", envelopeId: "feishu" });
-      expect(ambiguous).toMatchObject({ isError: true, output: `No message "feishu" in this wake-up. The messages are:\n${listing}` });
+      const ambiguous = await invoke(run, "handback", { reason: "?", envelopeId: "local" });
+      expect(ambiguous).toMatchObject({ isError: true, output: `No message "local" in this wake-up. The messages are:\n${listing}` });
       expect(calls).toHaveLength(2);
     });
 
     it("an unknown id: an error with the same list; nothing is handed back", async () => {
-      const { run, calls } = withPort([feishuMessage, secondMessage]);
+      const { run, calls } = withPort([message, secondMessage]);
       const r = await invoke(run, "handback", { reason: "x", envelopeId: "env_nope" });
       expect(r).toMatchObject({ isError: true, output: `No message "env_nope" in this wake-up. The messages are:\n${listing}` });
       expect(calls).toEqual([]);
@@ -683,7 +598,7 @@ describe("kernel.cells", () => {
       instruction: "修好 CI 并汇报",
       modelTier: "fast",
       contextMode: "fork_prefix",
-      bounds: { tools: ["read", "edit", "bash"], canSendTo: ["inbox:cell1"], maxTokens: 200000 },
+      bounds: { tools: ["read", "edit", "bash"], canSendTo: ["inbox:cell1"] },
       watches: [{ thread: "github:org/repo#108", cancelGroup: "pr108" }, { filter: { "payload.text": { $contains: "CI" } }, coalesceMinutes: 2 }],
       schedules: [{ at: "2026-11-18T09:00:00+08:00" }],
       cwd: "/repos/app",
@@ -712,8 +627,6 @@ describe("kernel.cells", () => {
     expect(spec.meta).toBeUndefined();
     expect([...spec.bounds!.tools!]).toEqual(["read", "edit", "bash"]);
 
-    // docs/05-proposals/03: no write queue — the spec carries no cwdMode
-    expect(spec).not.toHaveProperty("cwdMode");
 
     const r2 = await invoke(run, "spawn_cell", { preset: "sensor", title: "指标巡检", instruction: "每天 9 点查", input: { metric: "pay_success" } });
     expect(r2.output).toBe('Spawned "指标巡检" (sensor) as inbox:child_2 — cell id child_2. It starts now; you are woken when its turn is over.');
@@ -722,7 +635,6 @@ describe("kernel.cells", () => {
       initialPayload: { instruction: "每天 9 点查", input: { metric: "pay_success" } },
     });
     expect(run.ports.log.spawned[1]!.spec).not.toHaveProperty("cwd");
-    expect(run.ports.log.spawned[1]!.spec).not.toHaveProperty("cwdMode");
     expect((await invoke(run, "spawn_cell", { preset: "watcher", title: "t", instruction: "i" })).isError).toBe(true);
     // thrown errors become isError results inside the loop
     await expect(invoke(run, "spawn_cell", { preset: "worker", title: "t", instruction: "i", bounds: { canSendTo: ["nope"] } })).rejects.toThrow(
@@ -768,21 +680,6 @@ describe("kernel.cells", () => {
     expect(offered(1)).toEqual(["spawn_cell", "inspect_cell", "update_cell", "control_cell", "close_cell"]);
   });
 
-  it("spawn_cell takes no cwdMode (docs/05-proposals/03): it is not in the schema, and a stray one never reaches the spec", async () => {
-    const schema = tool("spawn_cell").inputSchema as { properties: Record<string, unknown> };
-    expect(Object.keys(schema.properties)).toContain("cwd");
-    expect(Object.keys(schema.properties)).not.toContain("cwdMode");
-    // the description says a child starts at once and nobody locks a directory
-    expect(tool("spawn_cell").description).toContain("It starts at once: nothing queues or locks a directory.");
-    expect(tool("spawn_cell").description).toContain('"active workspaces"');
-    expect(tool("spawn_cell").description).not.toMatch(/write queue|cwdMode/);
-
-    const run = fakeRun();
-    const r = await invoke(run, "spawn_cell", { preset: "worker", title: "t", instruction: "i", cwd: "/repos/app", cwdMode: "write" });
-    expect(r.isError).toBeUndefined();
-    expect(run.ports.log.spawned[0]!.spec).toMatchObject({ cwd: "/repos/app" });
-    expect(run.ports.log.spawned[0]!.spec).not.toHaveProperty("cwdMode");
-  });
 });
 
 describe("kernel.cells inspect_cell", () => {
@@ -871,29 +768,6 @@ describe("kernel.schedule", () => {
 });
 
 describe("workspace", () => {
-  it("validates read ops and forwards exec, surfacing non-zero exit codes", async () => {
-    const run = fakeRun({ exec: (t) => (t === "bash" ? { output: "1 failed", exitCode: 1 } : { output: "file text" }) });
-    expect((await invoke(run, "read", { op: "read_file", path: "src/a.ts", limit: 20 })).output).toBe("file text");
-    expect((await invoke(run, "read", { op: "search" })).isError).toBe(true);
-    const failBash = await invoke(run, "bash", { command: "pnpm test" });
-    expect(failBash.output).toBe("1 failed\n[exit code 1]");
-    expect(failBash.isError).toBe(true);
-    const okRun = fakeRun({ exec: () => ({ output: "all green", exitCode: 0 }) });
-    const okBash = await invoke(okRun, "bash", { command: "pnpm test" });
-    expect(okBash.output).toBe("all green");
-    expect(okBash.isError).toBeUndefined();
-    expect(run.ports.log.execs).toEqual([
-      { tool: "read", args: { op: "read_file", path: "src/a.ts", limit: 20 } },
-      { tool: "bash", args: { command: "pnpm test" } },
-    ]);
-    const started = await invoke(run, "job_start", { command: "pnpm build" });
-    expect(started.awaitsWakeup).toBe(true);
-    const jobId = (started.data as { jobId: string }).jobId;
-    await invoke(run, "job_input", { jobId, input: "y\n" });
-    expect((await invoke(run, "job_observe", { jobId })).output).toContain("state: running");
-    await invoke(run, "job_cancel", { jobId });
-    expect(run.ports.log.jobs[0]).toMatchObject({ input: ["y\n"], cancelled: true });
-  });
 
   it("Review fix (BUG-020): set_state blocks kernel-owned cell:* and pull:* keys alongside gtd:project/source/activity, cli:*, sys:*", async () => {
     const run = fakeRun();

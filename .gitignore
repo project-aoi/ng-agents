@@ -6,4 +6,3 @@ data/
 *.tsbuildinfo
 .vite/
 .DS_Store
-data-demo/

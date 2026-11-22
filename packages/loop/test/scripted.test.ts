@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { textMessage, type ModelRequest } from "@ng/protocol";
-import { call, say, ScriptedModelClient } from "../src";
+import { call, say, ScriptedModelClient } from "../src/testing";
 
 const req = (text: string, extra: Partial<ModelRequest> = {}): ModelRequest => ({
   tier: "fast",
@@ -12,17 +12,13 @@ const req = (text: string, extra: Partial<ModelRequest> = {}): ModelRequest => (
 });
 
 describe("ScriptedModelClient", () => {
-  it("plays a fixed sequence, records requests, estimates usage and ids tool calls uniquely per run", async () => {
-    const m = new ScriptedModelClient([call("save_note", { name: "x" }), say("done", { usage: { inputTokens: 7, outputTokens: 3 } })], {
-      price: { input: 1, output: 2 },
-    });
+  it("plays a fixed sequence, records requests and ids tool calls uniquely per run", async () => {
+    const m = new ScriptedModelClient([call("save_note", { name: "x" }), say("done")]);
     const a = await m.complete(req("hello"));
     expect(a.content).toEqual([{ type: "tool_use", id: "toolu_run_9_0_0", name: "save_note", input: { name: "x" } }]);
     expect(a.stopReason).toBe("tool_use");
-    expect(a.usage.inputTokens).toBeGreaterThan(0);
     const b = await m.complete(req("next"));
     expect(b).toMatchObject({ content: [{ type: "text", text: "done" }], stopReason: "end_turn", model: "scripted-fast" });
-    expect(b.usage).toMatchObject({ inputTokens: 7, outputTokens: 3, tokens: 10, billedCents: (7 + 6) / 1e4, priced: true });
     expect(m.calls.map((r) => r.messages[0]!.content[0])).toEqual([{ type: "text", text: "hello" }, { type: "text", text: "next" }]);
     expect(m.remaining).toBe(0);
     await expect(m.complete(req("more"))).rejects.toThrow("script exhausted");
@@ -30,7 +26,7 @@ describe("ScriptedModelClient", () => {
     expect((await lenient.complete(req("x"))).content).toEqual([]);
   });
 
-  it("answers from a function of the request (demo mode)", async () => {
+  it("answers from a function of the request", async () => {
     const m = new ScriptedModelClient((r, ctx) => {
       if (ctx.toolResults.length) return say(`saved (${ctx.toolResults[0]!.content})`);
       if (ctx.lastUserText.includes("记") && ctx.toolNames.includes("save_note")) return call("save_note", { name: "memo", body: ctx.lastUserText });

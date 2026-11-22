@@ -22,10 +22,10 @@ describe("kernel with CLI engines", () => {
   it("runs a cell with engine set through its CLI loop while the desk runs through the API loop", async () => {
     const fakes = tempDir("fake-cli");
     const claude = installFakeCli(fakes, "claude", [
-      { actions: [{ text: "noting it" }, { mcp: "set_state", args: { patches: { seen: "yes" } } }, { usage: { tokens: 700, costUsd: 0.01 } }] },
+      { actions: [{ text: "noting it" }, { mcp: "set_state", args: { patches: { seen: "yes" } } }] },
     ]);
     const h = await boot({ kernel: { cli: { claude: cliOpts(claude) } } });
-    expect(h.kernel.agentBackend).toBe("api");
+    expect(h.kernel.agentBackend).toBeNull();
     h.script.add("desk", tool("set_state", { patches: { desk: "api" } }), { text: "ok" });
     h.kernel.createRootCell({ id: "clicell", title: "CLI cell", processor: { kind: "llm", engine: "claude", toolsets: [TOOLSETS.context, TOOLSETS.comms] } });
 
@@ -36,7 +36,7 @@ describe("kernel with CLI engines", () => {
     // desk: API loop (the scripted model saw its request); the CLI cell never reached the model client
     expect(h.kernel.context.readStateSync("desk", "desk")).toBe("api");
     expect(h.script.requests.map((r) => r.cellId)).not.toContain("clicell");
-    // CLI cell: kernel tool through the MCP bridge, transcript mirrored, usage on the shared ledger, session persisted
+    // CLI cell: kernel tool through the MCP bridge, transcript mirrored, session persisted
     expect(h.kernel.context.readStateSync("clicell", "seen")).toBe("yes");
     const ev = evidence(h, "clicell");
     const kinds = ev.map(e => e.kind);
@@ -44,9 +44,6 @@ describe("kernel with CLI engines", () => {
     expect(kinds.slice(2,-1).sort()).toEqual(["assistant_text","tool_call","tool_result"]);
     expect(kinds.indexOf("tool_call")).toBeLessThan(kinds.indexOf("tool_result"));
     expect(ev.at(-1)).toMatchObject({ kind: "run_boundary", phase: "end", outcome: "completed" });
-    const usage = h.kernel.gate.usageSync("clicell");
-    expect(usage.ownTokens).toBeGreaterThanOrEqual(700);
-    expect(usage.ownCents).toBeCloseTo(1, 5);
     const rec = h.kernel.context.readStateSync<CliSessionRecord>("clicell", CLI_SESSION_KEY)!;
     expect(rec.engine).toBe("claude");
 
@@ -60,7 +57,7 @@ describe("kernel with CLI engines", () => {
     expect(claude.log().find((e) => e.type === "argv")!["cwd"]).toBe(join(h.dataDir, "cells", "clicell"));
   });
 
-  it("runs a worker on the host in its cwd (unsandboxed) and an explicit git_worktree one in its worktree (workspace-write); a fork_prefix child forks the parent's CLI session", async () => {
+  it("runs a worker on the host in its cwd (unsandboxed) and a fork_prefix child forks the parent's CLI session", async () => {
     const fakes = tempDir("fake-cli");
     const codex = installFakeCli(fakes, "codex", [
       { actions: [{ native: "shell", input: { command: "make" }, output: "built" }, { mcp: "report_to_parent", args: { kind: "result", text: "built it" } }] },
@@ -93,17 +90,6 @@ describe("kernel with CLI engines", () => {
       deskEv.flatMap((e) => (e.kind === "inbound" && e.envelope.type === PAYLOAD.cellResult ? [[e.envelope.id, (e.envelope.payload as CellResultPayload).summary]] : [])),
     ).toEqual([[`build:${buildRun}:settled`, "built it"]]);
 
-    // an explicitly isolated worker (opt-in, from a named repository): its own worktree, sandboxed
-    h.kernel.spawnCell(
-      "desk",
-      { id: "iso", preset: "worker", title: "isolated build", bounds: { isolation: "git_worktree" }, meta: { workspace: { repoPath: repo } }, processor: codexProcessor },
-      "build it",
-    );
-    await h.kernel.idle();
-    expect(String(argvs()[1]!["cwd"])).toContain(`${h.dataDir}/workspace/worktrees/`);
-    expect(configs()[1]).toMatchObject({ sandbox: "workspace-write", approval: "never", mcpApproval: "approve" });
-    expect(h.kernel.getCell("iso")!.status).toBe("active");
-
     // a CLI-run parent spawning a fork_prefix child: the kernel hands the child the parent's session to fork
     h.kernel.createRootCell({ id: "lead", cwd:repo, processor: { kind: "llm", engine: "claude", toolsets: [TOOLSETS.context, TOOLSETS.comms, TOOLSETS.cells] } });
     message(h, "lead", "unique-parent-start");
@@ -129,7 +115,6 @@ describe("kernel with CLI engines", () => {
     const agy = installFakeCli(fakes, "agy", [{ actions: [{ mcp: "set_state", args: { patches: { via: "agy" } } }] }]);
     const missing = `${fakes}/not-installed`;
     expect(() => createKernel({ agentBackend: "auto", cli: { claude: { bin: missing }, codex: { bin: missing }, agy: { bin: missing } } })).toThrow(/installed CLI agent/);
-    expect(() => createKernel({ agentBackend: "api" })).toThrow(/needs a model/);
 
     const h = await boot({ kernel: { model: undefined, agentBackend: "auto", cli: { claude: { bin: missing }, codex: { bin: missing }, agy: cliOpts(agy) } } });
     expect(h.kernel.agentBackend).toBe("agy");

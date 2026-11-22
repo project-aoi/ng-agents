@@ -12,14 +12,8 @@ export const workspaceSchema: SchemaModule = {
   ddl: /* sql */ `
 CREATE TABLE IF NOT EXISTS workspaces (
   cell_id       TEXT PRIMARY KEY REFERENCES cells(id),
-  isolation     TEXT NOT NULL CHECK (isolation IN ('none','shared_ro','git_worktree','container','cow_microvm')),
   path          TEXT,                          -- host working directory
-  base_repo     TEXT,
-  base_ref      TEXT,
-  branch        TEXT,
-  container_id  TEXT,
-  status        TEXT NOT NULL CHECK (status IN ('active','hibernated','destroyed','failed')),
-  snapshot_id   TEXT,
+  status        TEXT NOT NULL CHECK (status IN ('active','failed')),
   error         TEXT,
   created_at    INTEGER NOT NULL,
   updated_at    INTEGER NOT NULL
@@ -36,14 +30,13 @@ CREATE TABLE IF NOT EXISTS jobs (
   process_identity    TEXT,
   log_path            TEXT,
   exit_code           INTEGER,
-  stream_preview      INTEGER NOT NULL DEFAULT 0,
   result_envelope_id  TEXT,                    -- set once job.result is enqueued (idempotent completion)
   error               TEXT,
   started_at          INTEGER NOT NULL,
   finished_at         INTEGER,
   updated_at          INTEGER NOT NULL,
   cancel_requested_at INTEGER,                 -- "cancelling": requested, process group not yet confirmed gone
-  timeout_ms          INTEGER                  -- v3: max runtime budget (ms); enforced across restarts
+  timeout_ms          INTEGER                  -- time limit in milliseconds, enforced across restarts
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_cell ON jobs(cell_id, state);
 CREATE INDEX IF NOT EXISTS idx_jobs_running ON jobs(state) WHERE state = 'running';

@@ -54,7 +54,7 @@ export function cellIdOf(addr: InboxAddr): string {
 
 /**
  * Address-pattern rule shared by PolicyBounds.canSendTo and PolicyRule targets: an entry ending in `*` is a prefix
- * wildcard (`inbox:*`, `channel:feishu:*`); anything else must match exactly. A wildcard child entry is covered
+ * wildcard (`inbox:*`, `channel:ui:*`); anything else must match exactly. A wildcard child entry is covered
  * only by a parent wildcard whose prefix is a prefix of it.
  */
 export function addressCovers(pattern: string, value: string): boolean {
@@ -99,7 +99,7 @@ export function externalPrincipal(channelId: string, externalUserId: string): st
 /**
  * [docs/05 §5.3] An external main agent on the control plane (MCP / `/api/agent/*`): `agent:<agentId>`. It may
  * orchestrate like the owner (spawn, update, message, pause/resume/steer/cancel, close) but is never the owner: it
- * cannot approve a `channel:*` send, raise a budget, or decide a `budget_exhausted` card.
+ * must leave project approval to the owner.
  */
 export function agentPrincipal(agentId: string): `agent:${string}` {
   if (!agentId || agentId.includes(":")) throw new NgError("invalid_argument", `agentPrincipal: invalid agent id "${agentId}"`);

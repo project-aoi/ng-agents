@@ -4,9 +4,6 @@ import { afterEach, describe, expect, it } from "vitest";
 import { retireDeskState } from "../src/shared/retire-desk-state";
 import { run, withTx, gtdKeys, PAYLOAD, type ActionRecord, type ModelRequest, type ProjectRecord } from "@ng/protocol";
 import { BUILTIN_SKILLS, seedBuiltinSkills, setProjectLifecycleSync, startApprovedProjectSync, startProjectSync } from "../src";
-import { skillDigest } from "../src/shared/seed";
-import { SUPERSEDED_SKILL_DIGESTS } from "../src/shared/skills";
-import shippedBefore from "./fixtures/builtin-skills-2026-11-18.json";
 import { boot, childrenOf, cleanupAll, gitRepo, lastToolResult, projects, systemOf, tool } from "./helpers";
 
 afterEach(cleanupAll);
@@ -129,7 +126,6 @@ describe("project tools", () => {
     expect(explicit!.spec).toMatchObject({ preset: "checker", cwd: other });
     expect(reader!.spec).toMatchObject({ preset: "worker", cwd: repo, lifetime: "wakeable" });
     for (const c of [byDefault!, explicit!, reader!]) {
-      expect(c.spec.cwdMode).toBeUndefined();
       expect(c.bounds.maxDepth).toBe(0);
     }
     expect(childrenOf(h, projectId)).toEqual(started);
@@ -443,44 +439,7 @@ describe("built-in skills", () => {
     expect(systemOf(h, "desk")).not.toContain("# Skill: workspace-arbitration");
   });
 
-  it("an install from before a playbook changed gets the new text; a playbook the owner edited is left alone", async () => {
-    const h = await boot();
-    // What an earlier version seeded (the texts as shipped on 2026-11-18), one of them since edited by the owner.
-    for (const old of shippedBefore) {
-      h.kernel.context.upsertSkillOrNoteSync("desk", { kind: "skill", name: old.name, description: old.description, body: old.body, tags: old.tags, scope: "global", mode: "upsert" });
-    }
-    const mine = shippedBefore.find((x) => x.name === "workspace-arbitration")!;
-    h.kernel.context.upsertSkillOrNoteSync("desk", { kind: "skill", name: mine.name, description: mine.description, body: `${mine.body}\n## 我的补充\n先问我。\n`, tags: mine.tags, scope: "global", mode: "upsert" });
 
-    // Replaced: the untouched copies of texts that changed. Kept: the owner's edit, and what has not changed.
-    expect(seedBuiltinSkills(h.kernel.context, "desk")).toEqual(["project-relay", "domain-hub"]);
-    const relay = h.kernel.context.getKnowledgeSync({ kind: "skill", name: "project-relay", scope: "global" })!;
-    expect(relay.body).toBe(BUILTIN_SKILLS.find((x) => x.name === "project-relay")!.body);
-    expect(readFileSync(join(h.kernel.dataDir, "skills", "project-relay", "SKILL.md"), "utf8")).toContain("it rests (dormant)");
-    expect(readFileSync(join(h.kernel.dataDir, "skills", "domain-hub", "SKILL.md"), "utf8")).not.toContain("cwdMode");
-    expect(h.kernel.context.getKnowledgeSync({ kind: "skill", name: "workspace-arbitration", scope: "global" })!.body).toContain("## 我的补充");
-    expect(seedBuiltinSkills(h.kernel.context, "desk")).toEqual([]);
-
-    // The list of earlier texts is exactly what was shipped, and never names the current one.
-    for (const old of shippedBefore) {
-      const current = BUILTIN_SKILLS.find((x) => x.name === old.name)!;
-      const superseded = SUPERSEDED_SKILL_DIGESTS[old.name] ?? [];
-      if (skillDigest(current) === skillDigest(old)) expect(superseded).toEqual([]);
-      else expect(superseded).toContain(skillDigest(old));
-      expect(superseded).not.toContain(skillDigest(current));
-    }
-  });
-
-  it("a changed playbook is noticed here, so that the text it replaces is recorded and existing installs get the new one", () => {
-    // Failing because you changed a playbook? Add its previous digest (the expected value below) to
-    // SUPERSEDED_SKILL_DIGESTS in skills.ts — otherwise installs that still have the old text keep it — then update it here.
-    expect(Object.fromEntries(BUILTIN_SKILLS.map((s) => [s.name, skillDigest(s)]))).toEqual({
-      "project-relay": "4b065c12c6a48438292d8b85bf840628d8f5e1feac591130fec0f027799c323b",
-      "domain-hub": "e180da2ffb0a7c0251f94f16f036fd5aeea230f04e1cef4580022f4156165e53",
-      "workspace-arbitration": "558c6187ddfa8a62c2dddf1c700d255a374a0310a1f13d93bf735fca3563b441",
-      "habit-and-routine-discovery": "83ec914cbc32826910118b0100d5770b9e7d5b81c79607f25a3da1adc2efa430",
-    });
-  });
 });
 
 it.each(["agent", "human"] as const)("migrates approved legacy proposals while preserving %s edit provenance", async updatedBy => {

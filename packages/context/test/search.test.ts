@@ -20,7 +20,7 @@ function seed() {
     runId: "r1",
     at: at(),
   });
-  s.appendEvidenceSync("w", { kind: "external", source: "feishu", title: "群聊反馈", text: "用户反馈支付报错三次", runId: null, at: at() });
+  s.appendEvidenceSync("w", { kind: "external", source: "memory", title: "群聊反馈", text: "用户反馈支付报错三次", runId: null, at: at() });
   s.appendEvidenceSync("sib", { kind: "assistant_text", text: "兄弟分身的报价单记录", runId: "r9", at: at() });
   s.upsertSkillOrNoteSync("p", { kind: "working_note", scope: "cell", name: "报价约定", description: "项目共享笔记", body: "报价单需含税", mode: "upsert" });
   s.upsertSkillOrNoteSync("sib", { kind: "working_note", scope: "cell", name: "兄弟笔记", description: "不可见", body: "报价单草稿", mode: "upsert" });
@@ -219,8 +219,8 @@ describe("searchHistory scopes", () => {
     expect(sub("clickhouse_events")).toEqual([]);
 
     // A state value without strings is still found by its key.
-    h.store.commitSync("w2", { statePatches: { "budget:spent": 42 } });
-    expect(sub("budget:spent")).toEqual([expect.objectContaining({ source: "state", text: "42" })]);
+    h.store.commitSync("w2", { statePatches: { "run:count": 42 } });
+    expect(sub("run:count")).toEqual([expect.objectContaining({ source: "state", text: "42" })]);
 
     const uri = h.store.writeResourceSync("w2", "job log: deploy_target=staging-7");
     expect(sub("staging-7")).toEqual([expect.objectContaining({ source: "resource", uri, cellId: "w2" })]);

@@ -1,5 +1,5 @@
 import type { ProcessorSpec, ToolKind } from "@ng/protocol";
-import { PROCESSORS, PROMPTS, STD, TOOLSETS } from "./config";
+import { PROMPTS, STD, TOOLSETS } from "./config";
 import { SKILL_DOMAIN_HUB, SKILL_PROJECT_RELAY } from "./skills";
 
 // The processors of the presets' cells. Every role gets the general primitives (context, comms, schedule, cells,
@@ -53,17 +53,6 @@ export const SENSOR_LLM_PROCESSOR: ProcessorSpec = {
   prompt: PROMPTS.sensor,
   modelTier: "fast",
   toolsets: [TOOLSETS.sensor, STD.context, STD.workspace],
-};
-
-/** The reply watcher (await_reply): zero tokens, any message from the party is the reply. */
-export const WAIT_MATCH_PROCESSOR: ProcessorSpec = { kind: "code", entry: PROCESSORS.waitMatch };
-
-/** The reply watcher's model variant (await_reply interpret: true): the model judges messages, code keeps the books. */
-export const REPLY_WATCHER_LLM_PROCESSOR: ProcessorSpec = {
-  kind: "llm",
-  prompt: PROMPTS.watcher,
-  modelTier: "fast",
-  toolsets: [TOOLSETS.watcher, STD.comms, STD.context],
 };
 
 /**

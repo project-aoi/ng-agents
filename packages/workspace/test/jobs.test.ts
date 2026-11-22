@@ -19,7 +19,7 @@ const finished = <J extends { state: string }>(h: { mgr: { getJobSync(id: string
 describe("jobs", () => {
   it("startJob returns at once; on exit exactly one job.result is enqueued with the epoch read at start", async () => {
     const h = harness();
-    const port = await h.mgr.acquire("w1", "none");
+    const port = await h.mgr.acquire("w1");
     const { jobId } = await port.startJob({ command: "sleep 0.3; echo built ok; exit 3" });
     expect(h.mgr.getJobSync(jobId)).toMatchObject({ state: "running", epoch: 0, cellId: "w1", command: "sleep 0.3; echo built ok; exit 3" });
     expect(h.mgr.getJobSync(jobId)!.pid).toBeGreaterThan(0);
@@ -62,7 +62,7 @@ describe("jobs", () => {
         },
       },
     });
-    const port = await h.mgr.acquire("w1", "none");
+    const port = await h.mgr.acquire("w1");
     const { jobId } = await port.startJob({ command: "for i in 1 2 3; do echo step $i; done" });
     await finished(h, jobId);
     const payload = h.inbox.list("w1")[0]!.payload as JobResultPayload;
@@ -72,7 +72,7 @@ describe("jobs", () => {
 
   it("observeJob shows the tail while running; writeJobInput feeds stdin", async () => {
     const h = harness();
-    const port = await h.mgr.acquire("w1", "none");
+    const port = await h.mgr.acquire("w1");
     const { jobId } = await port.startJob({ command: "echo ready; read name; echo hello:$name" });
     await waitFor(() => h.mgr.observeJobSync(jobId)?.tail.includes("ready"));
     expect((await port.observeJob(jobId)).state).toBe("running");
@@ -84,7 +84,7 @@ describe("jobs", () => {
 
   it("cancelJob records cancelled with one result and kills the whole group, even a SIGTERM-ignoring member", async () => {
     const h = harness();
-    const port = await h.mgr.acquire("w1", "none");
+    const port = await h.mgr.acquire("w1");
     const { jobId } = await port.startJob({ command: "trap '' TERM; sleep 30 & echo $! > child.pid; wait" });
     const job = h.mgr.getJobSync(jobId)!;
     await waitFor(() => existsSync(join(port.root, "child.pid")));
@@ -105,8 +105,8 @@ describe("jobs", () => {
 
   it("cancelJobsForCell cancels only that cell's running jobs", async () => {
     const h = harness();
-    const p1 = await h.mgr.acquire("w1", "none");
-    const p2 = await h.mgr.acquire("w2", "none");
+    const p1 = await h.mgr.acquire("w1");
+    const p2 = await h.mgr.acquire("w2");
     const a = await p1.startJob({ command: "sleep 30" });
     const b = await p1.startJob({ command: "sleep 30" });
     const c = await p2.startJob({ command: "sleep 30" });
@@ -124,7 +124,7 @@ describe("jobs", () => {
 
   it("a failure inside the completion transaction rolls back the row update too; the job is completed exactly once later", async () => {
     const h = harness();
-    const port = await h.mgr.acquire("w1", "none");
+    const port = await h.mgr.acquire("w1");
     h.inbox.failNext = 1;
     const { jobId } = await port.startJob({ command: "echo done; exit 7" });
     await waitFor(() => h.inbox.calls >= 1);
@@ -140,7 +140,7 @@ describe("jobs", () => {
 
   it("if the kernel dies mid-transaction, recover() in the next process finishes the job from its recorded exit status", async () => {
     const h = harness();
-    const port = await h.mgr.acquire("w1", "none");
+    const port = await h.mgr.acquire("w1");
     h.inbox.failNext = 1;
     const { jobId } = await port.startJob({ command: "echo partial; exit 7" });
     await waitFor(() => h.inbox.calls >= 1);
@@ -159,7 +159,7 @@ describe("jobs", () => {
 
   it("recover() re-attaches a job that is still running and delivers its result when it ends", async () => {
     const h = harness();
-    const port = await h.mgr.acquire("w1", "none");
+    const port = await h.mgr.acquire("w1");
     const { jobId } = await port.startJob({ command: "sleep 0.5; echo late; exit 0" });
     h.mgr.close();
     const next = h.restart();
@@ -175,7 +175,7 @@ describe("jobs", () => {
 
   it("recover() marks a job whose process died with the old kernel as failed", async () => {
     const h = harness();
-    const port = await h.mgr.acquire("w1", "none");
+    const port = await h.mgr.acquire("w1");
     const { jobId } = await port.startJob({ command: "sleep 30" });
     const pid = h.mgr.getJobSync(jobId)!.pid!;
     h.mgr.close();
@@ -190,12 +190,12 @@ describe("jobs", () => {
 
   it("recover() never trusts a recycled pid: a live process without the job marker is neither adopted nor signalled", async () => {
     const h = harness();
-    await h.mgr.acquire("w1", "none");
+    await h.mgr.acquire("w1");
     run(
       h.db,
-      `INSERT INTO jobs (job_id, cell_id, epoch, command, cwd, state, pid, log_path, stream_preview, started_at, updated_at)
-       VALUES ('job_recycled', 'w1', 0, 'make', NULL, 'running', ?, NULL, 0, 1, 1),
-              ('job_unstarted', 'w1', 0, 'make', NULL, 'running', NULL, NULL, 0, 1, 1)`,
+      `INSERT INTO jobs (job_id, cell_id, epoch, command, cwd, state, pid, process_identity, log_path, started_at, updated_at)
+       VALUES ('job_recycled', 'w1', 0, 'make', NULL, 'running', ?, 'different process', NULL, 1, 1),
+              ('job_unstarted', 'w1', 0, 'make', NULL, 'running', NULL, NULL, NULL, 1, 1)`,
       [process.pid],
     );
     await h.mgr.recover();
@@ -204,48 +204,12 @@ describe("jobs", () => {
     expect(h.inbox.list("w1").map((e) => e.id).sort()).toEqual(["job_recycled:result", "job_unstarted:result"]);
   });
 
-  it("streamPreview jobs emit job.output chunks", async () => {
-    const h = harness();
-    const port = await h.mgr.acquire("w1", "none");
-    const { jobId } = await port.startJob({ command: "echo first; sleep 0.2; echo second", streamPreview: true });
-    await finished(h, jobId);
-    const text = h.events
-      .filter((e) => e.topic === "job.output")
-      .map((e) => (e.data as { jobId: string; chunk: string }).chunk)
-      .join("");
-    expect(text).toBe("first\nsecond\n");
-  });
 
-  it("streamPreview includes output written before the preview poller started", async () => {
-    // Returns only once the job has written to its log, so the preview always starts after the first output.
-    const runner: CommandRunner = {
-      spawn(req) {
-        const child = defaultCommandRunner.spawn(req);
-        const logFd = Array.isArray(req.stdio) ? req.stdio[1] : undefined;
-        if (typeof logFd === "number" && req.args.some((a) => a.includes("early-output"))) {
-          const deadline = Date.now() + 5_000;
-          while (fstatSync(logFd).size === 0 && Date.now() < deadline) {
-            // busy-wait: the point is to not yield before the job wrote
-          }
-        }
-        return child;
-      },
-    };
-    const h = harness({ runner });
-    const port = await h.mgr.acquire("w1", "none");
-    const { jobId } = await port.startJob({ command: "echo early-output; sleep 0.1", streamPreview: true });
-    await finished(h, jobId);
-    const text = h.events
-      .filter((e) => e.topic === "job.output")
-      .map((e) => (e.data as { jobId: string; chunk: string }).chunk)
-      .join("");
-    expect(text).toBe("early-output\n");
-  });
 
   it("enforces ownership, limits and cell state", async () => {
     const h = harness({ limits: { maxJobsPerCell: 1 } });
-    const p1 = await h.mgr.acquire("w1", "none");
-    const p2 = await h.mgr.acquire("w2", "none");
+    const p1 = await h.mgr.acquire("w1");
+    const p2 = await h.mgr.acquire("w2");
     const { jobId } = await p1.startJob({ command: "sleep 30" });
     await expect(p1.startJob({ command: "true" })).rejects.toSatisfy((e) => isNgError(e, "conflict"));
     await expect(p2.observeJob(jobId)).rejects.toSatisfy((e) => isNgError(e, "not_found"));
@@ -256,13 +220,13 @@ describe("jobs", () => {
     await expect(p1.startJob({ command: "  " })).rejects.toSatisfy((e) => isNgError(e, "invalid_argument"));
   });
 
-  it("stopRuntime stops the cell's jobs and waits for them; logs and the directory stay", async () => {
+  it("cancelling stops the cell's jobs and waits for them; logs and the directory stay", async () => {
     const h = harness();
-    const port = await h.mgr.acquire("w1", "none");
+    const port = await h.mgr.acquire("w1");
     const { jobId } = await port.startJob({ command: "echo started; sleep 30" });
     const job = h.mgr.getJobSync(jobId)!;
     await waitFor(() => readFileSync(job.logPath!, "utf8").includes("started"));
-    await h.mgr.stopRuntime("w1");
+    await h.mgr.cancelJobsForCell("w1");
     // Resolved = recorded AND gone: no window in which the row says cancelled while the process still runs.
     expect(h.mgr.getJobSync(jobId)!.state).toBe("cancelled");
     expect(pidGone(job.pid!)).toBe(true);
@@ -272,7 +236,7 @@ describe("jobs", () => {
 
   it("a cancel is 'cancelling' (still running, request recorded) until the whole process group is gone", async () => {
     const h = harness({ limits: { killGraceMs: 400 } });
-    const port = await h.mgr.acquire("w1", "none");
+    const port = await h.mgr.acquire("w1");
     // Ignores TERM, so the cancel has to wait out the grace period before SIGKILL.
     const { jobId } = await port.startJob({ command: "trap '' TERM; echo up; sleep 30 & wait" });
     const job = h.mgr.getJobSync(jobId)!;
@@ -295,7 +259,7 @@ describe("jobs", () => {
 
   it("the kernel dies between the cancel request and the kill: recover() kills the survivor before it returns, then records cancelled once", async () => {
     const h = harness();
-    const port = await h.mgr.acquire("w1", "none");
+    const port = await h.mgr.acquire("w1");
     const { jobId } = await port.startJob({ command: "trap '' TERM; echo up; sleep 30; exit 0" });
     const job = h.mgr.getJobSync(jobId)!;
     await waitFor(() => readFileSync(job.logPath!, "utf8").includes("up"));
@@ -319,7 +283,7 @@ describe("jobs", () => {
 
   it("the kernel dies after the kill but before recording it: recover() records cancelled, not a failure", async () => {
     const h = harness();
-    const port = await h.mgr.acquire("w1", "none");
+    const port = await h.mgr.acquire("w1");
     const { jobId } = await port.startJob({ command: "sleep 30" });
     const pid = h.mgr.getJobSync(jobId)!.pid!;
     run(h.db, "UPDATE jobs SET cancel_requested_at = 5, error = 'stopped by the owner' WHERE job_id = ?", [jobId]);
@@ -401,7 +365,7 @@ describe("process identity without /proc (macOS)", () => {
 
   it("recover() fails recycled pids immediately, and re-attaches unreadable (null) pids for confirmation without signalling them (BUG-027)", async () => {
     const h = harness();
-    await h.mgr.acquire("w1", "none");
+    await h.mgr.acquire("w1");
     const stranger = spawn("sleep", ["30"], { stdio: "ignore" });
     await once(stranger, "spawn");
     try {
@@ -409,9 +373,9 @@ describe("process identity without /proc (macOS)", () => {
       const now = Date.now();
       run(
         h.db,
-        `INSERT INTO jobs (job_id, cell_id, epoch, command, cwd, state, pid, log_path, stream_preview, started_at, updated_at)
-         VALUES ('job_recycled', 'w1', 0, 'make', NULL, 'running', ?, NULL, 0, ?, ?),
-                ('job_unreadable', 'w1', 0, 'make', NULL, 'running', ?, NULL, 0, ?, ?)`,
+        `INSERT INTO jobs (job_id, cell_id, epoch, command, cwd, state, pid, log_path, started_at, updated_at)
+         VALUES ('job_recycled', 'w1', 0, 'make', NULL, 'running', ?, NULL, ?, ?),
+                ('job_unreadable', 'w1', 0, 'make', NULL, 'running', ?, NULL, ?, ?)`,
         [process.pid, now, now, stranger.pid!, now, now],
       );
       await h.mgr.recover();
@@ -435,12 +399,11 @@ describe("process identity without /proc (macOS)", () => {
 
   it("holds a recovered cancellation while the process identity is unreadable", async () => {
     const h = harness();
-    const port = await h.mgr.acquire("w1", "none");
+    const port = await h.mgr.acquire("w1");
     const { jobId } = await port.startJob({ command: "while [ ! -f done ]; do sleep 0.05; done" });
     const pid = h.mgr.getJobSync(jobId)!.pid!;
     try {
       h.mgr.close();
-      run(h.db,"UPDATE jobs SET process_identity=NULL WHERE job_id=?",[jobId]); // legacy registration
       const calls = withoutProc(() => null);
       const next = h.restart();
       await next.recover();
@@ -465,7 +428,7 @@ describe("process identity without /proc (macOS)", () => {
   it.runIf(realPs !== null)("with the real `ps`: recover() re-attaches a live job by its marker and reports it when it ends", async () => {
     withoutProc(realPs!);
     const h = harness();
-    const port = await h.mgr.acquire("w1", "none");
+    const port = await h.mgr.acquire("w1");
     const { jobId } = await port.startJob({ command: "while [ ! -f go ]; do sleep 0.05; done; echo late" });
     const pid = h.mgr.getJobSync(jobId)!.pid!;
     expect(markedAlive(pid, JOB_MARKER, jobId)).toBe(true);
@@ -483,7 +446,7 @@ describe("process identity without /proc (macOS)", () => {
 
   it("a re-attached job survives repeated unreadable probes and settles from its exit file", async () => {
     const h = harness();
-    const port = await h.mgr.acquire("w1", "none");
+    const port = await h.mgr.acquire("w1");
     const { jobId } = await port.startJob({ command: "while [ ! -f go ]; do sleep 0.05; done" });
     const pid = h.mgr.getJobSync(jobId)!.pid!;
     let failures = 0;
@@ -544,7 +507,7 @@ describe("process identity without /proc (macOS)", () => {
 describe("job runtime timeout protection (BUG-027)", () => {
   it("warns once for a quiet running job, including across a restart", async () => {
     const h = harness({ limits: { jobQuietWarningMs: 120 } });
-    const port = await h.mgr.acquire("w1", "none");
+    const port = await h.mgr.acquire("w1");
     const { jobId } = await port.startJob({ command: "while [ ! -f done ]; do sleep 0.05; done" });
     try {
       const e = await waitFor(() => h.inbox.list("w1").find(e => e.type === "job.warning"));
@@ -565,7 +528,7 @@ describe("job runtime timeout protection (BUG-027)", () => {
 
   it("kills a runaway job when timeoutMs elapses and wakes the cell with exitCode 124", async () => {
     const h = harness({ limits: { jobTimeoutMs: 250, maxJobTimeoutMs: 5_000, killGraceMs: 200 } });
-    const port = await h.mgr.acquire("w1", "none");
+    const port = await h.mgr.acquire("w1");
     const { jobId } = await port.startJob({ command: "echo started; sleep 30" });
     const pid = h.mgr.getJobSync(jobId)!.pid!;
     expect(h.mgr.getJobSync(jobId)!.timeoutMs).toBe(250);
@@ -581,7 +544,7 @@ describe("job runtime timeout protection (BUG-027)", () => {
 
   it("enforces remaining timeoutMs after recover() re-attaches a surviving job", async () => {
     const h = harness({ limits: { jobTimeoutMs: 5_000, maxJobTimeoutMs: 10_000, killGraceMs: 200 } });
-    const port = await h.mgr.acquire("w1", "none");
+    const port = await h.mgr.acquire("w1");
     const { jobId } = await port.startJob({ command: "trap '' TERM; sleep 30; exit 0", timeoutMs: 400 });
     const pid = h.mgr.getJobSync(jobId)!.pid!;
     h.mgr.close();

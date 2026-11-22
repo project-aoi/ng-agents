@@ -236,7 +236,7 @@ export function rosterMessage(roster: readonly ChildSummary[]): ModelMessage {
     if (c.title) parts.push(`"${c.title}"`);
     if (c.preset) parts.push(c.preset);
     parts.push(c.status);
-    if (c.cwd) parts.push(`cwd ${c.cwd}${c.cwdMode ? ` (${c.cwdMode})` : ""}`);
+    if (c.cwd) parts.push(`cwd ${c.cwd}`);
     const indent = "  ".repeat(Math.max(0, (c.depth ?? 1) - 1));
     return `${indent}- ${parts.join(" · ")}${c.statusLine ? `: ${c.statusLine}` : ""}`;
   });

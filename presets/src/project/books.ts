@@ -5,7 +5,6 @@ import {
   newId,
   PAYLOAD,
   type ActionRecord,
-  type CellProgressPayload,
   type CellResultPayload,
   type ChildSummary,
   type Clock,
@@ -17,7 +16,6 @@ import {
 } from "@ng/protocol";
 import { ROLES } from "../shared/config";
 import { newAction, newProject, patchAction, statusLine } from "../shared/records";
-import type { ReplyWatchReport } from "../shared/watcher";
 import type { PlannedAction, ProjectTaskInput } from "./launch";
 
 // A project's books: the records that follow mechanically from what woke it, kept before the model runs (and whatever
@@ -32,7 +30,7 @@ export async function readActions(ports: RunPorts): Promise<ActionRecord[]> {
   return (await ports.context.listState(ports.self.cellId, gtdKeys.actionPrefix)).map((e) => e.value as ActionRecord).filter((a) => a && typeof a === "object");
 }
 
-const WAITING_PRESETS = new Set(["checker", "reply_watcher", "watcher", "sensor"]);
+const WAITING_PRESETS = new Set(["checker", "watcher", "sensor"]);
 
 export function waitingFor(description: string, parties: WaitingSet["parties"] = [], extra: Partial<WaitingSet> = {}): WaitingSet {
   return { description, parties, join: "all", ...extra };
@@ -57,15 +55,6 @@ function seedActions(self: string, planned: readonly PlannedAction[], clock: Clo
         now,
       ),
     );
-}
-
-/** A reply watcher's result: its party has answered (or the owner settled it offline). */
-function markReplied(a: ActionRecord, p: CellResultPayload, at: number): Partial<ActionRecord> {
-  if (!a.waiting?.parties.length) return {};
-  const r = (p.data as { gtd?: ReplyWatchReport } | undefined)?.gtd;
-  const repliedAt = typeof r?.at === "number" ? r.at : at;
-  const parties = a.waiting.parties.map((x) => (r?.partyId === undefined || x.id === r.partyId ? { ...x, replied: true, repliedAt } : x));
-  return { waiting: { ...a.waiting, parties }, progress: { done: parties.filter((x) => x.replied).length, total: parties.length, label: "已回" } };
 }
 
 /** The first Run of a project started with a seed: its record and planned actions. */
@@ -98,7 +87,6 @@ const isKernelNotice = (env: Envelope) => env.type.startsWith("kernel.");
  * 2. A child's `cell.result`: the action it carried is done (completed); otherwise it stays open — still with a
  *    dormant worker, which can be told what to change, or without a cell when the child is gone (the model
  *    re-dispatches or re-plans). A later turn of a worker whose action is already closed changes nothing here.
- * 3. A reply watcher's progress (timeout, nudge): the waiting party's deadline follows.
  * 4. Every open direct child is on the books: one started with plain spawn_cell (no action names it) gets an action too.
  * 5. A parked or finished record whose cell was woken by something real (resumed, or a follow-up beat the close) is
  *    active again.
@@ -136,17 +124,11 @@ export async function prepareProjectRun({ snapshot, ports, clock }: PrepareRunIn
       const a = carrying(p.childCellId);
       if (!a) continue;
       if (p.status === "completed") {
-        set(patchAction(a, { status: "done", ...(p.artifactId ? { artifactId: p.artifactId } : {}), ...markReplied(a, p, env.createdAt) }, now));
+        set(patchAction(a, { status: "done", ...(p.artifactId ? { artifactId: p.artifactId } : {}) }, now));
       } else if (p.childState !== "dormant") {
         set(patchAction(a, { cellId: null }, now));
       }
-    } else if (isEnvelopeOfType(env, "cell.progress")) {
-      const p = env.payload as CellProgressPayload;
-      const r = (p.data as { gtd?: ReplyWatchReport } | undefined)?.gtd;
-      const a = carrying(p.childCellId);
-      if (!a?.waiting || r?.kind !== "reply_wait" || typeof r.dueAt !== "number") continue;
-      const parties = a.waiting.parties.map((x) => (x.id === r.partyId ? { ...x, dueAt: r.dueAt } : x));
-      set(patchAction(a, { waiting: { ...a.waiting, parties, dueAt: r.dueAt }, dueAt: r.dueAt }, now));
+
     }
   }
 

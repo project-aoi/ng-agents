@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { CELL_STATUS_KEY, PAYLOAD, type CodeProcessor, type Registry } from "@ng/protocol";
-import { boot, cleanupAll, DAY, registerTestPresets, T0, tool, waitFor } from "./helpers";
+import { boot, cleanupAll, DAY, registerTestPresets, T0, waitFor } from "./helpers";
 
 afterEach(cleanupAll);
 
@@ -41,7 +41,7 @@ describe("read models", () => {
       ["wait", 2, "proj"],
     ]);
     // nobody gave them a directory: no cwd in the roster (the kernel's own fallback directory is noise)
-    expect(roster.some((r) => "cwd" in r || "cwdMode" in r)).toBe(false);
+    expect(roster.some((r) => "cwd" in r)).toBe(false);
     expect(roster[0]).toMatchObject({ title: "跑测试", running: false, jobs: [expect.objectContaining({ command: "sleep 30" })] });
     expect(roster[1]).toMatchObject({ statusLine: "已回 (2/3 家)", progress: { done: 2, total: 3 }, waitingOn: { threads: ["memory:q"], nextTimerAt: T0 + DAY, pendingApprovals: 0 } });
 
@@ -81,29 +81,19 @@ describe("read models", () => {
         registry.presets.register({
           name: "sensor",
           description: "test sensor in an explicit worktree",
-          defaults: { processor: { kind: "code", entry: "test.idle" }, lifetime: "persistent", bounds: { isolation: "git_worktree", tools: new Set(["read", "bash"]) } },
+          defaults: { processor: { kind: "code", entry: "test.idle" }, lifetime: "persistent", bounds: { isolation: "none", tools: new Set(["read", "bash"]) } },
         });
       },
     });
-    h.kernel.spawnCell("desk", { id: "s", preset: "sensor", bounds: { maxTokens: 10_000 } });
-    expect(h.kernel.getCell("s")!.bounds).toMatchObject({ isolation: "git_worktree", maxTokens: 10_000 });
+    h.kernel.spawnCell("desk", { id: "s", preset: "sensor", bounds: { maxConcurrentChildren: 1 } });
+    expect(h.kernel.getCell("s")!.bounds).toMatchObject({ isolation: "none", maxConcurrentChildren: 1 });
     expect([...h.kernel.getCell("s")!.bounds.tools].sort()).toEqual(["bash", "read"]);
-    expect(h.kernel.getCell("s")!.spec.bounds).toEqual({ isolation: "git_worktree", tools: ["bash", "read"], maxTokens: 10_000 });
+    expect(h.kernel.getCell("s")!.spec.bounds).toEqual({ isolation: "none", tools: ["bash", "read"], maxConcurrentChildren: 1 });
     // a preset that asks only for maxDepth 0 (the worker): that and the caller's field; the isolation is the parent's
     // (the desk: the host)
-    h.kernel.spawnCell("desk", { id: "w", preset: "worker", processor: { kind: "code", entry: "test.idle" }, bounds: { maxTokens: 10_000 } });
-    expect(h.kernel.getCell("w")!.bounds).toMatchObject({ isolation: "none", maxTokens: 10_000, maxDepth: 0 });
-    expect(h.kernel.getCell("w")!.spec.bounds).toEqual({ maxDepth: 0, maxTokens: 10_000 });
+    h.kernel.spawnCell("desk", { id: "w", preset: "worker", processor: { kind: "code", entry: "test.idle" }, bounds: { maxConcurrentChildren: 1 } });
+    expect(h.kernel.getCell("w")!.bounds).toMatchObject({ isolation: "none", maxConcurrentChildren: 1, maxDepth: 0 });
+    expect(h.kernel.getCell("w")!.spec.bounds).toEqual({ maxDepth: 0, maxConcurrentChildren: 1 });
   });
 
-  it("setFocus(false) delivers what focus held back", async () => {
-    const h = await boot();
-    await h.kernel.setFocus(true);
-    h.script.add("desk", tool("send_message", { to: "channel:ui:owner", text: "下午 3 点的会改到 4 点", summary: "notify" }));
-    await h.ui.capture({ text: "提醒我会议改时间了" });
-    await h.kernel.idle();
-    expect(h.kernel.hub.bufferedCountSync()).toBe(1);
-    expect(await h.kernel.setFocus(false)).toEqual({ sent: 1, failed: 0, unknown: 0 });
-    expect(h.kernel.hub.listOutboxSync({ channelId: "ui" }).map((o) => o.status)).toEqual(["sent"]);
-  });
 });

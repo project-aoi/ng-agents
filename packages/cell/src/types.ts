@@ -1,7 +1,7 @@
 import type { createHumanItems } from "./human-items";
-import type { ChannelHubImpl, ChannelHubOptions } from "@ng/channel";
+import type { ChannelHub } from "@ng/protocol";
 import type { ContextStoreOptions } from "@ng/context";
-import type { GateOptions, GateService, SecretStore } from "@ng/gate";
+import type { GateService } from "@ng/gate";
 import type { InboxService } from "@ng/inbox";
 import type { AgentBackendSetting, AgentLoopOptions, CliAgentLoopOptions } from "@ng/loop";
 import type {
@@ -46,8 +46,8 @@ export type CellSpecInput = Omit<CellSpec, "processor"> & { processor?: Processo
 
 export interface KernelOptions {
   /**
-   * Everything of the kernel's own on disk lives here: the database (`ng.db`), skills (`skills/`), job logs and
-   * explicit isolated workspaces (`workspace/`), the per-cell directories of cells nobody gave a `cwd` (`cells/`) and
+   * Everything of the kernel's own on disk lives here: the database (`ng.db`), skills (`skills/`), job logs
+   * (`workspace/jobs/`), the per-cell directories of cells nobody gave a `cwd` (`cells/`) and
    * the records of running CLI agents (`cli-procs/`). The directories cells work in are the owner's and are never
    * created or removed here. Default: a fresh directory under the OS temp dir that `close()` removes — fine for
    * tests; pass a real directory to persist.
@@ -55,19 +55,11 @@ export interface KernelOptions {
   dataDir?: string;
   /** An open database, or a path (":memory:" works). Default `<dataDir>/ng.db`. */
   db?: Db | string;
-  /**
-   * The model behind `llm` processors that run on the API engine. Required unless `loop` is given or `agentBackend`
-   * resolves to a CLI (then only cells with `processor.engine: "api"` need it).
-   */
+  /** Deterministic model injected by in-memory tests. */
   model?: ModelClient;
   /** A ready-made AgentLoop used instead of building one around `model` (no engine routing then). */
   loop?: AgentLoop;
-  /**
-   * Who executes `llm` Runs whose processor names no `engine`: `api` (the built-in tool loop over `model`), a CLI agent
-   * (`claude`, `codex`, `agy`), or `auto` = the first installed of claude, codex, agy, else `api` when `model` is given.
-   * Default: `api` when `model` is given, else `auto`. Every cell may override it with `processor.engine`; code
-   * processors always run in-process. See resolveAgentBackendFromEnv for the `NG_AGENT_BACKEND` variable.
-   */
+  /** The installed CLI to use when the processor does not select its own engine. */
   agentBackend?: AgentBackendSetting;
   /** Per-CLI loop settings (binary, tier models, env pass-through, timeouts, ...). */
   cli?: Partial<Record<CliEngine, Omit<CliAgentLoopOptions, "engine" | "registry" | "clock">>>;
@@ -86,34 +78,20 @@ export interface KernelOptions {
   registry?: Registry;
   /** The human owner's principal. Default "owner". */
   ownerPrincipal?: string;
-  /** Owner-facing channel patterns, handed identically to the Gate and the comms toolset. Default `channel:ui:*`, `channel:cli:*`. */
-  ownerAddresses?: readonly string[];
   /** Cell that receives unrouted ingress and handbacks. Default "desk". */
   deskCellId?: string;
-  /** @deprecated host work is the default. Ignored. */
-  allowHostWrites?: boolean;
   /** Bounds a root cell gets for every field its own `bounds` leaves out. Default DEFAULT_ROOT_BOUNDS. */
   rootBounds?: BoundsInit;
   /** Channels registered on the hub at construction (more can be added with `kernel.hub.register`). */
   channels?: readonly Channel[];
-  /** Secret values for the Gate's proxy. Default: `NG_SECRET_<REF>` environment variables. */
-  secrets?: SecretStore;
   /**
    * Default working directory of cells that have no `cwd` anywhere up their tree (e.g. the owner's main repository).
    * Absent: each such cell gets the kernel's own per-cell directory under `<dataDir>/cells/`.
    */
   repoPath?: string;
-  workspace?: Omit<WorkspaceManagerOptions, "db" | "bus" | "clock" | "dataDir" | "inbox" | "resources" | "injectSecret" | "defaultRepoPath">;
+  workspace?: Omit<WorkspaceManagerOptions, "db" | "bus" | "clock" | "dataDir" | "inbox" | "resources" | "defaultRepoPath">;
   context?: Pick<ContextStoreOptions, "summarize" | "limits" | "rescanSkillsOnCreate">;
   loopOptions?: Omit<AgentLoopOptions, "model" | "registry" | "clock">;
-  gate?: Pick<GateOptions, "tokenTtlMs" | "warnRatio" | "trustStreak" | "cacheReadWeight" | "wrapUp">;
-  hubOptions?: Pick<ChannelHubOptions, "sendTimeoutMs" | "requireToken">;
-  /**
-   * The owner's switch for budget limits. `false`: no cell is ever stopped, held or refused for its token or cost
-   * budget (usage is still counted and shown). Given, it applies to this process and is remembered; absent, the
-   * choice last made (also through `setBudgetLimits`) applies; default on. See Kernel.setBudgetLimits.
-   */
-  budgetLimits?: boolean;
   /** Runs in flight across all cells. Default 8. */
   maxConcurrentRuns?: number;
   /** Claim lease; renewed while the Run is alive. Default 10 minutes. */
@@ -134,14 +112,14 @@ export interface KernelOptions {
 /**
  * Who is asking. Default: the owner. Cells act as `cell:<id>` and may only touch their own descendants (and, for
  * watches/schedules/title/meta, themselves). An external main agent acts as `agent:<id>`: it may orchestrate any cell
- * but never widens bounds, raises budgets or approves outward sends (docs/05 §5.3).
+ * but never widens bounds or approves a project proposal (docs/05 §5.3).
  */
 export interface ActorOptions {
   principalId?: string;
 }
 
 export interface RootCellOptions extends ActorOptions {
-  /** Merged over the kernel's `rootBounds`; the result must have positive maxTokens and maxCents. */
+  /** Overrides for the kernel's default root bounds. */
   bounds?: BoundsInit;
 }
 
@@ -168,43 +146,16 @@ export interface IdleOptions {
   timeoutMs?: number;
 }
 
-// ==================== approvals (docs/04 §2, IMPL_BRIEF §2.7) ====================
-
-/**
- * The owner's decision on a Clarify card.
- * - approve: Gate.approve with the version the owner saw; a `channel.send` is executed right away by the kernel.
- * - deny: refuse it; the owning cell gets `approval.resolved` (denied, note = reason).
- * - snooze: hide the card until `until`; it resurfaces by itself (an epoch-guarded wake-up at `until`).
- * - revise: "🎙 按住口述修改意见" — the owning cell gets `approval.revise` and redrafts a new version.
- * - continue: card C "⏱ 追加额度继续 / 再等 1 天". Budget escalations raise the budget (`raise`, default +50% of the
- *   limiting cell's limit) of the cell that hit the limit; kernel retry-limit escalations requeue the failed messages;
- *   other escalation (custom) cards are acknowledged; any other card (e.g. a watcher's nudge) is withdrawn instead of
- *   executed. The owning cell gets `approval.resolved` with `decision: "continue"` (and `until`, `note`) to go on.
- * - resolve_offline: "✓ 线下已解决，直接完结" — withdraw the card and close the affected cell (completed). A root cell
- *   is never closed this way; it just gets `approval.resolved` (cancelled, decision resolve_offline).
- * - dismiss: withdraw the card; the owning cell learns it silently (no wake-up).
- */
 export type ApprovalDecision =
   | { decision: "approve"; approverId: string; seenArtifactVersion?: number; seenItemRevision?: number }
   | { decision: "deny"; approverId: string; reason?: string; seenItemRevision?: number }
   | { decision: "snooze"; until: number; approverId: string; seenItemRevision?: number }
   | { decision: "revise"; instruction: string; voice?: boolean; approverId: string; seenArtifactVersion?: number; seenItemRevision?: number }
-  | { decision: "continue"; approverId: string; seenArtifactVersion?: number; budgetLedgerId?:string; raise?: { tokens?: number; cents?: number }; until?: number; note?: string; seenItemRevision?: number }
+  | { decision: "continue"; approverId: string; seenArtifactVersion?: number; until?: number; note?: string; seenItemRevision?: number }
   | { decision: "resolve_offline"; approverId: string; note?: string; seenItemRevision?: number }
   | { decision: "dismiss"; approverId: string; reason?: string; seenItemRevision?: number };
 
-/**
- * What the UI shows verbatim.
- * - sent | failed | unknown: an approved `channel.send` was executed; `unknown` keeps the card's outcome visible and
- *   is never retried automatically ("发送结果未知，请核实"). Approving again after `failed` retries the send.
- * - approved: a non-send action was approved and handed back to the owning cell.
- * - version_mismatch: the draft changed since the owner looked ("草稿已更新，请重看"); `currentVersion` is what to show.
- * - revision_mismatch: the card changed since the caller looked (card-level optimistic lock); `currentRevision` is what to show.
- * - already_cancelled: the task was cancelled/closed, or the card was withdrawn.
- * - not_pending: the card was already decided (deny/snooze/revise/continue/resolve_offline/dismiss on a decided card).
- */
 export type ResolveApprovalResult =
-  | { status: "sent" | "failed" | "unknown"; actionId: string; artifactVersion: number | null; error?: string }
   | { status: "approved"; actionId: string }
   | { status: "version_mismatch"; actionId: string; currentVersion: number | null }
   | { status: "revision_mismatch"; actionId: string; currentRevision: number }
@@ -265,9 +216,6 @@ export interface KernelStats {
   /** Cards visible in Clarify now (snoozed ones excluded). */
   pendingApprovals: number;
   snoozedApprovals: number;
-  /** Owner notifications held back by focus mode (DND). */
-  bufferedNotifications: number;
-  focus: boolean;
 }
 
 export interface RunInfo {
@@ -289,7 +237,7 @@ export interface Kernel {
   readonly gate: GateService;
   readonly humanItems: ReturnType<typeof createHumanItems>;
   readonly workspace: WorkspaceManager;
-  readonly hub: ChannelHubImpl;
+  readonly hub: ChannelHub;
   readonly loop: AgentLoop;
   /** Engine of llm cells without `processor.engine` (null: none available — such Runs fail with a clear error). */
   readonly agentBackend: AgentEngine | null;
@@ -301,9 +249,8 @@ export interface Kernel {
   readonly dataDir: string;
   readonly deskCellId: string;
   readonly ownerPrincipal: string;
-  readonly ownerAddresses: readonly string[];
 
-  /** Recover (stale claims, interrupted sends, jobs, half-executed approvals), then dispatch. Idempotent. */
+  /** Recover stale claims and jobs, then start dispatching. */
   start(): Promise<void>;
   /** Graceful: abort Runs and release their claims without counting an attempt; Jobs keep running for recover(). */
   stop(): Promise<void>;
@@ -320,8 +267,8 @@ export interface Kernel {
   updateCell(cellId: string, patch: Partial<CellSpec>, opts?: ActorOptions): CellRecord;
   /**
    * Cascade over the subtree in one transaction (epochs, status, pending messages, schedules, watches, waits,
-   * approvals, tokens, GTD records); the returned promise settles after Runs are aborted and the runtime is stopped
-   * (Jobs cancelled and confirmed gone, an explicit container removed). Nothing on disk is touched.
+   * pending decisions and project records); the returned promise settles after Runs are aborted and the runtime is stopped
+   * (jobs cancelled and their processes confirmed gone). Nothing on disk is touched.
    */
   closeCell(cellId: string, reason?: CloseReason, opts?: ActorOptions): Promise<CloseResult>;
   /** Inbox.control as the owner (or `opts.principalId`); the kernel aborts Runs / cancels Jobs / closes on cancel. */
@@ -332,10 +279,6 @@ export interface Kernel {
   ingest(raw: Omit<Envelope, "to">, channelId: string): Promise<IngestResult>;
   reopenProject(cellId: string, principalId: string): Promise<string[]>;
   resolveApproval(actionId: string, decision: ApprovalDecision): Promise<ResolveApprovalResult>;
-  /** Engage focus (DND) on/off. Leaving focus delivers what was held back and returns the receipts' counts. */
-  setFocus(on: boolean): Promise<{ sent: number; failed: number; unknown: number } | null>;
-  /** The owner checked an `unknown` send on the external side: record it on the outbox row and the approval. */
-  resolveUnknownSend(actionId: string, verdict: "sent" | "failed", opts: { approverId: string; seenItemRevision: number; seenAttempt: number; note?: string }): "resolved" | "not_unknown" | "revision_mismatch" | "not_found";
 
   // ---------- read models ----------
   getCell(cellId: string): CellRecord | undefined;
@@ -373,17 +316,6 @@ export interface Kernel {
   /** Re-evaluate the stall check now (tests, and the app after it changed GTD records itself). */
   checkStalls(): void;
 
-  // ---------- budget limits ----------
-  /** Whether budget limits are enforced right now. */
-  budgetLimits(): { enforced: boolean };
-  /**
-   * Switch budget limits on or off — the owner only (an agent or a cell is refused with `bounds_violation`): off
-   * removes every stop a budget would cause, which is a wider grant than raising any single budget. Switching off
-   * starts the cells that were held at their budget stop and answers the budget cards that were waiting with
-   * "continue" (nothing is left to decide on them; the cells they were about go on); switching on applies the limits again from the next decision (a ledger
-   * that is over its limit stops its cells at their next step or wake-up). Remembered across restarts.
-   */
-  setBudgetLimits(enforced: boolean, opts?: ActorOptions): { enforced: boolean; changed: boolean; releasedCells: string[]; continuedCards: string[] };
 }
 
 /** docs/05 guard 2. A stalled_check wake-up and a Run that only it triggered never count as anchors. */
@@ -406,7 +338,7 @@ export interface AnchorReport {
 
 /** What a cell is doing right now (ReadModel.activityOf). `idle` is a coordinator with nothing in flight; `dormant` a leaf. */
 export interface CellActivity {
-  state: "working" | "waiting" | "dormant" | "idle" | "paused" | "budget_paused" | "closed";
+  state: "working" | "waiting" | "dormant" | "idle" | "paused" | "closed";
   /** One plain clause saying why (for refusals and status lines). */
   why: string;
 }

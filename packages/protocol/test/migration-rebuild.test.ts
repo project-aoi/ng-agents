@@ -23,8 +23,8 @@ CREATE TABLE cell_watches (
 CREATE TABLE schema_versions (owner TEXT PRIMARY KEY, version INTEGER NOT NULL, applied_at INTEGER NOT NULL);
 INSERT INTO schema_versions VALUES ('@ng/cell', 1, 0);
 INSERT INTO cells (id, parent_id, root_id, depth, preset, title, spec, bounds, principal_id, created_at, updated_at)
-  VALUES ('desk', NULL, 'desk', 0, 'inline', '主台', '{"processor":{"kind":"llm"}}', '{"tools":[],"canSendTo":[],"secretRefs":[],"isolation":"none","maxConcurrentChildren":1,"maxTokens":1,"maxCents":1,"maxDepth":1}', 'owner', 1, 1),
-         ('w1', 'desk', 'desk', 1, 'worker', 'w', '{"processor":{"kind":"llm"}}', '{"tools":[],"canSendTo":[],"secretRefs":[],"isolation":"none","maxConcurrentChildren":1,"maxTokens":1,"maxCents":1,"maxDepth":1}', 'owner', 2, 2);
+  VALUES ('desk', NULL, 'desk', 0, 'inline', '主台', '{"processor":{"kind":"llm"}}', '{"tools":[],"canSendTo":[],"isolation":"none","maxConcurrentChildren":1,"maxDepth":1}', 'owner', 1, 1),
+         ('w1', 'desk', 'desk', 1, 'worker', 'w', '{"processor":{"kind":"llm"}}', '{"tools":[],"canSendTo":[],"isolation":"none","maxConcurrentChildren":1,"maxDepth":1}', 'owner', 2, 2);
 INSERT INTO cell_watches (cell_id, thread, created_at) VALUES ('w1', 'github:o/r#1', 3);
 `;
 
@@ -48,7 +48,7 @@ describe("cells v1 → v2 (preset CHECK lifted by a table rebuild)", () => {
     expect(all<{ foreign_keys: number }>(db, "PRAGMA foreign_keys")[0]!.foreign_keys).toBe(1);
 
     const cells = cellsRepo(db);
-    const bounds = makeBounds({ tools: [], canSendTo: [], isolation: "none", maxConcurrentChildren: 1, maxTokens: 1, maxCents: 1, maxDepth: 0 });
+    const bounds = makeBounds({ tools: [], canSendTo: [], isolation: "none", maxConcurrentChildren: 1, maxDepth: 0 });
     const p = cells.insert({ id: "p1", parentId: "desk", preset: "project", title: "p", spec: { preset: "project", processor: { kind: "llm" } }, bounds, principalId: "owner" });
     expect(p.preset).toBe("project");
     // Foreign keys are enforced again: other tables still point at the rebuilt cells(id), and so does parent_id.

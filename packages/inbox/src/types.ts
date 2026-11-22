@@ -1,6 +1,5 @@
 import type {
   Bus,
-  ClaimMode,
   Clock,
   ControlAction,
   ControlAuthorizer,
@@ -41,7 +40,7 @@ export interface InboxOptions {
   /**
    * Monotonic milliseconds that stand still while the host is suspended, compared with `clock` to tell a machine that
    * slept from a lease that really ran out. Default `performance.now` when `clock` is the system clock; with any
-   * other clock (manual, demo: its jumps are deliberate) suspend detection is off unless a source is passed here.
+   * other clock with deliberate clock jumps suspend detection is off unless a source is passed here.
    */
   monotonicNow?: () => number;
 }
@@ -52,7 +51,6 @@ export interface InboxClaimRecord {
   claimId: string;
   cellId: string;
   workerId: string;
-  mode: ClaimMode;
   epoch: number;
   status: InboxClaimStatus;
   claimedAt: number;

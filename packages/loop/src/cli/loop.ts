@@ -41,12 +41,6 @@ export const CLI_SESSION_KEY = "cli:session";
 export const CLI_FORK_SESSION_KEY = "cli:session:fork";
 /** MCP server name the kernel tools are published under. */
 export const CLI_MCP_SERVER = "ng";
-/**
- * Workspace tools the CLI's own file/shell tools replace (the kernel-only job tools stay on MCP). `code_rpc` is among
- * them: it exists for API models without a shell, and a CLI agent that is offered it tends to route every command
- * through it instead of its own, much better, shell.
- */
-export const NATIVE_REPLACED_TOOLS: ReadonlySet<string> = new Set(["read", "write", "edit", "bash", "code_rpc"]);
 
 export const RUN_ENDED_NOTICE =
   "[The kernel ended this run with that result. Stop now: make no further tool calls and do no further work; reply with at most one short sentence. You will be woken with the next message.]";
@@ -84,10 +78,6 @@ export interface CliAgentLoopOptions {
   /** Variable names exempt from CLI_ENV_DROP (e.g. ANTHROPIC_API_KEY when the owner's CLI login is an API key). */
   keepEnv?: readonly string[];
   dropEnv?: readonly (string | RegExp)[];
-  /** Offer the CLI's native web tools. Default false (the API loop has none either). */
-  web?: boolean;
-  /** Meter the cost a CLI reports (Claude Code reports list-price cost even on a subscription). Default true. */
-  billReportedCost?: boolean;
   /** After a kernel tool ends the Run, how long the CLI may take to finish its turn before it is stopped. Default 10 s. */
   endRunGraceMs?: number;
   /** SIGTERM → SIGKILL grace. Default 3 s. */
@@ -119,7 +109,7 @@ export type CliDebugEvent =
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
 type EvidenceInput = DistributiveOmit<StepOrExternalEvidence, "runId" | "at">;
 type EndOutcome = NonNullable<ToolResult["endRun"]>;
-type StopReason = "cancelled" | "budget" | "timeout" | "steps";
+type StopReason = "cancelled" | "timeout" | "steps";
 /** How a batch of extra input reaches the CLI: a steer may cut the running turn short, a follow-up never does. */
 type DeliverMode = "interrupt" | "turn_end";
 
@@ -144,14 +134,11 @@ interface LegOutcome {
  *
  * 1. Capabilities: WorkspaceAccess (root, kernel-allowed tool kinds) ∩ processor.allowedTools → read-only or writing,
  *    mapped by the adapter onto the CLI's own permission/sandbox flags. cwd = the workspace root.
- * 2. Kernel tools: selectRunTools (same names, descriptions, schemas as the API loop) minus the workspace tools the CLI
- *    replaces natively, served by a per-Run loopback MCP bridge bound to this Run's ports.
+ * 2. Kernel tools: a per-Run loopback MCP bridge exposes the tools selected for this cell.
  * 3. Session: resume the cell's CLI session (Context state CLI_SESSION_KEY) with only the volatile tail; otherwise a
  *    fresh session with the frozen system text as the CLI's system prompt and the rendered history as the first
  *    message; fork_prefix children fork the parent's session when the CLI can. A failed resume/fork falls back to fresh.
- * 4. Everything the CLI does is mirrored into evidence (assistant text, tool calls and results, steer notes) and every
- *    reported usage is metered. endRun from a kernel tool ends the Run with the same outcome as the API loop (the CLI
- *    is told to stop and is stopped if it does not); abort kills the process tree; hard_stop → budget_stopped.
+ * 4. Assistant text, tool calls, results and steer notes are recorded as evidence.
  */
 export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { readonly engine: CliEngine; readonly adapter: CliAdapter } {
   const engine = opts.engine;
@@ -194,23 +181,14 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
     const runId = snapshot.runId;
     const append = (rec: EvidenceInput) => ports.context.appendEvidence(cellId, { ...rec, runId, at: clock.now() } as StepOrExternalEvidence);
 
-    if (ports.meter({ tokens: 0, billedCents: 0 }) === "hard_stop") return "budget_stopped";
 
     const { parentId: _specParent, ...specRest } = snapshot.spec;
     const cellSpec = ports.self.parentId ? { ...specRest, parentId: ports.self.parentId } : specRest;
-    const tools = selectRunTools(opts.registry.resolveTools(processor.toolsets ?? []), processor, snapshot.bounds, cellSpec).filter(
-      (t) => !(NATIVE_REPLACED_TOOLS.has(t.name) && t.kind === t.name),
-    );
+    const tools = selectRunTools(opts.registry.resolveTools(processor.toolsets ?? []), processor, snapshot.bounds, cellSpec);
     const byName = new Map<string, ToolDef>(tools.map((t) => [t.name, t]));
 
-    const access = await workspaceAccess(ports);
-    if (access.isolation === "container" || access.isolation === "cow_microvm") {
-      throw new NgError(
-        "unsupported",
-        `the ${engine} CLI runs on the host and cannot enter a ${access.isolation} workspace; give this cell engine "api" or a git_worktree workspace`,
-      );
-    }
-    const caps = capabilitiesOf(access, processor, opts.web ?? false);
+    const access = await ports.workspaceAccess();
+    const caps = capabilitiesOf(access, processor);
     const tier = processor.modelTier ?? opts.defaultTier ?? "strong";
     // The owner's switch first; a failure to read it must not stop the Run (the static setting or the CLI's own
     // default model still works).
@@ -247,7 +225,6 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
     let plan: { session?: LaunchRequest["session"]; prompt: string; forkedFrom?: string };
     let releaseParent: (()=>void) | undefined;
     let forkDelivered: number | undefined;
-    let forkBase: CliSessionRecord["reported"];
     const priorCursor = own?.lastDeliveredEvidenceSeq ?? 0;
     if (own && own.engine === engine && own.cwd === access.root && own.systemHash === snapshot.system.hash && sameModel(own)) {
       const missed = (ports.listEvidence?.({ afterSeq: priorCursor }) ?? []).filter(entry =>
@@ -271,7 +248,6 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
             && !activeCells.has(point.fromCellId) && !readingParent.has(point.fromCellId) && parent.lastDeliveredEvidenceSeq !== undefined &&
             ports.canForkSession(point.fromCellId,point.uptoSeq,parent.sessionId,parent.lastDeliveredEvidenceSeq)) {
           forkDelivered = parent.lastDeliveredEvidenceSeq;
-          forkBase = parent.reported;
           plan = { session: { id: parent.sessionId, mode: "fork" }, prompt: freshPrompt(snapshot.history.slice(forkIdx), input), forkedFrom: parent.sessionId };
           // The fork note is the first "earlier" message the child shows; the parent's part is in the forked session.
           plan.prompt = plan.prompt.replace(/^\[Earlier conversation[^\]]*\]\n\n/, "");
@@ -291,10 +267,6 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
     });
 
     let sessionId: string | null = plan.session?.mode === "resume" ? plan.session.id : null;
-    // Totals of the session that were already metered (CLIs that report running totals). A resumed session continues
-    // from its own record; a fork starts from its parent's history, so from the parent's figure.
-    const zeroUsage = { tokens: 0, cached: 0 };
-    let reported = plan.session?.mode === "resume" ? (own?.reported ?? zeroUsage) : plan.session?.mode === "fork" ? (forkBase ?? zeroUsage) : zeroUsage;
     let sessionBaselineSeq = plan.session?.mode === "resume" ? priorCursor : plan.session?.mode === "fork" ? (forkDelivered ?? snapshot.historyUptoSeq) : snapshot.historyUptoSeq;
     let sessionProgress = false;
     let awaitingSessionConfirmation = false;
@@ -334,7 +306,6 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
         updatedAt: clock.now(),
         runs: (own && own.sessionId === sessionId ? own.runs : 0) + (final ? 1 : 0),
         ...(plan.forkedFrom ? { forkedFrom: plan.forkedFrom } : {}),
-        ...(reported.tokens > 0 ? { reported } : {}),
       };
       const patches: Record<string, unknown> = { [CLI_SESSION_KEY]: rec };
       if (plan.forkedFrom) patches[CLI_FORK_SESSION_KEY] = null;
@@ -469,7 +440,6 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
             sessionBaselineSeq = snapshot.historyUptoSeq;
             nextPrompt=freshPrompt(snapshot.history,input);
             delete plan.forkedFrom;
-            reported=zeroUsage;
           } else {
             readingParent.set(point.fromCellId,new Promise<void>(resolve=>{
               releaseParent=()=>{readingParent.delete(point.fromCellId);resolve();releaseParent=undefined;};
@@ -494,17 +464,13 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
         const out = await runLeg(req, nextPromptItems);
         releaseParent?.();
         if (stopReason === "cancelled" || signal.aborted) return "cancelled";
-        if (stopReason === "budget") {
-          requeueUnconfirmed("run stopped by budget before mid-run input was confirmed");
-          return "budget_stopped";
-        }
         if (stopReason === "timeout") throw new Error(`${engine} run exceeded ${runTimeoutMs} ms and was stopped`);
         if (endOutcome) {
           requeueUnconfirmed("run ended by tool before mid-run input was confirmed");
           return finish(endOutcome);
         }
         if (stopReason === "steps") {
-          // Same outcome as the API loop: work is left, so this is not "completed" (docs/05 guard 1).
+          // The step limit leaves work for the next run.
           await append({ kind: "system_note", text: `[run stopped after ${maxSteps} tool calls (step limit); the kernel wakes you to continue]` });
           requeueUnconfirmed("run hit step limit before mid-run input was confirmed");
           return "step_limit";
@@ -528,7 +494,6 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
           sessionProgress = false;
           awaitingSessionConfirmation = false;
           sessionBaselineSeq = snapshot.historyUptoSeq;
-          reported = zeroUsage;
           sessionCreatedAt = clock.now();
           delete plan.forkedFrom;
           nextSession = undefined;
@@ -560,7 +525,6 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
             } else if (totalFreshRebuilds < MAX_FRESH_REBUILDS) {
               totalFreshRebuilds++;
               // No session to continue (the CLI never reported one): rebuild from SQLite evidence + unconfirmed inputs.
-              reported = zeroUsage;
               nextSession = undefined;
               nextPromptItems = out.relaunchItems;
               nextPrompt = rebuildFreshPrompt(snapshot, initialBatchIds, ports, tracked, steerSeqToEnvelopeId, out.relaunchItems);
@@ -695,7 +659,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
       };
 
       const handle = async (e: CliEvent): Promise<void> => {
-        if (finishTimer && nextConfirmTurn > legTurns && ["text", "tool_start", "tool_end", "usage"].includes(e.type)) {
+        if (finishTimer && nextConfirmTurn > legTurns && ["text", "tool_start", "tool_end"].includes(e.type)) {
           clearTimeout(finishTimer);
           finishTimer = undefined;
         }
@@ -743,23 +707,6 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
             }
             native.delete(e.id);
             await append({ kind: "tool_result", toolUseId: id, name: e.name, output: e.output || "(no output)", ...(e.isError ? { isError: true } : {}) });
-            break;
-          }
-          case "usage": {
-            let tokens = Math.max(0, Math.round(e.tokens));
-            let cached = Math.max(0, Math.round(e.cached ?? 0));
-            if (e.sessionTotal) {
-              // Only what this turn added is metered. A total below the one already seen means the CLI's counters
-              // started over (a rebuilt session): everything it reports is new.
-              const base = tokens >= reported.tokens ? reported : zeroUsage;
-              reported = { tokens, cached };
-              tokens -= base.tokens;
-              cached = Math.max(0, cached - base.cached);
-              persistSession(false);
-            }
-            cached = Math.min(cached, tokens);
-            const r = ports.meter({ tokens, billedCents: opts.billReportedCost === false ? 0 : Math.max(0, e.cents), ...(cached > 0 ? { cachedTokens: cached } : {}) });
-            if (r === "hard_stop" && !endOutcome) stop("budget");
             break;
           }
           case "turn_end":
@@ -880,44 +827,26 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
 }
 
 /** Kernel-side capabilities → what the CLI may do. */
-export function capabilitiesOf(access: WorkspaceAccess, processor: LlmProcessorSpec, web: boolean): CliCapabilities {
+export function capabilitiesOf(access: WorkspaceAccess, processor: LlmProcessorSpec): CliCapabilities {
   const allowedTools = processor.allowedTools ? new Set<ToolKind>(processor.allowedTools) : null;
   const has = (k: ToolKind) => access.tools.includes(k) && (allowedTools === null || allowedTools.has(k));
   const write = has("write");
   const edit = has("edit");
   const bash = has("bash");
-  const host = access.isolation === "none";
-  // On the host the agent researches like the owner would (docs/05 scenario 5), so its web tools are on.
-  return { root: access.root, isolation: access.isolation, write, edit, bash, readOnly: !(write || edit || bash), web: web || host, access: host ? "host" : "workspace" };
-}
-
-async function workspaceAccess(ports: RunPorts): Promise<WorkspaceAccess> {
-  if (ports.workspaceAccess) return ports.workspaceAccess();
-  // Ports without workspaceAccess (older/hand-written): the root appears once the workspace has been acquired.
-  if (!ports.workspace.root) {
-    try {
-      await ports.workspace.exec("read", { op: "list_dir", path: ".", depth: 1 });
-    } catch {
-      // the root may still be known; checked below
-    }
-  }
-  if (!ports.workspace.root) throw new NgError("unsupported", "these RunPorts expose no workspace root for a CLI agent");
-  return { root: ports.workspace.root, isolation: ports.workspace.isolation, tools: [...ports.self.bounds.tools] };
+  return { root: access.root, write, edit, bash, readOnly: !(write || edit || bash), web: true };
 }
 
 /**
  * What a CLI agent must know about being a cell, appended to the cell's frozen system text: a coding CLI arrives with
  * its own habits (its own way of asking the user, a task list nobody sees), so this says which of them do not apply
  * and where the kernel's tools take over. Its own sub-agents are its own business: they run inside this cell's
- * process and budget and are welcome — what a cell may not do is ask a terminal nobody is sitting at.
+ * process and are welcome — what a cell may not do is ask a terminal nobody is sitting at.
  */
 function kernelSystem(frozen: string, adapter: CliAdapter, caps: CliCapabilities, tools: readonly ToolDef[]): string {
   const example = tools[0] ? adapter.mcpToolName(CLI_MCP_SERVER, tools[0].name) : adapter.mcpToolName(CLI_MCP_SERVER, "set_state");
   const directory = caps.readOnly
-    ? `- Directory: \`${caps.root}\`. This workspace is read-only (its isolation level allows reading and searching only). ${adapter.readOnlyHowTo(caps)}`
-    : caps.access === "host"
-      ? `- Directory: \`${caps.root}\`. You work with this CLI's own file and shell tools, as you normally would, on the owner's real machine with no sandbox — the red lines above are the only guard, so keep to them. Nothing reserves this directory for you: another cell, or the owner, may be working in it at the same time.`
-      : `- Directory: \`${caps.root}\`, an isolated workspace of your own. You may change files and run commands inside it.`;
+    ? `- Directory: \`${caps.root}\`. This workspace is read-only (its tool permissions allow reading and searching only). ${adapter.readOnlyHowTo(caps)}`
+    : `- Directory: \`${caps.root}\`. You work with this CLI's own file and shell tools, as you normally would, on the owner's real machine with no sandbox — the red lines above are the only guard, so keep to them. Nothing reserves this directory for you: another cell, or the owner, may be working in it at the same time.`;
   const lines = [
     frozen.trimEnd(),
     "",

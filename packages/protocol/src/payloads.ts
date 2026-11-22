@@ -83,12 +83,12 @@ export interface UserMessagePayload {
   tags?: string[];
 }
 
-/** A deliverAt reminder, a cron tick or an idleSec wakeup. */
+/** A deliverAt reminder, or a cron tick. */
 export interface TimerFiredPayload {
   label: string;                        // e.g. "提醒：给牙医打电话", "weekly-metrics-check"
   data?: unknown;
   subjectKey?: string;
-  scheduleId?: string;                  // set by the Inbox for cron/idleSec firings
+  scheduleId?: string;                  // set by the Inbox for cron firings
   firedAt?: number;
 }
 
@@ -118,7 +118,7 @@ export interface CellTaskPayload {
  */
 export interface CellResultPayload {
   childCellId: string;
-  status: "completed" | "failed" | "cancelled" | "budget_stopped";
+  status: "completed" | "failed" | "cancelled";
   /** What the child reported (report_to_parent), else the last thing it said, else a placeholder. */
   summary: string;
   deliverable?: Deliverable;
@@ -155,7 +155,7 @@ export interface CellProgressPayload {
   data?: unknown;
 }
 
-/** Sent by the kernel to the owning cell whenever an approval is decided (and, for channel.send, executed). */
+/** Sent by the kernel to the owning cell whenever an approval is decided. */
 export interface ApprovalResolvedPayload {
   actionId: string;
   status: ApprovalStatus;
@@ -246,7 +246,7 @@ export interface StalledCheckPayload {
 
 /** [docs/05 guard 1] The previous Run stopped at its step limit with work left; continue where it stopped. */
 export interface RunContinuePayload {
-  reason: "step_limit" | "budget_raised";
+  reason: "step_limit";
   /** Consecutive continuations so far (1 = first). */
   count: number;
 }
@@ -340,7 +340,7 @@ export const kernelPayloadSchemas = {
   }),
   "cell.result": z.looseObject({
     childCellId: z.string(),
-    status: z.enum(["completed", "failed", "cancelled", "budget_stopped"]),
+    status: z.enum(["completed", "failed", "cancelled"]),
     summary: z.string(),
     deliverable: deliverableSchema.optional(),
     artifactId: z.string().optional(),
@@ -368,7 +368,7 @@ export const kernelPayloadSchemas = {
   }),
   "approval.resolved": z.looseObject({
     actionId: z.string(),
-    status: z.enum(["pending", "approved", "denied", "cancelled", "superseded", "executed", "failed", "unknown"]),
+    status: z.enum(["pending", "approved", "denied", "cancelled", "superseded", "executed"]),
     action: actionShape,
     approverId: z.string().optional(),
     humanEdited: z.boolean().optional(),
@@ -410,7 +410,7 @@ export const kernelPayloadSchemas = {
   }),
   "kernel.arbitration_unanswered": z.looseObject({causeKey: z.string(), waiters: z.array(z.object({cellId:z.string(),waitId:z.string(),registrationId:z.string().nullable()}))}),
   "kernel.stalled_check": z.looseObject({ projectCellId: z.string(), stalledSince: z.number(), detail: z.string() }),
-  "kernel.continue": z.looseObject({ reason: z.enum(["step_limit","budget_raised"]), count: z.number().int() }),
+  "kernel.continue": z.looseObject({ reason: z.enum(["step_limit"]), count: z.number().int() }),
   "kernel.wait_timeout": z.looseObject({ waitingFor: z.string(), reason: z.string(), since: z.number() }),
 } as const satisfies Record<KernelPayloadType, z.ZodType>;
 

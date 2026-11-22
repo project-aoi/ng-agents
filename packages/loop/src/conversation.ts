@@ -1,7 +1,6 @@
 import {
   mergeAdjacentMessages,
-  type ModelTurnMessage,
-  type NativeAssistantContent,
+  type ModelMessage,
   type PromptSnapshot,
   type TextBlock,
   type ToolResultBlock,
@@ -11,14 +10,14 @@ import {
 /**
  * The message list of one Run: `mergeAdjacentMessages([...history, ...tail])` from the snapshot, then append-only.
  * Steer notes and tool results are appended in the same order Context will rebuild them from evidence, so the next
- * Run's history matches what the model saw here (minus provider-native extras such as thinking blocks).
+ * Run's history matches what the model saw here.
  */
 export class Conversation {
-  readonly messages: ModelTurnMessage[];
+  readonly messages: ModelMessage[];
   /** Last block of the snapshot's history inside `messages` (prompt-cache breakpoint), if there is history. */
   readonly stablePrefixEnd: { message: number; block: number } | undefined;
 
-  private constructor(messages: ModelTurnMessage[], stablePrefixEnd: { message: number; block: number } | undefined) {
+  private constructor(messages: ModelMessage[], stablePrefixEnd: { message: number; block: number } | undefined) {
     this.messages = messages;
     this.stablePrefixEnd = stablePrefixEnd;
   }
@@ -47,9 +46,8 @@ export class Conversation {
     else this.messages.push({ role: "user", content: [{ type: "text", text }] });
   }
 
-  appendAssistant(content: Array<TextBlock | ToolUseBlock>, native: NativeAssistantContent | undefined): void {
-    const msg: ModelTurnMessage = { role: "assistant", content: content.length ? [...content] : [{ type: "text", text: "" }] };
-    if (native) msg.native = native;
+  appendAssistant(content: Array<TextBlock | ToolUseBlock>): void {
+    const msg: ModelMessage = { role: "assistant", content: content.length ? [...content] : [{ type: "text", text: "" }] };
     this.messages.push(msg);
   }
 
@@ -58,7 +56,7 @@ export class Conversation {
   }
 
   /** A copy safe to hand to a client (later appends do not show up in recorded requests). */
-  forRequest(): ModelTurnMessage[] {
+  forRequest(): ModelMessage[] {
     return this.messages.map((m) => ({ ...m, content: [...m.content] }));
   }
 }

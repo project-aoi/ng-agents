@@ -1,21 +1,13 @@
 import {createSensorSpec,sensorProcessor} from "../shared/sensor";
 import { z } from "zod";
 import {
-  anyCovers,
-  CELL_STATUS_KEY,
-  cellIdOf,
   defineTool,
   gtdKeys,
-  isChannelAddr,
-  isEnvelopeOfType,
   isNgError,
   newId,
   subjectKeys,
   type ActivityRecord,
-  type ApprovalRevisePayload,
   type CellSpec,
-  type ChannelAddr,
-  type ChannelSendAction,
   type ProcessorSpec,
   type ProjectProposal,
   type ProjectRecord,
@@ -27,27 +19,22 @@ import {
   type Toolset,
 } from "@ng/protocol";
 import type { ProjectInit } from "../project/launch";
-import { cardDeliverable, prep as cardPrep, proposalCard, responseCard } from "../shared/cards";
+import { cardDeliverable, prep as cardPrep, proposalCard } from "../shared/cards";
 import { KEYS, PROCESSORS, ROLES, TOOLSETS, type PresetsConfig } from "../shared/config";
 import { errorText, isCwdError, repoInput, watchFilterInput } from "../shared/inputs";
 import { notifyOwner } from "../shared/notify";
-import { HUB_PROCESSOR, SENSOR_LLM_PROCESSOR, WORKER_PROCESSOR } from "../shared/processors";
+import { HUB_PROCESSOR, SENSOR_LLM_PROCESSOR } from "../shared/processors";
 import { clip, formatWhen, itemRawInput, itemSource, newActivity } from "../shared/records";
 import type { SourceInit } from "../shared/sensor";
 import {
-  ACKNOWLEDGE_ACTION,
-  closeLinkedActions,
   currentItem,
   isRestored,
   launchProject,
-  readReplyItems,
-  replyAddressOf,
   SETTLE_ERROR,
   settleDesk,
   type DeskBooks,
   type ProposalItem,
   type ReminderData,
-  type ReplyItem,
 } from "./items";
 
 
@@ -58,7 +45,6 @@ const prepInput = z
     checked: z.array(z.object({ label: z.string(), uri: z.string(), detail: z.string().optional() })).optional(),
   })
   .describe("shown on the card: what you looked at");
-const replyToInput = z.string().optional().describe("channel address of the person who asked, if the result should go back to them (sent only after the owner confirms)");
 
 function parseTime(at: string | undefined, minutes: number | undefined, now: number): number | string {
   if (at !== undefined) {
@@ -76,7 +62,7 @@ function prepOf(p: z.infer<typeof prepInput> | undefined, fallback: string) {
 
 /** `gtd.desk`: the desk's GTD-aware composites. Each one runs the desk's bookkeeping for this wake-up first. */
 export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
-  const owner = cfg.ownerAddress;
+  const owner = "channel:ui:owner";
 
   /** Every desk tool first applies the wake-up's deterministic follow-ups, whichever tool the model picked. */
   function tool<S extends z.ZodType>(def: { name: string; description: string; input: S; run(args: z.output<S>, ctx: ToolContext, settled: string[]): Promise<ToolResult | string> }): ToolDef {
@@ -98,7 +84,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
   const now = (ctx: ToolContext) => ctx.clock.now();
   const self = (ctx: ToolContext) => ctx.ports.self.cellId;
   const restoredRefusal = {
-    output: "The owner moved this item back from the archive on purpose: it needs a card (present_to_owner, draft_reply, propose_project) or a project (start_project). Do not file it away again.",
+    output: "The owner moved this item back from the archive on purpose: it needs a card (present_to_owner or propose_project) or a project (start_project). Do not file it away again.",
     isError: true,
   };
 
@@ -135,7 +121,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
         t,
       );
       await ctx.ports.context.commit(self(ctx), { statePatches: { [gtdKeys.activity(a.id)]: a } });
-      await notifyOwner(ctx.ports, owner, `已存入${list}：${args.title}`, `note:${a.id}`);
+      await notifyOwner(ctx.ports, `已存入${list}：${args.title}`, `note:${a.id}`);
       return `Saved to "${list}" and the owner was told. Nothing else is needed for it.`;
     },
   });
@@ -168,7 +154,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
         t,
       );
       await ctx.ports.context.commit(self(ctx), { statePatches: { [gtdKeys.activity(id)]: a } });
-      await notifyOwner(ctx.ports, owner, `已设好 ${whenText} 的提醒：${args.text}`, `reminder-set:${id}`);
+      await notifyOwner(ctx.ports, `已设好 ${whenText} 的提醒：${args.text}`, `reminder-set:${id}`);
       return `Reminder set for ${new Date(when).toISOString()} (cancel with cancel_scheduled cancelGroup "reminder:${id}"). The owner was told.`;
     },
   });
@@ -199,171 +185,6 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
     },
   });
 
-  // ---------- replies: one card per item, kept across redrafts ----------
-
-  const draftReply = tool({
-    name: "draft_reply",
-    description: [
-      "Draft a reply to someone (not the owner) and put it on the owner's confirmation card; nothing is sent until the owner confirms that exact version.",
-      "Also use it to redraft after the owner asks for changes, or when a follow-up arrives in a thread whose reply is still waiting: it updates that same card with a new version (a draft the owner already edited themselves is kept, and your new text is put beside it).",
-      "Defaults to answering the person who sent the current message.",
-    ].join(" "),
-    input: z.object({
-      text: z.string().min(1).describe("the full reply text"),
-      to: z.string().optional().describe("channel:<channelId>:<target>; default: whoever sent the current message"),
-      title: z.string().optional().describe("card title in Chinese, e.g. 回复张三：限流阈值"),
-      targetLabel: z.string().optional().describe('recipient as the owner would name them, e.g. "张三（飞书）"'),
-      expectedVersion: z
-        .number()
-        .int()
-        .min(1)
-        .optional()
-        .describe("required when updating a draft the owner edited themselves: read the artifact first and pass its current version"),
-      prep: prepInput.optional(),
-    }),
-    async run(args, ctx) {
-      const { ports } = ctx;
-      const t = now(ctx);
-      const revise = ctx.snapshot.batch.envelopes.find((e) => isEnvelopeOfType(e, "approval.revise"));
-      const reviseSubject = revise ? (revise.payload as ApprovalRevisePayload & { subjectKey?: string }).subjectKey : undefined;
-      const env = currentItem(ctx);
-      let subjectKey = reviseSubject;
-      if (!subjectKey && env?.threads?.length) {
-        // A follow-up in a thread whose reply still waits on a card belongs to that item (one card per item).
-        const threads = new Set(env.threads);
-        const open = (await readReplyItems(ports)).filter((i) => i.status === "pending" && i.actionId && i.threads?.some((th) => threads.has(th)));
-        if (open.length === 1) subjectKey = open[0]!.subjectKey;
-      }
-      subjectKey ??= env ? `reply:${args.to ?? replyAddressOf(env) ?? env.from}:${env.threads?.[0] ?? env.id}` : undefined;
-      if (!subjectKey) return { output: "There is no message to reply to in this wake-up; give `to` and use send_message for a new conversation.", isError: true };
-      let item = (await readReplyItems(ports)).find(i => i.subjectKey === subjectKey);
-      const to = args.to ?? item?.target ?? replyAddressOf(env);
-      if (!to || !isChannelAddr(to)) return { output: `No reply address: pass to as channel:<channelId>:<target>.`, isError: true };
-      if (anyCovers([`${owner.split(":").slice(0, 2).join(":")}:*`], to)) return { output: "That is the owner's own address: use send_message for notes to the owner.", isError: true };
-      const target: ChannelAddr = to;
-      const title = args.title ?? item?.title ?? `回复：${clip(itemRawInput(env).text, 40) || "消息"}`;
-      const targetLabel = args.targetLabel ?? item?.targetLabel ?? target;
-
-      if (item?.status === "sent" && item.target === target && !revise) return "This reply was already sent.";
-      let artifactId = item?.artifactId;
-      let version: number;
-      const content = { format: "text" as const, title, body: args.text };
-      if (artifactId) {
-        const cur = await ports.context.getArtifact(artifactId);
-        if (!revise && cur?.updatedBy === "agent" && cur.content.body === content.body && cur.content.title === title &&
-            cur.content.format === content.format && (args.expectedVersion === undefined || args.expectedVersion === cur.version)) {
-          version = cur.version;
-        } else {
-          // BUG-032: NEVER auto-fill cur.version when cur.updatedBy === "human" (even during revise). Unless the model
-          // explicitly read the human's edited version and passed expectedVersion, omit expectedVersion so Context keeps
-          // the owner's version untouched and parks the agent's text beside it.
-          const expected =
-            args.expectedVersion !== undefined
-              ? args.expectedVersion
-              : cur && cur.updatedBy === "agent"
-                ? cur.version
-                : undefined;
-          const r = await ports.context.commit(self(ctx), { artifact: { artifactId, content, updatedBy: "agent", ...(expected !== undefined ? { expectedVersion: expected } : {}) } });
-          if (!r.ok && r.parked && item) {
-            return `The owner has edited this draft themselves (v${r.currentArtifact.version}): their text and their card stay as they are, and your new version was put beside it for them to use. Read the artifact first and pass expectedVersion: ${r.currentArtifact.version} if they asked you to revise their edited text.`;
-          }
-          if (!r.ok) return { output: `The draft changed meanwhile (now v${r.currentArtifact.version} by ${r.currentArtifact.updatedBy}); read it and redraft.`, isError: true };
-          version = r.artifactVersion ?? (cur?.version ?? 0) + 1;
-        }
-      } else {
-        artifactId = newId("art", ctx.clock);
-        const r = await ports.context.commit(self(ctx), { artifact: { artifactId, content, updatedBy: "agent" } });
-        version = r.ok ? (r.artifactVersion ?? 1) : 1;
-      }
-      item = {
-        subjectKey,
-        title,
-        target,
-        targetLabel,
-        artifactId,
-        status: "pending",
-        source: item?.source ?? itemSource(env, t),
-        rawInput: item?.rawInput ?? itemRawInput(env),
-        ...(item?.envelope ?? env ? { envelope: (item?.envelope ?? env)! } : {}),
-        ...((item?.threads ?? env?.threads) ? { threads: (item?.threads ?? env?.threads)! } : {}),
-        ...(item?.actionId ? { actionId: item.actionId } : {}),
-        createdAt: item?.createdAt ?? t,
-        updatedAt: t,
-      };
-      const card = responseCard(
-        { subjectKey, title, source: item.source, rawInput: item.rawInput, prep: prepOf(args.prep, revise ? "按主人的修改意见重拟了一版。" : "") },
-        { artifactId, version },
-        { target, targetLabel },
-        "send",
-      );
-      const action: ChannelSendAction = { type: "channel.send", target, content, artifactId, summary: title, subjectKey, sideEffect: "external", card: cardDeliverable(card, args.text) };
-      const r = await ports.submitReply(action, version, revise?.id ?? env?.id ?? subjectKey);
-      if (r.type === "deny") return { output: `Not allowed: ${r.feedback}`, isError: true };
-      if (r.type === "delivery") {
-        const sent = r.receipt === "sent";
-        const statePatches: Record<string, unknown> = {};
-        if (sent) {
-          const done = newActivity(
-            { id: `sent-${r.actionId}`, kind: "action_completed", title: `已回复${targetLabel}：${title}`, source: item.source, rawInput: item.rawInput.text, actionId: r.actionId, restorable: false }, t,
-          );
-          statePatches[gtdKeys.activity(done.id)] = done;
-        }
-        if (sent) await ports.context.commit(self(ctx), { statePatches });
-        const messages = {
-          sent: "A standing rule allowed it: sent (sent).",
-          failed: "Delivery failed. The owner can retry on the failed-send card.",
-          unknown: "Delivery status is unknown. The owner must verify the receipt before retrying.",
-          pending: "This reply is already being sent. Wait for its receipt.",
-          cancelled: "The owner closed this reply.",
-        };
-        return { output: `${messages[r.receipt]} Action ${r.actionId}, draft ${artifactId}.`, isError: !sent, data: { receipt: r.receipt, actionId: r.actionId } };
-      }
-      return { output: `Draft v${version} (${artifactId}) is on the owner's card ${r.actionId}. Nothing is sent until they confirm.`, endRun: "deferred_for_approval", data: { actionId: r.actionId, artifactId, version } };
-    },
-  });
-
-  const withdrawCard = tool({
-    name: "withdraw_card",
-    description:
-      "Take down a pending reply card that is no longer needed (e.g. someone else already answered in the group). It is archived and can be moved back. Defaults to the card of the thread the current message is in.",
-    input: z.object({ reason: z.string().min(1).describe('why, in Chinese, e.g. "群里李四已经回答了"'), subjectKey: z.string().optional() }),
-    async run(args, ctx) {
-      const { ports } = ctx;
-      const pending = (await readReplyItems(ports)).filter((i) => i.status === "pending" && i.actionId);
-      let item: ReplyItem | undefined;
-      if (args.subjectKey) item = pending.find((i) => i.subjectKey === args.subjectKey);
-      else {
-        const threads = new Set(currentItem(ctx)?.threads ?? []);
-        const byThread = pending.filter((i) => i.threads?.some((th) => threads.has(th)));
-        item = byThread.length === 1 ? byThread[0] : pending.length === 1 ? pending[0] : undefined;
-      }
-      if (!item) {
-        const list = pending.map((i) => `${i.subjectKey}（${i.title}）`).join("；") || "none";
-        return { output: `Which card? Pending reply cards: ${list}. Pass subjectKey.`, isError: true };
-      }
-      const r = ports.withdrawApproval ? await ports.withdrawApproval({ actionId: item.actionId! }, args.reason) : "not_pending";
-      if (r !== "cancelled") return "This card has already been decided.";
-      const t = now(ctx);
-      const a: ActivityRecord = newActivity(
-        {
-          id: `withdrawn-${item.actionId}`,
-          kind: "card_withdrawn",
-          title: `已撤下：${item.title}`,
-          detail: args.reason,
-          source: item.source,
-          rawInput: item.rawInput.text,
-          ...(item.envelope ? { envelope: item.envelope } : {}),
-          actionId: item.actionId!,
-          restorable: true,
-        },
-        t,
-      );
-      const linked = await closeLinkedActions(ports, item.actionId!, "cancelled", t);
-      await ports.context.commit(self(ctx), { statePatches: { [gtdKeys.activity(a.id)]: a, ...linked } });
-      return r === "cancelled" ? "Card withdrawn and archived." : "The card was no longer pending (already decided); archived the item.";
-    },
-  });
-
   const presentToOwner = tool({
     name: "present_to_owner",
     description:
@@ -378,22 +199,13 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
       const t = now(ctx);
       const env = currentItem(ctx);
       const subjectKey = env ? subjectKeys.inbound(env.id) : subjectKeys.cell(self(ctx));
-      const artifactId = newId("art", ctx.clock);
-      const content = { format: "markdown" as const, title: args.title, body: args.summary };
-      const saved = await ports.context.commit(self(ctx), { artifact: { artifactId, content, updatedBy: "agent" } });
-      const version = saved.ok ? (saved.artifactVersion ?? 1) : 1;
-      const card = responseCard(
-        { subjectKey, title: args.title, source: itemSource(env, t), rawInput: itemRawInput(env), prep: prepOf(args.prep, "") },
-        { artifactId, version },
-        { target: owner, targetLabel: "我" },
-        "accept",
-      );
-      const r = await ports.authorize(
-        { type: "custom", name: ACKNOWLEDGE_ACTION, artifactId, summary: args.title, subjectKey, sideEffect: "external", card: cardDeliverable(card, args.summary) },
-        { artifactVersion: version },
-      );
-      if (r.type === "deny") return { output: `Not allowed: ${r.feedback}`, isError: true };
-      return r.type === "defer" ? { output: "The card is waiting for the owner.", endRun: "deferred_for_approval" } : "A standing rule accepted it.";
+      if (!ports.createHumanItem) throw new Error("Human inbox is unavailable");
+      const item = ports.createHumanItem({
+        title: args.title, description: args.summary, subjectKey,
+        source: itemSource(env, t), rawInput: itemRawInput(env), prep: prepOf(args.prep, ""),
+        options: [{ id: "acknowledge", label: "知道了", effect: "reply" }],
+      });
+      return { output: "The card is waiting for the owner.", endRun: "deferred_for_approval", data: item };
     },
   });
 
@@ -402,18 +214,18 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
   const reviewWeek = tool({
     name: "review_week",
     description:
-      "Facts for the weekly review: replies of the last 7 days the owner rewrote before sending (your first draft vs. what they sent), and sources that use a model on every check. Use them to suggest a skill or a zero-cost check.",
+      "Facts for the weekly review: project plans the owner edited in the last seven days, and sources that use a model on every check. Use them to suggest a skill or a zero-cost check.",
     input: z.object({}),
     async run(_args, ctx) {
       const { ports } = ctx;
       const since = now(ctx) - 7 * 24 * 3_600_000;
       const lines: string[] = [];
-      for (const item of await readReplyItems(ports)) {
-        if (item.status !== "sent" || item.updatedAt < since) continue;
-        const cur = await ports.context.getArtifact(item.artifactId);
-        if (!cur || cur.updatedBy !== "human" || cur.version < 2) continue;
-        const first = await ports.context.readResource(self(ctx), `artifact://${item.artifactId}@1`).catch(() => "");
-        lines.push(`## ${item.title}（发给${item.targetLabel}）\n你的初稿：\n${clip(first, 600)}\n主人发出的版本：\n${clip(cur.content.body, 600)}`);
+      for (const { record } of ports.listOwnDecisions()) {
+        if (record.action.type !== "project.start" || !record.artifactId || record.updatedAt < since) continue;
+        const current = await ports.context.getArtifact(record.artifactId);
+        if (!current || current.updatedBy !== "human" || current.version < 2) continue;
+        const first = await ports.context.getArtifactVersion(record.artifactId, 1);
+        if (first) lines.push(`## ${record.card.title ?? record.subjectKey}\n方案初稿：\n${clip(first.content.body, 600)}\n主人修改后的方案：\n${clip(current.content.body, 600)}`);
       }
       for (const child of ctx.snapshot.tail.roster) {
         if (child.preset !== "sensor") continue;
@@ -429,9 +241,9 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
   const suggestSkill = tool({
     name: "suggest_skill",
     description:
-      "Offer the owner a SKILL.md distilled from a habit you observed (e.g. how they always rewrite a kind of reply). It appears in their weekly review; they decide whether to save it.",
+      "Offer the owner a SKILL.md distilled from a habit you observed (e.g. how they revise project plans). It appears in their weekly review; they decide whether to save it.",
     input: z.object({
-      name: z.string().regex(/^[a-z0-9]+(-[a-z0-9]+)*$/).max(64).describe("slug, e.g. supplier-reply-tone"),
+      name: z.string().regex(/^[a-z0-9]+(-[a-z0-9]+)*$/).max(64).describe("slug, e.g. project-plan-review"),
       description: z.string().min(1).describe("when to use it, one line"),
       body: z.string().min(1).describe("the procedure / rules, markdown"),
       reason: z.string().optional().describe("what you observed, in Chinese, shown to the owner"),
@@ -493,12 +305,9 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
       mode: z.enum(["now", "research_then_park"]).optional(),
       phases: z.array(z.string().min(1)).optional().describe("staged work: phases in order; the project runs one at a time, each after the owner's go-ahead"),
       plan: planInput.optional(),
-      replyTo: replyToInput,
-      replyLabel: z.string().optional(),
       continueConversation: z.boolean().optional().describe("the project continues from this conversation (it sees what you just discussed)"),
     }),
     async run(args, ctx) {
-      if (args.replyTo !== undefined && !isChannelAddr(args.replyTo)) return { output: "replyTo must be channel:<channelId>:<target>.", isError: true };
       const env = currentItem(ctx);
       const raw = itemRawInput(env).text;
       const init: ProjectInit = {
@@ -512,7 +321,6 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
         ...(args.mode ? { mode: args.mode } : {}),
         ...(args.phases?.length ? { phases: args.phases } : {}),
         ...(args.plan?.length ? { plan: args.plan.map((a) => ({ title: a.title, owner: a.owner, ...(a.nextStep ? { nextStep: a.nextStep } : {}), ...(a.phase ? { phase: a.phase } : {}) })) } : {}),
-        ...(args.replyTo ? { replyTo: args.replyTo as ChannelAddr, replyLabel: args.replyLabel ?? args.replyTo } : {}),
         ...(args.continueConversation ? { continueConversation: true } : {}),
       };
       let r: { projectId: string; started: boolean };
@@ -523,7 +331,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
         return { output: `Not started: ${errorText(err)}`, isError: true };
       }
       const park = args.mode === "research_then_park";
-      await notifyOwner(ctx.ports, owner, park ? `已记下：${args.title}，先做个调研，完成后放进以后再说` : `已立项：${args.title}，后台开始推进`, `start:${r.projectId}`);
+      await notifyOwner(ctx.ports, park ? `已记下：${args.title}，先做个调研，完成后放进以后再说` : `已立项：${args.title}，后台开始推进`, `start:${r.projectId}`);
       return `Started project ${r.projectId}「${args.title}」 and told the owner. Pass later changes to it with steer_item; stop it with stop_item.`;
     },
   });
@@ -578,33 +386,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
       const action: ProjectStartAction = { type: "project.start", proposal, artifactId, summary: `立项：${args.title}`, subjectKey, sideEffect: "external", card: cardDeliverable(card, body) };
       const r = await ports.authorize(action, { artifactVersion: version });
       if (r.type === "deny") return { output: `Not allowed: ${r.feedback}`, isError: true };
-      if (r.type === "allow") {
-        // BUG-032: standing rule allowed project.start directly — launch the project now and return projectId.
-        const init: ProjectInit = {
-          title: proposal.title,
-          outcome: proposal.outcome,
-          brief: ["已按主人的常设规则自动确认立项，按此方案开始推进。", proposal.background ?? ""].filter(Boolean).join("\n"),
-          proposal,
-          plan: proposal.actions.map((a) => ({ title: a.title, owner: a.owner, ...(a.nextStep ? { nextStep: a.nextStep } : {}), ...(a.effort ? { effort: a.effort } : {}) })),
-          source: remembered.source,
-          ...(remembered.rawInput.text ? { rawInput: remembered.rawInput.text } : {}),
-          ...(proposal.cwd ? { cwd: proposal.cwd } : {}),
-          ...(proposal.repos?.length ? { repos: proposal.repos } : {}),
-          ...(proposal.phases?.length ? { phases: proposal.phases } : {}),
-        };
-        let launched: { projectId: string; started: boolean };
-        try {
-          launched = await launchProject(ports, init, ctx.clock);
-        } catch (err) {
-          if (isCwdError(err)) return cwdRefusal(err);
-          return { output: `Not started: ${errorText(err)}`, isError: true };
-        }
-        await notifyOwner(ports, owner, `已按常设规则自动立项：${proposal.title}，后台开始推进`, `project:${launched.projectId}`);
-        return {
-          output: `A standing rule allowed it: started project ${launched.projectId}「${proposal.title}」 and told the owner.`,
-          data: { projectId: launched.projectId, artifactId, started: launched.started },
-        };
-      }
+      if (r.type !== "defer") throw new Error("Project proposal requires owner approval");
       return { output: `The proposal card ${r.actionId} (draft ${artifactId}) is waiting for the owner; you are woken with the decision.`, endRun: "deferred_for_approval", data: { actionId: r.actionId, artifactId } };
     },
   });
@@ -730,7 +512,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
       const id = newId("hub", ctx.clock);
       const coalesceMs = Math.round((args.coalesceMinutes ?? 2) * 60_000);
       const repos = args.repos.map((r) => ({ name: r.name, cwd: r.cwd, ...(r.defaultBranch ? { defaultBranch: r.defaultBranch } : {}) }));
-      const source: SourceInit = { title: args.title, description: args.rules, kind: "channel", mode: "active", processor: "llm" };
+      const source: SourceInit = { title: args.title, description: args.rules, kind: "watch", mode: "active", processor: "llm" };
       const spec: CellSpec = {
         id,
         preset: "hub",
@@ -751,7 +533,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
       } catch (err) {
         return { output: `Not added: ${errorText(err)}`, isError: true };
       }
-      await notifyOwner(ctx.ports, owner, `已添加直通入口：${args.title}`, `hub:${id}`);
+      await notifyOwner(ctx.ports, `已添加直通入口：${args.title}`, `hub:${id}`);
       return `Hub ${id} added and the owner was told: matching messages now go straight to it${coalesceMs > 0 ? `, batched over ${args.coalesceMinutes ?? 2} minute(s)` : ""}.`;
     },
   });
@@ -790,7 +572,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
       };
       const spec = createSensorSpec(newId("src",ctx.clock),source,processor,args.watchThread);
       const addr = await ctx.ports.spawnCell(spec, { instruction: args.description ?? args.title });
-      await notifyOwner(ctx.ports, owner, `已添加信源：${args.title}${args.mode === "observe" ? "（观察模式，只记笔记不出卡）" : ""}`, `source:${spec.id}`);
+      await notifyOwner(ctx.ports, `已添加信源：${args.title}${args.mode === "observe" ? "（观察模式，只记笔记不出卡）" : ""}`, `source:${spec.id}`);
       return `Source added (${addr}). It stays silent unless it finds something.`;
     },
   });
@@ -809,13 +591,11 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
 
   return {
     name: TOOLSETS.desk,
-    description: "The desk's GTD tools: captures, reminders, replies on cards, projects, hubs and sources, arbitration.",
+    description: "The desk's GTD tools: captures, reminders, projects, hubs and sources, arbitration.",
     tools: [
       captureNote,
       remindMe,
       archiveNotification,
-      draftReply,
-      withdrawCard,
       presentToOwner,
       startProject,
       proposeProject,

@@ -1,11 +1,9 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
   asClarifyCard,
-  CELL_RESULT_CANDIDATE_KEY,
   finalResultEnvelopeId,
   PAYLOAD,
   steerNoteText,
-  type CellResultCandidate,
   type CellResultPayload,
   type CodeProcessor,
   type ModelRequest,
@@ -214,18 +212,18 @@ describe("escalations", () => {
     expect(h.kernel.gate.listPendingSync()).toEqual([]);
   });
 
-  it("separates a persisted ancestor-held step-limit card from a new dead letter", async () => {
+  it("continues a step-limited task independently of its dead letters", async () => {
     const h = await boot({kernel:{maxAttempts:1}});
     h.kernel.spawnCell("desk", {id:"w", preset:"worker"});
-    const legacy = h.kernel.gate.authorizeSync({
-      type:"custom", name:"kernel.escalation", subjectKey:"kernel:w:retry_limit", sideEffect:"external", summary:"超步",
+    const stepRequest = h.kernel.gate.authorizeSync({
+      type:"custom", name:"kernel.escalation", subjectKey:"kernel:w:step_limit", sideEffect:"external", summary:"超步",
       args:{kernel:true, cellId:"w", reason:"retry_limit", stepLimit:true},
     }, {cellId:"desk", epoch:0, principalId:"kernel:escalation"});
-    if (legacy.type !== "defer") throw Error(legacy.type);
+    if (stepRequest.type !== "defer") throw Error(stepRequest.type);
     h.script.add("worker", {error: Error("dead letter")});
     h.kernel.sendToCell("w", {text:"重新核查"});
     await h.kernel.idle();
-    const step = h.kernel.humanItems.get(legacy.actionId)!;
+    const step = h.kernel.humanItems.get(stepRequest.actionId)!;
     expect(step.subjectKey).toBe("kernel:w:step_limit");
     const dead = h.kernel.humanItems.list().find(i => i.subjectKey === "kernel:w:retry_limit")!;
     await h.kernel.humanItems.decide(step.id, {optionId:"system.execute", seenItemRevision:step.itemRevision, note:"再走一步"}, "owner");
@@ -252,130 +250,6 @@ describe("escalations", () => {
     expect(h.kernel.inbox.listMessagesSync({cellId:"w"}).filter(m => m.envelope.id.includes("#retry:"))).toHaveLength(2);
   });
 
-  it("budget hard stop → an escalation card even though the budget is gone; raising it lets the cell continue", async () => {
-    const h = await boot();
-    h.script.add("worker", { text: "thinking hard", usage: { inputTokens: 600, outputTokens: 600 } });
-    h.kernel.spawnCell("desk", { id: "w", preset: "worker", title: "修 CI", bounds: { maxTokens: 1_000 } }, "fix CI");
-    await h.kernel.idle();
-    expect(h.of("run.finished").map((e) => e.outcome)).toEqual(["budget_stopped"]);
-    const [pending] = h.kernel.gate.listPendingSync();
-    const card = asClarifyCard(pending!.card.data)!;
-    expect(card).toMatchObject({ cardType: "escalation", subjectKey: "kernel:budget:w", title: "「修 CI」的预算已用完", escalation: { reason: "budget_exhausted", usage: { limitTokens: 1_000 } } });
-    expect(pending!.cellId).toBe("w");
-
-    // a message to a stopped cell is held, not claimed: no Run starts, it stays pending, and no second card is stacked
-    h.kernel.inbox.enqueueSync("w", { id: "poke", from: "inbox:desk", principalId: "cell:desk", kind: "event", type: PAYLOAD.userMessage, payload: { text: "poke" }, createdAt: h.clock.now() });
-    await h.kernel.idle();
-    expect(h.of("run.started").filter((e) => e.cellId === "w")).toHaveLength(1);
-    expect(h.kernel.inbox.listMessagesSync({ cellId: "w", envelopeId: "poke" })[0]).toMatchObject({ status: "pending" });
-    expect(h.kernel.gate.listPendingSync()).toHaveLength(1);
-
-    h.script.add("worker", (req) => {
-      expect(requestText(req)).toContain("poke");
-      return { text: "continuing", usage: { inputTokens: 10, outputTokens: 10 } };
-    });
-    expect(await h.kernel.resolveApproval(pending!.actionId, { decision: "continue", approverId: "owner", raise: { tokens: 5_000 } })).toMatchObject({ status: "continued" });
-    expect(h.kernel.gate.usageSync("w")).toMatchObject({ raisedTokens: 5_000, state: "ok" });
-    await h.kernel.idle();
-    // a budget stop is never a result: the worker's turn settled only with the Run after the raise, which took the
-    // message that waited
-    expect(h.of("run.finished").filter((e) => e.cellId === "w").map((e) => e.outcome)).toEqual(["budget_stopped", "completed"]);
-    expect(h.kernel.inbox.listMessagesSync({ cellId: "w", envelopeId: "poke" })[0]).toMatchObject({ status: "done" });
-    const resolved = h.kernel.inbox.listMessagesSync({ cellId: "w", type: PAYLOAD.approvalResolved })[0]!;
-    expect(resolved).toMatchObject({ status: "done" });
-    expect(resolved.envelope.payload).toMatchObject({ status: "executed", decision: "continue" });
-    expect(h.kernel.getCell("w")!.status).toBe("active");
-    expect(h.kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.cellResult }).map((m) => (m.envelope.payload as CellResultPayload).summary)).toEqual([
-      "continuing",
-    ]);
-  });
-
-  it("resolving an exhausted budget offline holds the affected cell until a raise", async () => {
-    const h = await boot();
-    h.script.add("worker", { text: "x", usage: { inputTokens: 2_000, outputTokens: 0 } });
-    h.kernel.spawnCell("desk", { id: "w", preset: "worker", bounds: { maxTokens: 1_000 } }, "go");
-    await h.kernel.idle();
-    const [card] = h.kernel.gate.listPendingSync();
-    expect(await h.kernel.resolveApproval(card!.actionId, { decision: "resolve_offline", approverId: "owner" })).toEqual({
-      status: "resolved_offline",
-      actionId: card!.actionId,
-      closedCellIds: [],
-    });
-    expect(h.kernel.getCell("w")).toMatchObject({status:"paused",pauseReason:"budget_declined"});
-    expect(h.kernel.gate.getApprovalSync(card!.actionId)!.status).toBe("cancelled");
-    h.kernel.gate.raiseBudgetSync("w",{tokens:2000},"owner");
-    expect(h.kernel.getCell("w")).toMatchObject({status:"active",pauseReason:null});
-  });
-});
-
-describe("DND", () => {
-  it("focus buffers the owner's notifications but never parent/child traffic", async () => {
-    // A child stages its result (what report_to_parent does); the kernel delivers it when the turn settles.
-    const report: CodeProcessor = {
-      name: "test.report",
-      async run({ ports, clock }) {
-        const r: CellResultCandidate = { status: "completed", summary: "child finished during focus", at: clock.now() };
-        await ports.context.commit(ports.self.cellId, { statePatches: { [CELL_RESULT_CANDIDATE_KEY]: r } });
-        return "completed";
-      },
-    };
-    const h = await boot({
-      setup(registry: Registry) {
-        registerTestPresets(registry);
-        registry.codeProcessors.register(report);
-      },
-    });
-    h.kernel.hub.setFocusSync(true);
-    h.script.add("desk", tool("send_message", { to: "channel:ui:owner", text: "子任务完成了", summary: "notify" }), { text: "ok" });
-    h.kernel.spawnCell("desk", { id: "c", preset: "worker", processor: { kind: "code", entry: "test.report" } }, "go");
-    await h.kernel.idle();
-
-    // the child's result woke the desk at once, focus or not
-    expect(h.kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.cellResult }).map((m) => [m.status, (m.envelope.payload as CellResultPayload).summary])).toEqual([
-      ["done", "child finished during focus"],
-    ]);
-    expect(h.of("run.finished").filter((e) => e.cellId === "desk").map((e) => e.outcome)).toEqual(["completed"]);
-    // ...while the desk's notice to the owner waits for the end of focus
-    expect(h.kernel.hub.listOutboxSync({ channelId: "ui" }).map((o) => o.status)).toEqual(["buffered_dnd"]);
-    expect(h.kernel.stats()).toMatchObject({ bufferedNotifications: 1, focus: true });
-
-    h.kernel.hub.setFocusSync(false);
-    expect(await h.kernel.hub.flushBuffered()).toMatchObject({ sent: 1 });
-  });
-});
-
-describe("competing workers", () => {
-  it("a cell that asks for a pool gets parallel Runs, one message each", async () => {
-    const h = await boot();
-    const g = gate();
-    for (let i = 0; i < 3; i++) {
-      h.script.add("pool", async () => {
-        await g.wait;
-        return { text: "done" };
-      });
-    }
-    // a pool lives on (a leaf must claim serially: settling a turn needs one claim to decide on)
-    h.kernel.spawnCell("desk", { id: "p", preset: "worker", lifetime: "persistent", claimMode: "competing_workers", maxParallelRuns: 3, meta: { role: "pool" } });
-    for (let i = 0; i < 3; i++) {
-      h.kernel.inbox.enqueueSync("p", { id: `j${i}`, from: "inbox:desk", principalId: "cell:desk", kind: "event", type: PAYLOAD.userMessage, payload: { text: `job ${i}` }, createdAt: h.clock.now() });
-    }
-    await waitFor(() => h.kernel.activeRuns().length === 3, 5_000, "three parallel runs");
-    g.open();
-    await h.kernel.idle();
-    expect(maxOverlap(h, ["p"])).toBe(3);
-    expect(h.kernel.inbox.listMessagesSync({ cellId: "p" }).every((m) => m.status === "done")).toBe(true);
-    expect(h.kernel.getCell("p")!.status).toBe("active");
-  });
-
-  it("a leaf (one-shot or wakeable) cannot ask for a pool", async () => {
-    const h = await boot();
-    expect(() => h.kernel.spawnCell("desk", { id: "p", preset: "watcher", claimMode: "competing_workers", maxParallelRuns: 3 })).toThrow(
-      "a one_shot cell claims serially (claimMode serial_coalesce)",
-    );
-    expect(() => h.kernel.spawnCell("desk", { id: "q", preset: "worker", claimMode: "competing_workers", maxParallelRuns: 3 })).toThrow(
-      "a wakeable cell claims serially (claimMode serial_coalesce)",
-    );
-  });
 });
 
 describe("leaf results (docs/05 guard 1: the kernel is the single sender)", () => {

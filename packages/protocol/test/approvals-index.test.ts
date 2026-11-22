@@ -6,7 +6,7 @@ function insertApproval(db: Db, actionId: string, subjectKey: string, status = "
   run(
     db,
     `INSERT INTO human_items (action_id, cell_id, epoch, principal_id, subject_key, action_type, action, action_hash, card, disposition, created_at, updated_at)
-     VALUES (?, 'desk', 0, 'cell:desk', ?, 'channel.send', '{}', 'h', '{}', ?, 1, 1)`,
+     VALUES (?, 'desk', 0, 'cell:desk', ?, 'project.start', '{}', 'h', '{}', ?, 1, 1)`,
     [actionId, subjectKey, status],
   );
 }

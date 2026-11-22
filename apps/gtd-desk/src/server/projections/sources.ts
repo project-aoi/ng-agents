@@ -1,6 +1,5 @@
-import { isHttpChannel } from "@ng/channel";
 import type { SourceRecord } from "@ng/protocol";
-import type { ChannelSourceDTO, SensorSourceDTO, SourcesDTO } from "../../shared/api";
+import type { SensorSourceDTO, SourcesDTO } from "../../shared/api";
 import { readSources, type ProjectionInput } from "./common";
 import { button, channelLabel, enc, post } from "./format";
 
@@ -26,32 +25,15 @@ export function cronText(cron: string): string {
 
 export function scheduleText(s: SourceRecord["schedule"]): string {
   if (s?.cron) return cronText(s.cron) + (s.tz ? `（${s.tz}）` : "");
-  if (s?.idleSec) return `空闲 ${Math.round(s.idleSec / 60)} 分钟后检查`;
   return "收到消息时";
 }
 
-const STATE_LABEL = { ready: "正常", stopped: "已停止", error: "出错" } as const;
 const STATUS_LABEL = { ok: "运行正常", error: "出错", paused: "已暂停" } as const;
 const MODE_LABEL = { active: "命中时投进信箱", observe: "只记观察笔记，不弹卡" } as const;
 const PROCESSOR_LABEL = { code: "脚本检查（零 Token）", llm: "模型初筛" } as const;
 
 export function projectSources(input: ProjectionInput): SourcesDTO {
   const { kernel, now } = input;
-  const channels: ChannelSourceDTO[] = kernel.hub.listInfoSync().map((c) => ({
-    id: c.id,
-    label: channelLabel(c.id),
-    kind: c.kind,
-    state: c.status.state,
-    stateLabel: STATE_LABEL[c.status.state] ?? c.status.state,
-    lastIngressAt: c.status.lastIngressAt,
-    lastDeliveryAt: c.status.lastDeliveryAt,
-    lastError: c.status.lastError,
-    hookPath: (() => {
-      const ch = kernel.hub.get(c.id);
-      return ch && isHttpChannel(ch) ? `/hooks/${enc(c.id)}` : null;
-    })(),
-  }));
-
   const sensors: SensorSourceDTO[] = [];
   for (const s of readSources(kernel)) {
     const cell = kernel.getCell(s.cellId);
@@ -91,5 +73,5 @@ export function projectSources(input: ProjectionInput): SourcesDTO {
     });
   }
   sensors.sort((a, b) => a.title.localeCompare(b.title, "zh"));
-  return { generatedAt: now, channels, sensors };
+  return { generatedAt: now, sensors };
 }

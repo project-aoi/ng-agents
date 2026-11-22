@@ -136,18 +136,4 @@ describe("app × real presets", () => {
     expect(texts(d, projectId)).toEqual([expect.stringContaining("主人点了启动")]);
   });
 
-  it("a reply taken over in Engage and sent from there is one entry in the activity drawer", async () => {
-    const d = await bootRealDesk();
-    d.script.add("desk", tool("draft_reply", { text: "下周二上线。", title: "回复 Alice：上线时间", targetLabel: "Alice" }));
-    await d.memory.inject({ from: "alice", text: "接口什么时候上线？", threads: ["memory:dm-alice"] });
-    await d.kernel.idle();
-    const card = (await d.get<ClarifyQueueDTO>("/api/clarify")).cards[0]!;
-    await d.post(`/api/human-items/${card.id}/decide`, {optionId:"system.execute",seenArtifactVersion:1,seenItemRevision:card.itemRevision});
-    await d.kernel.idle();
-    const acts = (await d.get<ActivityListDTO>("/api/activity")).items.filter((a) => a.kind === "action_completed");
-    expect(acts).toHaveLength(1);
-    // The app (on the click) and the desk (on its wake-up) both record the send, under the same id.
-    expect(acts[0]!.title).toContain("回复 Alice：上线时间");
-    expect(d.memory.sent.map((x) => x.content.body)).toEqual(["下周二上线。"]);
-  });
 });

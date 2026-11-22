@@ -1,10 +1,9 @@
 import type { createHumanItems } from "./human-items";
-import type { ChannelHubImpl } from "@ng/channel";
+import type { ChannelHub } from "@ng/protocol";
 import type { GateService } from "@ng/gate";
 import type { InboxService } from "@ng/inbox";
 import type { AgentLoop, BoundsInit, Bus, CellsRepo, Clock, ContextStore, Db, Registry } from "@ng/protocol";
 import type { WorkspaceManager } from "@ng/workspace";
-import type { Approvals } from "./approvals";
 import type { Dispatcher } from "./dispatcher";
 import type { Escalations } from "./escalations";
 import type { Lifecycle } from "./lifecycle";
@@ -24,14 +23,13 @@ export interface KernelCore {
   context: ContextStore;
   gate: GateService;
   workspace: WorkspaceManager;
-  hub: ChannelHubImpl;
+  hub: ChannelHub;
   loop: AgentLoop;
 
   dataDir: string;
   cliProcDir: string;
   deskCellId: string;
   ownerPrincipal: string;
-  ownerAddresses: readonly string[];
   rootBounds: BoundsInit;
   repoPath: string | undefined;
   leaseMs: number;
@@ -50,7 +48,6 @@ export interface KernelCore {
   lifecycle: Lifecycle;
   dispatcher: Dispatcher;
   escalations: Escalations;
-  approvals: Approvals;
   humanItems: ReturnType<typeof createHumanItems>;
   readModel: ReadModel;
   waits: Waits;

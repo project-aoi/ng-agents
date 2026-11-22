@@ -5,15 +5,12 @@ import { fileURLToPath } from "node:url";
 import { serve, type ServerType } from "@hono/node-server";
 import { createKernel, type Kernel, type KernelOptions } from "@ng/cell";
 import { UiChannel } from "@ng/channel";
-import { envSecretStore, type SecretStore } from "@ng/gate";
-import { createBus, createRegistry, DESK_CELL_ID, OWNER_PRINCIPAL, systemClock, type Channel, type CliEngine, type Clock, type ModelClient, type Registry } from "@ng/protocol";
+import { createBus, createRegistry, DESK_CELL_ID, OWNER_PRINCIPAL, systemClock, type Channel, type CliEngine, type Clock, type Registry } from "@ng/protocol";
 import { registerPresets, seedBuiltinSkills } from "@ng/presets";
 import type { Hono } from "hono";
 import { createAgentControlPlane } from "../agent/tools";
 import { createDeskApp } from "./app";
 import { selectBackend, type Env } from "./backend";
-import { channelsFromEnv } from "./channels";
-import { createDemoMode, type DemoMode } from "./demo";
 import { createDesk, type Desk } from "./desk";
 import { createEventHub, type EventHub } from "./events";
 import { DEFAULT_SETTINGS, type DeskSettings } from "./projections/common";
@@ -26,7 +23,6 @@ const APP_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 export interface DeskServerOptions {
   /** Configuration source (default process.env). */
   env?: Env;
-  /** Default NG_DESK_DATA_DIR, else ./data (./data-demo in demo mode, so demo content never mixes with real data). */
   dataDir?: string;
   /** Default NG_DESK_HOST, else 127.0.0.1. */
   host?: string;
@@ -38,24 +34,13 @@ export interface DeskServerOptions {
   allowedHosts?: string[];
   /** External main agents allowed on `/api/agent/*`: agent id → bearer token. Default NG_AGENT_TOKEN / NG_AGENT_TOKENS. */
   agentTokens?: Record<string, string>;
-  /**
-   * The owner's budget-limits switch at start: false = no cell is stopped for its budget. Default NG_BUDGET_LIMITS
-   * (`off` / `0` / `false`, `on` / `1` / `true`); unset = the choice last made in the workbench applies (default on).
-   */
-  budgetLimits?: boolean;
-  /** Explicit model; wins over the environment (tests, embedding). */
-  model?: ModelClient;
-  /** Demo seam: the model and seed used when no model is configured (default ./demo.ts createDemoMode()). */
-  demo?: DemoMode;
   /** Is this CLI agent installed? Default: `<bin> --version` runs (tests inject a fake). */
   detectCli?: (engine: CliEngine, bin: string) => boolean;
   clock?: Clock;
   /** Channels besides `ui` and the ones configured from the environment (e.g. a MemoryChannel in tests). */
   channels?: Channel[];
-  /** Secret store shared by the kernel and the channels; default `NG_SECRET_<REF>` from `env`. */
-  secrets?: SecretStore;
   /** Default `registerPresets` from @ng/presets. */
-  registerPresets?: (registry: Registry, opts: { deskCellId: string; ownerAddress: `channel:${string}:${string}`; timeZone?: string }) => unknown;
+  registerPresets?: (registry: Registry, opts: { deskCellId: string; timeZone?: string }) => unknown;
   /** Passed through to createKernel (after everything boot sets). */
   kernel?: Partial<KernelOptions>;
   /** Built web client; default <app>/dist/web; null = API only. */
@@ -85,15 +70,6 @@ function csv(v: string | undefined): string[] {
   return (v ?? "").split(",").map((s) => s.trim()).filter(Boolean);
 }
 
-/** NG_BUDGET_LIMITS: `off`/`0`/`false` → false, `on`/`1`/`true` → true, unset/empty → undefined (the stored choice). */
-export function budgetLimitsFromEnv(v: string | undefined): boolean | undefined {
-  const s = v?.trim().toLowerCase();
-  if (!s) return undefined;
-  if (s === "off" || s === "0" || s === "false") return false;
-  if (s === "on" || s === "1" || s === "true") return true;
-  throw new Error(`NG_BUDGET_LIMITS must be on or off, got "${v}"`);
-}
-
 function portOf(v: string | undefined): number {
   if (v === undefined || v === "") return DEFAULT_PORT;
   const n = Number(v);
@@ -102,7 +78,7 @@ function portOf(v: string | undefined): number {
 }
 
 /**
- * registry → presets → kernel (ui + configured channels) → desk root cell → start → (demo seed) → HTTP app.
+ * registry → presets → kernel (ui + configured channels) → desk root cell → start → HTTP app.
  * Fails before touching the data directory when the bind would be unsafe.
  */
 export async function createDeskServer(opts: DeskServerOptions = {}): Promise<DeskServer> {
@@ -114,26 +90,19 @@ export async function createDeskServer(opts: DeskServerOptions = {}): Promise<De
   const token = opts.token !== undefined ? opts.token : (env["NG_DESK_TOKEN"] ?? null);
   const security = securityPolicyFor(host, token, opts.allowedHosts ?? csv(env["NG_DESK_ALLOWED_HOSTS"]), opts.agentTokens ?? agentTokensFromEnv(env));
 
-  const budgetLimits = opts.budgetLimits ?? budgetLimitsFromEnv(env["NG_BUDGET_LIMITS"]);
   const timeZone = env["NG_DESK_TZ"] || Intl.DateTimeFormat().resolvedOptions().timeZone;
-  const demoMode = opts.demo ?? createDemoMode({ timeZone });
   const choice = selectBackend(env, {
-    ...(opts.model ? { model: opts.model } : {}),
-    demoModel: () => demoMode.model(),
     ...(opts.detectCli ? { detect: opts.detectCli } : {}),
   });
-  const dataDir = resolve(opts.dataDir ?? (env["NG_DESK_DATA_DIR"] || (choice.demo ? "./data-demo" : "./data")));
-  // Decided before the database is opened: a demo seed replays its scenarios from a few days ago.
-  const clock = opts.clock ?? (choice.demo && demoMode.clock ? demoMode.clock(dataDir) : systemClock);
+  const dataDir = resolve(opts.dataDir ?? (env["NG_DESK_DATA_DIR"] || "./data"));
+  const clock = opts.clock ?? systemClock;
   mkdirSync(dataDir, { recursive: true });
 
   const bus = opts.kernel?.bus ?? createBus({ onError: (err, topic) => onError(err, `bus handler for ${topic}`) });
-  const secrets = opts.secrets ?? envSecretStore({ env });
   const ownerPrincipal = opts.kernel?.ownerPrincipal ?? OWNER_PRINCIPAL;
   const deskCellId = opts.kernel?.deskCellId ?? DESK_CELL_ID;
-  const ownerAddresses = opts.kernel?.ownerAddresses ?? (csv(env["NG_OWNER_ADDRESSES"]).length ? ["channel:ui:*", "channel:cli:*", ...csv(env["NG_OWNER_ADDRESSES"])] : undefined);
 
-  if (choice.engine !== "api" && choice.engine !== "demo") {
+  {
     // What a CLI agent refused or why it failed belongs in the server log; launches only on request.
     const verbose = env["NG_CLI_DEBUG"] === "1";
     const engineOpts = choice.kernelOptions.cli?.[choice.engine];
@@ -146,32 +115,26 @@ export async function createDeskServer(opts: DeskServerOptions = {}): Promise<De
     }
   }
   const registry = opts.kernel?.registry ?? createRegistry();
-  (opts.registerPresets ?? (registerPresets as NonNullable<DeskServerOptions["registerPresets"]>))(registry, { deskCellId, ownerAddress: "channel:ui:owner", timeZone });
-  if (choice.demo) demoMode.setup?.(registry);
+  (opts.registerPresets ?? (registerPresets as NonNullable<DeskServerOptions["registerPresets"]>))(registry, { deskCellId, timeZone });
 
-  const ui = new UiChannel({ clock, bus, ownerPrincipal });
-  const external = channelsFromEnv(env, secrets, clock, ownerPrincipal);
+  const ui = new UiChannel({ clock, ownerPrincipal });
   const kernel = createKernel({
     dataDir,
     clock,
     bus,
     registry,
-    secrets,
     ownerPrincipal,
     deskCellId,
-    ...(ownerAddresses ? { ownerAddresses } : {}),
-    channels: [ui, ...external.channels, ...(choice.demo && demoMode.channels ? demoMode.channels(clock) : []), ...(opts.channels ?? [])],
+    channels: [ui, ...(opts.channels ?? [])],
     onError,
     // With a CLI agent behind the cells, the owner picks its model in the workbench; the list comes from the CLI.
-    ...(choice.engine !== "api" && choice.engine !== "demo" ? { modelSwitch: true } : {}),
-    ...(budgetLimits !== undefined ? { budgetLimits } : {}),
+    modelSwitch: true,
     ...choice.kernelOptions,
     ...opts.kernel,
   });
 
   let events: EventHub | undefined;
   try {
-    const fresh = kernel.getCell(deskCellId) === undefined;
     kernel.ensureRootCell({ id: deskCellId, preset: "inline", title: "主台" });
     // The playbooks the presets' prompts refer to (an owner-edited SKILL.md of the same name is kept).
     const seeded = seedBuiltinSkills(kernel.context, deskCellId);
@@ -180,32 +143,21 @@ export async function createDeskServer(opts: DeskServerOptions = {}): Promise<De
     const settings: DeskSettings = {
       ...DEFAULT_SETTINGS,
       ...opts.settings,
-      demo: choice.demo,
-      backend: choice.backend,
+      backend: choice.engine,
       tokenRequired: security.token !== null,
     };
     const desk = createDesk({ kernel, ui, settings, onError });
-    if (choice.demo && demoMode.seed) {
-      try {
-        await demoMode.seed({ kernel, ui, desk, clock, dataDir, fresh, log });
-      } catch (err) {
-        // A broken demo story must not keep the workbench from starting.
-        onError(err, "demo seed");
-      }
-    }
     events = createEventHub(kernel);
     const webDir = opts.webDir === undefined ? resolve(APP_ROOT, "dist/web") : opts.webDir;
     const agent = createAgentControlPlane({ kernel, desk, ui, settings });
-    const app = createDeskApp({ desk, hub: kernel.hub, events, security, agent, models: createModelSwitch(kernel), webDir, onError });
+    const app = createDeskApp({ desk, events, security, agent, models: createModelSwitch(kernel), webDir, onError });
     const agentAccess =
       security.agentTokens.size > 0
         ? `token for ${[...security.agentTokens.keys()].map((id) => `agent:${id}`).join(", ")}`
         : security.loopback && security.token === null
           ? "open on loopback as agent:local"
           : "closed (set NG_AGENT_TOKEN)";
-    log(
-      `data ${dataDir} · agents: ${choice.backend}${choice.demo ? " (demo mode)" : ""} — ${choice.reason} · channels: ui${choice.demo ? ", demo" : ""}${external.summary.length ? `, ${external.summary.join(", ")}` : ""} · main-agent API /api/agent/* (MCP: bin/ng-mcp.mjs): ${agentAccess}`,
-    );
+    log(`data ${dataDir} · agents: ${choice.engine} · main-agent API /api/agent/*: ${agentAccess}`);
 
     let server: ServerType | null = null;
     let closing: Promise<void> | null = null;

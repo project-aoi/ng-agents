@@ -17,8 +17,6 @@ import { clip, formatWhen, statusLine } from "./records";
 // for the project; a one_shot cell is then closed by the kernel, timers included. "Not yet" ends the Run as waiting,
 // which keeps a one_shot cell open.
 //
-// One timer source, a self-reminder (cancel group "probe"), re-armed after every check: an idleSec schedule would fire
-// once and then stay disarmed (a Run that only consumed an idle firing is not "real work" to the inbox), and cron
 // cannot say "every 45 seconds". Whatever woke a check, the pending reminder is dropped and the next one set afresh,
 // so there is never more than one.
 //

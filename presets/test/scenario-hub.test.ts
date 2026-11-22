@@ -4,7 +4,7 @@ import { boot, childrenOf, cleanupAll, continuesRun, gitRepo, lastToolResult, MI
 
 afterEach(cleanupAll);
 
-const at = (h: Harness, from: string, text: string) => h.memory.inject({ from, replyTarget: "chat-review", text, threads: ["memory:chat-review"] });
+const at = (h: Harness, from: string, text: string) => h.ui.capture({ text: `${from}：${text}`, threads: ["ui:reviews"] });
 
 describe("docs/05 scenario 6 — a hub for direct review requests: batched, routed, follow-ups forwarded", () => {
   it("add_hub with an operator watch and a window; one batch; workers per topic; follow-ups reach the worker still at it and wake the one that has finished — no successor; noise handed back", async () => {
@@ -15,7 +15,7 @@ describe("docs/05 scenario 6 — a hub for direct review requests: batched, rout
       tool("add_hub", {
         title: "代码评审直通",
         repos: [{ name: "gateway", cwd: repo, defaultBranch: "main" }],
-        rules: "群里 @bot 的代码评审请求：评审 MR，给出阻塞项和建议项；其他事情退回。",
+        rules: "工作台 @bot 的代码评审请求：评审 MR，给出阻塞项和建议项；其他事情退回。",
         watch: { filter: { "payload.text": { $contains: "@bot" } } },
         coalesceMinutes: 2,
       }),
@@ -70,7 +70,7 @@ describe("docs/05 scenario 6 — a hub for direct review requests: batched, rout
       }
       throw new Error(`unexpected worker ${title}`);
     });
-    await h.ui.capture({ text: "把群里 @bot 的评审请求直接转给评审助手处理" });
+    await h.ui.capture({ text: "把工作台 @bot 的评审请求直接转给评审助手处理" });
     await h.kernel.idle();
 
     expect(h.kernel.getCell(hub())).toMatchObject({
@@ -78,7 +78,7 @@ describe("docs/05 scenario 6 — a hub for direct review requests: batched, rout
       status: "active",
       spec: { lifetime: "persistent", absorbInbound: true, watches: [{ threadOrFilter: { "payload.text": { $contains: "@bot" } }, coalesceMs: 2 * MIN }] },
     });
-    expect(h.source(hub())).toMatchObject({ title: "代码评审直通", kind: "channel", processor: "llm", runCount: 0 } satisfies Partial<SourceRecord>);
+    expect(h.source(hub())).toMatchObject({ title: "代码评审直通", kind: "watch", processor: "llm", runCount: 0 } satisfies Partial<SourceRecord>);
     expect(h.notices()).toContain("已添加直通入口：代码评审直通");
     const deskRuns = h.deskRuns();
     const hubRuns = () => h.of("run.started").filter((e) => e.cellId === hub()).length;
@@ -99,7 +99,7 @@ describe("docs/05 scenario 6 — a hub for direct review requests: batched, rout
     h.clock.advance(2 * MIN);
     await h.kernel.idle();
 
-    expect(h.kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.userMessage }).map((m) => (m.envelope.payload as { text: string }).text)).toEqual(["把群里 @bot 的评审请求直接转给评审助手处理"]);
+    expect(h.kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.userMessage }).map((m) => (m.envelope.payload as { text: string }).text)).toEqual(["把工作台 @bot 的评审请求直接转给评审助手处理"]);
     expect(h.kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.handback })).toHaveLength(1);
     expect(h.deskRuns()).toBe(deskRuns + 1);
     expect(h.state(hub(), "hub:topics")).toMatchObject({ "mr-41": { state: "reviewing" } });

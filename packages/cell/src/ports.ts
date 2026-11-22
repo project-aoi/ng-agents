@@ -5,7 +5,6 @@ import {
   cellPrincipal,
   createEnvelope,
   inboxAddr,
-  isChannelAddr,
   isLeafLifetime,
   newId,
   parseAddress,
@@ -26,7 +25,6 @@ import {
   type RunPorts,
   type RunSelf,
   type ToolKind,
-  type WorkspaceAcquireOptions,
 } from "@ng/protocol";
 import type { ManagedWorkspacePort } from "@ng/workspace";
 import type { KernelCore } from "./core";
@@ -46,22 +44,9 @@ export interface RunContext {
 const RENEW_FRACTION = 4;
 
 /**
- * What a cell's workspace is acquired with: its directory, plus `meta.workspace` for a cell that explicitly asked for
- * an isolated workspace.
- */
-export function acquireOptionsFor(core: KernelCore, cell: CellRecord): WorkspaceAcquireOptions {
-  const meta = cell.spec.meta?.["workspace"];
-  const opts: WorkspaceAcquireOptions = meta && typeof meta === "object" ? { ...(meta as WorkspaceAcquireOptions) } : {};
-  const iso = cell.bounds.isolation;
-  if (iso === "none" || iso === "shared_ro") opts.cwd = ensureCwd(core, cell);
-  else if (!opts.repoPath) opts.repoPath = cell.spec.cwd ?? core.repoPath;
-  return opts;
-}
-
-/**
  * RunPorts bound to (cell, epoch, run, principal `cell:<id>`). Ports are the capability boundary — tools are not
  * trusted: every mutating port re-checks that this Run is still the cell's current one, workspace use is limited to
- * the cell's bounds, sends need a Gate token and an allowed
+ * the cell's bounds, sends need an allowed
  * target, Context *writes* are pinned to the cell (reads are open across internal cells, docs/05), and cell management
  * is limited to its own descendants plus the few things a cell may change about itself.
  */
@@ -121,14 +106,14 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
   const liveBounds = () => cells.get(cellId)?.bounds ?? bounds;
   const mayDeliver = (to: string) => to === inboxAddr(cellId) || deliveryAllowed(liveBounds(), cell.parentId, to);
 
-  // ---------- workspace (acquired lazily, with the isolation of the effective bounds) ----------
+  // ---------- host working directory ----------
 
   let acquiring: Promise<ManagedWorkspacePort> | null = null;
   let root = "";
 
   function acquire(): Promise<ManagedWorkspacePort> {
     acquiring ??= (async () => {
-      const port = await core.workspace.acquire(cellId, bounds.isolation, acquireOptionsFor(core, cell));
+      const port = await core.workspace.acquire(cellId, { cwd: ensureCwd(core, cell) });
       root = port.root;
       // Closed while the workspace was being acquired: nothing was created that would need undoing.
       assertLive("workspace");
@@ -146,19 +131,14 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
     if (!bounds.tools.has(tool)) {
       throw new NgError("bounds_violation", `${what} needs the "${tool}" tool, which is outside this cell's bounds (allowed: ${[...bounds.tools].sort().join(", ") || "none"})`);
     }
-    if (tool === "code_rpc" && !(["write", "edit", "bash"] as const).every((t) => bounds.tools.has(t))) {
-      // code_rpc scripts call write/edit/bash through the workspace host, past this port.
-      throw new NgError("bounds_violation", "code_rpc can write files and run commands, so it needs write, edit and bash in this cell's bounds");
-    }
   }
 
   const workspace: RunPorts["workspace"] & { writeJobInput(jobId: string, input: string): Promise<void> } = {
     cellId,
-    isolation: bounds.isolation,
     get root() {
       return root;
     },
-    async exec(tool: ToolKind, args: unknown, signal?: AbortSignal): Promise<ExecResult> {
+    async exec(tool: "bash", args: unknown, signal?: AbortSignal): Promise<ExecResult> {
       assertLive("workspace exec");
       checkTool(tool);
       const port = await acquire();
@@ -243,26 +223,10 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
     workspace,
     context: ctx,
 
-    async notifyChannel(req) {
-      assertLive("send");
-      if (!isChannelAddr(req.target)) throw new NgError("invalid_argument", `"${req.target}" is not a channel address (channel:<channelId>:<target>)`);
-      if (!deliveryAllowed(liveBounds(), cell.parentId, req.target)) {
-        throw new NgError("bounds_violation", `this cell may not send to ${req.target}; report to its parent instead`);
-      }
-      if (!req.actionToken) throw new NgError("bounds_violation", "a send needs a Gate action token: call authorize first");
-      return hub.send({
-        target: req.target,
-        content: req.content,
-        idempotencyKey: req.idempotencyKey,
-        actionToken: req.actionToken,
-        ...(req.respectDnd !== undefined ? { respectDnd: req.respectDnd } : {}),
-        cellId,
-      });
-    },
-
-    async streamPreview(target, chunk) {
-      if (!isChannelAddr(target) || !deliveryAllowed(liveBounds(), cell.parentId, target)) return;
-      await hub.streamPreview(target, chunk);
+    async notifyOwner(content, idempotencyKey) {
+      assertLive("notifyOwner");
+      if (!deliveryAllowed(liveBounds(), cell.parentId, "channel:ui:owner")) throw new NgError("bounds_violation", "此分身不能直接通知主人");
+      hub.notifyOwner({ cellId, content, idempotencyKey });
     },
 
     async cancelScheduled(scope: CancelScope) {
@@ -304,14 +268,7 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
         principalId,
         epoch: self.epoch,
         ...(o?.artifactVersion !== undefined ? { artifactVersion: o.artifactVersion } : {}),
-        ...(handle.wrapUp ? { wrapUp: true } : {}),
       });
-    },
-
-    meter(usage) {
-      heartbeat();
-      handle.spent += usage.tokens;
-      return gate.meter(cellId, usage, handle.wrapUp ? { wrapUp: true } : undefined);
     },
 
     drainSteer() {
@@ -350,14 +307,6 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
         return {record, ...(row ? {envelope:JSON.parse(row.envelope) as Envelope} : {})};
       });
     },
-    async submitReply(action, artifactVersion, sourceId) {
-      assertLive("send");
-      if (!deliveryAllowed(liveBounds(), cell.parentId, action.target)) {
-        throw new NgError("bounds_violation", `this cell may not send to ${action.target}`);
-      }
-      return core.approvals.submitReply(action, sourceId, { cellId, principalId, epoch: self.epoch, artifactVersion, ...(handle.wrapUp ? { wrapUp: true } : {}) });
-    },
-
     async emitToParent(type, payload, o = {}) {
       if (!cell.parentId) throw new NgError("invalid_argument", "a root cell has no parent to report to");
       assertLive("emitToParent");
@@ -432,22 +381,11 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
       inbox.handbackSync(runId, envelopeId, reason);
     },
 
-    async withdrawApproval(ref, reason) {
-      assertLive("withdrawApproval");
-      const rec =
-        ref.actionId !== undefined ? gate.getApprovalSync(ref.actionId) : ref.subjectKey !== undefined ? gate.findPendingBySubjectSync(ref.subjectKey, cellId) : undefined;
-      // A cell may take down only what it asked the owner itself.
-      if (!rec || rec.cellId !== cellId || rec.status !== "pending") return "not_pending";
-      const w = gate.withdrawSync(rec.actionId, reason);
-      return w === "cancelled" ? "cancelled" : "not_pending";
-    },
-
     async workspaceAccess() {
       assertLive("workspace");
       const port = await acquire();
       const b = liveBounds();
-      let tools = TOOL_KINDS.filter((t) => b.tools.has(t));
-      if (b.isolation === "shared_ro") tools = tools.filter((t) => t === "read");
+      const tools = TOOL_KINDS.filter((t) => b.tools.has(t));
       return { root: port.root, isolation: b.isolation, tools };
     },
 
@@ -477,7 +415,6 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
       const spec = cell.spec;
       // Hubs absorb by design; a leaf absorbs so that a follow-up is answered before its turn is reported as settled.
       if (!spec.absorbInbound && !isLeafLifetime(spec.lifetime)) return [];
-      if ((spec.claimMode ?? "serial_coalesce") !== "serial_coalesce") return [];
       return withTx(core.db, () => {
         const rows = inbox.drainInboundSync(cellId, runId);
         if (rows.length === 0) return [];

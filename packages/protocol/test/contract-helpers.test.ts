@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import {
-  actionClassOf,
   addressCovers,
   asClarifyCard,
   cardButtons,
@@ -24,7 +23,6 @@ import {
   selectRunTools,
   stableStringify,
   topBallOwner,
-  type ClarifyCard,
   type ProposedAction,
   type ToolContext,
 } from "../src";
@@ -32,55 +30,37 @@ import {
 describe("addresses and principals", () => {
   it("builds and parses addresses", () => {
     expect(inboxAddr("desk")).toBe("inbox:desk");
-    expect(channelAddr("feishu", "oc_123:thread")).toBe("channel:feishu:oc_123:thread");
-    expect(parseAddress("channel:feishu:oc_123:thread")).toEqual({
+    expect(channelAddr("memory", "oc_123:thread")).toBe("channel:memory:oc_123:thread");
+    expect(parseAddress("channel:memory:oc_123:thread")).toEqual({
       kind: "channel",
-      addr: "channel:feishu:oc_123:thread",
-      channelId: "feishu",
+      addr: "channel:memory:oc_123:thread",
+      channelId: "memory",
       target: "oc_123:thread",
     });
     expect(parseAddress("inbox:w1")).toEqual({ kind: "inbox", addr: "inbox:w1", cellId: "w1" });
-    expect(parseAddress("channel:feishu")).toBeNull();
+    expect(parseAddress("channel:memory")).toBeNull();
     expect(parseAddress("timer:x")).toBeNull();
     expect(isInboxAddr("inbox:x")).toBe(true);
     expect(isChannelAddr("inbox:x")).toBe(false);
     expect(isAddress("channel:web:owner")).toBe(true);
     expect(() => channelAddr("a:b", "t")).toThrow();
-    expect(addressCovers("channel:feishu:*", "channel:feishu:oc_1")).toBe(true);
+    expect(addressCovers("channel:memory:*", "channel:memory:oc_1")).toBe(true);
     expect(addressCovers("inbox:desk", "inbox:desk2")).toBe(false);
   });
 
   it("parses principals", () => {
     expect(parsePrincipal("owner")).toEqual({ kind: "owner" });
     expect(parsePrincipal(cellPrincipal("w1"))).toEqual({ kind: "cell", cellId: "w1" });
-    expect(parsePrincipal("feishu:ou_42")).toEqual({ kind: "external", channelId: "feishu", userId: "ou_42" });
+    expect(parsePrincipal("memory:ou_42")).toEqual({ kind: "external", channelId: "memory", userId: "ou_42" });
     expect(parsePrincipal("me", "me")).toEqual({ kind: "owner" });
   });
 });
 
-describe("hashAction / actionClassOf", () => {
-  const send: ProposedAction = {
-    type: "channel.send",
-    summary: "回复张三",
-    subjectKey: "msg:1",
-    sideEffect: "external",
-    target: "channel:feishu:oc_1",
-    content: { format: "text", body: "好的，周五前给你" },
-    artifactId: "art_1",
-  };
-
-  it("binds only operative fields", () => {
-    const same = { ...send, summary: "different", subjectKey: "x", artifactId: "other", card: { format: "card" as const, body: "" } };
-    expect(hashAction(same)).toBe(hashAction(send));
-    expect(hashAction({ ...send, content: { format: "text", body: "改了" } })).not.toBe(hashAction(send));
-    const { summary, subjectKey, sideEffect, artifactId, ...rest } = send;
-    void summary, subjectKey, sideEffect, artifactId;
-    expect(stableStringify(rest)).toContain('"target":"channel:feishu:oc_1"');
-  });
-
-  it("classifies actions coarsely", () => {
-    expect(actionClassOf(send)).toBe("channel.send|channel:feishu:*");
-    expect(actionClassOf({ type: "custom", summary: "", subjectKey: "s", sideEffect: "internal", name:"check" })).toBe("custom|check");
+describe("action hashing", () => {
+  it("hashes the operation independently of display text", () => {
+    const action = { type: "custom" as const, name: "review", args: { id: "a" }, summary: "审阅", subjectKey: "s", sideEffect: "internal" as const };
+    expect(hashAction({ ...action, summary: "请审阅" })).toBe(hashAction(action));
+    expect(hashAction({ ...action, args: { id: "b" } })).not.toBe(hashAction(action));
   });
 
   it("stableStringify sorts keys and drops undefined", () => {
@@ -183,28 +163,19 @@ describe("gtd conventions", () => {
     const base = {
       subjectKey: "msg:1",
       title: "回复张三",
-      source: { label: "飞书转发", at: 0 },
+      source: { label: "工作台", at: 0 },
       rawInput: { text: "接口什么时候好？", kind: "message" as const },
       prep: { summary: "查了 PR #108", checked: [] },
     };
-    const response: ClarifyCard = {
-      ...base,
-      cardType: "response",
-      draft: { artifactId: "a1", version: 2 },
-      reply: { target: "channel:feishu:oc_1", targetLabel: "张三" },
-      confirmVerb: "send",
-    };
-    expect(cardButtons(response).map((b) => b.label)).toEqual(["✓ 确认发送", "🎙 按住口述修改意见", "⏱ 推迟到下午", "下一张 →"]);
     expect(
       cardButtons({ ...base, cardType: "project_proposal", proposal: { title: "竞品", outcome: "报告", actions: [] } }).map((b) => b.id),
     ).toEqual(["confirm", "edit_plan", "someday", "skip"]);
     expect(
       cardButtons({ ...base, cardType: "escalation", escalation: { reason: "waiting_timeout", explanation: "C 未回" } }).map((b) => b.label),
-    ).toEqual(["✓ 发送催问并继续跟进", "⏱ 再等 1 天", "✓ 线下已解决，直接完结", "下一张 →"]);
+    ).toEqual(["⏱ 再等 1 天", "✓ 线下已解决，直接完结", "下一张 →"]);
     expect(
-      cardButtons({ ...base, cardType: "escalation", escalation: { reason: "budget_exhausted", explanation: "超额" } })[0],
+      cardButtons({ ...base, cardType: "escalation", escalation: { reason: "blocked", explanation: "需要确认" } })[0],
     ).toMatchObject({ id: "extend", primary: true });
-    expect(asClarifyCard(response)).toBe(response);
     expect(asClarifyCard({ cardType: "nope" })).toBeNull();
   });
 });

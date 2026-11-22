@@ -4,7 +4,6 @@ import type { Envelope, InboxAddr, PolicyBounds } from "./envelope";
 import type { ClaimedBatch, ScheduleRule } from "./inbox";
 import type { RunOutcome } from "./loop";
 import type { ModelMessage } from "./model";
-import type { Usage } from "./gate";
 
 // docs/02 §二 — ③ Context, verbatim (comments translated). Extensions follow the `[ext]` marker.
 
@@ -264,7 +263,7 @@ export type StepOrExternalEvidence =
   | (EvidenceBase & { kind: "tool_result"; toolUseId: string; name: string; output: string; isError?: boolean })
   | (EvidenceBase & { kind: "external"; source: string; title?: string; text: string; uri?: string })
   | (EvidenceBase & { kind: "system_note"; text: string })
-  | (EvidenceBase & { kind: "run_boundary"; phase: "start" | "end"; epoch: number; outcome?: RunOutcome | "error"; usage?: Usage; error?: string });
+  | (EvidenceBase & { kind: "run_boundary"; phase: "start" | "end"; epoch: number; outcome?: RunOutcome | "error"; error?: string });
 
 export type EvidenceOf<K extends EvidenceKind> = Extract<StepOrExternalEvidence, { kind: K }>;
 
@@ -442,14 +441,12 @@ export interface ChildSummary {
   depth?: number;
   parentId?: string | null;
   cwd?: string;
-  /** @deprecated never set any more (see CellSpec.cwdMode). */
-  cwdMode?: "read" | "write";
   /**
    * What the cell is doing right now: `working` (a Run or Job in flight, or a message waiting to start it), `waiting`
    * (a watch, a timer, an open wait or a card), `dormant` (a wakeable worker with nothing in flight and nothing that
    * would wake it — a message does), `paused`.
    */
-  activity?: "working" | "waiting" | "dormant" | "paused" | "budget_paused";
+  activity?: "working" | "waiting" | "dormant" | "paused";
   /** Direct leaf children only: evidence the viewing cell has not looked at with inspect_cell yet (`from`..`to`). */
   unread?: { from: number; to: number };
 }

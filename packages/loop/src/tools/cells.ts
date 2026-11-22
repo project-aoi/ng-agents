@@ -37,18 +37,14 @@ const scheduleInput = z.object({
   at: z.string().optional().describe("ISO 8601 time with offset, one-shot"),
   cron: z.string().optional(),
   tz: z.string().optional().describe("IANA timezone for cron"),
-  idleSec: z.number().int().min(1).optional(),
   cancelGroup: z.string().optional(),
 });
 
 const boundsInput = z.object({
   tools: z.array(z.enum(TOOL_KINDS)).optional(),
   canSendTo: z.array(z.string()).optional().describe("channel addresses the child may send to (inboxes are always reachable)"),
-  secretRefs: z.array(z.string()).optional(),
   isolation: z.enum(ISOLATION_LEVELS).optional(),
   maxConcurrentChildren: z.number().int().min(0).optional(),
-  maxTokens: z.number().int().min(0).optional(),
-  maxCents: z.number().min(0).optional(),
   maxDepth: z.number().int().min(0).optional(),
 });
 
@@ -70,10 +66,9 @@ function toSchedules(schedules: Array<z.infer<typeof scheduleInput>>): ScheduleR
     }
     if (s.cron) rule.cron = s.cron;
     if (s.tz) rule.tz = s.tz;
-    if (s.idleSec) rule.idleSec = s.idleSec;
     if (s.cancelGroup) rule.cancelGroup = s.cancelGroup;
-    if ([rule.deliverAt, rule.cron, rule.idleSec].filter((v) => v !== undefined).length !== 1) {
-      throw new Error("each schedule needs exactly one of at, cron or idleSec");
+    if ([rule.deliverAt, rule.cron].filter((v) => v !== undefined).length !== 1) {
+      throw new Error("each schedule needs exactly one of at or cron");
     }
     return rule;
   });
@@ -87,11 +82,8 @@ function toBounds(b: z.infer<typeof boundsInput>): Partial<PolicyBounds> {
     if (bad.length) throw new Error(`not addresses: ${bad.join(", ")}`);
     out.canSendTo = b.canSendTo as Address[];
   }
-  if (b.secretRefs) out.secretRefs = new Set(b.secretRefs);
   if (b.isolation) out.isolation = b.isolation;
   if (b.maxConcurrentChildren !== undefined) out.maxConcurrentChildren = b.maxConcurrentChildren;
-  if (b.maxTokens !== undefined) out.maxTokens = b.maxTokens;
-  if (b.maxCents !== undefined) out.maxCents = b.maxCents;
   if (b.maxDepth !== undefined) out.maxDepth = b.maxDepth;
   return out;
 }
@@ -111,7 +103,7 @@ export function cellsToolset(registry: Registry): Toolset {
     availableFor: canSpawn,
     description: [
       "Start a child cell for work that should not block you. It runs in the background and reports to your inbox (cell.result / cell.progress); your in-flight cells are listed at the end of every wake-up message.",
-      "Presets — worker: an executor for one piece of work (reads/changes code, runs commands, researches). When its turn is over you are told, and it stays dormant — costing nothing — until a message wakes it with everything it knows; it is closed with you. project: a persistent coordinator that owns one outcome over many steps (keeps the plan, the records and the shared artifacts; hands every piece of heavy work to workers). checker: a light one-shot checker that looks at a condition now and then (an MR merged? a reply arrived? a file appeared?), reports when it holds and is then closed. reply_watcher: a persistent reply listener, created with await_reply. sensor: a persistent scheduled source. hub: a persistent router for one stream of direct messages. inline: a light helper.",
+      "Presets — worker: an executor for one piece of work (reads/changes code, runs commands, researches). When its turn is over you are told, and it stays dormant — costing nothing — until a message wakes it with everything it knows; it is closed with you. project: a persistent coordinator that owns one outcome over many steps (keeps the plan, the records and the shared artifacts; hands every piece of heavy work to workers). checker: a light one-shot checker that looks at a condition now and then (an MR merged? a file appeared?), reports when it holds and is then closed. sensor: a persistent scheduled source. hub: a persistent coordinator for one internal topic. inline: a light helper.",
       "cwd is the directory on this machine the child works in (an absolute path that exists; ask the owner when you do not know it — never guess). A child without cwd inherits yours. It starts at once: nothing queues or locks a directory. The note \"active workspaces\" at the end of your wake-up message shows who is working where right now — if someone is already changing that repository, say in the instruction how to share it (only look; or work in a `git worktree` of its own), or send the work to the cell that is already there.",
       "Its permissions are always a subset of yours. Give it everything it needs in the instruction: it does not see your conversation (unless contextMode fork_prefix).",
     ].join(" "),

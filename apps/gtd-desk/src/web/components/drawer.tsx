@@ -142,30 +142,6 @@ function SourcesPanel() {
       <p className="drawer-note">信源只在命中目标时往信箱投信，平时安静运行，不会出现在项目列表里。</p>
 
       <section className="src-section">
-        <h3>外部渠道</h3>
-        {s.channels.length === 0 ? (
-          <p className="muted small">没有接入外部渠道。</p>
-        ) : (
-          <ul className="src-list">
-            {s.channels.map((c) => (
-              <li key={c.id} className="src">
-                <div className="src-head">
-                  <span className={`state-dot ${c.state}`} aria-hidden="true" />
-                  <strong>{c.label}</strong>
-                  <span className="muted small">{c.stateLabel}</span>
-                </div>
-                <p className="muted small">
-                  最近收到 {ago(c.lastIngressAt, now)} · 最近送出 {ago(c.lastDeliveryAt, now)}
-                </p>
-                {c.lastError && <p className="src-error">{c.lastError}</p>}
-                {c.hookPath && <HookPath path={c.hookPath} />}
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
-
-      <section className="src-section">
         <div className="src-section-head">
           <h3>定时 / 条件监控</h3>
           <button type="button" className="btn sm" aria-expanded={adding} onClick={() => setAdding((a) => !a)}>
@@ -194,28 +170,6 @@ function SourcesPanel() {
       </section>
       {res.error && <p className="stale-note">刷新失败：{res.error.message}</p>}
     </div>
-  );
-}
-
-function HookPath({ path }: { path: string }) {
-  const [copied, setCopied] = useState(false);
-  const url = `${window.location.origin}${path}`;
-  return (
-    <p className="small hook">
-      Webhook 地址 <code>{url}</code>
-      <button
-        type="button"
-        className="link-btn"
-        onClick={() => {
-          void navigator.clipboard?.writeText(url).then(() => {
-            setCopied(true);
-            setTimeout(() => setCopied(false), 1500);
-          });
-        }}
-      >
-        {copied ? "已复制" : "复制"}
-      </button>
-    </p>
   );
 }
 

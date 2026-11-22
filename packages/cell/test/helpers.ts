@@ -4,7 +4,8 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryChannel, UiChannel } from "@ng/channel";
-import { ScriptedModelClient, STANDARD_TOOLSETS, type ScriptResponder, type ScriptTurn } from "@ng/loop";
+import { STANDARD_TOOLSETS } from "@ng/loop";
+import { ScriptedModelClient, type ScriptResponder, type ScriptTurn } from "@ng/loop/testing";
 import {
   all,
   createRegistry,
@@ -201,7 +202,7 @@ export async function boot(opts: BootOptions = {}): Promise<Harness> {
     model: script.model,
     channels: [memory, ui],
     retryBackoffMs: 1_000,
-    workspace: { limits: { killGraceMs: 300, jobPollMs: 40, previewPollMs: 25 } },
+    workspace: { limits: { killGraceMs: 300, jobPollMs: 40 } },
     onError: () => undefined,
     ...opts.kernel,
   });

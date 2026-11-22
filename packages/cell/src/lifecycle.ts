@@ -26,7 +26,6 @@ import {
   type CellRecord,
   type CellResultPayload,
   type CellSpec,
-  type ActionRecord,
   type CellTaskPayload,
   type CloseReason,
   type InboxAddr,
@@ -186,25 +185,15 @@ export function createLifecycle(core: KernelCore): Lifecycle {
 
   // ---------- bounds ----------
 
-  function assertBudget(b: PolicyBounds, what: string): PolicyBounds {
-    if (!(b.maxTokens > 0) || !(b.maxCents > 0)) {
-      throw new NgError(
-        "invalid_argument",
-        `${what} needs positive maxTokens and maxCents (got ${b.maxTokens} tokens, ${b.maxCents} cents): a zero budget is exhausted from the start and the cell would be denied everything`,
-      );
-    }
-    return b;
-  }
-
   function rootBounds(init: BoundsInit | undefined): PolicyBounds {
-    return assertBudget(makeBounds({ ...core.rootBounds, ...definedEntries(init ?? {}) }), "a root cell");
+    return makeBounds({ ...core.rootBounds, ...definedEntries(init ?? {}) });
   }
 
   function updatedBounds(cell: CellRecord, req: Partial<PolicyBounds>, isOwner: boolean): PolicyBounds {
     const merged = { ...cell.bounds, ...definedEntries(req) } as Partial<PolicyBounds>;
     if (!cell.parentId) {
       if (!isOwner) throw new NgError("bounds_violation", "only the owner may change a root cell's bounds");
-      return assertBudget(makeBounds(merged as BoundsInit), "a root cell");
+      return makeBounds(merged as BoundsInit);
     }
     const parent = cells.require(cell.parentId);
     const next = attenuateBounds(parent.bounds, parent.id, merged);
@@ -244,7 +233,7 @@ export function createLifecycle(core: KernelCore): Lifecycle {
       validateSpec(registry, resolved);
       if (resolved.cwd !== undefined) assertDirectory(resolved.cwd, "cwd");
       const bounds = rootBounds(opts.bounds);
-      if (resolved.preset === "worker" || resolved.preset === "checker" || resolved.preset === "reply_watcher") bounds.maxDepth = 0;
+      if (resolved.preset === "worker" || resolved.preset === "checker") bounds.maxDepth = 0;
       delete resolved.bounds;
       return insertCell({ id, parentId: null, spec: { ...resolved, id }, bounds, principalId });
     });
@@ -299,11 +288,6 @@ export function createLifecycle(core: KernelCore): Lifecycle {
       }
       // Never trust requested bounds: Gate clamps them to the parent's effective bounds.
       const bounds = gate.attenuate(parent.bounds, parent.id, boundsRequest);
-      // The child spends from its ancestors' live ledgers (nothing is carved out for it), so a chain that is already
-      // stopped would start it dead.
-      if (bounds.maxTokens <= 0 || bounds.maxCents <= 0 || gate.usageSync(parent.id).state === "hard_stop") {
-        throw new NgError("bounds_violation", `the budget of "${parent.id}" (or an ancestor) is used up; a child would be denied everything. Ask the owner to raise it.`);
-      }
 
       const id = spec.id ?? newId("cell", clock);
       if (cells.get(id)) throw new NgError("duplicate", `cell "${id}" already exists`);
@@ -372,7 +356,7 @@ export function createLifecycle(core: KernelCore): Lifecycle {
 
       let bounds = cell.bounds;
       if (given.bounds !== undefined) {
-        if ((cell.preset === "worker" || cell.preset === "checker" || cell.preset === "reply_watcher") && (given.bounds.maxDepth ?? 0) > 0)
+        if ((cell.preset === "worker" || cell.preset === "checker") && (given.bounds.maxDepth ?? 0) > 0)
           throw new NgError("bounds_violation", `preset "${cell.preset}" has maxDepth 0`);
         bounds = updatedBounds(cell, given.bounds, isOwner);
         next.bounds = jsonSafeBounds({ ...(cell.spec.bounds ?? {}), ...definedEntries(given.bounds) });
@@ -458,7 +442,7 @@ export function createLifecycle(core: KernelCore): Lifecycle {
       for (const c of subtree) {
         const epoch = cells.bumpEpoch(c.id);
         run(db, `INSERT INTO cell_closures(cell_id,epoch,target_id,closure_id,was_revoked)
-          VALUES(?,?,?,?,EXISTS(SELECT 1 FROM ledger WHERE cell_id=? AND revoked_at IS NOT NULL))`,
+          VALUES(?,?,?,?,EXISTS(SELECT 1 FROM cells WHERE id=? AND revoked_at IS NOT NULL))`,
           [c.id,epoch,target.id,closureId,c.id]);
         // A worker that had finished its turns and was merely still addressable is archived with its project, not
         // cancelled: nothing of its work was cut short.
@@ -473,7 +457,7 @@ export function createLifecycle(core: KernelCore): Lifecycle {
         const closedCell=cells.require(id);
         if (closedCell.preset) registry.presets.get(closedCell.preset)?.onCellClosed?.(closedCell,id===target.id ? reason : "cancelled",context,clock);
       }
-      // Cancels the subtree's pending approvals and unused tokens, permanently.
+      // Cancel pending decisions held by this subtree.
       for (const c of closed) {
         run(db,`UPDATE human_items SET disposition='cancelled',status_reason='issuer_closed',updated_at=?,item_revision=item_revision+1
           WHERE cell_id=? AND epoch<? AND action_hash='' AND status IN ('pending','snoozed')`, [clock.now(),c.id,c.epoch]);
@@ -503,7 +487,7 @@ export function createLifecycle(core: KernelCore): Lifecycle {
       };
       core.dispatcher.abortCells([id], "close");
       const cleanup = Promise.all([existing?.done, core.dispatcher.settled([id])]).then(async () => {
-        if (stillClosed()) await core.workspace.stopRuntime(id, stillClosed);
+        if (stillClosed()) await core.workspace.cancelJobsForCell(id);
       }).catch((err: unknown) => core.onError(err, `stop runtime of closed cell ${id}`)).finally(() => {
         if (cleanups.get(id)?.epoch !== epoch) return;
         cleanups.delete(id);

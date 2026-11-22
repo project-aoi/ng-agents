@@ -155,7 +155,7 @@ describe("hubs are sources", () => {
     const hub = d.kernel.listCells({ parentId: "desk" }).find((c) => c.spec.meta?.["role"] === "hub")!;
     expect(hub).toBeDefined();
     const sources = await d.get<SourcesDTO>("/api/sources");
-    expect(sources.sensors.map((s) => [s.id, s.title, s.kind])).toEqual([[hub.id, "代码评审直通", "channel"]]);
+    expect(sources.sensors.map((s) => [s.id, s.title, s.kind])).toEqual([[hub.id, "代码评审直通", "watch"]]);
     const radar = await d.get<RadarDTO>("/api/radar");
     expect([...radar.projects, ...radar.someday]).toEqual([]);
   });

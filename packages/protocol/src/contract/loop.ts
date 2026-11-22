@@ -27,7 +27,7 @@ export interface AgentLoop {
     | "yielded_waiting"                 // set up a wait/watch or started an async background Job; releases this Run ($0 while waiting)
     | "deferred_for_approval"           // Gate.defer produced a pending card; state persisted, Run released
     | "cancelled"
-    | "budget_stopped"
+
     | "step_limit"                      // [ext] docs/05: hit the per-Run step cap with work left; the kernel schedules a continuation
     | "refused"                         // [ext] docs/05: the model refused the task; never reported as completed
   >;
@@ -35,17 +35,11 @@ export interface AgentLoop {
 
 // ==================== [ext] ====================
 
-export type RunOutcome = "completed" | "yielded_waiting" | "deferred_for_approval" | "cancelled" | "budget_stopped" | "step_limit" | "refused";
+export type RunOutcome = "completed" | "yielded_waiting" | "deferred_for_approval" | "cancelled" | "step_limit" | "refused";
 
-/**
- * [ext] Who executes an `llm` Run (docs/02 §四.8 "Loop 对接外部 CLI 适配器"): `api` = @ng/loop's own tool loop over a
- * ModelClient; the others = an installed CLI coding agent (Claude Code, OpenAI Codex CLI, Google Antigravity CLI) whose
- * native file/shell tools work in the cell's workspace and which reaches the kernel tools over a per-Run MCP bridge.
- */
-export type AgentEngine = "api" | "claude" | "codex" | "agy";
-export type CliEngine = Exclude<AgentEngine, "api">;
-export const AGENT_ENGINES = ["api", "claude", "codex", "agy"] as const satisfies readonly AgentEngine[];
-export const CLI_ENGINES = ["claude", "codex", "agy"] as const satisfies readonly CliEngine[];
+export const CLI_ENGINES = ["claude", "codex", "agy"] as const;
+export type CliEngine = typeof CLI_ENGINES[number];
+export type AgentEngine = CliEngine;
 export type LlmProcessorSpec = Extract<ProcessorSpec, { kind: "llm" }>;
 export type CodeProcessorSpec = Extract<ProcessorSpec, { kind: "code" }>;
 

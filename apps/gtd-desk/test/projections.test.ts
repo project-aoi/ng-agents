@@ -6,7 +6,7 @@ import { parseDecisions, waitingDTO } from "../src/server/projections/format";
 import { afternoonSlot, dueText, nextWeekly, weekStart } from "../src/server/projections/time";
 import { relativeTimeZh } from "../src/shared/api";
 import type { Kernel } from "@ng/cell";
-import { agentRedraft, bootDesk, cleanupAll, DAY, HOUR, makeProject, makeReplyCard, MIN, writeAction, writeActivity, writeProject, writeSource } from "./helpers";
+import { agentRedraft, bootDesk, cleanupAll, DAY, HOUR, makeProject, makeReviewCard, MIN, writeAction, writeActivity, writeProject, writeSource } from "./helpers";
 
 afterEach(cleanupAll);
 
@@ -20,45 +20,11 @@ function deferCard(kernel: Kernel, cellId: string, action: Record<string, unknow
 }
 
 describe("Clarify projection", () => {
-  it("a reply card carries the four fixed blocks and its buttons with their endpoints", async () => {
-    const { kernel, clock } = await bootDesk();
-    const { actionId, artifactId } = makeReplyCard(kernel);
-    const q = projectClarify(view(kernel));
-    expect(q).toMatchObject({ generatedAt: clock.now(), remaining: 1, inboxZero: false, snoozed: 0 });
-    const c = q.cards[0]!;
-    expect(c).toMatchObject({
-      id: actionId,
-      cardType: "response",
-      state: "pending",
-      title: "回复 Alice：接口什么时候上线",
-      sourceBar: { source: { label: "测试通道", at: clock.now() - 12 * MIN }, statusText: "已备好初稿 v1 · 等待确认", version: 1, draftUpdated: false },
-      rawInput: { text: "接口什么时候上线？", kind: "message" },
-      prep: { summary: "查了发布计划", checked: [{ label: "发布计划", uri: "https://example.test/plan" }] },
-      draft: { artifactId, version: 1, body: "您好，接口下周二上线。", updatedBy: "agent", save: { method: "PUT", path: `/api/artifacts/${artifactId}` } },
-      reply: { targetLabel: "Alice", channelLabel: "测试通道", confirmVerb: "send" },
-      proposal: null,
-      escalation: null,
-      outcome: null,
-    });
-    expect(c.buttons.map((b) => [b.id, b.label, b.group, b.primary])).toEqual([
-      ["confirm", "✓ 确认发送", "main", true],
-      ["revise_voice", "🎙 按住口述修改意见", "main", false],
-      ["snooze", "⏱ 推迟到下午", "main", false],
-      ["skip", "下一张 →", "main", false],
-      ["dismiss", "不需要处理（归档）", "more", false],
-    ]);
-    expect(c.buttons[1]).toMatchObject({ endpoint: { path: `/api/clarify/${actionId}/revise`, body: { voice: true } }, input: { field: "instruction" } });
-    expect(c.buttons[3]).toMatchObject({ client: "skip" });
-    expect(c.buttons[3]!.endpoint).toBeUndefined();
-
-    agentRedraft(kernel, artifactId, "新版本", 1);
-    expect(projectClarify(view(kernel)).cards[0]!.sourceBar).toMatchObject({ version: 2, draftUpdated: true, statusText: "草稿已更新为 v2 · 请重看" });
-  });
 
   it("snoozed cards are hidden until due; a card taken over in Engage is hidden while it stays pending", async () => {
     const { kernel, clock } = await bootDesk();
-    const a = makeReplyCard(kernel);
-    const b = makeReplyCard(kernel);
+    const a = makeReviewCard(kernel);
+    const b = makeReviewCard(kernel);
     kernel.gate.snoozeSync(a.actionId, clock.now() + HOUR);
     writeAction(kernel, "desk", { title: "自己回", owner: "human", approvalActionId: b.actionId } as never);
     expect(projectClarify(view(kernel))).toMatchObject({ remaining: 0, snoozed: 1, inboxZero: true });
@@ -93,43 +59,6 @@ describe("Clarify projection", () => {
     expect(c.buttons[1]).toMatchObject({ client: "open_plan_editor", endpoint: { method: "PUT", path: `/api/clarify/${id}/plan`, body: { expectedVersion: 2 } } });
   });
 
-  it("escalations: waiting timeout offers the nudge, one more day and resolve offline; budget offers more budget", async () => {
-    const { kernel } = await bootDesk();
-    kernel.spawnCell("desk", { id: "wq", preset: "watcher", title: "等报价", bounds: { canSendTo: ["channel:memory:*"] } });
-    kernel.context.commitSync("wq", { artifact: { artifactId: "art_n", content: { format: "text", body: "C 总，报价方便今天发一下吗？" }, updatedBy: "agent" } });
-    const t = kernel.clock.now();
-    const card: EscalationCard = {
-      cardType: "escalation",
-      subjectKey: "cell:wq",
-      title: "供应商 C 还没回报价",
-      source: { label: "后台分身", at: t },
-      rawInput: { text: "等待 3 家报价", kind: "system" },
-      prep: { summary: "A、B 已回", checked: [] },
-      escalation: {
-        reason: "waiting_timeout",
-        explanation: "C 已超时 1 天未回",
-        waiting: { description: "等待供应商报价回信", join: "all", parties: [{ id: "a", label: "A", replied: true }, { id: "b", label: "B", replied: true }, { id: "c", label: "C", replied: false, dueAt: t - DAY }] },
-        nudgeDraft: { artifactId: "art_n", version: 1 },
-        nudgeTarget: "channel:memory:supplier-c",
-      },
-    };
-    const id = deferCard(
-      kernel,
-      "wq",
-      { type: "channel.send", target: "channel:memory:supplier-c", content: { format: "text", body: "C 总，报价方便今天发一下吗？" }, artifactId: "art_n", summary: "催 C", subjectKey: "cell:wq", sideEffect: "external", card: { format: "card", body: "x", data: card } },
-      1,
-    );
-    const c = projectClarify(view(kernel)).cards.find((x) => x.id === id)!;
-    expect(c.escalation).toMatchObject({ reason: "waiting_timeout", reasonLabel: "等待超时", waiting: { replied: 2, total: 3, text: "已回 2/3 · 剩 C 已超时 1 天" } });
-    expect(c.reply).toMatchObject({ targetLabel: "channel:memory:supplier-c", channelLabel: "测试通道" });
-    expect(c.buttons.slice(0, 4).map((b) => [b.id, b.label])).toEqual([
-      ["confirm", "✓ 发送催问并继续跟进"],
-      ["extend", "⏱ 再等 1 天"],
-      ["resolve_offline", "✓ 线下已解决，直接完结"],
-      ["skip", "下一张 →"],
-    ]);
-    expect(c.buttons[1]!.endpoint!.body).toEqual({ until: kernel.clock.now() + DAY, seenItemRevision: 1 });
-  });
 
   it("cards without GTD card data are shown generically with confirm / deny", async () => {
     const { kernel } = await bootDesk();
@@ -158,7 +87,6 @@ describe("Engage projection", () => {
     expect(e.items[0]).toMatchObject({ actionId: overdue.id, overdue: true, kind: "quick" });
     expect(e.items[2]).toMatchObject({ actionId: inProject.id, project: { id: active, title: "活跃项目" } });
     expect(projectEngage(view(kernel), "45m").items.map((i) => i.actionId)).toEqual([later.id]);
-    expect(e.focus).toEqual({ on: false, buffered: 0, text: "免打扰未开启" });
   });
 
   it("the detail marks decision passages and fills the context pack from the item's source", async () => {
@@ -205,7 +133,7 @@ describe("Radar projection", () => {
     const bare = makeProject(kernel, "无人推进");
     const carded = makeProject(kernel, "有卡待确认");
     // a card in the project's own subtree is the owner's anchor (docs/05 guard 2)
-    makeReplyCard(kernel, { cellId: carded, subjectKey: subjectKeys.project(carded) });
+    makeReviewCard(kernel, { cellId: carded, subjectKey: subjectKeys.project(carded) });
     const timed = makeProject(kernel, "有闹钟");
     kernel.spawnCell(timed, { id: "t1", preset: "watcher", title: "超时提醒", schedules: [{ deliverAt: kernel.clock.now() + DAY }] });
     const paused = makeProject(kernel, "暂停中");
@@ -312,7 +240,7 @@ describe("status projection", () => {
     writeActivity(kernel, { kind: "note_saved", title: "存了一篇文章" });
     const p = makeProject(kernel, "停滞的");
     void p;
-    makeReplyCard(kernel);
+    makeReviewCard(kernel);
     kernel.checkStalls();
     // The kernel's single stall notice reaches the project after its grace period; the project looks and ends its
     // turn (the scripted model does nothing), and it stays flagged without a second notice.
@@ -320,12 +248,10 @@ describe("status projection", () => {
     await kernel.idle();
     const s = projectStatus(view(kernel));
     expect(s).toMatchObject({
-      demo: false,
       backend: "scripted",
       clarify: { pending: 1, snoozed: 0 },
       today: { archivedNotifications: 2, notesSaved: 1 },
       radar: { activeProjects: 1, stalledProjects: 0 },
-      focus: { on: false, buffered: 0 },
     });
     expect(s.statusLine.clarify).toBe("后台已静默归档 2 条通知 · 自动存好 1 条随手笔记 · 后台没有在途任务");
     expect(kernel.humanItems.list().some(item => item.relatedProjectIds.includes(p))).toBe(true);
@@ -334,15 +260,11 @@ describe("status projection", () => {
 });
 
 describe("sources projection", () => {
-  it("lists channels with their webhook paths and sensors with readable schedules", async () => {
+  it("lists sensors with readable schedules", async () => {
     const { kernel } = await bootDesk();
     kernel.spawnCell("desk", { id: "s2", preset: "sensor", title: "支付报错探头",processor:{kind:"code",entry:"gtd.sensor_script",args:{script:"checks/probe.sh"}},schedules:[{cron:"0 9 * * 1"}] });
     writeSource(kernel, "s2", { title: "支付报错探头", schedule: { cron: "0 9 * * 1" }, mode: "observe", processor: "code", runCount: 3 });
     const s = projectSources(view(kernel));
-    expect(s.channels.map((c) => [c.id, c.label, c.hookPath])).toEqual([
-      ["ui", "随手记", null],
-      ["memory", "测试通道", null],
-    ]);
     expect(s.sensors).toMatchObject([{ id: "s2", scheduleText: "每周一 09:00", modeLabel: "只记观察笔记，不弹卡", processorLabel: "脚本检查（零 Token）", status: "ok" }]);
     expect(s.sensors[0]!.buttons.map((b) => b.id)).toEqual(["pause", "mode", "delete"]);
   });

@@ -42,7 +42,6 @@ describe.each([...CLI_ENGINES])("live %s (NG_LIVE_CLI)", (engine: CliEngine) => 
               argv: launch?.type === "launch" ? launch.argv : null,
               permissions: launch?.type === "launch" ? launch.permissions : null,
               state: Object.fromEntries(r.ports.state),
-              usage: r.ports.totalUsage(),
               evidence: r.ports.log.evidence.map((e) => ({ kind: e.kind, ...("name" in e ? { name: e.name } : {}), ...("text" in e ? { text: e.text.slice(0, 200) } : {}), ...("output" in e ? { output: e.output.slice(0, 200) } : {}) })),
               notices: debug.filter((d) => d.type !== "launch"),
             },
@@ -55,7 +54,6 @@ describe.each([...CLI_ENGINES])("live %s (NG_LIVE_CLI)", (engine: CliEngine) => 
         console.log(report);
         expect(outcome).toBe("completed");
         expect(r.ports.state.get("smoke")).toBe("pelican");
-        expect(r.ports.totalUsage().tokens).toBeGreaterThan(0);
         expect((r.ports.state.get(CLI_SESSION_KEY) as CliSessionRecord).engine).toBe(engine);
       } finally {
         rmSync(root, { recursive: true, force: true });

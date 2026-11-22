@@ -36,7 +36,7 @@ describe("enqueue", () => {
     expect(rows[1]!.statusReason).toMatch(/^invalid/);
     expect(t.takeWakes()).toEqual([]);
     expect(t.inbox.dueCellIdsSync()).toEqual([]);
-    expect(t.inbox.claimNextRunSync("desk", "w", "serial_coalesce")).toBeNull();
+    expect(t.inbox.claimNextRunSync("desk", "w")).toBeNull();
     expect(t.inbox.pendingCountsSync(["desk"])).toEqual({ desk: 0 });
   });
 
@@ -94,8 +94,7 @@ describe("enqueue", () => {
     expect(code(() => t.inbox.enqueueSync("nope", msg()))).toBe("not_found");
     expect(code(() => t.inbox.enqueueSync("desk", msg({ id: "" })))).toBe("invalid_argument");
     expect(code(() => t.inbox.enqueueSync("desk", msg({ kind: "weird" as "event" })))).toBe("invalid_argument");
-    expect(code(() => t.inbox.enqueueSync("desk", msg(), { deliverAt: 1, idleSec: 5 }))).toBe("invalid_argument");
-    expect(code(() => t.inbox.enqueueSync("desk", msg(), { idleSec: 0 }))).toBe("invalid_argument");
+    expect(code(() => t.inbox.enqueueSync("desk", msg(), { deliverAt: 1, cron: "* * * * *" }))).toBe("invalid_argument");
     expect(code(() => t.inbox.enqueueSync("desk", timer("bad-cron"), { cron: "every day" }))).toBe("invalid_argument");
     expect(code(() => t.inbox.enqueueSync("desk", timer("bad-tz"), { cron: "0 9 * * *", tz: "Mars/Olympus" }))).toBe("invalid_argument");
     // a schedule template must be a valid payload: a bad one would quarantine every firing
@@ -109,7 +108,7 @@ describe("enqueue", () => {
     await expect(t.inbox.enqueue("desk", msg({ id: "a" }))).resolves.toBe("accepted");
     await expect(t.inbox.enqueue("desk", msg({ id: "a" }))).resolves.toBe("deduped");
     await expect(t.inbox.enqueue("ghost", msg())).rejects.toMatchObject({ code: "not_found" });
-    const batch = await t.inbox.claimNextRun("desk", "w", "serial_coalesce");
+    const batch = await t.inbox.claimNextRun("desk", "w");
     expect(batch?.envelopes.map((e) => e.id)).toEqual(["a"]);
     await t.inbox.complete(batch!.claimId);
     expect(t.inbox.listMessagesSync()[0]!.status).toBe("done");

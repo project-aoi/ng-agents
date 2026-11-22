@@ -25,7 +25,6 @@ import {
   type CellRecord,
   type CellsRepo,
   type ClaimedBatch,
-  type ClaimMode,
   type ControlAuthorizer,
   type ControlCommand,
   type ControlResult,
@@ -61,8 +60,7 @@ type Rule =
   | { kind: "now"; cancelGroup: string | null }
   | { kind: "at"; deliverAt: number; cancelGroup: string | null }
   | { kind: "coalesce"; key: string; windowMs: number }
-  | { kind: "cron"; cron: string; tz: string | null; cancelGroup: string | null }
-  | { kind: "idle"; idleSec: number; cancelGroup: string | null };
+  | { kind: "cron"; cron: string; tz: string | null; cancelGroup: string | null };
 
 interface InsertOpts {
   deliverAt: number;
@@ -88,17 +86,6 @@ const CONTROL_ACTIONS = new Set(["cancel", "pause", "resume", "steer"]);
 /** Wall-over-monotonic advance above this is a host suspend; below it, timer jitter and clock slewing. */
 const SUSPEND_SKEW_MS = 5_000;
 
-// "Real work" = anything except idle firings. Idle firings must not count as activity, otherwise an idle rule
-// would re-arm itself through its own Run and fire every idleSec forever (and two idle rules would ping-pong).
-const SQL_CLAIM_HAD_REAL_WORK = `SELECT 1 AS x FROM inbox_messages m LEFT JOIN inbox_schedules s ON s.id = m.schedule_id
-  WHERE m.claim_id = ? AND s.idle_sec IS NULL LIMIT 1`;
-const SQL_LIVE_REAL_CLAIM = `SELECT 1 AS x FROM inbox_claims k
-  JOIN inbox_messages m ON m.claim_id = k.claim_id
-  LEFT JOIN inbox_schedules s ON s.id = m.schedule_id
-  WHERE k.cell_id = ? AND k.status = 'active' AND s.idle_sec IS NULL LIMIT 1`;
-const SQL_DUE_REAL_WORK = `SELECT 1 AS x FROM inbox_messages m LEFT JOIN inbox_schedules s ON s.id = m.schedule_id
-  WHERE m.cell_id = ? AND m.status = 'pending' AND m.delivery = 'wakeup' AND m.deliver_at <= ?
-    AND (m.expected_epoch IS NULL OR m.expected_epoch = ?) AND s.idle_sec IS NULL LIMIT 1`;
 const SQL_DUE_WAKEUP = `SELECT 1 AS x FROM inbox_messages
   WHERE cell_id = ? AND status = 'pending' AND delivery = 'wakeup' AND deliver_at <= ?
     AND (expected_epoch IS NULL OR expected_epoch = ?) LIMIT 1`;
@@ -116,14 +103,6 @@ const SQL_ABSORB = `UPDATE inbox_messages SET status = 'claimed', claim_id = ?, 
 const SQL_MAYBE_CLAIMABLE = `SELECT 1 AS x WHERE
   EXISTS (SELECT 1 FROM inbox_messages WHERE cell_id = ? AND status = 'pending' AND delivery = 'wakeup' AND deliver_at <= ?)
   OR EXISTS (SELECT 1 FROM inbox_claims WHERE cell_id = ? AND status = 'active' AND lease_expires_at <= ?)`;
-// Competing: one wakeup row, chosen and taken by a single conditional UPDATE so two claimers can never get the same row.
-const SQL_TAKE_ONE = `UPDATE inbox_messages SET status = 'claimed', claim_id = ?, updated_at = ?
-  WHERE seq = (SELECT seq FROM inbox_messages
-               WHERE cell_id = ? AND status = 'pending' AND delivery = 'wakeup' AND deliver_at <= ?
-               ORDER BY seq LIMIT 1)
-    AND status = 'pending'
-  RETURNING seq, envelope`;
-
 export function createInbox(opts: InboxOptions): InboxService {
   const { db, bus, clock } = opts;
   const cells = cellsRepo(db, clock);
@@ -151,7 +130,7 @@ export function createInbox(opts: InboxOptions): InboxService {
   // Wall time keeps running while the host sleeps; the monotonic clock does not (performance.now() is CLOCK_MONOTONIC
   // on Linux and mach_absolute_time on macOS, and both stop during system sleep). A wall advance clearly larger than
   // the monotonic advance since the last sample is therefore time the machine was suspended: no Run could work or
-  // renew its lease in it. A manual or demo clock jumps on purpose, so detection is off for them by default.
+  // renew its lease in it. Manual clocks jump on purpose, so detection is off for them by default.
   const monotonicNow = opts.monotonicNow ?? (clock === systemClock ? () => performance.now() : null);
   let sample = monotonicNow ? { wall: clock.now(), mono: monotonicNow() } : null;
   let lastSuspend: { at: number; sleptMs: number } | null = null;
@@ -187,31 +166,10 @@ export function createInbox(opts: InboxOptions): InboxService {
     if (!cell || cell.status !== "active") return false;
     const serialHeld = get(
       db,
-      "SELECT 1 AS x FROM inbox_claims WHERE cell_id = ? AND status = 'active' AND mode = 'serial_coalesce' AND lease_expires_at > ? LIMIT 1",
+      "SELECT 1 AS x FROM inbox_claims WHERE cell_id = ? AND status = 'active' AND lease_expires_at > ? LIMIT 1",
       [cellId, now],
     );
     return !serialHeld && hasDueWakeup(cellId, now, cell.epoch);
-  }
-
-  function claimHadRealWork(claimId: string): boolean {
-    return get(db, SQL_CLAIM_HAD_REAL_WORK, [claimId]) !== undefined;
-  }
-
-  function rearmIdle(cellId: string, now: number): void {
-    const r = run(
-      db,
-      "UPDATE inbox_schedules SET next_fire_at = ? + idle_sec * 1000, updated_at = ? WHERE cell_id = ? AND active = 1 AND idle_sec IS NOT NULL",
-      [now, now, cellId],
-    );
-    if (r.changes > 0) scheduleChanged();
-  }
-
-  function suspendIdle(cellId: string, now: number): void {
-    run(
-      db,
-      "UPDATE inbox_schedules SET next_fire_at = NULL, updated_at = ? WHERE cell_id = ? AND active = 1 AND idle_sec IS NOT NULL",
-      [now, cellId],
-    );
   }
 
   function dropStale(cell: CellRecord, now: number): void {
@@ -274,7 +232,7 @@ export function createInbox(opts: InboxOptions): InboxService {
     return { result: "accepted", status, seq: row.seq };
   }
 
-  function upsertSchedule(cell: CellRecord, tpl: Envelope, rule: Extract<Rule, { kind: "cron" | "idle" }>, now: number): EnqueueResult {
+  function upsertSchedule(cell: CellRecord, tpl: Envelope, rule: Extract<Rule, { kind: "cron" }>, now: number): EnqueueResult {
     const valid = validatePayload(tpl);
     if (!valid.ok) {
       throw new NgError("invalid_argument", `schedule template "${tpl.id}" for cell "${cell.id}": ${valid.message}`);
@@ -284,17 +242,13 @@ export function createInbox(opts: InboxOptions): InboxService {
 
     const expected = tpl.expectedEpoch ?? null;
     const live = cell.status !== "closed" && (expected === null || expected === cell.epoch);
-    const cron = rule.kind === "cron" ? rule.cron : null;
-    const tz = rule.kind === "cron" ? rule.tz : null;
-    const idleSec = rule.kind === "idle" ? rule.idleSec : null;
-    // Evaluated even for an inactive rule so a bad expression or timezone fails the enqueue, not a later tick.
-    const firstCron = cron !== null ? nextCronAt(cron, tz, now) : null;
-    const nextFireAt = !live ? null : cron !== null ? firstCron : now + (idleSec ?? 0) * 1000;
-    const params: SqlParam[] = [toJson(tpl), cron, idleSec, tz, rule.cancelGroup, expected, nextFireAt, live ? 1 : 0, now];
+    const { cron, tz } = rule;
+    const firstFire = nextCronAt(cron, tz, now);
+    const params: SqlParam[] = [toJson(tpl), cron, tz, rule.cancelGroup, expected, live ? firstFire : null, live ? 1 : 0, now];
     if (existing) {
       run(
         db,
-        `UPDATE inbox_schedules SET envelope = ?, cron = ?, idle_sec = ?, tz = ?, cancel_group = ?, expected_epoch = ?,
+        `UPDATE inbox_schedules SET envelope = ?, cron = ?, tz = ?, cancel_group = ?, expected_epoch = ?,
            next_fire_at = ?, active = ?, updated_at = ?
          WHERE id = ?`,
         [...params, existing.id],
@@ -302,9 +256,9 @@ export function createInbox(opts: InboxOptions): InboxService {
     } else {
       run(
         db,
-        `INSERT INTO inbox_schedules (envelope, cron, idle_sec, tz, cancel_group, expected_epoch, next_fire_at, active, updated_at,
+        `INSERT INTO inbox_schedules (envelope, cron, tz, cancel_group, expected_epoch, next_fire_at, active, updated_at,
            id, cell_id, template_id, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [...params, newId("sch", clock), cell.id, tpl.id, now],
       );
     }
@@ -322,7 +276,6 @@ export function createInbox(opts: InboxOptions): InboxService {
     now: number,
     countAttempt = true,
   ): ReleaseResult {
-    const real = claimHadRealWork(c.claim_id);
     const epoch = cells.getEpoch(c.cell_id);
     const res: ReleaseResult = { requeued: 0, dead: 0, cancelled: 0 };
     if (epoch !== c.epoch) {
@@ -368,7 +321,6 @@ export function createInbox(opts: InboxOptions): InboxService {
       }
     }
     run(db, "UPDATE inbox_claims SET status = ?, finished_at = ?, release_reason = ? WHERE claim_id = ?", [status, now, reason, c.claim_id]);
-    if (real) rearmIdle(c.cell_id, now);
     return res;
   }
 
@@ -406,8 +358,7 @@ export function createInbox(opts: InboxOptions): InboxService {
     return rows;
   }
 
-  function claimNextRunSync(cellId: string, workerId: string, mode: ClaimMode, leaseMs?: number): ClaimedBatch | null {
-    if (mode !== "serial_coalesce" && mode !== "competing_workers") throw new NgError("invalid_argument", `unknown claim mode "${String(mode)}"`);
+  function claimNextRunSync(cellId: string, workerId: string, leaseMs?: number): ClaimedBatch | null {
     if (typeof workerId !== "string" || workerId.length === 0) throw new NgError("invalid_argument", "workerId is required");
     const lease = leaseMs ?? defaultLeaseMs;
     if (!Number.isFinite(lease) || lease <= 0) throw new NgError("invalid_argument", `leaseMs must be > 0 (got ${lease})`);
@@ -429,18 +380,15 @@ export function createInbox(opts: InboxOptions): InboxService {
       if (cell.status !== "active") return null;
       const now = clock.now();
       absorbSuspend(now);
-      const expired = expireClaims(now, cellId);
+      expireClaims(now, cellId);
       dropStale(cell, now);
 
-      const blocked =
-        mode === "serial_coalesce"
-          ? get(db, "SELECT 1 AS x FROM inbox_claims WHERE cell_id = ? AND status = 'active' LIMIT 1", [cellId])
-          : get(db, "SELECT 1 AS x FROM inbox_claims WHERE cell_id = ? AND status = 'active' AND mode = 'serial_coalesce' LIMIT 1", [cellId]);
+      const blocked = get(db, "SELECT 1 FROM inbox_claims WHERE cell_id = ? AND status = 'active' LIMIT 1", [cellId]);
       if (blocked) return null;
       if (!hasDueWakeup(cellId, now, cell.epoch)) return null;
 
       const claimId = newId("run", clock);
-      const rows = all<{ seq: number; envelope: string }>(db, mode === "serial_coalesce" ? SQL_TAKE_SERIAL : SQL_TAKE_ONE, [
+      const rows = all<{ seq: number; envelope: string }>(db, SQL_TAKE_SERIAL, [
         claimId,
         now,
         cellId,
@@ -451,19 +399,16 @@ export function createInbox(opts: InboxOptions): InboxService {
       const leaseExpiresAt = now + lease;
       run(
         db,
-        `INSERT INTO inbox_claims (claim_id, cell_id, worker_id, mode, epoch, status, claimed_at, lease_expires_at)
-         VALUES (?, ?, ?, ?, ?, 'active', ?, ?)`,
-        [claimId, cellId, workerId, mode, cell.epoch, now, leaseExpiresAt],
+        `INSERT INTO inbox_claims (claim_id, cell_id, worker_id, epoch, status, claimed_at, lease_expires_at)
+         VALUES (?, ?, ?, ?, 'active', ?, ?)`,
+        [claimId, cellId, workerId, cell.epoch, now, leaseExpiresAt],
       );
-      if (claimHadRealWork(claimId)) suspendIdle(cellId, now);
-      if (expired.length > 0 && mode === "competing_workers" && hasDueWakeup(cellId, now, cell.epoch)) announce(cellId, "released");
       scheduleChanged();
       return {
         claimId,
         cellId,
         epoch: cell.epoch,
         workerId,
-        mode,
         envelopes: rows.map((r) => fromJson<Envelope>(r.envelope)),
         seqs: rows.map((r) => r.seq),
         claimedAt: now,
@@ -486,7 +431,6 @@ export function createInbox(opts: InboxOptions): InboxService {
       const now = clock.now();
       run(db, "UPDATE inbox_messages SET status = 'done', updated_at = ? WHERE claim_id = ? AND status = 'claimed'", [now, claimId]);
       run(db, "UPDATE inbox_claims SET status = 'completed', finished_at = ? WHERE claim_id = ?", [now, claimId]);
-      if (claimHadRealWork(claimId)) rearmIdle(c.cell_id, now);
       if (isClaimable(c.cell_id, now)) announce(c.cell_id, "released");
     });
   }
@@ -643,7 +587,7 @@ export function createInbox(opts: InboxOptions): InboxService {
       const c = get<ClaimRow>(db, "SELECT * FROM inbox_claims WHERE claim_id = ?", [claimId]);
       // Only the cell's live serial Run may absorb: a claim that was released/expired no longer owns anything, and a
       // Run from before a cancel (epoch moved) is being aborted — what arrives now belongs to whatever runs next.
-      if (!c || c.cell_id !== cellId || c.status !== "active" || c.mode !== "serial_coalesce") return [];
+      if (!c || c.cell_id !== cellId || c.status !== "active") return [];
       if (cell.status !== "active" || c.epoch !== cell.epoch) return [];
       const now = clock.now();
       dropStale(cell, now);
@@ -652,8 +596,6 @@ export function createInbox(opts: InboxOptions): InboxService {
       const rows = all<{ seq: number; envelope: string }>(db, SQL_ABSORB, [claimId, now, cellId, now, PAYLOAD.controlSteer]);
       if (rows.length === 0) return [];
       rows.sort((a, b) => a.seq - b.seq);
-      // An idle-only Run that absorbs real work must count as real work when it ends (see SQL_CLAIM_HAD_REAL_WORK).
-      if (claimHadRealWork(claimId)) suspendIdle(cellId, now);
       return rows.map((r) => ({ envelope: fromJson<Envelope>(r.envelope), seq: r.seq }));
     });
   }
@@ -712,7 +654,7 @@ export function createInbox(opts: InboxOptions): InboxService {
       const cell = requireCell(cellId);
       const now = clock.now();
       const stored: Envelope = { ...env, to: inboxAddr(cellId) };
-      if (rule.kind === "cron" || rule.kind === "idle") return upsertSchedule(cell, stored, rule, now);
+      if (rule.kind === "cron") return upsertSchedule(cell, stored, rule, now);
       if (rule.kind === "coalesce") {
         return insertMessage(cell, stored, { deliverAt: windowEdge(cell, rule.key, rule.windowMs, now), cancelGroup: rule.key, scheduleId: null, announce: "enqueued" }, now).result;
       }
@@ -835,14 +777,14 @@ export function createInbox(opts: InboxOptions): InboxService {
           break;
         }
         case "pause": {
-          for (const t of cmd.pauseReason === "budget_declined" ? [cell] : [cell, ...cells.descendants(cellId, { status: ["active", "paused"] })]) {
+          for (const t of [cell, ...cells.descendants(cellId, { status: ["active", "paused"] })]) {
             if (t.status === "active") cells.setStatus(t.id, "paused",undefined,cmd.pauseReason);
             affected.push({ cellId: t.id, epoch: t.epoch });
           }
           break;
         }
         case "resume": {
-          for (const t of cmd.pauseReason === "budget_declined" ? [cell] : [cell, ...cells.descendants(cellId, { status: ["paused"] })]) {
+          for (const t of [cell, ...cells.descendants(cellId, { status: ["paused"] })]) {
             if (t.status === "paused") cells.setStatus(t.id, "active");
             affected.push({ cellId: t.id, epoch: t.epoch });
             if (isClaimable(t.id, now)) wake.push(t.id);
@@ -907,29 +849,14 @@ export function createInbox(opts: InboxOptions): InboxService {
         s.id,
       ]);
 
-    if (s.cron !== null) {
-      // Missed occurrences (process down, long pause) coalesce into this one firing.
-      const next = nextCronAt(s.cron, s.tz, now);
-      if (cell.status === "paused") {
-        setNext(next, null);
-        return none;
-      }
-      const r = fireSchedule(s, cell, fireAt, now);
-      setNext(next, now);
-      return r;
-    }
-
-    const idleMs = (s.idle_sec ?? 0) * 1000;
-    if (
-      cell.status === "paused" ||
-      get(db, SQL_LIVE_REAL_CLAIM, [cell.id]) !== undefined ||
-      get(db, SQL_DUE_REAL_WORK, [cell.id, now, cell.epoch]) !== undefined
-    ) {
-      setNext(now + idleMs, null);
+    // Missed occurrences (process down, long pause) coalesce into this one firing.
+    const next = nextCronAt(s.cron, s.tz, now);
+    if (cell.status === "paused") {
+      setNext(next, null);
       return none;
     }
     const r = fireSchedule(s, cell, fireAt, now);
-    setNext(null, now);
+    setNext(next, now);
     return r;
   }
 
@@ -1248,8 +1175,8 @@ export function createInbox(opts: InboxOptions): InboxService {
     async cancelScheduled(scope) {
       cancelScheduledSync(scope);
     },
-    async claimNextRun(cellId, workerId, mode, leaseMs) {
-      return claimNextRunSync(cellId, workerId, mode, leaseMs);
+    async claimNextRun(cellId, workerId, leaseMs) {
+      return claimNextRunSync(cellId, workerId, leaseMs);
     },
     async complete(claimId) {
       completeSync(claimId);
@@ -1318,8 +1245,8 @@ function normalizeRule(s: ScheduleRule | undefined): Rule {
   if (cancelGroup !== null && (typeof cancelGroup !== "string" || cancelGroup.length === 0)) {
     throw new NgError("invalid_argument", "schedule.cancelGroup must be a non-empty string");
   }
-  const given = [s.deliverAt, s.cron, s.idleSec, s.coalesce].filter((v) => v !== undefined && v !== null).length;
-  if (given > 1) throw new NgError("invalid_argument", "schedule: at most one of deliverAt, cron, idleSec, coalesce");
+  const given = [s.deliverAt, s.cron, s.coalesce].filter((v) => v !== undefined && v !== null).length;
+  if (given > 1) throw new NgError("invalid_argument", "schedule: at most one of deliverAt, cron, coalesce");
   if (s.coalesce !== undefined && s.coalesce !== null) {
     const { key, windowMs } = s.coalesce;
     if (typeof key !== "string" || key.length === 0) throw new NgError("invalid_argument", "schedule.coalesce.key must be a non-empty string");
@@ -1335,10 +1262,6 @@ function normalizeRule(s: ScheduleRule | undefined): Rule {
   if (s.cron !== undefined && s.cron !== null) {
     if (typeof s.cron !== "string" || s.cron.trim().length === 0) throw new NgError("invalid_argument", "schedule.cron must be a cron expression");
     return { kind: "cron", cron: s.cron.trim(), tz: s.tz ?? null, cancelGroup };
-  }
-  if (s.idleSec !== undefined && s.idleSec !== null) {
-    if (!Number.isInteger(s.idleSec) || s.idleSec <= 0) throw new NgError("invalid_argument", "schedule.idleSec must be a positive integer");
-    return { kind: "idle", idleSec: s.idleSec, cancelGroup };
   }
   return { kind: "now", cancelGroup };
 }

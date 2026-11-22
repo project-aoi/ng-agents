@@ -164,7 +164,7 @@ describe("a watcher with a check command", () => {
 });
 
 describe("dispatch keeps one timer source per watcher", () => {
-  it("check with schedules, check for a worker, and an idle schedule for a model watcher are refused; a cron rhythm is told to the watcher", async () => {
+  it("check with schedules and check for a worker are refused; a cron rhythm is told to the watcher", async () => {
     const h = await boot();
     const dir = tempDir("repo");
     let checker = "";
@@ -178,10 +178,6 @@ describe("dispatch keeps one timer source per watcher", () => {
       },
       (req) => {
         expect(lastToolResult(req)).toContain('check is for a watcher — give preset "checker"');
-        return tool("dispatch", { preset: "watcher", title: "等", instruction: "等", schedules: [{ idleSec: 600 }] });
-      },
-      (req) => {
-        expect(lastToolResult(req)).toContain("idleSec does not repeat for a watcher");
         expect(childrenOf(h, projectId)).toEqual([]);
         return tool("dispatch", { preset: "watcher", title: "等 MR !9 合入", instruction: "检查 MR !9 是否合入。", schedules: [{ cron: "*/10 * * * *", tz: "Asia/Shanghai" }] });
       },

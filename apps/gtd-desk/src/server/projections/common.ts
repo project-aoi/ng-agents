@@ -25,18 +25,15 @@ export type DeskKernel = Pick<
   | "stats"
   | "deskCellId"
   | "ownerPrincipal"
-  | "ownerAddresses"
   | "db"
   | "workspace"
   | "agentBackend"
   | "activityOf"
   | "activeWorkspaces"
   | "listWaits"
-  | "budgetLimits"
 >;
 
 export interface DeskSettings {
-  demo: boolean;
   backend: string;
   tokenRequired: boolean;
   /** Weekly review slot in local time: weekday 0 = Sunday … 5 = Friday. */
@@ -46,7 +43,6 @@ export interface DeskSettings {
 }
 
 export const DEFAULT_SETTINGS: DeskSettings = {
-  demo: false,
   backend: "unknown",
   tokenRequired: false,
   weeklyReview: { weekday: 5, hour: 16 },
@@ -138,7 +134,7 @@ export function asSource(value: unknown, updatedAt: number): SourceRecord | null
   if (!isObj(value) || typeof value["title"] !== "string") return null;
   return {
     ...(value as unknown as SourceRecord),
-    kind: (["cron", "watch", "channel", "webhook"] as const).includes(value["kind"] as never) ? (value["kind"] as SourceRecord["kind"]) : "cron",
+    kind: (["cron", "watch"] as const).includes(value["kind"] as never) ? (value["kind"] as SourceRecord["kind"]) : "cron",
     mode: value["mode"] === "observe" ? "observe" : "active",
     status: value["status"] === "error" || value["status"] === "paused" ? value["status"] : "ok",
     processor: value["processor"] === "code" ? "code" : "llm",

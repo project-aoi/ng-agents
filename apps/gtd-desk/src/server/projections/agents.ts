@@ -4,7 +4,6 @@ import { isAbsolute, join, resolve } from "node:path";
 import { workTreeKey, type WaitRecord } from "@ng/cell";
 import {
   all,
-  anyCovers,
   CELL_DIRECT_CHAT_KEY,
   CELL_STATUS_KEY,
   get,
@@ -57,7 +56,7 @@ import { whenText } from "./time";
 // What a person reads is plain Chinese — a state is "待命可唤醒", never the machinery behind it — while what a cell
 // touched (paths, commands, outputs, branch names) passes through verbatim.
 
-type Activity = { state: "working" | "waiting" | "dormant" | "idle" | "paused" | "budget_paused" | "closed"; why: string };
+type Activity = { state: "working" | "waiting" | "dormant" | "idle" | "paused" | "closed"; why: string };
 
 interface Facts {
   statusLine: string | null;
@@ -217,7 +216,7 @@ function roleOf(v: AgentsView, c: CellRecord): { roleLabel: string; layer: 0 | 1
   if (v.projects.has(c.id) || c.preset === "project") return { roleLabel: "项目协调", layer: 1 };
   if (c.preset === "hub" || role === "hub") return { roleLabel: "领域中枢", layer: 1 };
   if (c.preset === "sensor" || role === "sensor") return { roleLabel: "信源巡检", layer: 0 };
-  if (c.preset === "checker" || c.preset === "reply_watcher" || c.preset === "watcher" || role === "watcher" || role === "checker") return { roleLabel: "外部盯梢", layer: 2 };
+  if (c.preset === "checker" || c.preset === "watcher" || role === "watcher" || role === "checker") return { roleLabel: "外部盯梢", layer: 2 };
   if (isLeafCell(c)) return { roleLabel: "执行分身", layer: 2 };
   return { roleLabel: "分身", layer: 1 };
 }
@@ -274,7 +273,6 @@ export function personLabel(kernel: DeskKernel, principalId: string, sender?: { 
   return `你（经${/^[\x20-\x7e]/.test(name) ? " " : ""}${name}）`;
 }
 
-const isOwnerAddress = (kernel: DeskKernel, addr: string) => addr.startsWith("channel:") && anyCovers(kernel.ownerAddresses, addr);
 
 /** "~/dev/pay-core" */
 function homeShort(path: string): string {
@@ -312,17 +310,6 @@ export function branchOf(gitRoot: string | null): string | null {
 }
 
 // ==================== one node ====================
-
-function usageOf(kernel: DeskKernel, cellId: string): { tokensUsed: number; tokensLimit: number | null } {
-  try {
-    const u = kernel.gate.usageSync(cellId);
-    // With budget limits switched off there is no limit to draw a bar against: unlimited.
-    const limited = u.enforced !== false && Number.isFinite(u.limitTokens) && u.limitTokens > 0;
-    return { tokensUsed: u.subtreeTokens, tokensLimit: limited ? u.limitTokens : null };
-  } catch {
-    return { tokensUsed: 0, tokensLimit: null };
-  }
-}
 
 /** The leaf's records its parent has not looked at with inspect_cell (run boundaries are not news). */
 export function unpulledOf(kernel: DeskKernel, leaf: Pick<CellRecord, "id" | "parentId">): { count: number; cursor: number } {
@@ -371,7 +358,6 @@ function stateOf(v: AgentsView, c: CellRecord): { state: AgentVisualState; state
     const detail = job ? `后台命令：${oneLine(job.command, 120)}` : act.why.startsWith("a message is waiting") ? "收到新消息，马上开始处理" : runningStep(kernel, c.id);
     return { state: "running", stateLabel: "运行中", stateDetail: detail };
   }
-  if (act.state === "budget_paused") return {state:"paused",stateLabel:"等待追加额度",stateDetail:"后续任务已保留"};
   if (act.state === "paused") {
     const parked = v.projects.get(projectIdOf(v, c) ?? "")?.lifecycle === "someday";
     return { state: "paused", stateLabel: "已暂停", stateDetail: parked ? "放在以后再说里" : null };
@@ -416,7 +402,7 @@ export function nodeOf(v: AgentsView, c: CellRecord): TopologyNodeDTO {
     cellId: c.id,
     parentId: c.parentId,
     projectId: projectIdOf(v, c),
-    preset: c.preset==="watcher" ? (c.spec.lifetime==="persistent" ? "reply_watcher" : "checker") : c.preset,
+    preset: c.preset,
     roleLabel,
     title: titleOf(v, c),
     layer,
@@ -433,7 +419,6 @@ export function nodeOf(v: AgentsView, c: CellRecord): TopologyNodeDTO {
     lastEvidenceSeq: kernel.context.lastEvidenceSeqSync(c.id),
     unpulledCount: leaf ? unpulledOf(kernel, c).count : 0,
     hadDirectUserChat: (chat?.total ?? 0) > 0,
-    ...usageOf(kernel, c.id),
     pendingCardId: c.status === "closed" ? null : (card?.id ?? null),
     engageItem: human ? { cellId: human.cellId, actionId: human.actionId } : null,
     archivedChildren: (v.children.get(c.id) ?? []).filter((x) => x.status === "closed").length,
@@ -545,7 +530,7 @@ const baseName = (name: string) => name.replace(/^mcp__[^_]+(?:_[^_]+)*?__/, "")
 
 const READ = /^(read|read_file|view|view_file|grep|glob|ls|list_dir|list_files|find_files|grep_search|file_search|codebase_search|search_files|notebookread)$/i;
 const EDIT = /^(edit|write|multiedit|notebookedit|apply_patch|write_file|edit_file|create_file|str_replace_editor|replace_file_content|write_to_file|file_change)$/i;
-const RUN = /^(bash|shell|command|exec_command|local_shell|run_command|run_terminal_command|command_execution|job_start|code_rpc)$/i;
+const RUN = /^(bash|shell|command|exec_command|local_shell|run_command|run_terminal_command|command_execution|job_start)$/i;
 const WEB = /^(websearch|web_search|webfetch|web_fetch|read_url_content|search_web)$/i;
 const KERNEL_TOOL_ZH: Readonly<Record<string, string>> = {
   save_artifact: "保存报告",
@@ -664,7 +649,7 @@ function inboundItem(ctx: BuildCtx, seq: number, at: number, env: Envelope): Tim
     case PAYLOAD.userMessage: {
       const p = payloadOf<UserMessagePayload & { replyToId?: string }>(env);
       if (person) {
-        const direct = env.from === KERNEL_FROM.control || isOwnerAddress(kernel, env.from);
+        const direct = env.from === KERNEL_FROM.control || env.from === "channel:ui:owner";
         return { ...base, id: env.id, kind: "user_chat", text: p.text, senderLabel: personLabel(kernel, env.principalId, p.sender), direct, mode: "enqueue", syncedTo, replyToId: p.replyToId ?? null };
       }
       const who = p.sender?.displayName ?? p.sender?.id;
@@ -704,8 +689,6 @@ function inboundItem(ctx: BuildCtx, seq: number, at: number, env: Envelope): Tim
           return { ...base, id: e, kind: "milestone", text: `${label}已完成${summary}`, tone: "ok" };
         case "failed":
           return { ...base, id: e, kind: "milestone", text: `${label}没能完成${summary}`, tone: "warn" };
-        case "budget_stopped":
-          return { ...base, id: e, kind: "milestone", text: `${label}额度用完停下了${summary}`, tone: "warn" };
         default:
           return { ...base, id: e, kind: "milestone", text: `${label}已取消`, tone: "info" };
       }
@@ -744,14 +727,10 @@ function inboundItem(ctx: BuildCtx, seq: number, at: number, env: Envelope): Tim
         p.status === "approved"
           ? `${who}确认了：${what}`
           : p.status === "executed"
-            ? `${who}确认后已发出：${what}`
+            ? `${who}已执行：${what}`
             : p.status === "denied"
               ? `${who}拒绝了：${what}${p.note ? `（${p.note}）` : ""}`
-              : p.status === "failed"
-                ? `发送失败：${what}`
-                : p.status === "unknown"
-                  ? `发送结果未知：${what}`
-                  : `卡片已撤下：${what}${p.note ? `（${p.note}）` : ""}`;
+ : `卡片已撤下：${what}${p.note ? `（${p.note}）` : ""}`;
       return { ...base, id: e, kind: "system_event", text };
     }
     case PAYLOAD.approvalRevise:
@@ -810,8 +789,6 @@ function boundaryItem(seq: number, at: number, r: Extract<StepOrExternalEvidence
   if (r.phase !== "end") return null;
   const e = `e${seq}`;
   switch (r.outcome) {
-    case "budget_stopped":
-      return { seq, at, id: e, kind: "system_event", text: "预算用完，已暂停推进" };
     case "deferred_for_approval":
       return { seq, at, id: e, kind: "milestone", text: "提交了一张卡等你确认", tone: "info" };
     case "cancelled":
@@ -892,7 +869,7 @@ function buildItems(ctx: BuildCtx, records: readonly EvidenceEntry[]): Built[] {
       case "tool_call": {
         const base = baseName(r.name);
         const input = (r.input ?? {}) as Record<string, unknown>;
-        if (base === "send_message" && typeof input["to"] === "string" && isOwnerAddress(kernel, input["to"])) {
+        if (base === "send_message" && input["to"] === "channel:ui:owner") {
           hidden.add(r.toolUseId);
           const text = typeof input["text"] === "string" ? input["text"] : typeof input["artifactId"] === "string" ? `（发来一份草稿：${artifactRef(kernel, input["artifactId"])?.title ?? "未命名文档"}）` : "";
           if (text.trim()) push({ seq, at, id: `r${seq}`, kind: "assistant_reply", text: text.trim(), toOwner: true, question: isQuestion(text) }, seq);
@@ -1164,7 +1141,7 @@ function jobsOf(kernel: DeskKernel, facts: Facts | undefined): CellJobDTO[] {
   return (facts?.jobs ?? []).map((j) => {
     let tail: string | null = null;
     try {
-      const o = (kernel.workspace as { observeJobSync?: (id: string) => { tail: string } | undefined }).observeJobSync?.(j.jobId);
+      const o = kernel.workspace.observeJobSync(j.jobId);
       tail = o?.tail ? o.tail.slice(-2_000) : null;
     } catch {
       tail = null;

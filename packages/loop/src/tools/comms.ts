@@ -8,42 +8,30 @@ import {
   defineTool,
   DESK_CELL_ID,
   inboxAddr,
-  isChannelAddr,
   isInboxAddr,
   KERNEL_FROM,
   newId,
-  sha256Hex,
   PAYLOAD,
-  type AuthorizeResult,
   type CardPrep,
   type CellProgressPayload,
   type CellResultCandidate,
   type CellResultPayload,
   type CellSpec,
   type CellStatusLine,
-  type ChannelAddr,
-  type ChannelSendAction,
   type Deliverable,
-  type DraftRef,
   type EscalationCard,
   type HandbackPayload,
-  type PolicyBounds,
   type ProjectProposal,
   type ProjectProposalCard,
   type ProposedAction,
-  type ResponseCard,
-  type RunPorts,
-  type SendReceipt,
   type ToolContext,
+  type RunPorts,
   type ToolResult,
   type Toolset,
 } from "@ng/protocol";
 import { defaultSubjectKey, itemRawInput, itemSource, clip, primaryEnvelope, selfId } from "./util";
 
 export const COMMS_TOOLSET = "kernel.comms";
-
-/** Sends to these address patterns reach the owner themself: `notify_owner`, allowed without a card (docs/03 原则 2). */
-export const DEFAULT_OWNER_ADDRESSES: readonly string[] = ["channel:ui:*", "channel:cli:*"];
 
 /**
  * Optional port: `Inbox.handback(claimId = runId, envelopeId, reason)` bound to the Run. RunPorts does not declare it;
@@ -55,7 +43,6 @@ export interface HandbackPort {
 }
 
 export interface CommsToolsetOptions {
-  ownerAddresses?: readonly string[];
   /** Desk cell for the handback fallback. Default `desk`. */
   deskCellId?: string;
 }
@@ -76,40 +63,6 @@ function prepOf(p: z.infer<typeof prepInput> | undefined): CardPrep {
 
 function cardDeliverable(title: string, body: string, data: unknown): Deliverable {
   return { format: "card", title, body: body ? `${title}\n\n${body}` : title, data };
-}
-
-const RECEIPT_TEXT: Readonly<Record<SendReceipt, string>> = {
-  sent: "Sent.",
-  buffered_dnd: "Held: the owner is in focus mode; it is delivered when they leave it.",
-  failed: "Sending failed (the channel reported failure). Nothing was delivered.",
-  unknown: "Delivery status unknown: it may or may not have arrived. Do not resend it; tell the owner if it matters.",
-};
-
-async function decide(
-  ctx: ToolContext,
-  action: ProposedAction,
-  artifactVersion: number | undefined,
-  onAllow: (token: string) => Promise<ToolResult>,
-  sourceId?: string,
-): Promise<ToolResult> {
-  const r = action.type === "channel.send" && action.sideEffect === "external" && artifactVersion !== undefined && sourceId !== undefined
-    ? await ctx.ports.submitReply(action, artifactVersion, sourceId)
-    : await ctx.ports.authorize(action, artifactVersion !== undefined ? { artifactVersion } : undefined);
-  switch (r.type) {
-    case "delivery":
-      return { output: `${r.receipt === "pending" || r.receipt === "cancelled" ? r.receipt : RECEIPT_TEXT[r.receipt]} Action ${r.actionId}.`,
-        isError:r.receipt === "unknown" || r.receipt === "failed", data:r };
-    case "deny":
-      return { output: `Not allowed: ${r.feedback}`, isError: true, data: { decision: "deny" } };
-    case "defer":
-      return {
-        output: `Waiting for the owner's decision (card ${r.actionId}${r.boundArtifactVersion !== undefined ? `, draft v${r.boundArtifactVersion}` : ""}). This run ends now; you will receive approval.resolved with the outcome.`,
-        endRun: "deferred_for_approval",
-        data: { decision: "defer", actionId: r.actionId, boundArtifactVersion: r.boundArtifactVersion },
-      };
-    case "allow":
-      return onAllow(r.actionToken);
-  }
 }
 
 const STATUS_ALIASES: Readonly<Record<string, "completed" | "failed">> = {
@@ -149,7 +102,6 @@ const hasParent = ({ spec }: { spec?: CellSpec }) => spec === undefined || Boole
 const isLeaf = (spec: CellSpec | undefined) => isLeafLifetime(spec?.lifetime);
 /** complete_self / pause_self: for cells that live until they say so (a leaf's turns are settled by the kernel). */
 const settlesItself = ({ spec }: { spec?: CellSpec }) => spec !== undefined && Boolean(spec.parentId) && !isLeaf(spec);
-const canReachChannels = (bounds: PolicyBounds) => bounds.canSendTo.some((a) => a.startsWith("channel:"));
 
 /** `inbox:<cellId>` → what to tell the model about a cell-to-cell delivery (docs/05 guard 1: a closed target is said out loud). */
 async function sendToInbox(ctx: ToolContext, to: `inbox:${string}`, args: { text?: string | undefined; refId?:string | undefined; summary: string }): Promise<ToolResult> {
@@ -182,132 +134,28 @@ async function sendToInbox(ctx: ToolContext, to: `inbox:${string}`, args: { text
 
 /**
  * `kernel.comms`: send_message, request_approval, report_to_parent, handback, wait, complete_self, pause_self.
- * send_message and request_approval always go through `authorize` (allow → act with the token; deny → feedback to the
- * model; defer → the card is pending in Gate and the Run ends `deferred_for_approval`).
  */
 export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
-  const ownerAddresses = opts.ownerAddresses ?? DEFAULT_OWNER_ADDRESSES;
   const deskCellId = opts.deskCellId ?? DESK_CELL_ID;
-
-  // A retry starts with the same triggering envelope. Distinct inline replies within that turn
-  // keep their own ordinal; repeating the same reply uses its original slot.
-  const inlineReplies = new WeakMap<RunPorts, Map<string, Map<string, number>>>();
-  function inlineDraftId(ports: RunPorts, scope: string, content: Deliverable): string {
-    const turn = inlineReplies.get(ports) ?? new Map<string, Map<string, number>>();
-    inlineReplies.set(ports, turn);
-    const slots = turn.get(scope) ?? new Map<string, number>();
-    turn.set(scope, slots);
-    const body = JSON.stringify(content);
-    const slot = slots.get(body) ?? slots.size;
-    slots.set(body, slot);
-    return "art_" + sha256Hex(JSON.stringify([scope, slot]));
-  }
 
   const sendMessage = defineTool({
     name: "send_message",
     kind: "kernel",
-    description: [
-      "Send a message to a person or to another cell.",
-      "To a person — channel:<channelId>:<target>: messages to the owner go out directly; messages to anyone else are saved as a versioned draft and normally wait on an approval card for the owner (the run then ends and you are woken with the outcome). To revise a draft you already saved, pass its artifactId instead of text.",
-      "To a cell — inbox:<cellId>: delivered at once, no approval (a follow-up to a worker of yours — working or dormant, it wakes with everything it knows —, a question to inbox:desk or to your parent, an answer to a cell that asked you). The result tells you if the cell is closed — then nothing was delivered and you start a new worker instead.",
-    ].join(" "),
+    description: "Send a message to the owner in the workbench or to a cell. A message to a dormant worker wakes it with its existing context.",
     input: z.object({
-      to: z.string().describe("channel:<channelId>:<target> for a person, inbox:<cellId> for a cell (inbox:desk = the desk)"),
-      text: z.string().min(1).optional(),
-      artifactId: z.string().min(1).optional().describe("channel only: send the current version of this draft"),
-      format: z.enum(["text", "markdown"]).optional(),
-      title: z.string().optional(),
-      summary: z.string().min(1).describe("one line saying what this message is, for the card and the audit log"),
-      refId:z.string().trim().min(1).optional().describe("inbox only: the reference of the individual wait this answers"),
-      targetLabel: z.string().optional().describe('recipient as the owner would name it, e.g. "张三（飞书）"'),
-      urgent: z.boolean().optional().describe("deliver even during the owner's focus time"),
-      subjectKey: z.string().optional().describe("the item this belongs to (one pending card per item); defaults to the current item"),
-      prep: prepInput.optional(),
-      nudge: z
-        .object({ explanation: z.string().min(1) })
-        .optional()
-        .describe("this is a follow-up after a waiting timeout: explain who has not replied and since when"),
+      to: z.string().describe("inbox:<cellId> or the owner's workbench address"),
+      text: z.string().min(1),
+      summary: z.string().min(1),
+      refId: z.string().trim().min(1).optional().describe("the reference of the individual wait this answers"),
     }),
     async handler(args, ctx) {
       if (isInboxAddr(args.to)) return sendToInbox(ctx, args.to, args);
-      if (!isChannelAddr(args.to)) {
-        return { output: `"${args.to}" is not an address. Use channel:<channelId>:<target> for a person or inbox:<cellId> for a cell.`, isError: true };
+      if (args.to !== "channel:ui:owner") {
+        return { output: "Choose a cell inbox or the owner's workbench address.", isError: true };
       }
-      if (!canReachChannels(ctx.ports.self.bounds)) {
-        return { output: "This cell has no channel it may send to. Report to your parent (report_to_parent) or ask the desk (send_message to inbox:desk) instead.", isError: true };
-      }
-      if ((args.text === undefined) === (args.artifactId === undefined)) return { output: "Give exactly one of text or artifactId.", isError: true };
-      const to: ChannelAddr = args.to;
-      const allowed = ctx.ports.self.bounds.canSendTo;
-      if (!anyCovers(allowed, to)) {
-        // Checked before saving a draft so a refused send leaves nothing behind; Gate checks again.
-        const channels = allowed.filter((a) => a.startsWith("channel:"));
-        return { output: `Not allowed: ${to} is outside your send permissions (${channels.join(", ") || "no channels"}).`, isError: true };
-      }
-      const toOwner = anyCovers(ownerAddresses, to);
-      const source = primaryEnvelope(ctx.snapshot);
-      const subjectKey = args.subjectKey ?? `reply:${to}:${source?.threads?.[0] ?? source?.id ?? args.artifactId ?? selfId(ctx)}`;
-
-      let content: Deliverable;
-      let draft: DraftRef | undefined;
-      if (args.artifactId) {
-        const a = await ctx.ports.context.getArtifact(args.artifactId);
-        if (!a) return { output: `No artifact ${args.artifactId}.`, isError: true };
-        content = a.content;
-        draft = { artifactId: a.artifactId, version: a.version };
-      } else {
-        content = { format: args.format ?? "text", body: args.text!, ...(args.title ? { title: args.title } : {}) };
-        if (!toOwner) {
-          // Outward messages always travel as a versioned draft: the human can edit it on the card and Gate binds the approval to that version.
-          const scope = JSON.stringify([selfId(ctx), source?.id, subjectKey, to]);
-          const artifactId = inlineDraftId(ctx.ports, scope, content);
-          const existing = await ctx.ports.context.getArtifact(artifactId);
-          if (existing) {
-            content = existing.content;
-            draft = {artifactId, version:existing.version};
-          } else {
-            const saved = await ctx.ports.context.commit(selfId(ctx), {artifact:{artifactId, content, updatedBy:"agent", expectedVersion:0}});
-            if (!saved.ok) return {output:`Draft ${artifactId} changed; read its current version.`, isError:true};
-            draft = {artifactId, version:saved.artifactVersion ?? 1};
-          }
-        }
-      }
-
-      const action: ChannelSendAction = {
-        type: "channel.send",
-        summary: args.summary,
-        subjectKey,
-        sideEffect: toOwner ? "notify_owner" : "external",
-        target: to,
-        content,
-        ...(draft ? { artifactId: draft.artifactId } : {}),
-        ...(args.urgent ? { urgent: true } : {}),
-      };
-      if (!toOwner && draft) {
-        const title = args.title ?? content.title ?? args.summary;
-        const base = { subjectKey, title, source: itemSource(ctx.snapshot), rawInput: itemRawInput(ctx.snapshot), prep: prepOf(args.prep) };
-        const card: ResponseCard | EscalationCard = args.nudge
-          ? { ...base, cardType: "escalation", escalation: { reason: "waiting_timeout", explanation: args.nudge.explanation, nudgeDraft: draft, nudgeTarget: to } }
-          : { ...base, cardType: "response", draft, reply: { target: to, targetLabel: args.targetLabel ?? to }, confirmVerb: "send" };
-        action.card = cardDeliverable(title, content.body, card);
-      }
-
-      const sourceId = JSON.stringify([source?.id, subjectKey, draft?.artifactId]);
-      const result = await decide(ctx, action, draft?.version, async (actionToken) => {
-        const receipt = await ctx.ports.notifyChannel({
-          target: to,
-          content,
-          idempotencyKey: `${ctx.snapshot.runId}:${ctx.toolUseId}`,
-          actionToken,
-          respectDnd: !args.urgent,
-        });
-        return { output: RECEIPT_TEXT[receipt], isError: receipt === "failed" || receipt === "unknown", data: { receipt } };
-      }, sourceId);
-      if (draft) {
-        result.output += ` Draft ${draft.artifactId} v${draft.version}.`;
-        result.data = { ...(result.data as object), artifactId: draft.artifactId, version: draft.version };
-      }
-      return result;
+      if (!anyCovers(ctx.ports.self.bounds.canSendTo, args.to)) return { output: "This cell cannot notify the owner. Send to your parent or to the desk.", isError: true };
+      await ctx.ports.notifyOwner({ format: "text", body: args.text }, `${ctx.snapshot.runId}:${ctx.toolUseId}`);
+      return { output: "已通知主人。" };
     },
   });
 
@@ -316,8 +164,8 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
     kind: "kernel",
     description: [
       "Ask the owner to decide before you go on (not for sending messages — send_message handles that).",
-      "project: propose a multi-step project with its actions; escalation: you are blocked or out of retries/budget and need a decision; action: approve one specific operation (e.g. merging a PR).",
-      "Usually becomes an approval card and the run ends; you are woken with approval.resolved. If a standing rule already allows it, you get the go-ahead immediately.",
+      "project: propose a multi-step project with its actions; escalation: you are blocked or out of retries and need a decision; action: approve one specific operation (e.g. merging a PR).",
+      "Usually becomes an approval card and the run ends; you are woken with approval.resolved.",
     ].join(" "),
     input: z.object({
       kind: z.enum(["project", "escalation", "action"]),
@@ -351,14 +199,14 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
         .optional()
         .describe("kind project"),
       escalation: z
-        .object({ reason: z.enum(["blocked", "retry_limit", "budget_exhausted", "waiting_timeout"]), explanation: z.string().min(1) })
+        .object({ reason: z.enum(["blocked", "retry_limit", "waiting_timeout"]), explanation: z.string().min(1) })
         .optional()
         .describe("kind escalation"),
       action: z.object({ name: z.string().min(1), args: z.unknown().optional() }).optional().describe("kind action"),
     }),
     async handler(args, ctx) {
       const subjectKey = args.subjectKey ?? defaultSubjectKey(ctx);
-      const protectedAction = args.kind === "project" || args.escalation?.reason === "budget_exhausted";
+      const protectedAction = args.kind === "project";
       if (!protectedAction && args.kind !== "action" && (args.options || args.relatedProjectIds)) {
         if (!ctx.ports.createHumanItem) return { output: "Custom cards are unavailable.", isError: true };
         const item = ctx.ports.createHumanItem({
@@ -433,10 +281,14 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
       }
       if (args.options) action.cardOptions = args.options;
       if (args.relatedProjectIds) action.relatedProjectIds = args.relatedProjectIds;
-      return decide(ctx, action, artifactVersion, async () => ({
-        output: "Approved by a standing rule — go ahead.",
-        data: { decision: "allow" },
-      }));
+      const decision = await ctx.ports.authorize(action, artifactVersion !== undefined ? { artifactVersion } : undefined);
+      if (decision.type === "deny") return { output: decision.feedback, isError: true, data: { decision: "deny" } };
+      if (decision.type === "allow") return { output: "Approved.", data: { decision: "allow" } };
+      return {
+        output: `Waiting for the owner's decision (card ${decision.actionId}). You will receive approval.resolved with the outcome.`,
+        endRun: "deferred_for_approval",
+        data: { decision: "defer", actionId: decision.actionId, boundArtifactVersion: decision.boundArtifactVersion },
+      };
     },
   });
 

@@ -1,8 +1,8 @@
 import type { CellSpec } from "./contract/cell";
-import type { ChannelAddr, Envelope } from "./contract/envelope";
+import type { Envelope } from "./contract/envelope";
 
 // GTD records are Context state under conventional keys (IMPL_BRIEF §2.8) — the kernel has no project/task tables.
-// The three UI views are projections over cells + cell_state + approvals + artifacts + inbox_messages.
+// The three UI views are projections over cells + cell_state + human_items + artifacts + inbox_messages.
 
 // ==================== keys ====================
 
@@ -107,9 +107,9 @@ export interface Progress {
   label?: string;                       // e.g. "正在并发整理竞品资料", "报价已回"
 }
 
-/** Where an item came from (card source bar: "飞书转发 · 12 分钟前"). */
+/** Where an item came from (card source bar: "工作台 · 12 分钟前"). */
 export interface ItemSource {
-  label: string;                        // e.g. "飞书转发", "随手记", "GitHub Webhook", "指标巡检"
+  label: string;                        // e.g. "工作台", "随手记", "指标巡检"
   channelId?: string;
   principalId?: string;
   envelopeId?: string;
@@ -216,8 +216,8 @@ export interface ActivityRecord {
 export interface SourceRecord {
   title: string;
   description?: string;
-  kind: "cron" | "watch" | "channel" | "webhook";
-  schedule?: { cron?: string; idleSec?: number; tz?: string };
+  kind: "cron" | "watch";
+  schedule?: { cron?: string; tz?: string };
   mode: "active" | "observe";           // observe = write observation notes only, never post to the desk
   status: "ok" | "error" | "paused";
   processor: "code" | "llm";
@@ -233,7 +233,7 @@ export interface SourceRecord {
 // ==================== Clarify cards (docs/04 §2) ====================
 // A Clarify card is a *pending Gate approval*; its approvalCard Deliverable has format "card" and data: ClarifyCard.
 
-export type ClarifyCardType = "response" | "project_proposal" | "escalation";
+export type ClarifyCardType = "project_proposal" | "escalation";
 
 export interface DraftRef {
   artifactId: string;
@@ -256,18 +256,6 @@ interface ClarifyCardBase {
   rawInput: { text: string; kind: "message" | "voice_transcript" | "monitor_summary" | "system" };
   /** Block 3: agent prep. */
   prep: CardPrep;
-}
-
-/** A. External response / delivery confirmation (Gate defer on a channel.send or a merge). */
-export interface ResponseCard extends ClarifyCardBase {
-  cardType: "response";
-  draft: DraftRef;
-  reply: { target: ChannelAddr; targetLabel: string };
-  /**
-   * "确认发送" vs "确认合入" vs "确认收下". `accept` = a background result for the owner themself (nothing goes out):
-   * the action is a `custom` one handed back to the owning cell, and `reply.target` is the owner's own address.
-   */
-  confirmVerb: "send" | "merge" | "accept";
 }
 
 export interface ProposedProjectAction {
@@ -309,7 +297,7 @@ export interface ProjectProposalCard extends ClarifyCardBase {
   draft?: DraftRef;
 }
 
-export type EscalationReason = "waiting_timeout" | "budget_exhausted" | "retry_limit" | "blocked";
+export type EscalationReason = "waiting_timeout" | "retry_limit" | "blocked";
 
 /** C. Waiting timeout / blocked escalation. */
 export interface EscalationCard extends ClarifyCardBase {
@@ -318,29 +306,13 @@ export interface EscalationCard extends ClarifyCardBase {
     reason: EscalationReason;
     explanation: string;                // what happened and where it is stuck
     waiting?: WaitingSet;
-    usage?: { tokens: number; cents: number; limitTokens: number; limitCents: number };
-    /** waiting_timeout: the prepared nudge draft sent by "发送催问并继续跟进". */
-    nudgeDraft?: DraftRef;
-    nudgeTarget?: ChannelAddr;
   };
 }
 
-export type ClarifyCard = ResponseCard | ProjectProposalCard | EscalationCard;
+export type ClarifyCard = ProjectProposalCard | EscalationCard;
 
 // ---------- buttons (block 4) ----------
 
-/**
- * confirm         A: Gate.approve(seen version) → kernel sends via Channel; `unknown` keeps the card with a hint, never auto-resent.
- *                 B: approve project.start → kernel/desk creates the project root cell.
- *                 C (waiting_timeout): approve the nudge send + reschedule the next check (Inbox deliverAt).
- * revise_voice    A: enqueue `approval.revise` to the owning cell; its Loop drafts a new artifact version.
- * snooze          A: Gate.snooze until the afternoon; the card returns when it expires.
- * edit_plan       B: edit the proposal in place, saved through Context.commit with expectedVersion.
- * someday         B: record the project as lifecycle "someday"; no background resources run.
- * extend          C: "再等 1 天" → reschedule the timeout; budget → Gate.raiseBudget, then resume the cell.
- * resolve_offline C: mark done and closeCell (epoch++ cascade reclaims watches/sandboxes).
- * skip            all: UI-only "下一张 →", no state change.
- */
 export type CardButtonId = "confirm" | "revise_voice" | "snooze" | "edit_plan" | "someday" | "extend" | "resolve_offline" | "skip";
 
 export interface CardButton {
@@ -354,13 +326,6 @@ const SKIP: CardButton = { id: "skip", label: "下一张 →" };
 /** Buttons of a card in display order: 1 primary + 2 adjust/defer + skip (docs/04 §2.1 rule 4, §2.2 table). */
 export function cardButtons(card: ClarifyCard): CardButton[] {
   switch (card.cardType) {
-    case "response":
-      return [
-        { id: "confirm", label: card.confirmVerb === "merge" ? "✓ 确认合入" : card.confirmVerb === "accept" ? "✓ 确认收下" : "✓ 确认发送", primary: true },
-        { id: "revise_voice", label: "🎙 按住口述修改意见" },
-        { id: "snooze", label: "⏱ 推迟到下午" },
-        SKIP,
-      ];
     case "project_proposal":
       return [
         { id: "confirm", label: "✓ 确认立项并让 Agent 开工", primary: true },
@@ -371,14 +336,13 @@ export function cardButtons(card: ClarifyCard): CardButton[] {
     case "escalation":
       if (card.escalation.reason === "waiting_timeout") {
         return [
-          { id: "confirm", label: "✓ 发送催问并继续跟进", primary: true },
           { id: "extend", label: "⏱ 再等 1 天" },
           { id: "resolve_offline", label: "✓ 线下已解决，直接完结" },
           SKIP,
         ];
       }
       return [
-        { id: "extend", label: "⏱ 追加额度继续", primary: true },
+        { id: "extend", label: "继续处理", primary: true },
         { id: "resolve_offline", label: "✓ 线下已解决，直接完结" },
         SKIP,
       ];
@@ -389,5 +353,5 @@ export function cardButtons(card: ClarifyCard): CardButton[] {
 export function asClarifyCard(data: unknown): ClarifyCard | null {
   if (!data || typeof data !== "object") return null;
   const t = (data as { cardType?: unknown }).cardType;
-  return t === "response" || t === "project_proposal" || t === "escalation" ? (data as ClarifyCard) : null;
+  return t === "project_proposal" || t === "escalation" ? (data as ClarifyCard) : null;
 }

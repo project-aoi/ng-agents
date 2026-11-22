@@ -69,7 +69,7 @@ INSERT INTO cell_waits (cell_id, wait_id, waiting_for, reason, epoch, timeout_at
 DROP TABLE old_cell_waits;
 `,
     },
-    {version:5,up:`ALTER TABLE cells ADD COLUMN pause_reason TEXT CHECK(pause_reason IN ('manual','parked','budget_declined') OR pause_reason IS NULL);
+    {version:5,up:`ALTER TABLE cells ADD COLUMN pause_reason TEXT CHECK(pause_reason IN ('manual','parked') OR pause_reason IS NULL);
       UPDATE cells SET pause_reason='manual' WHERE status='paused';`},
     {version:6,up:`UPDATE cells SET spec=json_set(spec,'$.ccParent',json('true'))
       WHERE json_type(spec,'$.ccParent') IS NULL AND (json_extract(spec,'$.lifetime') IN ('wakeable','one_shot') OR preset='watcher');`},
@@ -86,7 +86,8 @@ CREATE TABLE IF NOT EXISTS cells (
   bounds        TEXT NOT NULL,                 -- JSON SerializedBounds, effective (after attenuate)
   epoch         INTEGER NOT NULL DEFAULT 0,
   status        TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','paused','closed')),
-  pause_reason TEXT CHECK(pause_reason IN ('manual','parked','budget_declined') OR pause_reason IS NULL),
+  revoked_at INTEGER,
+  pause_reason TEXT CHECK(pause_reason IN ('manual','parked') OR pause_reason IS NULL),
   close_reason  TEXT CHECK (close_reason IS NULL OR close_reason IN ('completed','cancelled')),
   principal_id  TEXT NOT NULL,                 -- who created it
   created_at    INTEGER NOT NULL,

@@ -158,7 +158,7 @@ describe("a wakeable worker's turn settles: the parent is told, the worker stays
   it("a one_shot leaf (a watcher) still reports once and is closed, with its timers", async () => {
     const h = await boot();
     project(h);
-    h.kernel.spawnCell("proj", { id: "wt", preset: "watcher", title: "wt", meta: { role: "wt" }, schedules: [{ idleSec: 600 }] }, "is the MR merged?");
+    h.kernel.spawnCell("proj", { id: "wt", preset: "watcher", title: "wt", meta: { role: "wt" }, schedules: [{ cron: "0 9 * * *" }] }, "is the MR merged?");
     h.script.add("wt", tool("report_to_parent", { kind: "result", text: "merged at 10:02" }));
     await h.kernel.idle();
     expect(h.kernel.getCell("wt")).toMatchObject({ status: "closed", closeReason: "completed" });
@@ -454,71 +454,6 @@ describe("what a coordinator sees at every wake-up", () => {
     expect(tail).toContain("[others active in your work tree right now");
     expect(tail).toMatch(/- a "a".* — working/);
     expect(h.kernel.activeWorkspaces()).toEqual([]);
-  });
-});
-
-describe("the budget stop holds a cell before anything is claimed", () => {
-  it("a held cell's messages stay in its inbox and are all delivered after the raise; one card, one click for the whole chain", async () => {
-    const h = await boot();
-    h.kernel.spawnCell("desk", { id: "proj", preset: "project", title: "支付重试", meta: { role: "proj" }, bounds: { maxTokens: 1_000 } });
-    h.script.add("proj", { text: "planning", usage: { inputTokens: 700, outputTokens: 700 } });
-    h.kernel.sendToCell("proj", { text: "start" }, { principalId: "cell:desk" });
-    await h.kernel.idle();
-    expect(h.of("run.finished").filter((e) => e.cellId === "proj").map((e) => e.outcome)).toEqual(["budget_stopped"]);
-
-    // Two reports arrive while it is stopped. Nothing is claimed: no Run starts, nothing is marked done.
-    for (const id of ["r1", "r2"]) {
-      h.kernel.inbox.enqueueSync("proj", { id, from: "inbox:desk", principalId: "cell:desk", kind: "event", type: PAYLOAD.cellMessage, payload: { fromCellId: "desk", text: `report ${id}` }, createdAt: h.clock.now() });
-    }
-    await h.kernel.idle();
-    expect(h.of("run.started").filter((e) => e.cellId === "proj")).toHaveLength(1);
-    expect(h.kernel.inbox.listMessagesSync({ cellId: "proj", status: ["pending"] }).map((m) => m.envelope.id).sort()).toEqual(["r1", "r2"]);
-    const cards = h.kernel.gate.listPendingSync();
-    expect(cards).toHaveLength(1);
-
-    let saw = "";
-    h.script.add("proj", (req) => {
-      saw = requestText(req);
-      return { text: "continuing", usage: { inputTokens: 10, outputTokens: 10 } };
-    });
-    expect(await h.kernel.resolveApproval(cards[0]!.actionId, { decision: "continue", approverId: "owner" })).toMatchObject({ status: "continued" });
-    await h.kernel.idle();
-    // Both reports reached the model, in one Run, after the raise.
-    expect(saw).toContain("report r1");
-    expect(saw).toContain("report r2");
-    expect(h.kernel.inbox.listMessagesSync({ cellId: "proj", status: ["pending"] }).filter(m=>m.envelope.type!==PAYLOAD.stalledCheck)).toEqual([]);
-    expect(h.kernel.gate.usageSync("proj").state).not.toBe("hard_stop");
-  });
-
-  it("a coordinator with nothing in flight beneath it may still wrap up within the allowance; a leaf may not", async () => {
-    const h = await boot({ kernel: { gate: { wrapUp: { ratio: 0.5 } } } });
-    h.kernel.spawnCell("desk", { id: "proj", preset: "project", title: "调研", meta: { role: "proj" }, bounds: { maxTokens: 1_000 } });
-    worker(h, "w1");
-    h.script.add("w1", { text: "报告已存", usage: { inputTokens: 300, outputTokens: 50 } });
-    h.script.add("proj", { usage: { inputTokens: 10, outputTokens: 5 } });
-    await h.kernel.idle();
-    // The rest of the project's budget goes elsewhere (another cell's spending lands on the shared ledger).
-    h.kernel.gate.meter("w1", { tokens: 650, billedCents: 0 });
-    expect(h.kernel.gate.usageSync("proj").state).toBe("hard_stop");
-
-    // The worker is a leaf: a message to it is held, with a card.
-    h.kernel.sendToCell("w1", { text: "one more thing" }, { principalId: "cell:proj" });
-    await h.kernel.idle();
-    expect(h.of("run.started").filter((e) => e.cellId === "w1")).toHaveLength(1);
-    expect(h.kernel.gate.listPendingSync()).toHaveLength(1);
-
-    // The project has nothing running beneath it: it may still close its books — one cheap turn past the limit.
-    let wrapped = false;
-    h.script.add("proj", () => {
-      wrapped = true;
-      return { ...tool("complete_self", { summary: "调研完成", closeChildren: true }), usage: { inputTokens: 100, outputTokens: 20 } };
-    });
-    h.kernel.sendToCell("proj", { text: "wrap up" }, { principalId: "cell:desk" });
-    await h.kernel.idle();
-    expect(wrapped).toBe(true);
-    expect(h.kernel.getCell("proj")).toMatchObject({ status: "closed", closeReason: "completed" });
-    // Past limit + allowance it is stopped like everyone else.
-    expect(h.kernel.gate.usageSync("desk", { wrapUp: true }).state).not.toBe("hard_stop");
   });
 });
 

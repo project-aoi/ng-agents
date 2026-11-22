@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createChannelHub } from "@ng/channel";
 import { createContextStore } from "@ng/context";
-import { createGate, DEFAULT_OWNER_ADDRESSES } from "@ng/gate";
+import { createGate } from "@ng/gate";
 import { createInbox } from "@ng/inbox";
 import {
   createAgentLoop,
@@ -15,10 +15,8 @@ import {
   registerStandardToolsets,
   resolveAgentBackend,
   STANDARD_TOOLSETS,
-  UnconfiguredModelClient,
 } from "@ng/loop";
 import {
-  cellPrincipal,
   cellsRepo,
   KERNEL_FROM,
   newId,
@@ -35,13 +33,11 @@ import {
   type CliEngine,
 } from "@ng/protocol";
 import { createWorkspaceManager } from "@ng/workspace";
-import { createApprovals } from "./approvals";
-import { createBudgetSwitch } from "./budget-switch";
 import { createKeepAwake } from "./awake";
 import { DEFAULT_ROOT_BOUNDS, DEFAULTS } from "./constants";
 import type { KernelCore } from "./core";
 import { createDispatcher } from "./dispatcher";
-import { createEscalations, isKernelEscalation } from "./escalations";
+import { createEscalations } from "./escalations";
 import { createLifecycle } from "./lifecycle";
 import { createModelSettings, type ModelSettings } from "./models";
 import { createReadModel } from "./readmodel";
@@ -76,11 +72,10 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
   mkdirSync(dataDir, { recursive: true });
   // Resolve the backend before opening the workbench database.
   let agentBackend: AgentEngine | null = null;
-  if (!opts.loop) {
-    const setting = opts.agentBackend ?? (opts.model ? "api" : "auto");
+  if (!opts.loop && (opts.agentBackend || !opts.model)) {
+    const setting = opts.agentBackend ?? "auto";
     const bins = Object.fromEntries(Object.entries(opts.cli ?? {}).flatMap(([e, o]) => (o?.bin ? [[e, o.bin]] : [])));
-    agentBackend = resolveAgentBackend(setting, { apiAvailable: Boolean(opts.model), bins });
-    if (agentBackend === "api" && !opts.model) throw new NgError("invalid_argument", 'agentBackend "api" needs a model');
+    agentBackend = resolveAgentBackend(setting, { bins });
     if (agentBackend === null) {
       throw new NgError("invalid_argument", "createKernel needs a model, a ready-made loop, or an installed CLI agent (claude, codex or agy)");
     }
@@ -99,24 +94,17 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
   const bus = opts.bus ?? createBus({ onError: (err, topic) => onError(err, `bus handler for ${topic}`) });
   const registry = opts.registry ?? createRegistry();
   const ownerPrincipal = opts.ownerPrincipal ?? DEFAULTS.ownerPrincipal;
-  const ownerAddresses = [...(opts.ownerAddresses ?? DEFAULT_OWNER_ADDRESSES)];
   const deskCellId = opts.deskCellId ?? DEFAULTS.deskCellId;
-  if (!registry.toolsets.has(STANDARD_TOOLSETS.workspace)) registerStandardToolsets(registry, { ownerAddresses, deskCellId });
+  if (!registry.toolsets.has(STANDARD_TOOLSETS.workspace)) registerStandardToolsets(registry, { deskCellId });
   const cells = cellsRepo(db, clock);
 
   // ---------- primitives ----------
-  const budgetSwitch = createBudgetSwitch({ dataDir, ...(opts.budgetLimits !== undefined ? { initial: opts.budgetLimits } : {}) });
   const gate = createGate({
     db,
     bus,
     clock,
     ownerPrincipal,
-    ownerAddresses,
-    budgetEnforced: () => budgetSwitch.enforced(),
-    onSuperseded: (record, actor) => core.approvals.superseded(record, actor),
-    setBudgetPaused: (id, paused, principalId) => { inbox.controlSync(id, {action:paused ? "pause" : "resume", pauseReason:"budget_declined", principalId}); },
-    ...(opts.secrets ? { secrets: opts.secrets } : {}),
-    ...opts.gate,
+    onSuperseded: (record, actor) => core.humanItems.superseded(record, actor),
   });
   const inbox = createInbox({
     db,
@@ -150,33 +138,12 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     dataDir: join(dataDir, "workspace"),
     inbox,
     resources: context,
-    // Host-side secret proxy: the Gate decides (secret.use within bounds), the value never enters the sandbox.
-    injectSecret: (secretRef, ctx) => {
-      const r = gate.authorizeSync(
-        {
-          type: "secret.use",
-          secretRef,
-          purpose: ctx.purpose,
-          summary: ctx.purpose,
-          subjectKey: `cell:${ctx.cellId}`,
-          sideEffect: "internal",
-        },
-        { cellId: ctx.cellId, principalId: cellPrincipal(ctx.cellId), epoch: ctx.epoch },
-      );
-      if (r.type !== "allow") throw new Error(r.type === "deny" ? r.feedback : `secret "${secretRef}" needs the owner's approval first`);
-      return gate.injectSecretSync(r.actionToken, secretRef);
-    },
   });
   const hub = createChannelHub({
     db,
     bus,
     clock,
     ownerPrincipal,
-    ...opts.hubOptions,
-    verifyToken: (token, req) => {
-      const r = gate.verifyTokenSync(token, { type: "channel.send", target: req.target, content: req.content, summary: "", subjectKey: "", sideEffect: "external" });
-      return r.ok ? { ok: true } : { ok: false, reason: r.reason };
-    },
   });
   // ---------- the owner's model switch (one per CLI engine, created on first use) ----------
   const modelSwitch = opts.modelSwitch ? (opts.modelSwitch === true ? {} : opts.modelSwitch) : null;
@@ -206,7 +173,7 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
   const loop: AgentLoop =
     opts.loop ??
     createRoutingLoop({
-      api: createAgentLoop({ model: opts.model ?? new UnconfiguredModelClient(), registry, clock, ...opts.loopOptions }),
+      local: createAgentLoop({ ...(opts.model ? { model: opts.model } : {}), registry, clock, ...opts.loopOptions }),
       defaultEngine: agentBackend,
       cliLoop: (engine) => {
         const settings = modelSettingsOf(engine);
@@ -240,7 +207,6 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     cliProcDir,
     deskCellId,
     ownerPrincipal,
-    ownerAddresses,
     rootBounds: { ...DEFAULT_ROOT_BOUNDS, ...Object.fromEntries(Object.entries(opts.rootBounds ?? {}).filter(([, v]) => v !== undefined)) },
     repoPath: opts.repoPath,
     leaseMs: opts.leaseMs ?? DEFAULTS.leaseMs,
@@ -258,7 +224,6 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     lifecycle: undefined as never,
     dispatcher: undefined as never,
     escalations: undefined as never,
-    approvals: undefined as never,
     humanItems: undefined as never,
     readModel: undefined as never,
     waits: undefined as never,
@@ -268,7 +233,6 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
   core.lifecycle = createLifecycle(core);
   core.dispatcher = createDispatcher(core, { idleTimeoutMs: DEFAULTS.idleTimeoutMs });
   core.escalations = createEscalations(core);
-  core.approvals = createApprovals(core);
   core.humanItems = createHumanItems(core);
   core.readModel = createReadModel(core);
   core.stall = createStallMonitor(core);
@@ -287,8 +251,6 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
   // ---------- wiring ----------
   const unsubscribe: Array<() => void> = [];
   unsubscribe.push(bus.on("inbox.enqueued", (e) => dispatcher.notify(e.cellId)));
-  // A raised budget lets the cells that were held at the budget stop start, with every message that waited for them.
-  unsubscribe.push(bus.on("ledger.raised", e => dispatcher.budgetChanged(e.cellId)));
   unsubscribe.push(
     bus.on("inbox.dead", (e) => {
       core.escalations.deadLetter(e);
@@ -335,11 +297,9 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     // Refresh already-materialized persistent prefixes in parent order after a new release or an offline skill edit.
     for (const c of cells.list({status:["active","paused"]}).sort((a,b)=>a.depth-b.depth)) context.refreshPrefixSync(c.id);
     // Ask the backend CLI for its models now, so the first Run does not have to wait for the list.
-    if (agentBackend && agentBackend !== "api") modelSettingsOf(agentBackend)?.warm();
+    if (agentBackend) modelSettingsOf(agentBackend)?.warm();
     // A previous process's in-flight Runs died with it; their batches go back to the queue (one attempt each).
     inbox.recoverClaimsSync({ reason: "recovered at startup: the previous kernel stopped during this run" });
-    hub.recoverInterruptedSync();
-    core.approvals.reconcile();
     try {
       // A kernel that was killed leaves its CLI agents running (they have their own process groups) while their
       // batches were just taken back above: stop them before anything is dispatched into the same directories.
@@ -362,18 +322,15 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     // A cell that was closed (its settle transaction committed) just before the previous kernel died may have left
     // Jobs running: their runtime is stopped before the dispatcher hands anyone that directory (docs/05 guard 4).
     const orphaned = new Set(workspace.listJobsSync({ state: ["running"] }).filter((j) => cells.get(j.cellId)?.status === "closed").map((j) => j.cellId));
-    await Promise.all([...orphaned].map((id) => workspace.stopRuntime(id).catch((err: unknown) => onError(err, `stop runtime of closed cell ${id}`))));
+    await Promise.all([...orphaned].map((id) => workspace.cancelJobsForCell(id).catch((err: unknown) => onError(err, `stop runtime of closed cell ${id}`))));
     // Leases are renewed before the inbox looks at a moved ManualClock, so a live Run is never expired by a test step.
     const sweep = () => {
       dispatcher.renewAll();
-      hub.expireEditorLeasesSync();
-      if (!hub.isFocusSync() && hub.bufferedCountSync()) void track(hub.flushBuffered(true)).catch(err=>onError(err,"flush buffered notifications"));
     };
     sweep();
     if (isSubscribable(clock)) unsubscribeClock = clock.subscribe(sweep);
     heartbeat = setInterval(sweep, Math.min(15_000, Math.max(1_000, Math.floor(core.leaseMs / 3))));
     heartbeat.unref?.();
-    if (!budgetSwitch.enforced()) gate.clearBudgetDeclinesSync(ownerPrincipal);
     dispatcher.start();
     inbox.start();
     for (const id of inbox.dueCellIdsSync()) dispatcher.notify(id);
@@ -381,7 +338,7 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     keepAwake.start();
   }
 
-  async function stopRuntime() {
+  async function stopKernel() {
     await starting?.catch(() => undefined);
     core.stall.stop();
     keepAwake.stop();
@@ -408,13 +365,12 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     loop,
     agentBackend,
     modelSettings(engine) {
-      const e = engine ?? (agentBackend && agentBackend !== "api" ? agentBackend : null);
+      const e = engine ?? (agentBackend ? agentBackend : null);
       return e ? modelSettingsOf(e) : null;
     },
     dataDir,
     deskCellId,
     ownerPrincipal,
-    ownerAddresses,
 
     async start() {
       if (stopped) throw new NgError("conflict", "this kernel was stopped; create a new one on the same database to continue");
@@ -423,7 +379,7 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
 
     async stop() {
       stopped = true;
-      return stopping ??= stopRuntime();
+      return stopping ??= stopKernel();
     },
 
     async close() {
@@ -462,15 +418,7 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
 
     ingest: (raw, channelId) => ingest(core, raw, channelId),
     reopenProject: core.lifecycle.reopenProject,
-    resolveApproval: (actionId, decision) => core.approvals.resolve(actionId, decision),
-    resolveUnknownSend: (actionId, verdict, opts) => core.approvals.resolveUnknownSend(actionId, verdict, opts),
-    async setFocus(on) {
-      hub.setFocusSync(on);
-      if (hub.isFocusSync()) return null;
-      const r = await track(hub.flushBuffered(true));
-      return { sent: r.sent, failed: r.failed, unknown: r.unknown };
-    },
-
+    resolveApproval: (actionId, decision) => core.humanItems.resolve(actionId, decision),
     getCell: (cellId) => cells.get(cellId),
     listCells: (filter) => cells.list(filter),
     rosterFor: (cellId) => core.readModel.rosterFor(cellId),
@@ -489,30 +437,6 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     },
     checkStalls: () => void core.stall.evaluate(),
 
-    budgetLimits: () => ({ enforced: budgetSwitch.enforced() }),
-    setBudgetLimits(enforced, o) {
-      const principalId = o?.principalId ?? ownerPrincipal;
-      if (principalId !== ownerPrincipal) throw new NgError("bounds_violation", `switching budget limits needs the owner; ${principalId} may not`);
-      if (typeof enforced !== "boolean") throw new NgError("invalid_argument", "setBudgetLimits takes true (enforce) or false (off)");
-      const changed = budgetSwitch.set(enforced);
-      const releasedCells: string[] = [];
-      const continuedCards: string[] = [];
-      if (changed && !enforced) {
-        // Nothing is left to decide on a budget card: each is answered "continue" for the owner (no budget is raised —
-        // no ledger is stopped any more), which wakes the cell it was about exactly as a click on the card would.
-        for (const rec of gate.listPendingSync({ includeSnoozed: true })) {
-          if (!isKernelEscalation(rec.action) || rec.action.args.reason !== "budget_exhausted") continue;
-          continuedCards.push(rec.actionId);
-          void core.approvals
-            .resolve(rec.actionId, { decision: "continue", approverId: ownerPrincipal, note: "budget limits were switched off" })
-            .catch((err: unknown) => onError(err, `continue budget card ${rec.actionId}`));
-        }
-        // And nothing holds the cells that waited at their budget stop.
-        releasedCells.push(...new Set([...gate.clearBudgetDeclinesSync(principalId),...dispatcher.heldForBudget()]));
-        dispatcher.budgetChanged();
-      }
-      return { enforced: budgetSwitch.enforced(), changed, releasedCells, continuedCards };
-    },
   };
   return kernel;
 }

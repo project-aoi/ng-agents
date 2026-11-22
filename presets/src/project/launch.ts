@@ -4,7 +4,6 @@ import {
   newId,
   type BallOwner,
   type CellSpec,
-  type ChannelAddr,
   type Clock,
   type Effort,
   type ItemSource,
@@ -57,8 +56,6 @@ export interface ProjectInit {
   /** The owner's original words, quoted in the brief. */
   rawInput?: string;
   /** Someone outside who asked: the result goes back to them (after the owner confirms the card). */
-  replyTo?: ChannelAddr;
-  replyLabel?: string;
   /** Continue from the starting cell's conversation (fork_prefix). */
   continueConversation?: boolean;
 }
@@ -79,8 +76,6 @@ export interface ProjectTaskInput {
   phases?: string[];
   mode: ProjectMode;
   repos?: RepoRef[];
-  replyTo?: ChannelAddr;
-  replyLabel?: string;
 }
 
 export interface ProjectLaunch {
@@ -137,9 +132,6 @@ export function renderBrief(init: ProjectInit): string {
       ...init.plan.map((a) => `- [${OWNER_TEXT[a.owner]}] ${a.title}${a.phase ? `（阶段 ${a.phase}）` : ""}${a.nextStep ? `：${a.nextStep}` : ""}`),
     );
   }
-  if (init.replyTo) {
-    section("结果回复给", `${init.replyLabel ?? init.replyTo}（${init.replyTo}）：完成后用 send_message 把结论发给对方，主人确认后才会发出。`);
-  }
   return out.join("\n").trimEnd();
 }
 
@@ -169,7 +161,6 @@ export function projectLaunch(init: ProjectInit, clock: Clock): ProjectLaunch {
     ...(init.plan?.length ? { actions: init.plan } : {}),
     ...(init.phases?.length ? { phases: init.phases } : {}),
     ...(init.repos?.length ? { repos: init.repos } : {}),
-    ...(init.replyTo ? { replyTo: init.replyTo, replyLabel: init.replyLabel ?? init.replyTo } : {}),
   };
   return { projectId, spec, task: { title: init.title, instruction: renderBrief(init), input } };
 }

@@ -6,11 +6,10 @@ import type { Envelope } from "./envelope";
 export interface ScheduleRule {
   deliverAt?: number;                   // one-shot delayed delivery timestamp (a column on the queue row, no separate one-shot alarm table)
   cron?: string;                        // periodic trigger (e.g. a sensor polling a source)
-  idleSec?: number;                     // fire when this Cell has been idle for N seconds (background housekeeping)
   cancelGroup?: string;                 // linked-cancel group (e.g. clear pending timeout nudges when the other side replies early)
   tz?: string;                          // [ext] IANA timezone for `cron` (default: process local time)
   /**
-   * [ext] docs/05 §3.3 — fixed (tumbling) batching window, keyed. Exclusive with deliverAt/cron/idleSec. At enqueue:
+   * [ext] docs/05 §3.3 — fixed (tumbling) batching window, keyed. Exclusive with deliverAt/cron. At enqueue:
    * the cell has an active claim → deliver now (the running Loop absorbs it); otherwise, if a pending wakeup row of the
    * same cell with `cancel_group = key` is not yet due, reuse *its* deliver_at (the window's fixed right edge: never
    * extended by later arrivals, never borrowed from another key or an ordinary timer); else deliver_at = now + windowMs.
@@ -22,7 +21,7 @@ export interface ScheduleRule {
 export interface Inbox {
   enqueue(cellId: string, env: Envelope, schedule?: ScheduleRule): Promise<"accepted" | "deduped">;
   cancelScheduled(scope: { cellId: string; cancelGroup?: string; envelopeId?: string }): Promise<void>;
-  claimNextRun(cellId: string, workerId: string, mode: "serial_coalesce" | "competing_workers", leaseMs?: number): Promise<ClaimedBatch | null>;
+  claimNextRun(cellId: string, workerId: string, leaseMs?: number): Promise<ClaimedBatch | null>;
   complete(claimId: string): Promise<void>;
   handback(claimId: string, envelopeId: string, reason: string): Promise<void>; // hand an off-topic new item back to the desk for re-triage
   // independent control bypass: skips the normal queue lock, authorized via Gate, immediately interrupts the in-flight Run/Job (cancel atomically advances the Cell epoch)
@@ -36,11 +35,8 @@ export interface Inbox {
   //   - stores the envelope with `to = inbox:<cellId>`; same (cellId, env.id) again → "deduped" (nothing changes).
   //   - unregistered type or payload failing validatePayload → stored as `quarantined` (still "accepted").
   //   - env.expectedEpoch set and ≠ the cell's current epoch → stored as `dropped_epoch`; closed cell → `cancelled`.
-  //   - schedule: at most one of deliverAt | cron | idleSec. deliverAt → the row's deliver_at; cron/idleSec → an
+  //   - schedule: at most one of deliverAt | cron. deliverAt → the row's deliver_at; cron → an
   //     inbox_schedules row (the envelope is the template; firings get id `${env.id}@${fireAt}`).
-  //     idleSec fires once the cell has had no live claim, no due pending message and no finished Run for N seconds
-  //     (counted from the rule's creation or the end of the last Run), then stays disarmed until the next Run that
-  //     processed something other than idle firings ends. cancelGroup tags the row/schedule.
   //     A schedule template whose payload fails validation throws NgError("invalid_argument") (never quarantined).
   //     Re-enqueueing the template id of a *deactivated* schedule replaces and re-activates it ("accepted").
   //   - unknown cellId → throws NgError("not_found").
@@ -55,7 +51,7 @@ export interface Inbox {
   enqueueSync(cellId: string, env: Envelope, schedule?: ScheduleRule): EnqueueResult;
   /** Returns how many pending messages + schedules were cancelled. */
   cancelScheduledSync(scope: CancelScope): number;
-  claimNextRunSync(cellId: string, workerId: string, mode: ClaimMode, leaseMs?: number): ClaimedBatch | null;
+  claimNextRunSync(cellId: string, workerId: string, leaseMs?: number): ClaimedBatch | null;
   completeSync(claimId: string): void;
   handbackSync(claimId: string, envelopeId: string, reason: string): void;
   controlSync(cellId: string, cmd: ControlCommand): ControlResult;
@@ -103,7 +99,7 @@ export interface Inbox {
   /** [ext] Active claims of the cell, optionally excluding one (the settling Run's own). */
   activeClaimCountSync(cellId: string, exceptClaimId?: string): number;
   /**
-   * Advance time-driven state as of `clock.now()`: expire leases, fire due cron/idleSec schedules into messages,
+   * Advance time-driven state as of `clock.now()`: expire leases, fire due cron schedules into messages,
    * and emit `inbox.enqueued {reason:"due"}` for cells whose delayed messages just became due (`"released"` for cells
    * whose expired claims returned work). Missed cron occurrences coalesce into one firing.
    */
@@ -127,7 +123,6 @@ export interface Inbox {
 
 // Spelled out (not derived from `Inbox[...]`) so the interface above can reference them without a cycle.
 export type EnqueueResult = "accepted" | "deduped";
-export type ClaimMode = "serial_coalesce" | "competing_workers";
 export interface CancelScope {
   cellId: string;
   cancelGroup?: string;
@@ -135,7 +130,7 @@ export interface CancelScope {
 }
 export type ControlAction = "cancel" | "pause" | "resume" | "steer";
 export interface ControlCommand {
-  pauseReason?: "manual"|"parked"|"budget_declined";
+  pauseReason?: "manual"|"parked";
   action: ControlAction;
   principalId: string;
   steerMessage?: string;
@@ -170,7 +165,6 @@ export interface ControlResult {
  *
  * - `serial_coalesce`: at most one active claim per cell; the batch holds every due pending message of the cell
  *   (wakeup and silent_inject), in seq order. A cell with only silent_inject messages is not claimable.
- * - `competing_workers`: several claims may be active for one cell; each batch holds exactly one wakeup message.
  * - Messages whose `expectedEpoch` differs from the cell's current epoch are marked `dropped_epoch` at claim time
  *   and never appear in a batch. Paused/closed cells are not claimable.
  */
@@ -179,7 +173,6 @@ export interface ClaimedBatch {
   cellId: string;
   epoch: number;                        // cell epoch at claim time
   workerId: string;
-  mode: ClaimMode;
   envelopes: Envelope[];                // seq order
   seqs: number[];                       // inbox_messages.seq of each envelope, same order
   claimedAt: number;
@@ -237,7 +230,7 @@ export interface ReleaseOptions {
 }
 
 /**
- * A recurring rule created by `enqueue(cellId, template, { cron | idleSec })`. Each firing inserts a message whose
+ * A recurring rule created by `enqueue(cellId, template, { cron })`. Each firing inserts a message whose
  * envelope is the template with id `${template.id}@${fireAt}` (deterministic, so a double tick cannot double-fire).
  * Re-enqueueing the same template id for the same cell returns "deduped".
  */
@@ -245,8 +238,7 @@ export interface InboxScheduleRecord {
   id: string;
   cellId: string;
   template: Envelope;
-  cron: string | null;
-  idleSec: number | null;
+  cron: string;
   tz: string | null;
   cancelGroup: string | null;
   expectedEpoch: number | null;

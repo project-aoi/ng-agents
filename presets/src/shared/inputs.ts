@@ -20,7 +20,6 @@ export const scheduleInput = z.object({
   at: z.string().optional().describe("ISO 8601 time with offset, one-shot"),
   cron: z.string().optional(),
   tz: z.string().optional().describe("IANA timezone for cron"),
-  idleSec: z.number().int().min(1).optional(),
   cancelGroup: z.string().optional(),
 });
 
@@ -45,10 +44,9 @@ export function toSchedule(s: z.infer<typeof scheduleInput>): ScheduleRule {
   }
   if (s.cron) rule.cron = s.cron;
   if (s.tz) rule.tz = s.tz;
-  if (s.idleSec) rule.idleSec = s.idleSec;
   if (s.cancelGroup) rule.cancelGroup = s.cancelGroup;
-  if ([rule.deliverAt, rule.cron, rule.idleSec].filter((v) => v !== undefined).length !== 1) {
-    throw new NgError("invalid_argument", "each schedule needs exactly one of at, cron or idleSec");
+  if ([rule.deliverAt, rule.cron].filter((v) => v !== undefined).length !== 1) {
+    throw new NgError("invalid_argument", "each schedule needs exactly one of at or cron");
   }
   return rule;
 }

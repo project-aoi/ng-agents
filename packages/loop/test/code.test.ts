@@ -5,7 +5,7 @@ import { createFakeRun, ScriptedModelClient } from "../src/testing";
 import { makeRegistry } from "./helpers";
 
 describe("code runs", () => {
-  it("runs a registered code processor with its args, without any model call or metering", async () => {
+  it("runs a registered code processor with its args, without making a model call", async () => {
     const registry = makeRegistry();
     const seen: unknown[] = [];
     const join: CodeProcessor = {
@@ -24,7 +24,6 @@ describe("code runs", () => {
     expect(seen).toEqual([{ expect: 3 }, 2]);
     expect(ports.state.get("joined")).toBe(true);
     expect(model.calls).toHaveLength(0);
-    expect(ports.log.metered).toHaveLength(0);
   });
 
   it("fails loudly for an unregistered entry, and reports cancelled when aborted mid-processor", async () => {

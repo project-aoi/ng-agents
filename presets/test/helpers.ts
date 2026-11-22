@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryChannel, UiChannel } from "@ng/channel";
 import { createKernel, type Kernel, type KernelOptions } from "@ng/cell";
-import { ScriptedModelClient, type ScriptResponder, type ScriptTurn } from "@ng/loop";
+import { ScriptedModelClient, type ScriptResponder, type ScriptTurn } from "@ng/loop/testing";
 import {
   asClarifyCard,
   createRegistry,
@@ -121,7 +121,7 @@ export interface Harness {
   ui: UiChannel;
   events: Array<{ topic: BusTopic; data: unknown }>;
   of<K extends BusTopic>(topic: K): Array<BusTopics[K]>;
-  /** Owner notifications (UI channel outbox bodies), oldest first. */
+  /** Owner notifications, oldest first. */
   notices(): string[];
   /** Pending Clarify cards (snoozed included). */
   cards(): Array<ApprovalRecord & { clarify: ClarifyCard }>;
@@ -157,7 +157,7 @@ export async function boot(opts: BootOptions = {}): Promise<Harness> {
     model: script.model,
     channels: [memory, ui],
     retryBackoffMs: 1_000,
-    workspace: { limits: { killGraceMs: 300, jobPollMs: 40, previewPollMs: 25 } },
+    workspace: { limits: { killGraceMs: 300, jobPollMs: 40 } },
     onError: () => undefined,
     ...opts.kernel,
   });
@@ -178,7 +178,7 @@ export async function boot(opts: BootOptions = {}): Promise<Harness> {
     of<K extends BusTopic>(topic: K) {
       return events.filter((e) => e.topic === topic).map((e) => e.data as BusTopics[K]);
     },
-    notices: () => kernel.hub.listOutboxSync({ channelId: "ui", order: "oldest" }).map((r) => r.content.body),
+    notices: () => kernel.hub.listNotificationsSync().reverse().map((r) => r.content.body),
     cards: () =>
       kernel.gate.listPendingSync({ includeSnoozed: true }).map((a) => {
         const clarify = asClarifyCard(a.card.data);

@@ -5,13 +5,11 @@ import {
   cellIdOf,
   defineTool,
   gtdKeys,
-  isChannelAddr,
   isNgError,
   newId,
   type ActionRecord,
   type BallOwner,
   type CellSpec,
-  type ChannelAddr,
   type InboxAddr,
   type ProcessorSpec,
   type ProjectRecord,
@@ -20,15 +18,14 @@ import {
   type ToolResult,
   type Toolset,
 } from "@ng/protocol";
-import { TOOLSETS, type PresetsConfig } from "../shared/config";
+import { TOOLSETS } from "../shared/config";
 import { errorText, isCwdError, parseIso, scheduleInput, toSchedule, toWatch, watchInput } from "../shared/inputs";
 import { PROBE, probeProcessor } from "../shared/probe";
 import { CHECKER_PROCESSOR, WORKER_PROCESSOR } from "../shared/processors";
 import { clip, newAction, newProject, patchAction, patchProject, statusLine } from "../shared/records";
-import { replyWatcherSpec, type ReplyParty } from "../shared/watcher";
 import { readActions, readProject, waitingFor } from "./books";
 
-// `gtd.project`: the project cell's own records — dispatch, track_action, await_reply, update_project,
+// `gtd.project`: the project cell's own records — dispatch, track_action, update_project,
 // finish_project. Records live in the project's state (gtd:project, gtd:action:<id>); every result says in plain
 // words what was recorded and what happens next.
 
@@ -92,7 +89,7 @@ function spawnRefusal(err: unknown): ToolResult {
   return { output: `Not started: ${errorText(err)}`, isError: true };
 }
 
-export function projectToolset(cfg: PresetsConfig): Toolset {
+export function projectToolset(): Toolset {
   function tool<S extends z.ZodType>(def: { name: string; description: string; input: S; run(args: z.output<S>, ctx: ToolContext): Promise<ToolResult | string> }): ToolDef {
     return defineTool({ name: def.name, kind: "kernel", description: def.description, input: def.input, availableFor: hasParent, handler: (args, ctx) => def.run(args, ctx) });
   }
@@ -122,23 +119,16 @@ export function projectToolset(cfg: PresetsConfig): Toolset {
         .array(scheduleInput)
         .optional()
         .describe(
-          'watcher without check, rarely needed: a fixed rhythm to wake it on, as cron (e.g. {"cron": "*/10 * * * *"}), instead of the one reminder at a time it sets itself, fitted to what it saw. It is told so in its task and sets no reminders of its own. Usually leave it out. Not with check (the command keeps its own timer), and not idleSec (it fires once after the watcher has gone quiet, not on a rhythm).',
+          'watcher without check, rarely needed: a fixed rhythm to wake it on, as cron (e.g. {"cron": "*/10 * * * *"}), instead of the one reminder at a time it sets itself, fitted to what it saw. It is told so in its task and sets no reminders of its own. Usually leave it out. Not with check (the command keeps its own timer).',
         ),
     }),
     async run(args, ctx) {
       const check = args.check;
       const preset = args.preset==="watcher" ? "checker" : args.preset ?? (check ? "checker" : "worker");
       // One timer source per watcher (BUG-005): a check keeps its own, a model watcher either gets a fixed cron
-      // rhythm (and is told so) or sets its own reminders; an idle schedule would not repeat for it.
+      // rhythm or sets its own reminders.
       if (check && preset !== "checker") return { output: 'Not started: check is for a watcher — give preset "checker" (or leave preset out).', isError: true };
       if (check && args.schedules?.length) return { output: "Not started: a watcher with check keeps its own timer (check.everySec); leave schedules out.", isError: true };
-      if (preset === "checker" && args.schedules?.some((r) => r.idleSec !== undefined)) {
-        return {
-          output:
-            'Not started: idleSec does not repeat for a watcher — it fires once after the watcher has gone quiet. For a fixed rhythm use cron (e.g. "*/10 * * * *"), give a check command, or leave schedules out and let the watcher set its own reminders.',
-          isError: true,
-        };
-      }
       const project = await readProject(ctx.ports);
       const actions = await readActions(ctx.ports);
       const existing = args.actionId !== undefined ? actions.find((a) => a.id === args.actionId) : undefined;
@@ -255,77 +245,6 @@ export function projectToolset(cfg: PresetsConfig): Toolset {
     },
   });
 
-  const awaitReply = tool({
-    name: "await_reply",
-    description: [
-      "Wait for one person's reply on a thread without spending a model: their reply on the watched thread (or from that sender) is recorded and wakes you with what they said.",
-      "If nothing comes by the deadline, a polite follow-up is drafted and put on the owner's card; the owner decides whether it is sent. Recorded as a waiting action.",
-    ].join(" "),
-    input: z.object({
-      who: z.string().min(1).describe('as the owner names them, e.g. "张三" or "供应商 C"'),
-      description: z.string().min(1).describe('what is awaited, e.g. "等张三给 Doubao work 的代码地址"'),
-      thread: z.string().optional().describe('thread their reply arrives on, "<channelId>:<threadId>"'),
-      principalId: z.string().optional().describe("only this sender counts as their reply (alone: any message from them)"),
-      to: z.string().optional().describe("channel address a follow-up would go to"),
-      dueAt: z.string().optional().describe("deadline, ISO 8601 with offset"),
-      waitHours: z.number().positive().optional().describe("deadline in hours from now (default 24)"),
-      nudgeText: z.string().optional().describe("the follow-up to draft at the deadline"),
-      interpret: z.boolean().optional().describe("judge each message with a small model (default: any message from them is the reply)"),
-    }),
-    async run(args, ctx) {
-      if (!args.thread && !args.principalId) return { output: "Give thread or principalId, so their reply can reach the watcher.", isError: true };
-      if (args.to !== undefined && !isChannelAddr(args.to)) return { output: "to must be channel:<channelId>:<target>.", isError: true };
-      const now = ctx.clock.now();
-      const parsed = args.dueAt !== undefined ? parseIso(args.dueAt, "dueAt") : now + (args.waitHours !== undefined ? args.waitHours * 3_600_000 : cfg.defaultWaitMs);
-      if (typeof parsed === "string") return { output: parsed, isError: true };
-      const project = await projectOf(ctx);
-      const party: ReplyParty = {
-        id: "p1",
-        label: args.who,
-        ...(args.to ? { to: args.to as ChannelAddr } : {}),
-        ...(args.thread ? { thread: args.thread } : {}),
-        ...(args.principalId ? { principalId: args.principalId } : {}),
-        dueAt: parsed,
-      };
-      const actionId = newId("act", ctx.clock);
-      const spec = replyWatcherSpec(party, {
-        description: args.description,
-        itemTitle: project.title,
-        actionId,
-        ...(args.nudgeText ? { nudgeText: args.nudgeText } : {}),
-        ...(args.interpret ? { interpret: true } : {}),
-        ...(project.source ? { source: project.source } : {}),
-        rawInput: { text: args.description, kind: "system" },
-      });
-      let addr: InboxAddr;
-      try {
-        addr = await ctx.ports.spawnCell(spec, { instruction: `等待${args.who}回复：${args.description}`, input: { party } });
-      } catch (err) {
-        return spawnRefusal(err);
-      }
-      const watcherId = cellIdOf(addr);
-      const action = newAction(
-        {
-          id: actionId,
-          title: args.description,
-          owner: "waiting",
-          projectCellId: self(ctx),
-          cellId: watcherId,
-          dueAt: parsed,
-          waiting: waitingFor(args.description, [{ id: party.id, label: args.who, replied: false, dueAt: parsed }], { dueAt: parsed, cancelGroup: "timeout" }),
-          progress: { done: 0, total: 1, label: "已回" },
-        },
-        now,
-      );
-      await save(ctx, { [gtdKeys.action(actionId)]: action });
-      return {
-        output: `Waiting for ${args.who} until ${new Date(parsed).toISOString()} (action ${actionId}, watcher ${watcherId}). Their reply wakes you with what they said; at the deadline the owner gets a follow-up to confirm.`,
-        data: { cellId: watcherId, actionId },
-        awaitsWakeup: true,
-      };
-    },
-  });
-
   const updateProject = tool({
     name: "update_project",
     description: "Keep the project's record current: the one-line summary on the owner's board (where things stand), and if they changed, its title, outcome or directory.",
@@ -397,7 +316,7 @@ export function projectToolset(cfg: PresetsConfig): Toolset {
   return {
     name: TOOLSETS.project,
     description: "A project's own books: dispatch work, track who has the ball, wait for a reply, keep the record current, finish.",
-    tools: [dispatch, trackAction, awaitReply, updateProject, finishProject],
+    tools: [dispatch, trackAction, updateProject, finishProject],
   };
 }
 

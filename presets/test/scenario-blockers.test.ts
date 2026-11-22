@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { PAYLOAD, type ModelRequest } from "@ng/protocol";
-import { KEYS, startProjectSync } from "../src";
+import { startProjectSync } from "../src";
 import { boot, childrenOf, cleanupAll, continuesRun, gitRepo, lastToolResult, requestText, systemOf, tool, type Harness } from "./helpers";
 
 afterEach(cleanupAll);

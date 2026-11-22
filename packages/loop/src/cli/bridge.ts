@@ -29,10 +29,7 @@ export interface ToolBridgeOptions {
   /** Optional MCP `instructions` returned from initialize. */
   instructions?: string;
   tools: readonly BridgeToolSpec[];
-  /**
-   * Executes one tools/call. Calls are serialized by the bridge (one at a time, in arrival order), like the API loop
-   * runs a step's tool calls in order. A thrown error becomes an isError result.
-   */
+  /** Executes tools in arrival order. Errors become tool results. */
   call(name: string, args: unknown, meta: { requestId: string; signal: AbortSignal }): Promise<BridgeCallResult>;
   /** Interpreter for the shim. Default: the kernel's own Node binary. */
   nodePath?: string;

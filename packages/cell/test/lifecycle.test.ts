@@ -4,7 +4,6 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   finalResultEnvelopeId,
   isNgError,
-  makeBounds,
   PAYLOAD,
   serializeBounds,
   type Address,
@@ -13,7 +12,7 @@ import {
   type Registry,
 } from "@ng/protocol";
 import { scheduleEnvelopeId } from "../src";
-import { boot, cleanupAll, DAY, HOUR, registerTestPresets, T0, tool, TOOLSETS, waitFor } from "./helpers";
+import { boot, cleanupAll, DAY, HOUR, registerTestPresets, T0, tool, waitFor } from "./helpers";
 
 afterEach(cleanupAll);
 
@@ -54,7 +53,7 @@ const greedySpawner: CodeProcessor = {
           preset: "worker",
           title: "greedy grandchild",
           processor: { kind: "code", entry: "test.idle" },
-          bounds: { tools: new Set(["read", "write", "edit", "bash", "code_rpc"]), canSendTo: ["channel:*", "inbox:*"] as unknown as Address[], secretRefs: new Set(["github"]), isolation: "none", maxDepth: 9, maxTokens: 1e12, maxCents: 1e9 },
+          bounds: { tools: new Set(["read", "write", "edit", "bash"]), canSendTo: ["channel:*", "inbox:*"] as unknown as Address[], isolation: "none", maxDepth: 9 },
         },
         "go",
       );
@@ -75,35 +74,12 @@ function setupWith(...procs: CodeProcessor[]) {
   };
 }
 
-describe("root cells", () => {
-  it("must have positive budgets; omitted fields come from the kernel's root defaults", async () => {
-    const h = await boot({ desk: false });
-    expectNgError(() => h.kernel.createRootCell({ id: "r0", preset: "inline" }, { bounds: { maxTokens: 0 } }), "invalid_argument", /positive maxTokens and maxCents/);
-    // A full PolicyBounds built with makeBounds() has zero budgets: exactly the trap this guards against.
-    expectNgError(() => h.kernel.createRootCell({ id: "r1", preset: "inline" }, { bounds: makeBounds({ tools: ["read"] }) }), "invalid_argument");
-    const desk = h.kernel.createRootCell({ id: "desk", preset: "inline" });
-    expect(desk.bounds.maxTokens).toBeGreaterThan(0);
-    expect(desk.bounds.maxCents).toBeGreaterThan(0);
-    expect(desk.bounds.maxDepth).toBe(4); // DEFAULT_ROOT_BOUNDS
-    expect(desk.bounds.isolation).toBe("none"); // the owner's machine
-    // the preset's defaults (test "inline" desk: every toolset, persistent)
-    expect(desk.spec).toMatchObject({ processor: { kind: "llm", toolsets: [TOOLSETS.context, TOOLSETS.comms, TOOLSETS.schedule, TOOLSETS.cells, TOOLSETS.workspace] }, lifetime: "persistent" });
-    expect(desk.spec).not.toHaveProperty("cwdMode");
-    expect(desk.spec.processor).not.toHaveProperty("allowedTools");
-    expect(desk.spec).not.toHaveProperty("cwd"); // nobody gave it a directory
-    expect(h.kernel.ensureRootCell({ id: "desk", preset: "inline" }).createdAt).toBe(desk.createdAt);
-    expectNgError(() => h.kernel.createRootCell({ id: "desk", preset: "inline" }), "duplicate");
-    expectNgError(() => h.kernel.createRootCell({ id: "x", preset: "inline" }, { principalId: "cell:desk" }), "bounds_violation");
-    expectNgError(() => h.kernel.createRootCell({ id: "y", processor: { kind: "code", entry: "nope" } }), "not_found", /code processor "nope"/);
-  });
-});
-
 describe("spawnCell", () => {
   it("attenuates: a child never gets more than its parent, whatever it asks for, and spawning from a Run is held to the same rule", async () => {
     const h = await boot({ setup: setupWith(greedySpawner, idle), desk: false });
     h.kernel.createRootCell(
       { id: "desk", preset: "inline" },
-      { bounds: { tools: ["read", "write"], canSendTo: ["channel:ui:*"], isolation: "git_worktree", maxDepth: 2, maxConcurrentChildren: 3, maxTokens: 50_000, maxCents: 100 } },
+      { bounds: { tools: ["read", "write"], canSendTo: ["channel:ui:*"], isolation: "none", maxDepth: 2, maxConcurrentChildren: 3 } },
     );
     h.kernel.spawnCell(
       "desk",
@@ -113,7 +89,7 @@ describe("spawnCell", () => {
         // one-shot: the kernel closes it once it is done, which waits for its child (the maxDepth it asks for: it gets 1)
         lifetime: "one_shot",
         processor: { kind: "code", entry: "test.greedy" },
-        bounds: { tools: new Set(["read", "write", "bash"]), canSendTo: ["channel:*"] as unknown as Address[], secretRefs: new Set(["github"]), isolation: "none", maxDepth: 7, maxTokens: 1e9, maxCents: 1e6, maxConcurrentChildren: 99 },
+        bounds: { tools: new Set(["read", "write", "bash"]), canSendTo: ["channel:*"] as unknown as Address[], isolation: "none", maxDepth: 7, maxConcurrentChildren: 99 },
       },
       "go",
     );
@@ -121,11 +97,10 @@ describe("spawnCell", () => {
     expect(serializeBounds(child.bounds)).toEqual({
       tools: ["read", "write"],
       canSendTo: ["channel:ui:*", "inbox:desk"], // asked for channel:*, got the parent's narrower channel:ui:*
-      secretRefs: [],
-      isolation: "git_worktree",
+
+      isolation: "none",
       maxConcurrentChildren: 3,
-      maxTokens: 50_000,
-      maxCents: 100,
+
       maxDepth: 1,
     });
     expect(child.spec.bounds).toMatchObject({ tools: ["bash", "read", "write"] }); // the request, kept readable
@@ -140,8 +115,8 @@ describe("spawnCell", () => {
     expect(serializeBounds(grand.bounds)).toMatchObject({
       tools: ["read", "write"],
       canSendTo: ["channel:ui:*", "inbox:child", "inbox:desk"],
-      secretRefs: [],
-      isolation: "git_worktree",
+
+      isolation: "none",
       maxDepth: 0,
     });
     // the one-shot child closed only after its grandchild's turn was over (closing cascades; it waits for children at

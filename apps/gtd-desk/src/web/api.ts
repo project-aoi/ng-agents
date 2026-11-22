@@ -15,15 +15,12 @@ import type {
   Effort,
   EngageDetailDTO,
   EngageListDTO,
-  FocusResponse,
   HttpMethod,
   ModelsDTO,
   RadarDTO,
   ResourcePageDTO,
   SendCellMessageRequest,
   SendCellMessageResponse,
-  SetBudgetLimitsRequest,
-  SetBudgetLimitsResponse,
   SourcesDTO,
   SetModelRequest,
   SourcesMutationResponse,
@@ -147,12 +144,9 @@ const enc = encodeURIComponent;
 export const api = {
   status: () => request<StatusDTO>("GET", "/api/status"),
   capture: (req: CaptureRequest) => request<CaptureResponse>("POST", "/api/capture", req),
-  focus: (on: boolean, keepalive = false) => request<FocusResponse>("POST", "/api/focus", { on }, { keepalive }),
   /** The CLI agent's models; `refresh` asks the CLI again instead of using the cached list. */
   models: (refresh = false) => request<ModelsDTO>("GET", refresh ? "/api/models?refresh=1" : "/api/models"),
   setModel: (req: SetModelRequest) => request<ModelsDTO>("PUT", "/api/models", req),
-  /** The owner's budget-limits switch (false = nothing is stopped for its budget; usage is still counted). */
-  setBudgetLimits: (enforced: boolean) => request<SetBudgetLimitsResponse>("PUT", "/api/settings/budget-limits", { enforced } satisfies SetBudgetLimitsRequest),
 
   clarify: () => request<ClarifyQueueDTO>("GET", "/api/clarify"),
 

@@ -1,4 +1,3 @@
-import { isAbsolute, relative, resolve } from "node:path";
 import type { CliAdapter, CliCapabilities, CliDriver, CliEvent, DriverIO, LaunchRequest } from "../types";
 import { asRecord, contentText, HOST_UNSANDBOXED, num, str } from "./util";
 
@@ -16,12 +15,7 @@ import { asRecord, contentText, HOST_UNSANDBOXED, num, str } from "./util";
  *     fetches, the ACP catch-all kinds (`switch_mode`, `other`, e.g. the owner's own MCP tools). No `--sandbox`.
  *   - Host access, read-only: reads/searches anywhere and web fetches approved; edits/deletes/moves, commands, mode
  *     switches (a switch could stop agy from asking) and unclassified requests rejected. No `--sandbox`.
- *   - Workspace access: reads allowed, edits/deletes/moves only for writing cells and only inside the workspace,
- *     commands only with bash, web only when enabled, everything else rejected. Writing cells with bash run with
- *     `--sandbox` (agy's terminal sandbox: Linux namespaces, project folder writable, no network; agy silently runs
- *     without it when user namespaces are unavailable).
  * - Steer: `session/cancel` the running prompt, then `session/prompt` with the steer text (same process and session).
- * - Usage: `session/prompt` result `usage.totalTokens` per turn; no cost is reported (cents 0). No native fork.
  */
 export function agyAdapter(): CliAdapter {
   return {
@@ -38,30 +32,20 @@ export function agyAdapter(): CliAdapter {
 }
 
 export function agyArgs(req: LaunchRequest): string[] {
-  const { caps } = req;
-  return ["acp", ...(caps.access === "workspace" && !caps.readOnly && caps.bash ? ["--sandbox"] : []), ...req.extraArgs];
+  return ["acp", ...req.extraArgs];
 }
 
 function describePermissions(caps: CliCapabilities): string {
-  if (caps.access === "host") {
-    const web = caps.web ? "web fetches, " : "";
-    if (!caps.readOnly) {
-      return `agy: host access, writing — the kernel's ACP client approves every permission request (edits/deletes/moves anywhere, commands, ${web}MCP tools, mode switches); no --sandbox; ${HOST_UNSANDBOXED}.`;
-    }
-    return `agy: host access, read-only — the kernel's ACP client approves reads and searches anywhere, ${web}and the kernel's MCP tools, and rejects every edit/delete/move, command, mode switch and unclassified request (enforced per call by the client; relies on agy asking, which its default mode does unless the owner's agy settings pre-allow a rule); no --sandbox.`;
+  const web = caps.web ? "web fetches, " : "";
+  if (!caps.readOnly) {
+    return `agy: host access, writing — the kernel's ACP client approves every permission request (edits/deletes/moves anywhere, commands, ${web}MCP tools, mode switches); no --sandbox; ${HOST_UNSANDBOXED}.`;
   }
-  if (caps.readOnly) {
-    return `agy: read-only — every edit/command permission request is rejected by the kernel's ACP client (enforced per call by the client; relies on agy asking, which its default mode does unless the owner's agy settings pre-allow a rule).`;
-  }
-  const allowed = [caps.write || caps.edit ? "file edits inside the workspace" : null, caps.bash ? "commands" : null].filter(Boolean).join(" and ");
-  const sandbox = caps.bash ? " Commands run in agy's terminal sandbox (--sandbox; OS namespaces, writes only in the project folder, no network — skipped by agy when unavailable)." : "";
-  return `agy: writing — the kernel's ACP client approves ${allowed || "nothing beyond reads"} and rejects the rest.${sandbox}`;
+  return `agy: host access, read-only — the kernel's ACP client approves reads and searches anywhere, ${web}and the kernel's MCP tools, and rejects every edit/delete/move, command, mode switch and unclassified request (enforced per call by the client; relies on agy asking, which its default mode does unless the owner's agy settings pre-allow a rule); no --sandbox.`;
 }
 
 type Pending = "initialize" | "session" | "model" | "prompt";
 
 const PERMISSION_KINDS_READ = new Set(["read", "search", "think"]);
-const PERMISSION_KINDS_WRITE = new Set(["edit", "delete", "move"]);
 
 /**
  * Decide one `session/request_permission` from the cell's capabilities (exported for tests). ACP tool kinds: read,
@@ -71,38 +55,9 @@ export function agyPermissionAllowed(toolCall: Record<string, unknown>, caps: Cl
   const prefix = `mcp_${serverName}_`;
   if ((str(toolCall["name"]) ?? "").startsWith(prefix) || (str(toolCall["title"]) ?? "").startsWith(`Run ${prefix}`)) return true;
   const kind = str(toolCall["kind"]) ?? "other";
-  if (caps.access === "host") {
-    if (kind === "fetch") return caps.web;
-    // A writing cell on the host may do anything the owner could; a read-only one reads/searches anywhere.
-    return !caps.readOnly || PERMISSION_KINDS_READ.has(kind);
-  }
-  const paths = locationPaths(toolCall);
-  const inside = paths.every((p) => isInside(caps.root, p));
-  if (PERMISSION_KINDS_READ.has(kind)) return inside || caps.isolation === "none";
-  if (PERMISSION_KINDS_WRITE.has(kind)) return !caps.readOnly && (caps.write || caps.edit) && inside;
-  if (kind === "execute") return !caps.readOnly && caps.bash;
   if (kind === "fetch") return caps.web;
-  return false;
-}
-
-function locationPaths(toolCall: Record<string, unknown>): string[] {
-  const out: string[] = [];
-  for (const l of Array.isArray(toolCall["locations"]) ? (toolCall["locations"] as unknown[]) : []) {
-    const p = str(asRecord(l)["path"]);
-    if (p) out.push(p);
-  }
-  const raw = asRecord(toolCall["rawInput"]);
-  for (const k of ["path", "file_path", "filePath", "AbsolutePath", "TargetFile"]) {
-    const p = str(raw[k]);
-    if (p) out.push(p);
-  }
-  return out;
-}
-
-function isInside(root: string, p: string): boolean {
-  const abs = isAbsolute(p) ? p : resolve(root, p);
-  const rel = relative(root, abs);
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  // A writing cell on the host may do anything the owner could; a read-only one reads/searches anywhere.
+  return !caps.readOnly || PERMISSION_KINDS_READ.has(kind);
 }
 
 class AgyDriver implements CliDriver {
@@ -231,10 +186,6 @@ class AgyDriver implements CliDriver {
       case "prompt": {
         this.#flushText(out);
         this.#promptId = null;
-        const usage = asRecord(result["usage"]);
-        const tokens = num(usage["totalTokens"]) || num(usage["inputTokens"]) + num(usage["outputTokens"]) + num(usage["cachedReadTokens"]) + num(usage["cachedWriteTokens"]) + num(usage["thoughtTokens"]);
-        const cached = Math.min(num(usage["cachedReadTokens"]), tokens);
-        if (tokens > 0) out.push({ type: "usage", tokens, cents: 0, ...(cached > 0 ? { cached } : {}) });
         const stopped = this.#cancelled || result["stopReason"] === "cancelled";
         const next = this.#queued.shift();
         if (next !== undefined) {

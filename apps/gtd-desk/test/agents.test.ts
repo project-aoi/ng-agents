@@ -1,5 +1,5 @@
 // 分身实况 (Agents): the topology, one cell's timeline, a person's message to a cell, its controls, spilled outputs and
-// the live tail — plus the Radar fields and the control-plane tools that go with them, and the owner's budget switch.
+// the live tail — plus the Radar fields and the control-plane tools that go with them.
 
 import { execFileSync } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
@@ -28,7 +28,6 @@ import type {
   RadarDTO,
   ResourcePageDTO,
   SendCellMessageResponse,
-  SetBudgetLimitsResponse,
   StatusDTO,
   TimelineItemDTO,
   TopologyDTO,
@@ -36,11 +35,10 @@ import type {
 } from "../src/shared/api";
 import type { AgentToolResult } from "../src/agent/routes";
 import { AGENT_TOOLS } from "../src/agent/guide";
-import { budgetLimitsFromEnv } from "../src/server/boot";
 import { createEventHub } from "../src/server/events";
 import { projectReview } from "../src/server/projections/review";
 import { DEFAULT_SETTINGS, inputOf } from "../src/server/projections/common";
-import { bootDesk, cleanupAll, HOUR, makeReplyCard, registerTestPresets, requestText, tempDir, tool, writeAction, writeProject, type TestDesk } from "./helpers";
+import { bootDesk, cleanupAll, HOUR, makeReviewCard, registerTestPresets, requestText, tempDir, tool, writeAction, writeProject, type TestDesk } from "./helpers";
 
 afterEach(cleanupAll);
 
@@ -132,7 +130,7 @@ describe("GET /api/agents/topology", () => {
     const t = await d.get<TopologyDTO>("/api/agents/topology");
     expect(t.deskCellId).toBe("desk");
     expect(t.nodes.map((n) => n.cellId)).toEqual(["desk", "proj", "w1", "w2", "wt", "s1"]);
-    expect(nodeOf(t, "desk")).toMatchObject({ roleLabel: "总助理", layer: 0, parentId: null, projectId: null, archivedChildren: 1, engine: "api", processorType: "llm", canChat: true, stateLabel: "待命" });
+    expect(nodeOf(t, "desk")).toMatchObject({ roleLabel: "总助理", layer: 0, parentId: null, projectId: null, archivedChildren: 1, engine: null, processorType: "llm", canChat: true, stateLabel: "待命" });
     expect(nodeOf(t, "proj")).toMatchObject({ roleLabel: "项目协调", layer: 1, projectId: "proj", title: "支付重试改造", state: "waiting", stateLabel: "待命", cwd: repo, gitRoot: repo, unpulledCount: 0 });
     expect(nodeOf(t, "w1")).toMatchObject({
       roleLabel: "执行分身",
@@ -155,8 +153,6 @@ describe("GET /api/agents/topology", () => {
     expect(nodeOf(t, "s1")).toMatchObject({ roleLabel: "信源巡检", layer: 0, state: "waiting", modelTier: "fast" });
     expect(t.waits).toEqual([{ fromCellId: "w2", targetCellId: "proj", targetLabel: "项目协调「支付重试改造」", description: "目录里有陌生改动，等项目指示", since: expect.any(Number) }]);
     expect(t.counts).toMatchObject({ running: 0, dormant: 1, archived: 2 });
-    expect(nodeOf(t, "w1").tokensUsed).toBeGreaterThanOrEqual(0);
-    expect(nodeOf(t, "desk").tokensLimit).toBeGreaterThan(0);
     for (const n of t.nodes) expect(`${n.stateLabel} ${n.stateDetail ?? ""}`).not.toMatch(INTERNAL);
 
     // With the archive: the finished project and its worker, as history (nobody can talk to them).
@@ -172,7 +168,7 @@ describe("GET /api/agents/topology", () => {
 
     // The owner's ball: an open action of theirs on the project's books, a card of the desk's.
     const act = writeAction(k, "proj", { title: "确认最大重试次数", owner: "human", nextStep: "回复 3 还是 5" });
-    const card = makeReplyCard(k);
+    const card = makeReviewCard(k);
     const b = await d.get<TopologyDTO>("/api/agents/topology");
     expect(nodeOf(b, "proj")).toMatchObject({ state: "blocked_human", stateLabel: "等你拍板", stateDetail: "等你处理：确认最大重试次数", engageItem: { cellId: "proj", actionId: act.id } });
     expect(nodeOf(b, "desk")).toMatchObject({ state: "blocked_human", pendingCardId: card.actionId, engageItem: null });
@@ -266,9 +262,9 @@ describe("GET /api/cells/:cellId/timeline", () => {
     add({ kind: "tool_result", toolUseId: "t6", name: "send_message", output: "Sent to the owner." });
     k.context.commitSync("w1", { artifact: { artifactId: "art_r", content: { format: "markdown", title: "退避方案", body: "# 退避\n指数退避，最多 5 次" }, updatedBy: "agent" } });
     step("t7", "save_artifact", { title: "退避方案", body: "# 退避" }, "Saved art_r v1.");
-    add({ kind: "run_boundary", phase: "end", epoch: 0, outcome: "budget_stopped" });
     add({ kind: "inbound", envelope: env(PAYLOAD.jobResult, { jobId: "j1", command: "pnpm build", state: "succeeded", exitCode: 0, tail: "" }, { from: KERNEL_FROM.workspace, principalId: "cell:w1" }) });
     add({ kind: "inbound", envelope: env(PAYLOAD.stalledCheck, { projectCellId: "proj", stalledSince: t0, detail: "x" }, { from: KERNEL_FROM.stall, principalId: "kernel" }) });
+    add({ kind: "inbound", envelope: env(PAYLOAD.timerFired, { label: "复核结果" }) });
     return { d, k, repo, add, env };
   }
 
@@ -304,7 +300,6 @@ describe("GET /api/cells/:cellId/timeline", () => {
     expect(asked).toMatchObject({ text: "最大重试次数要改成 3 吗？", toOwner: true, question: true });
     expect(saved).toMatchObject({ summary: "执行了 1 步操作：保存报告", steps: [{ name: "save_artifact" }] });
     expect(art).toMatchObject({ verb: "created", artifact: { artifactId: "art_r", title: "退避方案", version: 1 } });
-    expect(of(t.items, "system_event").map((e) => e.text)).toEqual(["预算用完，已暂停推进", "后台命令结束：pnpm build（成功）", "系统巡检唤醒"]);
     expect(JSON.stringify(t.items.map((i) => ("text" in i ? i.text : "summary" in i ? i.summary : "")))).not.toMatch(INTERNAL);
 
     expect(t.pendingQuestion).toEqual({ id: asked.id, text: "最大重试次数要改成 3 吗？" });
@@ -530,16 +525,14 @@ describe("GET /api/resources", () => {
 
 // ==================== live tail ====================
 
-describe("SSE: cell_tail and job_chunk", () => {
-  it("coalesces new records per cell (latest seq wins), forwards job output at once, and leaves no timer behind on close", async () => {
+describe("SSE: cell_tail", () => {
+  it("coalesces new records per cell (latest seq wins), and leaves no timer behind on close", async () => {
     const bus = createBus();
-    const hub = createEventHub({ bus, hub: {} as never }, { debounceMs: 20 });
+    const hub = createEventHub({ bus }, { debounceMs: 20 });
     const seen: DeskEvent[] = [];
     hub.subscribe((e) => seen.push(e));
     for (const seq of [11, 12, 13]) bus.emit("evidence.appended", { cellId: "w1", seq, kind: "tool_call", runId: "r" });
     bus.emit("evidence.appended", { cellId: "w2", seq: 14, kind: "assistant_text", runId: "r" });
-    bus.emit("job.output", { jobId: "j1", cellId: "w1", chunk: "PASS src/retry.test.ts\n" });
-    expect(seen).toEqual([{ event: "job_chunk", data: { cellId: "w1", jobId: "j1", chunk: "PASS src/retry.test.ts\n" } }]);
     await sleep(60);
     expect(seen.filter((e) => e.event === "cell_tail")).toEqual([
       { event: "cell_tail", data: { cellId: "w1", lastSeq: 13 } },
@@ -685,7 +678,6 @@ describe("control plane: chat_with_desk, message_cell, inspect_cell, read_resour
     const got = await agentOk(d, "get_project", { id: "proj" });
     expect(got.text).toContain("尚未汇总至项目的 Worker 最新动态");
     expect(got.text).toContain("最大重试改成 3");
-    expect(got.text).toMatch(/额度：已用 \d+ \/ \d+ tokens/);
     expect(got.data).toMatchObject({ unpulled: [{ cellId: "w1" }], cells: expect.arrayContaining([expect.objectContaining({ id: "w1", state: "待命可唤醒" })]) });
     d.script.add("project", tool("inspect_cell", { cellId: "w1" }));
     k.sendToCell("proj", { text: "看看 w1" }, { principalId: "cell:desk" });
@@ -721,67 +713,5 @@ describe("control plane: chat_with_desk, message_cell, inspect_cell, read_resour
     expect((await agentRefused(d, "read_artifact", { id: "art_big", version: 7 })).text).toContain("has no version 7");
   });
 
-  it("no tool flips budget limits; the agent's credential does not open the owner's switch", async () => {
-    const d = await boot({ agentTokens: { main: AGENT_TOKEN }, token: "owner-token-0123456789abcdef" });
-    expect(AGENT_TOOLS.map((t) => t.name).filter((n) => /budget|limit|setting/i.test(n))).toEqual([]);
-    const r = await d.req("PUT", "/api/settings/budget-limits", { enforced: false }, { authorization: `Bearer ${AGENT_TOKEN}` });
-    expect(r.status).toBe(401);
-    expect(d.kernel.budgetLimits().enforced).toBe(true);
-    expect((await agentRefused(d, "set_budget_limits", { enforced: false })).text).toContain("Unknown tool");
-  });
-});
-
-// ==================== the owner's budget switch ====================
-
-describe("budget limits switch", () => {
-  it("NG_BUDGET_LIMITS: off/0/false, on/1/true, unset = the stored choice", async () => {
-    for (const v of ["off", "0", "false", "OFF"]) expect(budgetLimitsFromEnv(v)).toBe(false);
-    for (const v of ["on", "1", "true"]) expect(budgetLimitsFromEnv(v)).toBe(true);
-    expect(budgetLimitsFromEnv(undefined)).toBeUndefined();
-    expect(budgetLimitsFromEnv("")).toBeUndefined();
-    expect(() => budgetLimitsFromEnv("maybe")).toThrow(/NG_BUDGET_LIMITS/);
-    const d = await boot({ env: { NG_BUDGET_LIMITS: "off" } });
-    expect(d.kernel.budgetLimits().enforced).toBe(false);
-    expect((await d.get<StatusDTO>("/api/status")).budgetLimits).toEqual({ enforced: false, label: "额度限制：已关闭" });
-    // With limits off there is no limit to draw a bar against.
-    expect(nodeOf(await d.get<TopologyDTO>("/api/agents/topology"), "desk").tokensLimit).toBeNull();
-  });
-
-  it("PUT /api/settings/budget-limits: off lets a budget-stopped project go on and takes its card down; on again; bad body", async () => {
-    const d = await boot();
-    const k = d.kernel;
-    expect((await d.get<StatusDTO>("/api/status")).budgetLimits).toEqual({ enforced: true, label: "额度限制：开" });
-    k.spawnCell("desk", { id: "proj", preset: "inline", title: "调研", meta: { role: "project", projectCellId: "proj" }, bounds: { maxTokens: 1_000 } });
-    writeProject(k, "proj", { title: "调研" });
-    d.script.add("project", { text: "planning", usage: { inputTokens: 3_000, outputTokens: 2_000 } });
-    k.sendToCell("proj", { text: "start" }, { principalId: "cell:desk" });
-    await k.idle();
-    k.sendToCell("proj", { text: "second message" }, { principalId: "cell:desk" });
-    await k.idle();
-    expect((await d.get<ClarifyQueueDTO>("/api/clarify")).cards).toHaveLength(1);
-
-    let saw = "";
-    d.script.add("project", (req) => {
-      saw = requestText(req);
-      return { text: "continuing" };
-    });
-    const off = await d.req<SetBudgetLimitsResponse>("PUT", "/api/settings/budget-limits", { enforced: false });
-    expect(off.status).toBe(200);
-    expect(off.json).toMatchObject({ ok: true, enforced: false, message: "已关闭额度限制：1 个因额度暂停的任务已继续", status: { budgetLimits: { enforced: false } } });
-    await k.idle();
-    expect(saw).toContain("second message");
-    expect((await d.get<ClarifyQueueDTO>("/api/clarify")).cards).toEqual([]);
-    expect((await d.req<SetBudgetLimitsResponse>("PUT", "/api/settings/budget-limits", { enforced: false })).json.message).toBe("额度限制本来就是关着的");
-    expect((await d.req<SetBudgetLimitsResponse>("PUT", "/api/settings/budget-limits", { enforced: true })).json).toMatchObject({ enforced: true, message: "已开启额度限制" });
-    expect((await d.req("PUT", "/api/settings/budget-limits", { enforced: "no" })).status).toBe(400);
-    expect((await d.req("PUT", "/api/settings/budget-limits", {})).status).toBe(400);
-  });
-
-  it("the agent's overview and get_project say when limits are off", async () => {
-    const d = await boot({ agentTokens: { main: AGENT_TOKEN }, env: { NG_BUDGET_LIMITS: "0" } });
-    project(d, "proj", "调研");
-    expect((await agentOk(d, "workbench_overview")).text).toContain("额度限制已关闭：不会因额度暂停");
-    expect((await agentOk(d, "get_project", { id: "proj" })).text).toContain("额度：额度限制已关闭：不会因额度暂停");
-  });
 });
 

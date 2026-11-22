@@ -1,6 +1,5 @@
 import {
-  isLeafLifetime,
-  AGENT_ENGINES,
+  CLI_ENGINES,
   ISOLATION_LEVELS,
   NgError,
   PRESET_NAMES,
@@ -49,7 +48,7 @@ export function resolveSpec(registry: Registry, input: CellSpecInput, parent: Ce
   if (!input || typeof input !== "object") throw new NgError("invalid_argument", "spec must be an object");
   const { fork: _fork, parentId: _parentId, ...caller } = definedEntries(input) as CellSpec;
   if (caller.preset === "watcher") {
-    const role = caller.lifetime === "persistent" ? "reply_watcher" : "checker";
+    const role = "checker";
     if (registry.presets.has(role)) caller.preset = role;
   }
   const preset = caller.preset ? registry.presets.get(caller.preset) : undefined;
@@ -58,7 +57,7 @@ export function resolveSpec(registry: Registry, input: CellSpecInput, parent: Ce
   const defaults = (preset?.defaults ?? {}) as Partial<CellSpec>;
 
   const spec = { ...defaults, ...caller } as CellSpec;
-  if (caller.preset === "checker" || caller.preset === "reply_watcher") spec.lifetime = defaults.lifetime;
+  if (caller.preset === "checker") spec.lifetime = defaults.lifetime;
   // docs/05: a cell works where its parent works unless it says otherwise (watchers/sensors keep to themselves).
   if (typeof spec.cwd === "string" && spec.cwd) spec.cwd = normalizeCwd(spec.cwd);
   else if (parent?.spec.cwd && preset?.inheritCwd !== false) spec.cwd = parent.spec.cwd;
@@ -86,8 +85,8 @@ export function validateSpec(registry: Registry, spec: CellSpec): void {
   if (!p || (p.kind !== "llm" && p.kind !== "code")) throw new NgError("invalid_argument", "spec.processor.kind must be llm or code");
   if (p.kind === "llm") {
     if (p.prompt !== undefined && !registry.prompts.has(p.prompt)) throw new NgError("not_found", `prompt "${p.prompt}" is not registered`);
-    if (p.engine !== undefined && !(AGENT_ENGINES as readonly string[]).includes(p.engine)) {
-      throw new NgError("invalid_argument", `unknown processor.engine "${String(p.engine)}" (expected ${AGENT_ENGINES.join(" | ")})`);
+    if (p.engine !== undefined && !(CLI_ENGINES as readonly string[]).includes(p.engine)) {
+      throw new NgError("invalid_argument", `unknown processor.engine "${String(p.engine)}" (expected ${CLI_ENGINES.join(" | ")})`);
     }
     registry.resolveTools(p.toolsets ?? []);
   } else {
@@ -99,22 +98,9 @@ export function validateSpec(registry: Registry, spec: CellSpec): void {
   if (spec.contextMode !== undefined && spec.contextMode !== "isolated" && spec.contextMode !== "fork_prefix") {
     throw new NgError("invalid_argument", `invalid contextMode "${String(spec.contextMode)}"`);
   }
-  if (spec.claimMode !== undefined && spec.claimMode !== "serial_coalesce" && spec.claimMode !== "competing_workers") {
-    throw new NgError("invalid_argument", `invalid claimMode "${String(spec.claimMode)}"`);
-  }
-  if (spec.maxParallelRuns !== undefined && (!Number.isInteger(spec.maxParallelRuns) || spec.maxParallelRuns < 1)) {
-    throw new NgError("invalid_argument", "maxParallelRuns must be a positive integer");
-  }
   if (spec.cwd !== undefined && (typeof spec.cwd !== "string" || !spec.cwd.startsWith("/"))) throw new NgError("invalid_argument", "cwd must be an absolute path");
-  if (spec.cwdMode !== undefined && spec.cwdMode !== "read" && spec.cwdMode !== "write") {
-    throw new NgError("invalid_argument", `invalid cwdMode "${String(spec.cwdMode)}" (read | write)`);
-  }
   if (spec.lifetime !== undefined && spec.lifetime !== "one_shot" && spec.lifetime !== "wakeable" && spec.lifetime !== "persistent") {
     throw new NgError("invalid_argument", `invalid lifetime "${String(spec.lifetime)}" (one_shot | wakeable | persistent)`);
-  }
-  if (isLeafLifetime(spec.lifetime) && spec.claimMode === "competing_workers") {
-    // Settling a turn needs "nothing else of this cell is running" to be decidable from one claim.
-    throw new NgError("invalid_argument", `a ${spec.lifetime} cell claims serially (claimMode serial_coalesce)`);
   }
   if (spec.absorbInbound !== undefined && typeof spec.absorbInbound !== "boolean") throw new NgError("invalid_argument", "absorbInbound must be a boolean");
   for (const w of spec.watches ?? []) {

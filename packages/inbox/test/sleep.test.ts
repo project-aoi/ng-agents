@@ -27,7 +27,7 @@ describe("host suspend vs. lease expiry", () => {
   it("a 31-minute suspend pushes active leases forward instead of expiring them (the batch is delivered once)", () => {
     const t = sleepy();
     t.inbox.enqueueSync("desk", msg({ id: "m1" }));
-    const batch = t.inbox.claimNextRunSync("desk", "kernel", "serial_coalesce", 10 * MIN)!;
+    const batch = t.inbox.claimNextRunSync("desk", "kernel", 10 * MIN)!;
 
     t.suspend(31 * MIN);
     const slept = 31 * MIN - 1_000;
@@ -47,7 +47,7 @@ describe("host suspend vs. lease expiry", () => {
   it("time that really passed (both clocks moved 11 minutes) expires the lease exactly as before", () => {
     const t = sleepy();
     t.inbox.enqueueSync("desk", msg());
-    const batch = t.inbox.claimNextRunSync("desk", "kernel", "serial_coalesce", 10 * MIN)!;
+    const batch = t.inbox.claimNextRunSync("desk", "kernel", 10 * MIN)!;
     t.awake(11 * MIN);
     expect(t.inbox.tickSync()).toEqual({ fired: 0, dueCellIds: ["desk"], expiredClaims: 1 });
     expect(t.inbox.getClaimSync(batch.claimId)).toMatchObject({ status: "expired", leaseExpiresAt: batch.leaseExpiresAt });
@@ -58,7 +58,7 @@ describe("host suspend vs. lease expiry", () => {
   it("a skew of a few seconds is jitter, not a suspend", () => {
     const t = sleepy();
     t.inbox.enqueueSync("desk", msg());
-    const batch = t.inbox.claimNextRunSync("desk", "kernel", "serial_coalesce", 10 * MIN)!;
+    const batch = t.inbox.claimNextRunSync("desk", "kernel", 10 * MIN)!;
     t.suspend(10 * MIN + 1_000, 10 * MIN - 3_000); // 4 s unexplained
     expect(t.inbox.tickSync().expiredClaims).toBe(1);
     expect(t.inbox.getClaimSync(batch.claimId)!.status).toBe("expired");
@@ -68,10 +68,10 @@ describe("host suspend vs. lease expiry", () => {
   it("the lazy expiry in claimNextRunSync absorbs the suspend too: the cell stays held by its Run", () => {
     const t = sleepy();
     t.inbox.enqueueSync("desk", msg({ id: "first" }));
-    const batch = t.inbox.claimNextRunSync("desk", "kernel", "serial_coalesce", 10 * MIN)!;
+    const batch = t.inbox.claimNextRunSync("desk", "kernel", 10 * MIN)!;
     t.inbox.enqueueSync("desk", msg({ id: "arrived before the lid closed" }));
     t.suspend(31 * MIN);
-    expect(t.inbox.claimNextRunSync("desk", "kernel", "serial_coalesce", 10 * MIN)).toBeNull();
+    expect(t.inbox.claimNextRunSync("desk", "kernel", 10 * MIN)).toBeNull();
     expect(t.inbox.getClaimSync(batch.claimId)!.status).toBe("active");
     expect(t.inbox.lastSuspendSync()!.sleptMs).toBe(31 * MIN - 1_000);
     // ...and the first tick after that does not add the same suspend a second time.
@@ -84,7 +84,7 @@ describe("host suspend vs. lease expiry", () => {
   it("a suspend is absorbed even when nothing is due yet, so a long lease keeps the time it slept through", () => {
     const t = sleepy();
     t.inbox.enqueueSync("desk", msg());
-    const batch = t.inbox.claimNextRunSync("desk", "kernel", "serial_coalesce", 60 * MIN)!;
+    const batch = t.inbox.claimNextRunSync("desk", "kernel", 60 * MIN)!;
     t.suspend(31 * MIN);
     expect(t.inbox.tickSync().expiredClaims).toBe(0); // the lease was not due: the cheap path would have skipped it
     t.awake(30 * MIN); // past the original wall-clock expiry, within the lease's awake time
@@ -96,8 +96,8 @@ describe("host suspend vs. lease expiry", () => {
     const t = sleepy([{ id: "desk" }, { id: "a", parentId: "desk" }]);
     t.inbox.enqueueSync("desk", msg());
     t.inbox.enqueueSync("a", msg());
-    const d = t.inbox.claimNextRunSync("desk", "kernel", "serial_coalesce", 10 * MIN)!;
-    const a = t.inbox.claimNextRunSync("a", "kernel", "serial_coalesce", 10 * MIN)!;
+    const d = t.inbox.claimNextRunSync("desk", "kernel", 10 * MIN)!;
+    const a = t.inbox.claimNextRunSync("a", "kernel", 10 * MIN)!;
     t.suspend(31 * MIN);
     expect(t.inbox.renewLeaseSync(a.claimId, 10 * MIN)).toBe(true);
     expect(t.inbox.getClaimSync(a.claimId)!.leaseExpiresAt).toBe(t.clock.now() + 10 * MIN);
@@ -109,7 +109,7 @@ describe("host suspend vs. lease expiry", () => {
   it("an extension rolled back with its transaction is found again by the next check", () => {
     const t = sleepy();
     t.inbox.enqueueSync("desk", msg());
-    const batch = t.inbox.claimNextRunSync("desk", "kernel", "serial_coalesce", 10 * MIN)!;
+    const batch = t.inbox.claimNextRunSync("desk", "kernel", 10 * MIN)!;
     t.suspend(31 * MIN);
     expect(() =>
       withTx(t.db, () => {
@@ -126,7 +126,7 @@ describe("host suspend vs. lease expiry", () => {
   it("with a manual clock and no monotonic source, a wall jump is deliberate and expires leases as it always did", () => {
     const t = setup();
     t.inbox.enqueueSync("desk", msg());
-    const batch = t.inbox.claimNextRunSync("desk", "kernel", "serial_coalesce", 10 * MIN)!;
+    const batch = t.inbox.claimNextRunSync("desk", "kernel", 10 * MIN)!;
     t.clock.advance(31 * MIN);
     expect(t.inbox.tickSync().expiredClaims).toBe(1);
     expect(t.inbox.getClaimSync(batch.claimId)!.status).toBe("expired");

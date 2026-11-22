@@ -104,7 +104,7 @@ export interface Harness {
   restart(extra?: Partial<WorkspaceManagerOptions>): WorkspaceManager;
 }
 
-export const FAST_LIMITS = { killGraceMs: 300, jobPollMs: 40, previewPollMs: 25, bashTimeoutMs: 20_000 };
+export const FAST_LIMITS = { killGraceMs: 300, jobPollMs: 40, bashTimeoutMs: 20_000 };
 
 export function harness(extra: Partial<WorkspaceManagerOptions> = {}, cellIds: string[] = ["desk", "w1", "w2"]): Harness {
   const db = openDatabase(":memory:");
@@ -118,7 +118,7 @@ export function harness(extra: Partial<WorkspaceManagerOptions> = {}, cellIds: s
   for (const id of cellIds) cells.insert({ id, parentId: id === "desk" ? null : "desk" });
   const managers: WorkspaceManager[] = [];
   const make = (more: Partial<WorkspaceManagerOptions> = {}) => {
-    const m = createWorkspaceManager({ db, bus, clock, dataDir, inbox, ripgrep: false, ...extra, ...more, limits: { ...FAST_LIMITS, ...extra.limits, ...more.limits } });
+    const m = createWorkspaceManager({ db, bus, clock, dataDir, inbox, ...extra, ...more, limits: { ...FAST_LIMITS, ...extra.limits, ...more.limits } });
     managers.push(m);
     return m;
   };

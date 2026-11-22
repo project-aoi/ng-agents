@@ -11,13 +11,10 @@ import {
 } from "../src";
 
 const desk: PolicyBounds = makeBounds({
-  tools: ["read", "write", "edit", "bash", "code_rpc"],
-  canSendTo: ["inbox:*", "channel:web:owner", "channel:feishu:*"],
-  secretRefs: ["github", "feishu"],
+  tools: ["read", "write", "edit", "bash"],
+  canSendTo: ["inbox:*", "channel:web:owner", "channel:memory:*"],
   isolation: "none",
   maxConcurrentChildren: 5,
-  maxTokens: 1_000_000,
-  maxCents: 500,
   maxDepth: 3,
 });
 
@@ -25,11 +22,8 @@ const worker = (over: Parameters<typeof makeBounds>[0] = {}) =>
   makeBounds({
     tools: ["read", "edit", "bash"],
     canSendTo: ["inbox:desk"],
-    secretRefs: ["github"],
-    isolation: "git_worktree",
+    isolation: "none",
     maxConcurrentChildren: 2,
-    maxTokens: 200_000,
-    maxCents: 100,
     maxDepth: 2,
     ...over,
   });
@@ -41,20 +35,11 @@ describe("isSubsetBounds", () => {
   });
 
   it("rejects each kind of widening", () => {
-    expect(isSubsetBounds(worker({ tools: ["read", "write", "edit", "bash", "code_rpc"] }), makeBounds({ ...serializeBounds(desk), tools: ["read"] }))).toBe(false);
-    expect(isSubsetBounds(worker({ canSendTo: ["channel:slack:me"] }), desk)).toBe(false);
-    expect(isSubsetBounds(worker({ secretRefs: ["aws"] }), desk)).toBe(false);
+    expect(isSubsetBounds(worker({ tools: ["read", "write", "edit", "bash"] }), makeBounds({ ...serializeBounds(desk), tools: ["read"] }))).toBe(false);
+    expect(isSubsetBounds(worker({ canSendTo: ["channel:other:me"] }), desk)).toBe(false);
     expect(isSubsetBounds(worker({ maxConcurrentChildren: 6 }), desk)).toBe(false);
-    expect(isSubsetBounds(worker({ maxTokens: 1_000_001 }), desk)).toBe(false);
-    expect(isSubsetBounds(worker({ maxCents: 500.5 }), desk)).toBe(false);
   });
 
-  it("treats isolation as a floor", () => {
-    const parent = worker({ isolation: "git_worktree", maxDepth: 2 });
-    expect(isSubsetBounds(worker({ isolation: "container", maxDepth: 1 }), parent)).toBe(true);
-    expect(isSubsetBounds(worker({ isolation: "shared_ro", maxDepth: 1 }), parent)).toBe(false);
-    expect(isSubsetBounds(worker({ isolation: "none", maxDepth: 1 }), parent)).toBe(false);
-  });
 
   it("requires maxDepth to drop by one for a child, but not for narrowing", () => {
     expect(isSubsetBounds(worker({ maxDepth: 3 }), desk)).toBe(false);
@@ -65,10 +50,10 @@ describe("isSubsetBounds", () => {
   });
 
   it("covers addresses with trailing-* wildcards", () => {
-    expect(isSubsetBounds(worker({ canSendTo: ["channel:feishu:chat_1"] }), desk)).toBe(true);
-    expect(isSubsetBounds(worker({ canSendTo: ["channel:feishu:*"] }), desk)).toBe(true);
-    const narrow = makeBounds({ ...serializeBounds(desk), canSendTo: ["channel:feishu:chat_1"] });
-    expect(isSubsetBounds(worker({ canSendTo: ["channel:feishu:*"] }), narrow)).toBe(false);
+    expect(isSubsetBounds(worker({ canSendTo: ["channel:memory:chat_1"] }), desk)).toBe(true);
+    expect(isSubsetBounds(worker({ canSendTo: ["channel:memory:*"] }), desk)).toBe(true);
+    const narrow = makeBounds({ ...serializeBounds(desk), canSendTo: ["channel:memory:chat_1"] });
+    expect(isSubsetBounds(worker({ canSendTo: ["channel:memory:*"] }), narrow)).toBe(false);
   });
 
   it("always allows reporting back to the parent's own inbox when parentCellId is given", () => {
@@ -84,14 +69,13 @@ describe("bounds serialization", () => {
     const json = JSON.stringify(serializeBounds(desk));
     const back = deserializeBounds(json);
     expect(back.tools).toBeInstanceOf(Set);
-    expect(back.secretRefs).toBeInstanceOf(Set);
     expect(serializeBounds(back)).toEqual(serializeBounds(desk));
     expect(isSubsetBounds(back, desk, { relation: "narrowing" })).toBe(true);
   });
 
   it("produces stable sorted arrays", () => {
-    const b = makeBounds({ tools: ["write", "read"], secretRefs: ["b", "a"], canSendTo: ["inbox:z", "inbox:a", "inbox:a"] });
-    expect(serializeBounds(b)).toMatchObject({ tools: ["read", "write"], secretRefs: ["a", "b"], canSendTo: ["inbox:a", "inbox:z"] });
+    const b = makeBounds({ tools: ["write", "read"], canSendTo: ["inbox:z", "inbox:a", "inbox:a"] });
+    expect(serializeBounds(b)).toMatchObject({ tools: ["read", "write"], canSendTo: ["inbox:a", "inbox:z"] });
   });
 
   it("rejects malformed input", () => {
@@ -113,13 +97,10 @@ describe("bounds serialization", () => {
     expect(serializeBounds(makeBounds())).toEqual({
       tools: [],
       canSendTo: [],
-      secretRefs: [],
       isolation: "none",
       maxConcurrentChildren: 0,
-      maxTokens: 0,
-      maxCents: 0,
       maxDepth: 0,
     });
-    expect(describeBounds(desk)).toContain("Tools: bash, code_rpc, edit, read, write.");
+    expect(describeBounds(desk)).toContain("Tools: bash, edit, read, write.");
   });
 });

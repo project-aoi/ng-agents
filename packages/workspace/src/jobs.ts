@@ -1,7 +1,6 @@
 import type { ChildProcess } from "node:child_process";
 import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, rmSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { StringDecoder } from "node:string_decoder";
 import {
   afterCommit,
   cellPrincipal,
@@ -22,10 +21,9 @@ import {
   type JobState,
   type WorkspaceRecord,
 } from "@ng/protocol";
-import type { IsolationDriver } from "./drivers/types";
 import type { WorkspaceStore } from "./store";
 import type { CommandRunner, JobObservation, WorkspaceLimits, WorkspaceManagerOptions } from "./types";
-import { processIdentity, processInspection } from "@ng/protocol";
+import { processIdentity } from "@ng/protocol";
 import { errorMessage, groupAlive, killGroup, pidAlive, processHasMarker, sleep } from "./util";
 
 export const JOB_MARKER = "NG_JOB_ID";
@@ -56,7 +54,6 @@ interface LiveJob {
   quietTimer: NodeJS.Timeout | null;
   terminationRetry: NodeJS.Timeout | null;
   warned: Set<string>;
-  preview: { timer: NodeJS.Timeout; offset: number; decoder: StringDecoder } | null;
   done: Promise<void>;
   markDone: () => void;
   isDone: boolean;
@@ -81,9 +78,8 @@ export interface JobDeps {
   runner: CommandRunner;
   limits: WorkspaceLimits;
   jobsDirOf(cellId: string): string;
-  sandboxEnv(cellId: string): Record<string, string>;
-  /** The workspace record and driver of a cell, if it has one (used to signal processes inside a container). */
-  workspaceOf(cellId: string): { ws: WorkspaceRecord; driver: IsolationDriver } | undefined;
+  shell: string;
+  hostEnv(): Record<string, string>;
 }
 
 export function readTail(path: string | null, maxChars: number): string {
@@ -122,11 +118,9 @@ export class JobManager {
 
   async start(
     ws: WorkspaceRecord,
-    driver: IsolationDriver,
-    spec: { command: string; streamPreview?: boolean | undefined; timeoutMs?: number | undefined },
+    spec: { command: string; timeoutMs?: number | undefined },
   ): Promise<{ jobId: string }> {
     if (this.#closed) throw new NgError("conflict", "the workspace manager is closed");
-    if (driver.readOnly) throw new NgError("bounds_violation", `jobs are not allowed in a ${driver.level} workspace`);
     if (typeof spec?.command !== "string" || !spec.command.trim()) throw new NgError("invalid_argument", "startJob: command must be a non-empty string");
     if (spec.timeoutMs !== undefined && (!Number.isFinite(spec.timeoutMs) || spec.timeoutMs <= 0)) {
       throw new NgError("invalid_argument", "startJob: timeoutMs must be a positive number");
@@ -151,7 +145,7 @@ export class JobManager {
           throw new NgError("conflict", `cell "${cellId}" already has ${this.d.limits.maxJobsPerCell} running jobs; wait for one or cancel one`);
         }
         // The epoch is read in the same transaction that records the job: it becomes the result's expectedEpoch.
-        store.insertJob({ jobId, cellId, epoch: cell.epoch, command: spec.command, cwd: root, logPath, streamPreview: spec.streamPreview === true, timeoutMs });
+        store.insertJob({ jobId, cellId, epoch: cell.epoch, command: spec.command, cwd: root, logPath, timeoutMs });
         afterCommit(db, () => bus.emit("job.changed", { jobId, cellId, state: "running" }));
       });
     } catch (err) {
@@ -162,15 +156,10 @@ export class JobManager {
 
     let child: ChildProcess;
     try {
-      const plan = driver.plan(ws, {
-        // Carry `${JOB_MARKER}=${jobId}` as sh's $0 in addition to the env marker: on macOS with SIP, `/bin/sh` is an
-        // Apple platform binary whose environment is stripped from `ps -E`, while its argv ($0) remains visible.
-        argv: ["/bin/sh", "-c", JOB_WRAPPER, `${JOB_MARKER}=${jobId}`, driver.toSandboxPath(ws, exitPath), driver.shell(), "-c", spec.command],
-        cwd: root,
-        env: this.d.sandboxEnv(cellId),
-        marker: { name: JOB_MARKER, value: jobId },
+      child = this.d.runner.spawn({
+        file: "/bin/sh", args: ["-c", JOB_WRAPPER, `${JOB_MARKER}=${jobId}`, exitPath, this.d.shell, "-c", spec.command],
+        cwd: root, env: { ...this.d.hostEnv(), [JOB_MARKER]: jobId }, detached: true, stdio: ["pipe", fd, fd],
       });
-      child = this.d.runner.spawn({ ...plan, detached: true, stdio: ["pipe", fd, fd] });
       child.on("error", (err) => console.error(`[workspace] job ${jobId} process error:`, err));
       await new Promise<void>((resolve, reject) => {
         child.once("spawn", resolve);
@@ -206,8 +195,6 @@ export class JobManager {
         code === 0 ? { state: "succeeded", exitCode: 0, error: null } : { state: "failed", exitCode: code, error: signal ? `terminated by ${signal}` : null };
       this.#settle(live, outcome);
     });
-    // The log was created empty just above; output written before the poller starts must not be skipped.
-    if (spec.streamPreview) this.#startPreview(live, { fromStart: true });
     return { jobId };
   }
 
@@ -233,7 +220,6 @@ export class JobManager {
       quietTimer: null,
       terminationRetry: null,
       warned: new Set(),
-      preview: null,
       done,
       markDone,
       isDone: false,
@@ -378,11 +364,6 @@ export class JobManager {
     if (live.terminationRetry) clearTimeout(live.terminationRetry);
     if (live.timeoutTimer) clearTimeout(live.timeoutTimer);
     live.timeoutTimer = null;
-    if (live.preview) {
-      this.#pumpPreview(live);
-      clearInterval(live.preview.timer);
-      live.preview = null;
-    }
     this.#complete(live, outcome);
   }
 
@@ -416,50 +397,6 @@ export class JobManager {
     }
   }
 
-  // ---------- preview ----------
-
-  /** `fromStart`: a fresh job (preview everything); otherwise a job re-attached after a restart (only new output). */
-  #startPreview(live: LiveJob, opts: { fromStart?: boolean } = {}): void {
-    let offset = 0;
-    if (!opts.fromStart) {
-      try {
-        const fd = openSync(live.logPath, "r");
-        offset = fstatSync(fd).size;
-        closeSync(fd);
-      } catch {
-        offset = 0;
-      }
-    }
-    const timer = setInterval(() => this.#pumpPreview(live), this.d.limits.previewPollMs);
-    timer.unref();
-    live.preview = { timer, offset, decoder: new StringDecoder("utf8") };
-  }
-
-  #pumpPreview(live: LiveJob): void {
-    const p = live.preview;
-    if (!p) return;
-    let fd: number;
-    try {
-      fd = openSync(live.logPath, "r");
-    } catch {
-      return;
-    }
-    try {
-      const size = fstatSync(fd).size;
-      while (p.offset < size) {
-        const n = Math.min(size - p.offset, 64 * 1024);
-        const buf = Buffer.alloc(n);
-        const read = readSync(fd, buf, 0, n, p.offset);
-        if (read <= 0) break;
-        p.offset += read;
-        const chunk = p.decoder.write(buf.subarray(0, read));
-        if (chunk) this.d.bus.emit("job.output", { jobId: live.jobId, cellId: live.cellId, chunk });
-      }
-    } finally {
-      closeSync(fd);
-    }
-  }
-
   // ---------- observe / input ----------
 
   observeSync(jobId: string): JobObservation | undefined {
@@ -484,7 +421,7 @@ export class JobManager {
   /**
    * Request → kill → confirm → record, in that order (docs/05 guard 4):
    * 1. the request is written to the row (`cancel_requested_at`, the job stays `running` = "cancelling");
-   * 2. TERM → grace → KILL on the process group (and inside a container);
+   * 2. TERM → grace → KILL on the process group;
    * 3. only when nothing of the job is alive any more does it become `cancelled`, with its job.result.
    * Whoever counts running jobs (the kernel's view of who is active in which directory) therefore never sees the directory as free
    * while an old process can still write to it, and a kernel that dies between 1 and 3 leaves a row `recover()`
@@ -542,19 +479,13 @@ export class JobManager {
       if (state === false) return true; // confirmed gone or PID belongs to another process
       if (state === null) return false; // unreadable identity: never signal, never falsely claim terminated
     }
-    const target = this.d.workspaceOf(job.cellId);
-    const marker = { name: JOB_MARKER, value: job.jobId };
-    const signalAll = (sig: "TERM" | "KILL") => {
-      killGroup(pid, `SIG${sig}`);
-      if (target?.driver.killInside) void target.driver.killInside(target.ws, marker, sig).catch(() => {});
-    };
-    signalAll("TERM");
+    killGroup(pid, "SIGTERM");
     if (await this.#waitGone(job, live, this.d.limits.killGraceMs)) return true;
     if (!ours && pidAlive(pid)) {
       const state = this.#processState(job);
       if (state !== true) return state === false && !groupAlive(pid);
     }
-    signalAll("KILL");
+    killGroup(pid, "SIGKILL");
     return this.#waitGone(job, live, 2000);
   }
 
@@ -565,12 +496,7 @@ export class JobManager {
    * - `null`:  re-attached process appears alive, but its identity could not be read
    */
   #processState(job:JobRecord) {
-    const state = processHasMarker(job.pid!, JOB_MARKER, job.jobId, job.processIdentity);
-    if (state !== null || job.processIdentity) return state;
-    // Legacy rows have no persisted PID identity. Only the host clock is comparable to ps lstart.
-    const identity = processInspection.readIdentity(job.pid!);
-    const logTime = job.logPath && statSync(job.logPath, { throwIfNoEntry: false })?.mtimeMs;
-    return identity && logTime && Date.parse(identity.slice(0,24)) > logTime + 1000 ? false : null;
+    return processHasMarker(job.pid!, JOB_MARKER, job.jobId, job.processIdentity);
   }
 
   #aliveState(job: JobRecord, live: LiveJob | undefined): boolean | null {
@@ -684,7 +610,6 @@ export class JobManager {
       this.#settle(live, exit ?? { state: "failed", exitCode: null, error: "the job process ended without recording an exit status" });
     }, this.d.limits.jobPollMs);
     live.poller.unref();
-    if (job.streamPreview && job.logPath) this.#startPreview(live);
   }
 
   /** Stop watching without killing anything (the processes outlive this manager). */
@@ -695,7 +620,6 @@ export class JobManager {
       if (live.terminationRetry) clearTimeout(live.terminationRetry);
       if (live.poller) clearInterval(live.poller);
       if (live.timeoutTimer) clearTimeout(live.timeoutTimer);
-      if (live.preview) clearInterval(live.preview.timer);
       if (live.retry) clearTimeout(live.retry);
       live.child?.stdin?.destroy();
       live.child?.unref();

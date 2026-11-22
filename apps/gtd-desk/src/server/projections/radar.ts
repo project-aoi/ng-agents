@@ -42,7 +42,6 @@ function nodeState(n: CellNode, activity: KernelActivity): ProjectWorkerDTO["sta
   switch (activity.get(n.cellId)?.state) {
     case "working":
       return "running";
-    case "budget_paused":
     case "paused":
       return "paused";
     case "waiting":

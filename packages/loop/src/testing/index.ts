@@ -10,5 +10,5 @@ export {
   type FakeRunOptions,
   type FakeRunPorts,
 } from "./fake-ports";
-export { ScriptedModelClient, say, call } from "../models/scripted";
+export * from "../models/scripted";
 export { installFakeCli, FAKE_CLI_PATH, type FakeCli, type FakeCliAction, type FakeCliTurn, type FakeCliLogEntry } from "./fake-cli";

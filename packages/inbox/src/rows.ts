@@ -1,7 +1,6 @@
 import {
   fromJson,
   toBool,
-  type ClaimMode,
   type Envelope,
   type InboxMessageRecord,
   type InboxMessageStatus,
@@ -36,8 +35,7 @@ export interface ScheduleRow {
   cell_id: string;
   template_id: string;
   envelope: string;
-  cron: string | null;
-  idle_sec: number | null;
+  cron: string;
   tz: string | null;
   cancel_group: string | null;
   expected_epoch: number | null;
@@ -52,7 +50,6 @@ export interface ClaimRow {
   claim_id: string;
   cell_id: string;
   worker_id: string;
-  mode: string;
   epoch: number;
   status: string;
   claimed_at: number;
@@ -86,7 +83,6 @@ export function toSchedule(r: ScheduleRow): InboxScheduleRecord {
     cellId: r.cell_id,
     template: fromJson<Envelope>(r.envelope),
     cron: r.cron,
-    idleSec: r.idle_sec,
     tz: r.tz,
     cancelGroup: r.cancel_group,
     expectedEpoch: r.expected_epoch,
@@ -103,7 +99,6 @@ export function toClaim(r: ClaimRow): InboxClaimRecord {
     claimId: r.claim_id,
     cellId: r.cell_id,
     workerId: r.worker_id,
-    mode: r.mode as ClaimMode,
     epoch: r.epoch,
     status: r.status as InboxClaimStatus,
     claimedAt: r.claimed_at,

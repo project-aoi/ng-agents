@@ -10,8 +10,6 @@ export type FakeCliAction =
   | { text: string }
   | { mcp: string; args?: unknown }
   | { native: string; input?: unknown; output?: string; kind?: string; path?: string }
-  /** codex reports it as the session's running total (like the real CLI); `cached`: cache reads among `tokens`. */
-  | { usage: { tokens?: number; costUsd?: number; cached?: number } }
   /** codex only: a raw item emitted as `item.completed` (e.g. a code-mode `custom_tool_call`). */
   | { item: Record<string, unknown> }
   | { sleep: number }

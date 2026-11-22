@@ -4,7 +4,8 @@ import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryChannel } from "@ng/channel";
-import { ScriptedModelClient, STANDARD_TOOLSETS, type ScriptResponder, type ScriptTurn } from "@ng/loop";
+import { STANDARD_TOOLSETS } from "@ng/loop";
+import { ScriptedModelClient, type ScriptResponder, type ScriptTurn } from "@ng/loop/testing";
 import {
   gtdKeys,
   ManualClock,
@@ -18,7 +19,6 @@ import {
   type ModelRequest,
   type ProjectRecord,
   type Registry,
-  type ResponseCard,
   type SourceRecord,
 } from "@ng/protocol";
 import type { Kernel } from "@ng/cell";
@@ -124,7 +124,7 @@ export async function bootDesk(opts: Partial<DeskServerOptions> & { clock?: Manu
   const server = await createDeskServer({
     env: {},
     dataDir: tempDir("data"),
-    model: script.model,
+    detectCli: () => true,
     clock,
     channels: [memory],
     registerPresets: registerTestPresets,
@@ -132,7 +132,7 @@ export async function bootDesk(opts: Partial<DeskServerOptions> & { clock?: Manu
     log: () => undefined,
     onError: () => undefined,
     ...opts,
-    kernel: { db: ":memory:", retryBackoffMs: 1_000, ...opts.kernel },
+    kernel: { ...(opts.detectCli ? {} : { model: script.model, agentBackend: undefined }), db: ":memory:", retryBackoffMs: 1_000, ...opts.kernel },
   });
   script.kernel = server.kernel;
   cleanups.push(() => server.close());
@@ -228,47 +228,35 @@ export function inboundEnvelope(kernel: Kernel, text: string, from = "alice"): E
   };
 }
 
-export interface ReplyCardOptions {
+export interface ReviewCardOptions {
   cellId?: string;
   text?: string;
-  target?: ChannelAddr;
   subjectKey?: string;
   title?: string;
   rawInput?: string;
   envelopeId?: string;
 }
 
-/** What the desk's send_message does for an outward reply: a v1 agent draft + a deferred channel.send with a ResponseCard. */
-export function makeReplyCard(kernel: Kernel, o: ReplyCardOptions = {}): { actionId: string; artifactId: string; subjectKey: string } {
+/** A review decision bound to a versioned draft. */
+export function makeReviewCard(kernel: Kernel, o: ReviewCardOptions = {}): { actionId: string; artifactId: string; subjectKey: string } {
   const cellId = o.cellId ?? "desk";
-  const target = o.target ?? "channel:memory:alice";
   const text = o.text ?? "您好，接口下周二上线。";
   const artifactId = newId("art", kernel.clock);
   const subjectKey = o.subjectKey ?? subjectKeys.inbound(newId("env", kernel.clock));
   const saved = kernel.context.commitSync(cellId, { artifact: { artifactId, content: { format: "text", body: text }, updatedBy: "agent" } });
   if (!saved.ok) throw new Error("draft not saved");
-  const card: ResponseCard = {
-    cardType: "response",
-    subjectKey,
-    title: o.title ?? "回复 Alice：接口什么时候上线",
-    source: { label: "测试通道", channelId: "memory", at: kernel.clock.now() - 12 * MIN, ...(o.envelopeId ? { envelopeId: o.envelopeId } : {}) },
-    rawInput: { text: o.rawInput ?? "接口什么时候上线？", kind: "message" },
-    prep: { summary: "查了发布计划", checked: [{ label: "发布计划", uri: "https://example.test/plan" }] },
-    draft: { artifactId, version: 1 },
-    reply: { target, targetLabel: "Alice" },
-    confirmVerb: "send",
-  };
+  const title = o.title ?? "审阅发布计划";
+  const card = { format: "card" as const, title, body: text };
   const cell = kernel.getCell(cellId)!;
   const r = kernel.gate.authorizeSync(
     {
-      type: "channel.send",
-      target,
-      content: { format: "text", body: text },
+      type: "custom",
+      name: "review",
       artifactId,
-      summary: card.title,
+      summary: title,
       subjectKey,
       sideEffect: "external",
-      card: { format: "card", title: card.title, body: text, data: card },
+      card,
     },
     { cellId, principalId: `cell:${cellId}`, epoch: cell.epoch, artifactVersion: 1 },
   );

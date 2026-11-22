@@ -29,7 +29,6 @@ describe("the registered script sensor", () => {
     expect(ports.log.execs[0]?.args).toMatchObject({ command: expect.stringContaining("bash 'checks/pay.sh'") });
     expect(ports.log.emitted.filter((e) => e.type === PAYLOAD.sourceHit)).toHaveLength(hits);
     expect(ports.state.get(gtdKeys.source)).toMatchObject({ runCount: 1, status: exitCode ? "error" : "ok" });
-    expect(ports.log.metered).toHaveLength(0);
   });
   it("quotes script paths and env safely", () => {
     expect(scriptCommand("it's.mjs", { A: "x'y" })).toBe(`A='x'\\''y' node 'it'\\''s.mjs'`);

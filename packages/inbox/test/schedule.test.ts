@@ -15,7 +15,7 @@ describe("deliverAt", () => {
     expect(t.inbox.listMessagesSync({ deliverAfter: t.clock.now() }).map((r) => r.envelope.id)).toEqual(["remind-dentist"]);
 
     t.clock.advance(30 * MIN - 1);
-    expect(t.inbox.claimNextRunSync("desk", "k", "serial_coalesce")).toBeNull();
+    expect(t.inbox.claimNextRunSync("desk", "k")).toBeNull();
     expect(t.inbox.tickSync().dueCellIds).toEqual([]);
 
     t.clock.advance(1);
@@ -26,7 +26,7 @@ describe("deliverAt", () => {
     expect(t.takeWakes()).toEqual([]);
     expect(t.inbox.nextWakeAtSync()).toBeNull();
 
-    const batch = t.inbox.claimNextRunSync("desk", "k", "serial_coalesce")!;
+    const batch = t.inbox.claimNextRunSync("desk", "k")!;
     expect(batch.envelopes.map((e) => e.id)).toEqual(["remind-dentist"]);
   });
 
@@ -49,7 +49,7 @@ describe("deliverAt", () => {
     t.clock.now = () => wall;
     t.inbox.tickSync();
     t.inbox.enqueueSync("desk", msg({ id: mode }));
-    const claim = mode === "retried" && t.inbox.claimNextRunSync("desk", "k", "serial_coalesce");
+    const claim = mode === "retried" && t.inbox.claimNextRunSync("desk", "k");
     wall -= MIN;
     if (claim) t.inbox.releaseSync(claim.claimId, "retry", { retryAt: wall + 1000 });
     expect(t.inbox.dueCellIdsSync()).toEqual([]);
@@ -57,7 +57,7 @@ describe("deliverAt", () => {
     wall = T0;
     expect(t.inbox.tickSync().dueCellIds).toEqual(["desk"]);
     expect(t.inbox.tickSync().dueCellIds).toEqual([]);
-    expect(t.inbox.claimNextRunSync("desk", "k", "serial_coalesce")?.envelopes[0]?.id).toBe(mode);
+    expect(t.inbox.claimNextRunSync("desk", "k")?.envelopes[0]?.id).toBe(mode);
   });
 
   it("is cheap and quiet when nothing is due", () => {
@@ -88,7 +88,7 @@ describe("cancelScheduled", () => {
     expect(t.inbox.cancelScheduledSync({ cellId: "watch", cancelGroup: "quote:acme" })).toBe(2);
     t.clock.advance(48 * 60 * MIN);
     t.inbox.tickSync();
-    const batch = t.inbox.claimNextRunSync("watch", "k", "serial_coalesce")!;
+    const batch = t.inbox.claimNextRunSync("watch", "k")!;
     expect(batch.envelopes.map((e) => e.id)).toEqual(["other"]);
     const cancelled = t.inbox.listMessagesSync({ cellId: "watch", status: ["cancelled"] });
     expect(cancelled.map((r) => r.envelope.id)).toEqual(["nudge-1", "nudge-2"]);
@@ -118,7 +118,7 @@ describe("cron", () => {
     expect(t.inbox.enqueueSync("sensor", timer("sensor:schedule:0", "早 9 点查指标"), { cron: "0 9 * * *", tz: "UTC" })).toBe("accepted");
     expect(t.inbox.enqueueSync("sensor", timer("sensor:schedule:0", "早 9 点查指标"), { cron: "0 9 * * *", tz: "UTC" })).toBe("deduped");
     const [rule] = t.inbox.listSchedulesSync({ cellId: "sensor" });
-    expect(rule).toMatchObject({ cron: "0 9 * * *", tz: "UTC", idleSec: null, active: true, nextFireAt: T0 + 60 * MIN });
+    expect(rule).toMatchObject({ cron: "0 9 * * *", tz: "UTC", active: true, nextFireAt: T0 + 60 * MIN });
     expect(t.inbox.nextWakeAtSync()).toBe(T0 + 60 * MIN);
 
     t.clock.advance(59 * MIN);
@@ -129,7 +129,7 @@ describe("cron", () => {
     expect(t.inbox.tickSync().fired).toBe(0); // a second tick at the same instant cannot double-fire
 
     const fireAt = T0 + 60 * MIN;
-    const batch = t.inbox.claimNextRunSync("sensor", "k", "serial_coalesce")!;
+    const batch = t.inbox.claimNextRunSync("sensor", "k")!;
     expect(batch.envelopes).toHaveLength(1);
     const env = batch.envelopes[0]!;
     expect(env.id).toBe(`sensor:schedule:0@${fireAt}`);
@@ -188,55 +188,6 @@ describe("cron", () => {
   });
 });
 
-describe("idleSec", () => {
-  it("fires once after the cell has been idle, and is re-armed only by the next real Run", () => {
-    const t = setup();
-    t.inbox.enqueueSync("desk", timer("tidy", "后台整理"), { idleSec: 600 });
-    expect(t.inbox.nextWakeAtSync()).toBe(T0 + 600_000);
-
-    t.clock.advance(600_000);
-    expect(t.inbox.tickSync().fired).toBe(1);
-    expect(t.inbox.listSchedulesSync()[0]).toMatchObject({ nextFireAt: null, lastFiredAt: T0 + 600_000 });
-
-    // the idle Run itself is not activity: no re-arm, no firing every 10 minutes forever
-    const idleRun = t.inbox.claimNextRunSync("desk", "k", "serial_coalesce")!;
-    expect(idleRun.envelopes.map((e) => e.id)).toEqual([`tidy@${T0 + 600_000}`]);
-    t.inbox.completeSync(idleRun.claimId);
-    t.clock.advance(3_600_000);
-    expect(t.inbox.tickSync().fired).toBe(0);
-    expect(t.inbox.nextWakeAtSync()).toBeNull();
-
-    // a real Run re-arms it, counted from the end of that Run
-    t.inbox.enqueueSync("desk", msg({ id: "user" }));
-    const real = t.inbox.claimNextRunSync("desk", "k", "serial_coalesce")!;
-    t.clock.advance(120_000);
-    t.inbox.completeSync(real.claimId);
-    const endedAt = t.clock.now();
-    expect(t.inbox.listSchedulesSync()[0]!.nextFireAt).toBe(endedAt + 600_000);
-    t.clock.advance(599_999);
-    expect(t.inbox.tickSync().fired).toBe(0);
-    t.clock.advance(1);
-    expect(t.inbox.tickSync().fired).toBe(1);
-    expect(t.inbox.listMessagesSync({ type: "timer.fired" })).toHaveLength(2);
-  });
-
-  it("does not fire while a real Run is in flight or real work is waiting", () => {
-    const t = setup();
-    t.inbox.enqueueSync("desk", timer("tidy"), { idleSec: 60 });
-    t.inbox.enqueueSync("desk", msg({ id: "long-task" }));
-    const run = t.inbox.claimNextRunSync("desk", "k", "serial_coalesce", 3_600_000)!;
-    expect(t.inbox.listSchedulesSync()[0]!.nextFireAt).toBeNull(); // suspended while the Run is live
-    t.clock.advance(10 * 60_000);
-    expect(t.inbox.tickSync().fired).toBe(0);
-    t.inbox.completeSync(run.claimId);
-
-    // real work queued but not yet claimed (e.g. the cell is busy elsewhere) also blocks it; the rule re-checks later
-    t.inbox.enqueueSync("desk", msg({ id: "queued" }), { deliverAt: t.clock.now() + 60_000 });
-    t.clock.advance(60_000);
-    expect(t.inbox.tickSync().fired).toBe(0);
-    expect(t.inbox.listSchedulesSync()[0]!.nextFireAt).toBe(t.clock.now() + 60_000);
-  });
-});
 
 describe("start()/stop() with the system clock", () => {
   it("re-arms an immediate row when the wall clock rolls back between its announcement and its claim", () => {
@@ -252,10 +203,10 @@ describe("start()/stop() with the system clock", () => {
       inbox.start();
       inbox.enqueueSync("desk", msg({id:"immediate"}));
       vi.setSystemTime(T0 - MIN);
-      expect(inbox.claimNextRunSync("desk","k","serial_coalesce")).toBeNull();
+      expect(inbox.claimNextRunSync("desk","k")).toBeNull();
       vi.advanceTimersByTime(MIN);
       expect(reasons.at(-1)).toBe("due");
-      expect(inbox.claimNextRunSync("desk","k","serial_coalesce")?.envelopes[0]?.id).toBe("immediate");
+      expect(inbox.claimNextRunSync("desk","k")?.envelopes[0]?.id).toBe("immediate");
     } finally {
       inbox.stop();
       db.close();
@@ -278,7 +229,7 @@ describe("start()/stop() with the system clock", () => {
       expect(wakes).toEqual([]);
       await new Promise((r) => setTimeout(r, 150));
       expect(wakes).toEqual(["desk:due"]);
-      expect(inbox.claimNextRunSync("desk", "k", "serial_coalesce")!.envelopes.map((e) => e.id)).toEqual(["soon"]);
+      expect(inbox.claimNextRunSync("desk", "k")!.envelopes.map((e) => e.id)).toEqual(["soon"]);
     } finally {
       inbox.stop();
       db.close();

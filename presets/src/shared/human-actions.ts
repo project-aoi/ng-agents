@@ -44,10 +44,7 @@ export function humanActionDomain(db: Db, clock: Clock): StateDomain {
       id: row.key.slice(gtdKeys.actionPrefix.length),
       title: fields.title ?? card.title,
       owner: "human",
-      status:
-        fields.approvalActionId && fields.status && fields.status !== "open"
-          ? fields.status
-          : unfinishedAtClose
+      status: unfinishedAtClose
             ? "open"
             : row.status === "resolved"
               ? "done"
@@ -69,7 +66,6 @@ export function humanActionDomain(db: Db, clock: Clock): StateDomain {
     if (!record || record.owner !== "human") {
       if (existing) {
         run(db, "DELETE FROM human_item_origins WHERE cell_id=? AND key=?", [cellId, key]);
-        if (!(JSON.parse(existing.fields) as ActionRecord).approvalActionId)
           run(
             db,
             "UPDATE human_items SET disposition='cancelled',status_reason='reassigned',updated_at=?,item_revision=item_revision+1 WHERE action_id=?",
@@ -79,9 +75,6 @@ export function humanActionDomain(db: Db, clock: Clock): StateDomain {
       return false;
     }
     if (!record.id || gtdKeys.action(record.id) !== key || !record.title) throw new NgError("invalid_argument", "invalid personal action");
-    const explicit =
-      record.approvalActionId &&
-      get<{ action_id: string }>(db, "SELECT action_id FROM human_items WHERE action_id=?", [record.approvalActionId]);
     const project = record.projectCellId ?? get<{ id: string }>(db, "SELECT id FROM cells WHERE id=? AND preset='project'", [cellId])?.id;
     const subject = `action:${cellId}:${record.id}`;
     const prior = get<{ action_id: string }>(
@@ -89,20 +82,11 @@ export function humanActionDomain(db: Db, clock: Clock): StateDomain {
       "SELECT action_id FROM human_items WHERE subject_key=? AND status_reason='reassigned' ORDER BY updated_at DESC LIMIT 1",
       [subject],
     );
-    const previousLink = existing && (JSON.parse(existing.fields) as ActionRecord).approvalActionId;
-    let id = explicit ? explicit.action_id : !previousLink && existing ? existing.item_id : prior?.action_id;
-    const linked = !!explicit;
+    let id = existing?.item_id ?? prior?.action_id;
     const personal =
       !project &&
       !record.cellId &&
       get<{ parent_id: string | null }>(db, "SELECT parent_id FROM cells WHERE id=?", [cellId])?.parent_id === null;
-    if (explicit && existing && explicit.action_id !== existing.item_id && !(JSON.parse(existing.fields) as ActionRecord).approvalActionId) {
-      run(
-        db,
-        "UPDATE human_items SET disposition='cancelled',status_reason='linked',updated_at=?,item_revision=item_revision+1 WHERE action_id=?",
-        [clock.now(), existing.item_id],
-      );
-    }
     const now = Number.isFinite(record.updatedAt) ? record.updatedAt : clock.now();
     const disposition = record.status === "done" ? "executed" : record.status === "cancelled" ? "cancelled" : "pending";
     const { status, owner, updatedAt, ...fields } = record;
@@ -154,7 +138,7 @@ export function humanActionDomain(db: Db, clock: Clock): StateDomain {
           now,
         ],
       );
-    } else if (!linked) {
+    } else {
       const old = existing?.item_id === id && (entry(existing).value as ActionRecord);
       if (!old || existing?.epoch !== existing?.issuer_epoch || JSON.stringify(old) !== JSON.stringify(record))
         run(
@@ -163,18 +147,12 @@ export function humanActionDomain(db: Db, clock: Clock): StateDomain {
         artifact_id=?,item_revision=item_revision+1,updated_at=? WHERE action_id=?`,
           [card, disposition, record.effort ?? null, record.dueAt ?? null, record.artifactId ?? null, now, id],
         );
-    } else if (project)
-      run(
-        db,
-        `UPDATE human_items SET related_project_ids=json_insert(related_project_ids,'$[#]',?)
-      WHERE action_id=? AND NOT EXISTS(SELECT 1 FROM json_each(related_project_ids) WHERE value=?)`,
-        [project, id, project],
-      );
+    }
     run(
       db,
       `INSERT INTO human_item_origins(cell_id,key,item_id,fields) VALUES(?,?,?,?)
       ON CONFLICT(cell_id,key) DO UPDATE SET item_id=excluded.item_id,fields=excluded.fields`,
-      [cellId, key, id, JSON.stringify(linked ? { ...fields, status } : fields)],
+      [cellId, key, id, JSON.stringify(fields)],
     );
     return true;
   }
@@ -215,9 +193,9 @@ export function humanActionDomain(db: Db, clock: Clock): StateDomain {
       };
     }
     const source = entry.value as import("@ng/protocol").SourceRecord;
-    const schedule = get<{ cron: string | null; idle_sec: number | null; tz: string | null }>(
+    const schedule = get<{ cron: string; tz: string | null }>(
       db,
-      "SELECT cron,idle_sec,tz FROM inbox_schedules WHERE cell_id=? AND active=1 ORDER BY created_at,id LIMIT 1",
+      "SELECT cron,tz FROM inbox_schedules WHERE cell_id=? AND active=1 ORDER BY created_at,id LIMIT 1",
       [cell.id],
     );
     return {
@@ -230,7 +208,6 @@ export function humanActionDomain(db: Db, clock: Clock): StateDomain {
           ? {
               schedule: {
                 ...(schedule.cron ? { cron: schedule.cron } : {}),
-                ...(schedule.idle_sec ? { idleSec: schedule.idle_sec } : {}),
                 ...(schedule.tz ? { tz: schedule.tz } : {}),
               },
             }

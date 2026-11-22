@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Worker } from "node:worker_threads";
 import { afterEach, describe, expect, it } from "vitest";
-import { all, cellsRepo, createBus, openDatabase, systemClock, type ClaimMode } from "@ng/protocol";
+import { all, cellsRepo, createBus, openDatabase, systemClock } from "@ng/protocol";
 import { createInbox } from "../src";
 import { msg } from "./helpers";
 
@@ -17,14 +17,14 @@ interface WorkerResult {
   batches: number;
 }
 
-async function race(mode: ClaimMode, workers: number, preload: number, producePerWorker: number) {
+async function race(workers: number, preload: number, producePerWorker: number) {
   const dir = mkdtempSync(join(tmpdir(), "ng-inbox-race-"));
   dirs.push(dir);
   const path = join(dir, "ng.db");
   const db = openDatabase(path);
   cellsRepo(db, systemClock).insert({ id: "hot" });
   const inbox = createInbox({ db, bus: createBus(), clock: systemClock });
-  for (let i = 0; i < preload; i++) inbox.enqueueSync("hot", msg({ id: `race-${mode}-${i}` }));
+  for (let i = 0; i < preload; i++) inbox.enqueueSync("hot", msg({ id: `race-${i}` }));
   const total = preload + workers * producePerWorker;
 
   const shared = new SharedArrayBuffer(16);
@@ -33,7 +33,7 @@ async function race(mode: ClaimMode, workers: number, preload: number, producePe
     (_, i) =>
       new Worker(new URL("./race-worker.ts", import.meta.url), {
         execArgv: ["--import", "tsx"],
-        workerData: { path, cellId: "hot", mode, workerId: `t${i}`, produce: producePerWorker, total, shared },
+        workerData: { path, cellId: "hot", workerId: `t${i}`, produce: producePerWorker, total, shared },
       }),
   );
   const results = threads.map(
@@ -56,17 +56,9 @@ async function race(mode: ClaimMode, workers: number, preload: number, producePe
 }
 
 describe("races across threads and connections (WAL file)", () => {
-  it("competing_workers: every message is claimed exactly once", { timeout: 60_000 }, async () => {
-    const r = await race("competing_workers", 4, 150, 25);
-    expect(r.seqs).toHaveLength(250);
-    expect(new Set(r.seqs).size).toBe(250);
-    expect(r.statuses).toEqual([{ status: "done", n: 250 }]);
-    expect(r.claims).toEqual([{ status: "completed", n: 250 }]);
-    expect(r.batches.reduce((a, b) => a + b, 0)).toBe(250);
-  });
 
   it("serial_coalesce: never two live claims for the cell, nothing claimed twice", { timeout: 60_000 }, async () => {
-    const r = await race("serial_coalesce", 4, 20, 50);
+    const r = await race(4, 20, 50);
     expect(r.maxHeld).toBe(1);
     expect(r.seqs).toHaveLength(220);
     expect(new Set(r.seqs).size).toBe(220);
@@ -92,7 +84,7 @@ describe("dispatcher polling stays read-only when nothing is due", () => {
     writer.exec("BEGIN IMMEDIATE");
     try {
       const started = Date.now();
-      expect(inbox.claimNextRunSync("idle", "k", "serial_coalesce")).toBeNull();
+      expect(inbox.claimNextRunSync("idle", "k")).toBeNull();
       expect(inbox.tickSync()).toEqual({ fired: 0, dueCellIds: [], expiredClaims: 0 });
       expect(inbox.dueCellIdsSync()).toEqual([]);
       expect(inbox.nextWakeAtSync()).toBeGreaterThan(Date.now());

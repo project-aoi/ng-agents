@@ -22,11 +22,7 @@ export interface SecurityPolicy {
   token: string | null;
   /** Host header names accepted (lowercase, no port). null = any (the token is the guard). */
   allowedHosts: ReadonlySet<string> | null;
-  /**
-   * docs/05 §5.3 — credentials of external main agents for `/api/agent/*`, agent id → token. Separate from the owner's
-   * token on purpose: whoever holds one of these acts as `agent:<id>` (may orchestrate, may never approve an outward
-   * send or raise a budget), and the owner's token is not accepted on the agent API at all.
-   */
+  /** Each external agent authenticates with its own token and acts as agent:<id>. */
   agentTokens: ReadonlyMap<string, string>;
   /** The desk is bound to a loopback address. */
   loopback: boolean;

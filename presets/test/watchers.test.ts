@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { PAYLOAD, subjectKeys, type EscalationCard, type ModelRequest } from "@ng/protocol";
-import { KEYS, LEGACY, startProjectSync, type WatcherState } from "../src";
-import { boot, childrenOf, cleanupAll, continuesRun, DAY, HOUR, requestText, T0, tool, type Harness } from "./helpers";
+import { PAYLOAD, type ModelRequest } from "@ng/protocol";
+import { LEGACY, startProjectSync } from "../src";
+import { boot, childrenOf, cleanupAll, continuesRun, requestText, tool } from "./helpers";
 
 afterEach(cleanupAll);
 
@@ -9,139 +9,6 @@ function lastUserText(req: ModelRequest): string {
   const last = [...req.messages].reverse().find((m) => m.role === "user");
   return (last?.content ?? []).map((b) => (b.type === "text" ? b.text : "")).join("\n");
 }
-
-async function waitForZhang(h: Harness, extra: Record<string, unknown> = {}): Promise<{ project: string; watcher: string }> {
-  h.script.add(
-    "project",
-    tool("await_reply", { who: "张三", description: "等张三给 Doubao work 的代码地址", thread: "memory:dm-zhang", to: "channel:memory:zhang", waitHours: 1, ...extra }),
-    tool("wait", { reason: "等张三回复" }),
-  );
-  const { projectId } = startProjectSync(h.kernel, { title: "Harness 对比", outcome: "报告", brief: "对比" });
-  await h.kernel.idle();
-  return { project: projectId, watcher: childrenOf(h, projectId)[0]! };
-}
-
-const fromZhang = (h: Harness, text: string) => h.memory.inject({ from: "zhang", text, threads: ["memory:dm-zhang"] });
-
-describe("await_reply — the zero-token reply watcher reports to its project in plain words", () => {
-  it("the reply closes the watcher with one result; the project's books mark the party replied", async () => {
-    const h = await boot();
-    const { project, watcher } = await waitForZhang(h);
-    expect(h.kernel.getCell(watcher)).toMatchObject({
-      preset: "reply_watcher",
-      status: "active",
-      spec: { lifetime: "persistent", processor: { kind: "code", entry: "gtd.wait_match" }, watches: [{ threadOrFilter: { thread: "memory:dm-zhang" } }] },
-    });
-    expect(h.actions(project)).toEqual([
-      expect.objectContaining({
-        owner: "waiting",
-        status: "open",
-        cellId: watcher,
-        dueAt: T0 + HOUR,
-        waiting: expect.objectContaining({ description: "等张三给 Doubao work 的代码地址", parties: [expect.objectContaining({ label: "张三", replied: false, dueAt: T0 + HOUR })] }),
-      }),
-    ]);
-    const deskRuns = h.deskRuns();
-
-    h.script.add("project", (req) => {
-      expect(requestText(req)).toContain("张三已回复：代码在 git@x:doubao/work.git");
-      return {};
-    });
-    h.clock.advance(10 * 60_000);
-    await fromZhang(h, "代码在 git@x:doubao/work.git");
-    await h.kernel.idle();
-
-    expect(h.deskRuns()).toBe(deskRuns);
-    expect(h.kernel.getCell(watcher)).toMatchObject({ status: "closed", closeReason: "completed" });
-    expect(h.script.pending("project")).toBe(0);
-    const [a] = h.actions(project);
-    expect(a).toMatchObject({ status: "done", progress: { done: 1, total: 1 } });
-    expect(a!.waiting!.parties[0]).toMatchObject({ replied: true, repliedAt: T0 + 10 * 60_000 });
-    expect(h.kernel.inbox.listMessagesSync({ cellId: watcher, type: PAYLOAD.timerFired }).map((m) => m.status)).toEqual(["cancelled"]);
-    expect(h.script.requests.filter((r) => r.cellId === watcher)).toEqual([]); // zero tokens
-  });
-
-  it.each([false, true])("tracks an unknown standing nudge until verified (owner address=%s)", async ownerAddress => {
-    const h = await boot(ownerAddress ? {kernel:{ownerAddresses:["channel:ui:*","channel:memory:zhang"]}} : {});
-    const {watcher}=await waitForZhang(h);
-    h.kernel.gate.upsertPolicyRuleSync({match:{type:"channel.send",target:"channel:memory:zhang"},effect:"allow",createdBy:"owner"});
-    h.memory.respondWith("unknown");
-    h.clock.set(T0+HOUR);
-    await h.kernel.idle();
-    const item=h.kernel.humanItems.list().find(i=>i.cellId===watcher)!;
-    expect(item).toMatchObject({status:"unknown",attempt:1});
-    expect(h.state<WatcherState>(watcher,KEYS.watcher)?.cardActionId).toBe(item.id);
-    await h.kernel.humanItems.decide(item.id,{optionId:"system.sent",seenArtifactVersion:item.artifactVersion!,
-      seenItemRevision:item.itemRevision,seenAttempt:1},"owner");
-    await h.kernel.idle();
-    expect(h.state<WatcherState>(watcher,KEYS.watcher)).toMatchObject({status:"waiting",nudges:1});
-    expect(h.memory.deliveries).toHaveLength(1);
-  });
-
-  it("a timeout puts the drafted nudge on the watcher's own card; confirming sends it and sets the next check", async () => {
-    const h = await boot();
-    const { project, watcher } = await waitForZhang(h);
-    h.clock.set(T0 + HOUR);
-    await h.kernel.idle();
-    const [card] = h.cards();
-    expect(card).toMatchObject({ cellId: watcher, subjectKey: subjectKeys.cell(watcher) });
-    const esc = card!.clarify as EscalationCard;
-    expect(esc).toMatchObject({ cardType: "escalation", title: "张三还没回复：等张三给 Doubao work 的代码地址", escalation: { reason: "waiting_timeout", nudgeTarget: "channel:memory:zhang", nudgeDraft: { version: 1 } } });
-    expect(h.state<WatcherState>(watcher, KEYS.watcher)).toMatchObject({ status: "overdue" });
-
-    h.memory.respondWith("failed");
-    expect(await h.kernel.resolveApproval(card!.actionId, { decision:"approve", approverId:"owner", seenArtifactVersion:1 })).toMatchObject({status:"failed"});
-    await h.kernel.idle();
-    expect(h.state<WatcherState>(watcher, KEYS.watcher)).toMatchObject({cardActionId:card!.actionId, status:"overdue"});
-    expect(await h.kernel.resolveApproval(card!.actionId, { decision: "approve", approverId: "owner", seenArtifactVersion: 1 })).toMatchObject({ status: "sent" });
-    expect(h.memory.sent.map((d) => [d.target, d.content.body])).toEqual([["zhang", "您好，想跟进一下：等张三给 Doubao work 的代码地址。方便的话请回复一下，谢谢！"]]);
-    await h.kernel.idle();
-    expect(h.state<WatcherState>(watcher, KEYS.watcher)).toMatchObject({ status: "waiting", nudges: 1, dueAt: T0 + HOUR + DAY });
-    // The project learns of it at its next turn: the books move the party's deadline.
-    const notes = h.kernel.inbox.listMessagesSync({ cellId: project, type: PAYLOAD.cellProgress }).map((m) => (m.envelope.payload as { text: string }).text);
-    expect(notes.at(-1)).toContain("催问已发出");
-    h.kernel.sendToCell(project, { text: "主人：张三那边怎么样了？" });
-    await h.kernel.idle();
-    expect(h.actions(project)[0]!.waiting!.parties[0]).toMatchObject({ replied: false, dueAt: T0 + HOUR + DAY });
-
-    await fromZhang(h, "抱歉，地址是 git@x:doubao/work.git");
-    await h.kernel.idle();
-    expect(h.kernel.getCell(watcher)?.status).toBe("closed");
-    expect(h.actions(project)[0]).toMatchObject({ status: "done" });
-    expect(h.cards()).toEqual([]);
-  });
-
-  it("interpret: a small model hands off-topic messages back and records the real answer", async () => {
-    const h = await boot();
-    h.script.setDefault("watcher", (req) => {
-      if (continuesRun(req)) return {};
-      const text = lastUserText(req);
-      if (text.includes("顺便问下")) return tool("handback", { reason: "和代码无关的新问题" });
-      if (text.includes("发你了")) return tool("record_reply", { summary: "给了代码仓库地址" });
-      return tool("update_watch");
-    });
-    const { project, watcher } = await waitForZhang(h, { interpret: true });
-    expect(h.kernel.getCell(watcher)?.spec.processor).toMatchObject({ kind: "llm", modelTier: "fast", prompt: "gtd.watcher" });
-
-    h.script.add("desk", (req) => {
-      expect(requestText(req)).toContain("顺便问下");
-      return tool("wait", { reason: "noted" });
-    });
-    await fromZhang(h, "顺便问下，下周团建去哪？");
-    await h.kernel.idle();
-    expect(h.kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.handback })).toHaveLength(1);
-    expect(h.kernel.getCell(watcher)?.status).toBe("active");
-
-    h.script.add("project", (req) => {
-      expect(requestText(req)).toContain("张三已回复：给了代码仓库地址");
-      return {};
-    });
-    await fromZhang(h, "仓库地址发你了");
-    await h.kernel.idle();
-    expect(h.kernel.getCell(watcher)?.status).toBe("closed");
-    expect(h.actions(project)[0]).toMatchObject({ status: "done" });
-  });
-});
 
 describe("the default watcher: a one-shot checker that watches on its own", () => {
   it("looks, sets its own watch, sleeps; the event wakes it; it reports once and closes", async () => {
@@ -156,7 +23,7 @@ describe("the default watcher: a one-shot checker that watches on its own", () =
       (req) => {
         // a leaf: the shell, its own watches and reminders, reporting — but nothing that starts or steers cells
         const names = req.tools.map((t) => t.name);
-        expect(names).toEqual(expect.arrayContaining(["bash", "update_cell", "set_reminder", "report_to_parent", "wait"]));
+        expect(names).toEqual(expect.arrayContaining(["job_start", "update_cell", "set_reminder", "report_to_parent", "wait"]));
         for (const n of ["spawn_cell", "control_cell", "close_cell"]) expect(names).not.toContain(n);
         return tool("update_cell", { watches: [{ thread: "memory:mr-5" }] });
       },
@@ -194,7 +61,6 @@ describe("a source filtered by a small model", () => {
     await h.kernel.idle();
     const sensor = h.kernel.listCells({ parentId: "desk", preset: "sensor" })[0]!;
     expect(sensor.spec).toMatchObject({ lifetime: "persistent", processor: { kind: "llm", modelTier: "fast" } });
-    expect(sensor.spec.cwdMode).toBeUndefined();
     expect((sensor.spec.processor as { allowedTools?: unknown }).allowedTools).toBeUndefined();
     expect(h.source(sensor.id)).toMatchObject({ kind: "watch", processor: "llm", runCount: 0, hitCount: 0 });
     const deskRuns = h.deskRuns();
@@ -212,7 +78,7 @@ describe("a source filtered by a small model", () => {
     await h.kernel.idle();
     expect(h.source(sensor.id)).toMatchObject({ runCount: 2, hitCount: 1 });
     expect(h.activities()).toEqual([expect.objectContaining({ kind: "notification_archived", source: expect.objectContaining({ label: "信源 · 用户反馈重复扣款" }) })]);
-    expect(h.script.requests.find((r) => r.cellId === sensor.id)!.req.tools.map((t) => t.name)).toContain("bash");
+    expect(h.script.requests.find((r) => r.cellId === sensor.id)!.req.tools.map((t) => t.name)).toContain("job_start");
   });
 });
 
@@ -242,17 +108,4 @@ describe("cells from before docs/05", () => {
       expect.objectContaining({ childCellId: "prj_old", status: "cancelled", summary: "这个事项是旧版本创建的，已无法继续；请重新发起。" }),
     ]);
   });
-});
-
-it("keeps both overdue reply watchers' decisions visible within one project", async () => {
-  const h = await boot();
-  const parties = ["alice","bob"];
-  h.script.add("project", ...parties.map(who => tool("await_reply", {who, description:"等回复", thread:"memory:"+who, to:"channel:memory:"+who, waitHours:1})), tool("wait", {reason:"等回复"}));
-  const { projectId } = startProjectSync(h.kernel, {title:"分头跟进", outcome:"收齐回复", brief:"分别询问"});
-  await h.kernel.idle();
-  const watchers = childrenOf(h, projectId);
-  expect(watchers).toHaveLength(2);
-  h.clock.advance(HOUR);
-  await h.kernel.idle();
-  expect(h.cards().map(card => card.subjectKey).sort()).toEqual(watchers.map(id => subjectKeys.cell(id)).sort());
 });
