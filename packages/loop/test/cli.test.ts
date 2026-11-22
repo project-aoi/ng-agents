@@ -2,7 +2,7 @@ import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { createRegistry, makeBounds, TOOL_KINDS, type Address, type CliEngine, type PolicyBounds, type Registry, type RunOutcome } from "@ng/protocol";
+import { createEnvelope, createRegistry, makeBounds, TOOL_KINDS, type Address, type CliEngine, type PolicyBounds, type Registry, type RunOutcome } from "@ng/protocol";
 import {
   CLI_FORK_SESSION_KEY,
   CLI_SESSION_KEY,
@@ -299,20 +299,21 @@ describe.each(ENGINES)("CLI loop with a fake %s", (engine) => {
     expect(r.ports.log.authorizations[0]?.result.type).toBe("defer");
   });
 
-  it("replays a post-settlement system note once, and confirms only the input seen by this session", async () => {
+  it("replays system notes and external evidence once, and confirms only the input seen by this session", async () => {
     const s = setup(engine, [{actions:[{text:"first"}]}, {actions:[{text:"second"}]}]);
     const first = s.run();
     await runOf(s, first);
     const own = first.ports.state.get(CLI_SESSION_KEY) as CliSessionRecord;
     const next = s.run({runId:"second", batch:["next task"]});
-    next.snapshot.historyUptoSeq = 101;
-    next.snapshot.summaryUptoSeq = 101;
+    next.snapshot.historyUptoSeq = 102;
+    next.snapshot.summaryUptoSeq = 102;
     next.ports.state.set(CLI_SESSION_KEY, {...own,lastDeliveredEvidenceSeq:100});
     const evidence = [
       {seq:100,cellId:next.snapshot.cellId,record:{runId:"history",kind:"system_note" as const,text:"already received",at:0}},
       {seq:101,cellId:next.snapshot.cellId,record:{runId:"history",kind:"system_note" as const,text:"closure was deferred",at:1}},
-      {seq:102,cellId:next.snapshot.cellId,record:{runId:"history",kind:"inbound" as const,envelope:next.snapshot.batch.envelopes[0]!,at:2}},
-      {seq:103,cellId:next.snapshot.cellId,record:{runId:"history",kind:"system_note" as const,text:"late note",at:3}},
+      {seq:102,cellId:next.snapshot.cellId,record:{runId:null,kind:"external" as const,source:"sensor",title:"release",text:"observed while asleep",at:1}},
+      {seq:103,cellId:next.snapshot.cellId,record:{runId:"history",kind:"inbound" as const,envelope:next.snapshot.batch.envelopes[0]!,at:2}},
+      {seq:104,cellId:next.snapshot.cellId,record:{runId:null,kind:"external" as const,source:"sensor",text:"late observation",at:3}},
     ];
     next.ports.listEvidence = opts => evidence.filter(e => e.seq > (opts?.afterSeq ?? 0));
     const confirmed: number[] = [];
@@ -320,8 +321,9 @@ describe.each(ENGINES)("CLI loop with a fake %s", (engine) => {
     await runOf(s,next);
     const prompt = s.fake.prompts()[1]!;
     expect(prompt.match(/closure was deferred/g)).toHaveLength(1);
-    expect(prompt).not.toMatch(/already received|late note/);
-    expect(confirmed.at(-1)).toBe(102);
+    expect(prompt.match(/observed while asleep/g)).toHaveLength(1);
+    expect(prompt).not.toMatch(/already received|late observation/);
+    expect(confirmed.at(-1)).toBe(103);
   });
 
   it("resumes its session on the next Run with only the new input", async () => {
@@ -435,6 +437,17 @@ describe.each(ENGINES)("CLI loop with a fake %s", (engine) => {
     expect(s.fake.prompts()[0]).toContain("original parent evidence");
   });
 
+  it("replays the fork history when the parent's working directory differs", async () => {
+    const s = setup(engine,[{actions:[{text:"fresh child"}]}]);
+    const child = s.run({
+      cellId:"child", parentId:"parent", spec:{processor:{kind:"llm",toolsets:TOOLSETS},contextMode:"fork_prefix",fork:{fromCellId:"parent",uptoSeq:1}},
+      history:[{role:"user",content:[{type:"text",text:"from the parent's history"}]}, {role:"user",content:[{type:"text",text:FORK_NOTE_PREFIX+" parent"}]}],
+    });
+    child.ports.state.set(CLI_FORK_SESSION_KEY,{engine,sessionId:"parent",model:null,cwd:tempDir("another-workdir"),systemHash:"parent",lastDeliveredEvidenceSeq:1});
+    expect(await runOf(s,child)).toBe("completed");
+    expect(launches(s)[0]!.session).toBeUndefined();
+    expect(s.fake.prompts()[0]).toContain("from the parent's history");
+  });
   it("continues a fork_prefix child from the parent's CLI session when the CLI can fork", async () => {
     const s = setup(engine, [{ actions: [{ text: "parent" }] }, { actions: [{ text: "child" }] }]);
     const parent = s.run({ cellId: "parent", runId: "run_p" });
@@ -542,9 +555,11 @@ describe("CLI loop errors", () => {
     expect(cursor).toEqual([]);
     expect(first.ports.state.get(CLI_SESSION_KEY)).toMatchObject({ lastDeliveredEvidenceSeq:old.seq });
     const history = first.ports.listEvidence!({});
-    expect(history.some(e => e.record.kind === "system_note" && e.record.text.includes(steer))).toBe(false);
+    const note = history.map(e => e.record).find(e => e.kind === "system_note" && e.text.includes(steer));
+    expect(note).toMatchObject({envelopeId:"steer_1"});
 
-    const next = s.run({runId:"next", batch:[steer]});
+    const envelope = createEnvelope({id:"steer_1", from:"kernel:control", principalId:"owner", kind:"event", type:"control.steer", payload:{message:steer}});
+    const next = s.run({runId:"next", batch:[envelope]});
     next.snapshot.historyUptoSeq = history.at(-1)!.seq;
     next.ports.listEvidence = filter => history.filter(e => e.seq > (filter?.afterSeq ?? 0));
     next.ports.state.set(CLI_SESSION_KEY, first.ports.state.get(CLI_SESSION_KEY));
@@ -582,6 +597,15 @@ describe("CLI loop errors", () => {
     expect(r.ports.state.has("overflow")).toBe(false);
   });
 
+  it("advances the delivered input cursor for an AGY refusal", async () => {
+    const s = setup("agy", [{actions:[], refused:true}]);
+    const run = s.run();
+    await recordBatch(run);
+    const cursor = watchCursor(run);
+    expect(await runOf(s,run)).toBe("refused");
+    expect(cursor).toEqual([1]);
+  });
+
   it("surfaces a failing CLI as an error (the kernel retries the claim)", async () => {
     const s = setup("codex", [{ actions: [{ fail: "model overloaded" }] }]);
     const first = s.run();
@@ -592,7 +616,7 @@ describe("CLI loop errors", () => {
 });
 
   it("requeues an unconfirmed live steer and delivers it once on the next resume", async () => {
-    const s = setup("claude", [{ actions: [{sleep:600}, {mcp:"wait",args:{reason:"waiting for input"}}, {exit:0}] },
+    const s = setup("claude", [{ actions: [{awaitQueuedInput:true}, {mcp:"wait",args:{reason:"waiting for input"}}] },
       {actions:[{text:"continued"}]}],{endRunGraceMs:100});
     const first = s.run();
     await recordBatch(first);
@@ -601,10 +625,13 @@ describe("CLI loop errors", () => {
     await waitFor(()=>s.fake.prompts().length>0,"the first prompt");
     first.ports.pushSteer("review the red folder");
     expect(await outcome).toBe("yielded_waiting");
-    expect(first.ports.log.requeued.flatMap(r=>r.envelopeIds)).toHaveLength(1);
+    expect(first.ports.log.requeued.flatMap(r=>r.envelopeIds)).toEqual(["steer_1"]);
+    expect(cursor.at(-1)).toBe(1);
     const history = first.ports.listEvidence!({});
-    expect(history.some(({record})=>record.kind==="system_note" && record.text.includes("red folder"))).toBe(false);
-    const next = s.run({runId:"next",batch:["review the red folder"]});
+    expect(history.map(e => e.record)).toContainEqual(expect.objectContaining({kind:"system_note", envelopeId:"steer_1"}));
+    expect(history.some(e => e.record.kind === "assistant_text" && e.record.text === "continued")).toBe(false);
+    const envelope = createEnvelope({id:"steer_1", from:"kernel:control", principalId:"owner", kind:"event", type:"control.steer", payload:{message:"review the red folder"}});
+    const next = s.run({runId:"next",batch:[envelope]});
     next.snapshot.historyUptoSeq = history.at(-1)!.seq;
     next.ports.listEvidence = filter=>history.filter(e=>e.seq>(filter?.afterSeq ?? 0));
     next.ports.state.set(CLI_SESSION_KEY,{...first.ports.state.get(CLI_SESSION_KEY) as CliSessionRecord,lastDeliveredEvidenceSeq:cursor.at(-1)});

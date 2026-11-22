@@ -18,7 +18,7 @@ export interface SummaryInput {
   previousSummary: string | null;
   /** The messages being folded, merged (mergeAdjacentMessages), oldest first. */
   messages: ModelMessage[];
-  /** Keep the result under this many characters. */
+  /** Prose and reference list target. Complete reference addresses take precedence when they alone exceed this size. */
   maxChars: number;
 }
 
@@ -49,7 +49,7 @@ export const DEFAULT_LIMITS: ContextLimits = {
   spillTailChars: 800,
   skillIndexMaxLines: 200,
   compactAtChars: 240_000,
-  keepRecentChars: 60_000,
+  keepRecentChars: 128_000,
   summaryMaxChars: 8000,
   searchLimit: 20,
 };

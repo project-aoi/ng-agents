@@ -1,3 +1,4 @@
+import { homedir } from "node:os";
 import { describe, expect, it } from "vitest";
 import { gtdKeys, PAYLOAD, systemClock } from "@ng/protocol";
 import { createFakeRun } from "@ng/loop/testing";
@@ -30,7 +31,28 @@ describe("the registered script sensor", () => {
     expect(ports.log.emitted.filter((e) => e.type === PAYLOAD.sourceHit)).toHaveLength(hits);
     expect(ports.state.get(gtdKeys.source)).toMatchObject({ runCount: 1, status: exitCode ? "error" : "ok" });
   });
+  it("records a replayed observation once and passes the trigger to the script", async () => {
+    const processor = sensorProcessor("script:~/check.sh");
+    const fixture = createFakeRun({
+      cellId: "sensor",
+      batch: ["changed"],
+      spec: { processor, meta: { gtd: { source: { title: "reports", kind: "watch", mode: "observe", processor: "code" } } } },
+      exec: () => ({ exitCode: 0, output: "one observation" }),
+    });
+    const input = { ports: fixture.ports, snapshot: fixture.snapshot, args: processor.args!, clock: systemClock, signal: fixture.controller.signal };
+    await createScriptSensor().run(input);
+    await createScriptSensor().run({ ...input, snapshot: { ...input.snapshot, runId: "new-claim" } });
+    expect(fixture.ports.log.execs).toHaveLength(1);
+    const command = (fixture.ports.log.execs[0]!.args as { command: string }).command;
+    expect(command).toContain(scriptCommand("~/check.sh", {}).trim());
+    expect(command).toContain(`NG_TRIGGER_JSON='${JSON.stringify(input.snapshot.batch.envelopes[0])}'`);
+    expect(fixture.ports.log.knowledge).toHaveLength(1);
+    expect(fixture.ports.state.get(gtdKeys.source)).toMatchObject({ runCount: 1, hitCount: 1 });
+  });
+
   it("quotes script paths and env safely", () => {
+    expect(scriptCommand("~/check.sh", {})).toBe(`bash '${homedir()}/check.sh'`);
+    expect(() => sensorProcessor("script:  ")).toThrow("需要脚本路径");
     expect(scriptCommand("it's.mjs", { A: "x'y" })).toBe(`A='x'\\''y' node 'it'\\''s.mjs'`);
     expect(scriptCommand("/abs/run", {})).toBe(`'/abs/run'`);
   });

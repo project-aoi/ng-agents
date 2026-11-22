@@ -1,9 +1,14 @@
+import { homedir } from "node:os";
+import { join } from "node:path";
+
 export function shellQuote(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
 /** Picks an interpreter by extension so the script need not be executable. */
-export function scriptCommand(path: string, env: Record<string, string>): string {
+export function scriptCommand(script: string, env: Record<string, string>): string {
+  if (!script.trim()) throw new Error("需要脚本路径");
+  const path = script.startsWith("~/") ? join(homedir(), script.slice(2)) : script;
   const ext = /\.([a-z]+)$/i.exec(path)?.[1]?.toLowerCase();
   const q = shellQuote(path);
   let runner: string;

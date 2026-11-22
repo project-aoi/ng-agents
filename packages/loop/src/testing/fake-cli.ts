@@ -12,6 +12,7 @@ type FakeCliAction =
   | { native: string; input?: unknown; output?: string; kind?: string; path?: string }
   /** codex only: a raw item emitted as `item.completed` (e.g. a code-mode `custom_tool_call`). */
   | { item: Record<string, unknown> }
+  | { awaitQueuedInput: true }
   | { sleep: number }
   | { fail: string }
   | { exit: number };
@@ -20,7 +21,11 @@ export interface FakeCliTurn {
   actions: FakeCliAction[];
   /** Claude can report a successful result while acknowledging an interrupt. */
   acknowledgeInterrupt?: boolean;
+  /** AGY reports a refusal after the scripted actions. */
+  refused?: boolean;
   omitQueuedTurnCount?: boolean;
+  /** Claude exits after its result even if it has buffered another user turn. */
+  exitAfterTurn?: boolean;
 }
 
 interface FakeCliLogEntry {

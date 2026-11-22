@@ -200,23 +200,30 @@ export function createLifecycle(core: KernelCore): Lifecycle {
     return isOwner ? next : meetBounds(next, cell.bounds);
   }
 
-  /** Keep child ⊆ parent after a parent narrowed: re-clamp descendants (never widen them). */
-  function cascadeNarrowing(rootId: string): void {
-    const queue = [rootId];
-    while (queue.length > 0) {
-      const parent = cells.require(queue.shift()!);
+  /** Refresh inherited prefixes and tightened bounds in parent-first order. */
+  function refreshDescendants(rootId: string, rootBoundsChanged: boolean): void {
+    const queue = [{ id: rootId, narrowed: rootBoundsChanged }];
+    for (const entry of queue) {
+      const parent = cells.require(entry.id);
       for (const child of cells.children(parent.id, { status: ["active", "paused"] })) {
-        let next: PolicyBounds;
-        try {
-          next = meetBounds(attenuateBounds(parent.bounds, parent.id, child.bounds), child.bounds);
-        } catch {
-          next = meetBounds(child.bounds, { ...parent.bounds, canSendTo: [...parent.bounds.canSendTo, inboxAddr(parent.id)], maxDepth: 0 });
+        let narrowed = false;
+        if (entry.narrowed) {
+          let next: PolicyBounds;
+          try {
+            next = meetBounds(attenuateBounds(parent.bounds, parent.id, child.bounds), child.bounds);
+          } catch {
+            next = meetBounds(child.bounds, { ...parent.bounds, canSendTo: [...parent.bounds.canSendTo, inboxAddr(parent.id)], maxDepth: 0 });
+          }
+          narrowed = !sameBounds(next, child.bounds);
+          if (narrowed) {
+            cells.update(child.id, { bounds: next });
+            afterCommit(db, () => bus.emit("cell.changed", { cellId: child.id, change: "updated" }));
+          }
         }
-        if (sameBounds(next, child.bounds)) continue;
-        cells.update(child.id, { bounds: next });
-        context.refreshPrefixSync(child.id);
-        afterCommit(db, () => bus.emit("cell.changed", { cellId: child.id, change: "updated" }));
-        queue.push(child.id);
+        if (narrowed || child.spec.fork?.fromCellId === parent.id) {
+          context.refreshPrefixSync(child.id);
+          queue.push({ id: child.id, narrowed });
+        }
       }
     }
   }
@@ -346,7 +353,7 @@ export function createLifecycle(core: KernelCore): Lifecycle {
         refreshPrefix = true;
       }
       if (given.title !== undefined) next.title = given.title;
-      if (given.meta !== undefined) next.meta = given.meta;
+      if (given.meta !== undefined) { next.meta = given.meta; refreshPrefix = true; }
       if (given.processor !== undefined) {
         next.processor = given.processor;
         refreshPrefix = true;
@@ -379,8 +386,10 @@ export function createLifecycle(core: KernelCore): Lifecycle {
       }
 
       const updated = cells.update(cellId, { spec: next, title: next.title ?? null, bounds });
-      if (!sameBounds(bounds, cell.bounds)) cascadeNarrowing(cellId);
-      if (refreshPrefix) context.refreshPrefixSync(cellId);
+      if (refreshPrefix) {
+        context.refreshPrefixSync(cellId);
+        refreshDescendants(cellId, !sameBounds(bounds, cell.bounds));
+      }
       afterCommit(db, () => bus.emit("cell.changed", { cellId, change: "updated" }));
       return updated;
     });

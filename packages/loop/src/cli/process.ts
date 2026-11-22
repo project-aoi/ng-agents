@@ -1,8 +1,9 @@
+import { createHash, randomUUID } from "node:crypto";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import { groupAlive, pidAlive, processIdentity, processDescendants, processHasMarker } from "@ng/protocol";
+import { groupAlive, markedGroupState, processInspection, pidAlive, processIdentity, processDescendants, processHasMarker } from "@ng/protocol";
 
 export interface CliProcess {
   readonly child: ChildProcess;
@@ -26,7 +27,7 @@ const STDERR_KEEP = 8_192;
  */
 export function spawnCli(
   argv: readonly string[],
-  opts: { cwd: string; env: Record<string, string>; onLine(line: string): void; registry?: CliProcessRegistration },
+  opts: { cwd: string; env: Record<string, string>; onLine(line: string): void; registry?: CliProcessRegistration; killGraceMs?: number },
 ): CliProcess {
   const [file, ...args] = argv;
   if (!file) throw new Error("empty argv");
@@ -38,8 +39,19 @@ export function spawnCli(
   const child = spawn(wrapped ? "/bin/sh" : file, wrapped ? ["-c", 'trap ":" TERM; "$@"; exit $?', `${CLI_PROCESS_MARKER}=${marker}`, file, ...args] : args, { cwd: opts.cwd, env, stdio: ["pipe", "pipe", "pipe"], detached: true, windowsHide: true });
   const record = reg && marker && child.pid ? registerCliProcess(reg, { pid: child.pid, marker, cwd: opts.cwd, bin: file }) : null;
   let stopping: Promise<void> | undefined;
-  if (record) child.once("exit", () => {
-    if (!stopping && !groupAlive(child.pid!)) rmSync(record, { force: true });
+  const pid = child.pid ?? -1;
+  const leaderIsOurs = () => child.exitCode === null && child.signalCode === null;
+  function stop(graceMs: number): Promise<void> {
+    if (pid <= 0 || (!leaderIsOurs() && (pidAlive(pid) || !groupAlive(pid)))) return stopping ?? Promise.resolve();
+    stopping ??= stopProcessTree(pid, leaderIsOurs, graceMs).then(gone => {
+      if (record && gone) rmSync(record, { force: true });
+    });
+    return stopping;
+  }
+  child.once("exit", () => {
+    if (stopping) return;
+    if (groupAlive(pid)) void stop(opts.killGraceMs ?? 3_000);
+    else if (record) rmSync(record, { force: true });
   });
   let stderr = "";
   let inputOpen = true;
@@ -97,7 +109,6 @@ export function spawnCli(
     });
   });
 
-  const pid = child.pid ?? -1;
   return {
     child,
     pid,
@@ -118,14 +129,7 @@ export function spawnCli(
       inputOpen = false;
       child.stdin!.end();
     },
-    async kill(graceMs) {
-      const leaderIsOurs = () => child.exitCode === null && child.signalCode === null;
-      if (pid <= 0 || !leaderIsOurs()) return stopping;
-      stopping ??= stopProcessTree(pid, leaderIsOurs, graceMs).then(gone => {
-        if (record && gone) rmSync(record, {force:true});
-      });
-      return stopping;
-    },
+    kill: stop,
   };
 }
 
@@ -141,8 +145,34 @@ export const CLI_PROCESS_MARKER = "NG_CLI_PROC";
 export interface CliProcessRegistration {
   /** Directory of the records (`<dataDir>/cli-procs`). */
   dir: string;
+  ownerInstanceId?: string;
   runId: string;
   cellId: string;
+}
+
+const liveOwners = new Set<string>();
+let localIdentity: string | undefined;
+function identityHash(pid: number): string {
+  const stamp = processIdentity(pid);
+  return stamp ? createHash("sha256").update(stamp).digest("hex") : "";
+}
+
+export function createCliOwner(): { ownerInstanceId: string; release(): void } {
+  localIdentity ??= identityHash(process.pid);
+  const ownerInstanceId = `${process.pid}:${localIdentity}:${randomUUID()}`;
+  liveOwners.add(ownerInstanceId);
+  return { ownerInstanceId, release: () => { liveOwners.delete(ownerInstanceId); } };
+}
+
+export function isCliOwnerAlive(instanceId: string | undefined): boolean {
+  if (!instanceId) return false;
+  const [pid, stamp, instance] = instanceId.split(":");
+  if (!instance) return false;
+  const ownerPid = Number(pid);
+  if (ownerPid === process.pid) return liveOwners.has(instanceId);
+  if (!pidAlive(ownerPid)) return false;
+  const current = identityHash(ownerPid);
+  return !stamp || !current || stamp === current;
 }
 
 interface CliProcessRecord {
@@ -155,8 +185,12 @@ interface CliProcessRecord {
   startedAt: number;
   identity?: string | null;
   unknownSince?: number;
-  /** PID of the kernel process that spawned this CLI (so live re-reaps never touch the current kernel's children). */
-  ownerPid?: number;
+  ownerInstanceId?: string;
+}
+
+function registrationState(rec: CliProcessRecord): boolean | null {
+  return Number.isSafeInteger(rec.pid) && rec.pid > 0 && typeof rec.marker === "string"
+    ? markedGroupState(rec.pid, CLI_PROCESS_MARKER, rec.marker, rec.identity) : false;
 }
 
 function registerCliProcess(reg: CliProcessRegistration, p: { pid: number; marker: string; cwd: string; bin: string }): string | null {
@@ -171,7 +205,7 @@ function registerCliProcess(reg: CliProcessRegistration, p: { pid: number; marke
       cwd: p.cwd,
       bin: p.bin,
       startedAt: Date.now(),
-      ownerPid: process.pid,
+      ownerInstanceId: reg.ownerInstanceId,
       identity: process.platform === "darwin" ? processIdentity(p.pid) : null,
     };
     writeFileSync(path, JSON.stringify(rec), { mode: 0o600 });
@@ -205,10 +239,11 @@ export interface ReapedCliProcess {
   /**
    * - `"killed"`: positively identified orphan; terminated (SIGTERM/SIGKILL) and record removed.
    * - `"gone"`: confirmed exited or PID recycled; stale record removed without signalling.
+   * - `"owned"`: another kernel instance is still handling this cell.
    * - `"unknown"`: PID appears alive, but environment could not be read; NOT killed, record kept on disk so the
    *   dispatcher can hold replacement CLI runs for `cellId` until confirmed gone.
    */
-  status: "killed" | "gone" | "unknown";
+  status: "killed" | "gone" | "unknown" | "owned";
   /** true iff `status === "killed"`. */
   killed: boolean;
 }
@@ -221,7 +256,7 @@ export interface ReapedCliProcess {
  */
 export async function reapOrphanedCliProcesses(
   dir: string,
-  opts: { graceMs?: number; cellId?: string; skipOwnerPid?: number } = {},
+  opts: { graceMs?: number; cellId?: string; ownerInstanceId?: string } = {},
 ): Promise<ReapedCliProcess[]> {
   const graceMs = opts.graceMs ?? 3_000;
   let files: string[];
@@ -242,8 +277,12 @@ export async function reapOrphanedCliProcesses(
         return;
       }
       if (opts.cellId !== undefined && rec.cellId !== opts.cellId) return;
-      if (opts.skipOwnerPid !== undefined && rec.ownerPid === opts.skipOwnerPid) return;
-      const state = typeof rec.pid === "number" && rec.pid > 0 && typeof rec.marker === "string" ? cliProcessStatus(rec.pid, rec.marker, rec.identity) : false;
+      if (opts.ownerInstanceId && rec.ownerInstanceId === opts.ownerInstanceId) return;
+      const state = registrationState(rec);
+      if (state !== false && isCliOwnerAlive(rec.ownerInstanceId)) {
+        out.push({ pid: rec.pid, cellId: rec.cellId, runId: rec.runId, cwd: rec.cwd, status: "owned", killed: false });
+        return;
+      }
       if (state === null) {
         // The dispatcher retries unknown registrations within the observation window without sending a signal.
         out.push({ pid: rec.pid, cellId: rec.cellId, runId: rec.runId, cwd: rec.cwd, status: "unknown", killed: false });
@@ -272,7 +311,7 @@ export async function reapOrphanedCliProcesses(
  * cleaned up. Returns `"clear"` when no unresolved orphan remains for `cellId`, `"unknown"` if one is still unverified
  * alive (caller should defer dispatching a replacement CLI run), or `"alive"` if an identifiable orphan needs reaping.
  */
-export function probeOrphanCliCell(dir: string, cellId: string, opts: { skipOwnerPid?: number } = {}): "clear" | "unknown" | "alive" {
+export function probeOrphanCliCell(dir: string, cellId: string, opts: { ownerInstanceId?: string } = {}): "clear" | "unknown" | "alive" {
   let files: string[];
   try {
     files = readdirSync(dir).filter((f) => f.endsWith(".json"));
@@ -290,16 +329,24 @@ export function probeOrphanCliCell(dir: string, cellId: string, opts: { skipOwne
       continue;
     }
     if (rec.cellId !== cellId) continue;
-    if (opts.skipOwnerPid !== undefined && rec.ownerPid === opts.skipOwnerPid) continue;
-    const state = typeof rec.pid === "number" && rec.pid > 0 && typeof rec.marker === "string" ? cliProcessStatus(rec.pid, rec.marker, rec.identity) : false;
+    if (opts.ownerInstanceId && rec.ownerInstanceId === opts.ownerInstanceId) continue;
+    const state = registrationState(rec);
     if (state === false) {
       rmSync(path, { force: true });
+      continue;
+    }
+    if (isCliOwnerAlive(rec.ownerInstanceId)) {
+      sawUnknown = true;
       continue;
     }
     if (state === true) return "alive";
     if (rec.unknownSince === undefined) {
       rec.unknownSince = Date.now();
-      writeFileSync(path, JSON.stringify(rec), { mode: 0o600 });
+      try {
+        writeFileSync(path, JSON.stringify(rec), { mode: 0o600 });
+      } catch {
+        // Another recovery may have removed the record. Keep the hold until the next probe.
+      }
     } else if (Date.now() - rec.unknownSince >= 30_000) {
       // No verifiable process to reap. Retire the stale registration without signalling this PID.
       rmSync(path, { force: true });
@@ -312,44 +359,42 @@ export function probeOrphanCliCell(dir: string, cellId: string, opts: { skipOwne
 
 /** Called after identifying the leader. Its descendants can live in independent process groups. */
 async function stopProcessTree(pid: number, leaderIsOurs: () => boolean, graceMs: number): Promise<boolean> {
-  const tree = descendants(pid);
-  const running = () => groupAlive(pid) || tree.some(pidAlive) || (pidAlive(pid) && leaderIsOurs());
+  const tree = new Map<number, string | null>();
+  const scan = () => {
+    if (!leaderIsOurs()) return;
+    for (const child of descendants(pid)) {
+      if (!tree.has(child)) tree.set(child, processInspection.readIdentity(child));
+    }
+  };
+  const sameChild = (child: number, before: string | null) =>
+    pidAlive(child) && before !== null && processInspection.readIdentity(child) === before;
+  const ownGroup = () => leaderIsOurs() || !pidAlive(pid);
+  const groupRuns = () => groupAlive(pid) && ownGroup();
+  function signal(sig: NodeJS.Signals) {
+    if (groupRuns()) {
+      try { process.kill(-pid, sig); } catch { /* group already exited */ }
+    } else if (leaderIsOurs()) {
+      try { process.kill(pid, sig); } catch { /* leader already exited */ }
+    }
+    for (const [child, before] of tree) {
+      if (!sameChild(child, before)) continue;
+      try { process.kill(child, sig); } catch { /* descendant already exited */ }
+    }
+  }
   async function waitGone(ms: number) {
     const deadline = performance.now() + ms;
-    while (running()) {
+    while (groupRuns() || (pidAlive(pid) && leaderIsOurs()) || [...tree].some(([p, before]) => sameChild(p, before))) {
       if (performance.now() >= deadline) return false;
       await new Promise(r => setTimeout(r, 25));
     }
     return true;
   }
-  signalAll(pid, tree, "SIGTERM");
+  scan();
+  signal("SIGTERM");
   if (await waitGone(graceMs)) return true;
-  const sameLeader = leaderIsOurs();
-  if (sameLeader) tree.push(...descendants(pid));
-  // A surviving group keeps its pgid after its leader exits.
-  signalAll(pid, tree, "SIGKILL", !sameLeader && pidAlive(pid));
+  scan();
+  signal("SIGKILL");
   return waitGone(2_000);
-}
-
-function signalAll(pid: number, tree: readonly number[], sig: NodeJS.Signals, leaderGone = false): void {
-  if (!leaderGone) {
-    try {
-      process.kill(-pid, sig);
-    } catch {
-      try {
-        process.kill(pid, sig);
-      } catch {
-        // already gone
-      }
-    }
-  }
-  for (const p of tree) {
-    try {
-      process.kill(p, sig);
-    } catch {
-      // already gone
-    }
-  }
 }
 
 /** Descendant pids of `root` (cross-platform: Linux `/proc`, macOS/POSIX `ps -eo pid=,ppid=`). */

@@ -1124,7 +1124,7 @@ export function createInbox(opts: InboxOptions): InboxService {
     return all<ClaimRow>(db, sql, params).map(toClaim);
   }
 
-  function recoverClaimsSync(ropts: { workerId?: string; reason?: string } = {}): number {
+  function recoverClaimsSync(ropts: { workerId?: string; reason?: string; ownerAlive?: (id: string) => boolean } = {}): number {
     return withTx(db, () => {
       const now = clock.now();
       const rows =
@@ -1133,12 +1133,13 @@ export function createInbox(opts: InboxOptions): InboxService {
           : all<ClaimRow>(db, "SELECT * FROM inbox_claims WHERE status = 'active' AND worker_id = ? ORDER BY claimed_at", [ropts.workerId]);
       const reason = ropts.reason ?? "recovered: the process holding the claim ended";
       const cellIds = new Set<string>();
-      for (const c of rows) {
+      const stopped = rows.filter(c => !ropts.ownerAlive?.(c.worker_id));
+      for (const c of stopped) {
         finishClaim(c, "released", reason, undefined, now);
         cellIds.add(c.cell_id);
       }
       for (const id of cellIds) if (isClaimable(id, now)) announce(id, "released");
-      return rows.length;
+      return stopped.length;
     });
   }
 

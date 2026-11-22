@@ -1,5 +1,24 @@
 import type { SummaryInput } from "./deps";
-import { oneLine } from "./text";
+import { oneLine, safeTail } from "./text";
+
+/** Extract references from the original strings, before any excerpt or JSON escaping. */
+export function referencesIn(...values: unknown[]): string[] {
+  const refs = new Set<string>();
+  function visit(value: unknown) {
+    if (typeof value === "string") {
+      for (const match of value.matchAll(/(?:res|artifact):\/\/[^\s"'<>\x60\\\]\[(){}，。；、,;]+|\bart_[\w.-]+/gu))
+        refs.add(match[0].replace(/[.!?]+$/, ""));
+    } else if (value && typeof value === "object") {
+      for (const child of Object.values(value)) visit(child);
+    }
+  }
+  for (const value of values) visit(value);
+  return [...refs];
+}
+
+export function referenceLine(refs: readonly string[]): string {
+  return refs.length ? "[references] " + refs.join(" ") : "";
+}
 
 /**
  * Default summariser: no model, fully deterministic. One line per folded block (role + a clipped excerpt), appended
@@ -15,18 +34,8 @@ export function truncatingSummary(input: SummaryInput): string {
       else lines.push(`${b.isError ? "tool error" : "tool result"}: ${oneLine(b.content, 160)}`);
     }
   }
-  const kept: string[] = [];
-  let size = 0;
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i]!;
-    if (size + line.length + 1 > input.maxChars) break;
-    kept.unshift(line);
-    size += line.length + 1;
-  }
-  const dropped = lines.length - kept.length;
-  if (dropped > 0) {
-    if (kept[0]?.startsWith("… (") === true) kept.shift();
-    kept.unshift(`… (${dropped} older lines dropped)`);
-  }
-  return kept.join("\n");
+  const refs = referenceLine(referencesIn(input.previousSummary, input.messages));
+  const body = lines.filter(line => !line.startsWith("[references] ")).join("\n");
+  const remaining = input.maxChars - refs.length - (refs ? 1 : 0);
+  return [safeTail(body, remaining), refs].filter(Boolean).join("\n");
 }

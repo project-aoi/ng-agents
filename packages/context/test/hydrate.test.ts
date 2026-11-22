@@ -689,10 +689,25 @@ it("compacts a large multi-tool step only after its last result", async () => {
   expect(json(snap.history.at(-1))).toContain("both checks complete");
 });
 
-it("hydrates a legacy assignment with a null payload", () => {
-  const h = deskHarness();
-  const envelope = {...userEnvelope(h.clock, ""), type:"cell.task", payload:null};
-  simulateRun(h,"desk",[envelope], reply("ready"));
-  const snap = h.store.hydrateSync("desk", batchOf("desk", []), "isolated");
-  expect(snap.tail.notes?.some(note=>note.startsWith("[original task]"))).toBeFalsy();
+it("retains structured assignments and every reference when an oversized summary is clipped", async () => {
+  const h = deskHarness({store:{
+    limits:{compactAtChars:1800,keepRecentChars:500,summaryMaxChars:900,inlineChars:8000},
+    summarize: () => "stale entry ".repeat(1000) + "LATEST SUMMARY DECISION",
+  }});
+  const assignment = {
+    ...userEnvelope(h.clock, ""), type:"cell.task",
+    payload: {parentCellId:"lead", instruction:"Follow the release plan", input:{target:"prod", reports:["artifact://project/report@1"]}},
+  };
+  simulateRun(h, "desk", [assignment], reply("initial"));
+  simulateRun(h, "desk", [userEnvelope(h.clock, "long run")], runId => [
+    {kind:"tool_call",name:"inspect",toolUseId:"tool",input:{},runId,at:0},
+    {kind:"tool_result",name:"inspect",toolUseId:"tool",output:"x".repeat(2200)+" res://cell/report art_anchor "+"y".repeat(1900),runId,at:0},
+  ]);
+  await h.store.compact("desk",{force:true});
+  const snap = h.store.hydrateSync("desk",batchOf("desk",[]),"isolated");
+  const summary = get<{summary:string}>(h.db,"SELECT summary FROM prompt_prefixes WHERE cell_id='desk'")!.summary;
+  for (const ref of ["artifact://project/report@1", "res://cell/report", "art_anchor"]) expect(summary).toContain(ref);
+  expect(summary).toContain("LATEST SUMMARY DECISION");
+  expect(snap.tail.notes?.[0]).toContain('"target":"prod"');
+  expect(summary.length).toBeLessThanOrEqual(900);
 });

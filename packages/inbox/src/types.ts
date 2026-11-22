@@ -100,7 +100,7 @@ export interface InboxService extends Inbox {
    * Kernel startup: release every active claim (optionally only one worker's) — their Runs died with the previous
    * process. Counts as a failed attempt. Returns the number of claims released.
    */
-  recoverClaimsSync(opts?: { workerId?: string; reason?: string }): number;
+  recoverClaimsSync(opts?: { workerId?: string; reason?: string; ownerAlive?: (id: string) => boolean }): number;
   /** The last host suspend this process detected (wall time at detection, time asleep); active leases were extended by it. */
   lastSuspendSync(): { at: number; sleptMs: number } | null;
 }

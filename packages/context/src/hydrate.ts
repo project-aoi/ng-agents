@@ -30,7 +30,8 @@ import {
   rosterMessage,
   summaryMessage,
 } from "./render";
-import { oneLine } from "./text";
+import { oneLine, safeHead, safeTail } from "./text";
+import { referenceLine, referencesIn } from "./summarize";
 
 interface PrefixRow {
   cell_id: string;
@@ -146,8 +147,10 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
     if (!row?.payload) return null;
     const task = JSON.parse(row.payload);
     if (task == null) return null;
-    const refs = [...new Set((row.payload.match(/(?:res:\/\/|art_)[^\s"\],]+/g) ?? []))].join(" ").slice(0,180);
-    return `[original task] parent=${task.parentCellId ?? ""} ${refs} ${typeof task.instruction==="string" ? task.instruction : JSON.stringify(task)}`.replace(/\s+/g, " ").slice(0, 800);
+    const refs = referencesIn(task);
+    const instruction = typeof task.instruction === "string" ? oneLine(task.instruction, 800) : "";
+    const input = task.input === undefined ? "" : "input=" + stableStringify(task.input);
+    return [`[original task] parent=${task.parentCellId ?? ""}`, instruction, input, ...refs].filter(Boolean).join(" ");
   }
 
   function buildSystem(cell: CellRecord): { text: string; skills: SkillIndexEntry[] } {
@@ -242,7 +245,7 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
     upto: number | undefined,
     openAtEnd: "error" | "fork",
   ): { messages: ModelMessage[]; uptoSeq: number } {
-    // A legacy child may hydrate for the first time after its parent compacted past the fork point.
+    // A child may hydrate for the first time after its parent compacted past the fork point.
     const futureSummary = upto !== undefined && row.summary_upto_seq > upto;
     const messages = futureSummary ? [] : headMessages(row, true);
     const afterSeq = futureSummary ? 0 : row.summary_upto_seq;
@@ -321,13 +324,14 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
       if (!row || row.summary_upto_seq !== plan.baseUpto || row.compactions !== plan.baseCompactions) return null;
       const cell = cells.require(plan.cellId);
       const task = originalTask(cell.id);
-      const body = summary.split("\n").filter(line=>!line.startsWith("[original task]")).join("\n");
-      const max = limits.summaryMaxChars;
-      const prefix = task ? (task + "\n").slice(0, max) : "";
-      const remaining = max - prefix.length;
-      const label = "\n[latest work] ";
-      const suffix = plan.latestExcerpt && remaining > label.length ? label + plan.latestExcerpt.slice(-(remaining - label.length)) : "";
-      summary = (prefix + body.slice(0, remaining - suffix.length) + suffix).trim();
+      const body = summary.split("\n").filter(line => !line.startsWith("[original task]") && !line.startsWith("[references] ")).join("\n");
+      const refs = referenceLine(referencesIn(plan.input.previousSummary, plan.input.messages, summary, task));
+      const available = Math.max(0, limits.summaryMaxChars - refs.length - (refs ? 1 : 0));
+      const prefix = task ? safeHead(task, Math.floor(available / 2)) : "";
+      const remaining = Math.max(0, available - prefix.length - (prefix ? 1 : 0));
+      const latest = plan.latestExcerpt ? safeTail(plan.latestExcerpt, Math.floor(remaining / 2) - 15) : "";
+      const suffix = latest ? "[latest work] " + latest : "";
+      summary = [prefix, safeTail(body, remaining - suffix.length - (suffix ? 1 : 0)), suffix, refs].filter(Boolean).join("\n").trim();
       // The cache is lost at a compaction anyway, so the cell switches to its own, freshly built system prefix.
       const sys = buildSystem(cell);
       run(

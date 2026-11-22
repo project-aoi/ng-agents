@@ -174,6 +174,9 @@ export function createContextStore(opts: ContextStoreOptions): ContextStore {
         afterCommit(db, () => bus.emit("state.changed", { cellId, keys }));
       }
 
+      if (tx.appendReference) {
+        knowledge.upsert(cellId, { ...tx.appendReference, kind: "reference", scope: "cell", mode: "append" });
+      }
       const version = decision ? artifacts.apply(cellId, tx.artifact!, decision) : undefined;
 
       for (const out of tx.inboxOut ?? []) {

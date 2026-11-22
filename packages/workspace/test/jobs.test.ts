@@ -3,7 +3,7 @@ import { once } from "node:events";
 import { existsSync, fstatSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { isNgError, run, validatePayload, type JobResultPayload } from "@ng/protocol";
+import { groupAlive, isNgError, run, validatePayload, type JobResultPayload } from "@ng/protocol";
 import { defaultCommandRunner, JOB_MARKER, type CommandRunner } from "../src";
 import { markedAlive, processHasMarker, processInspection, psEnvironment } from "../src/util";
 import { cleanupAll, harness, pidGone, waitFor } from "./helpers";
@@ -171,6 +171,29 @@ describe("jobs", () => {
     expect(envs).toHaveLength(1);
     expect((envs[0]!.payload as JobResultPayload).tail).toContain("late");
     // writeJobInput is unavailable after a restart (the stdin pipe died with the old kernel) — documented.
+  });
+
+  it.each(["live", "reattached", "already exited"])("waits for background children before publishing the result of a %s job", async (mode) => {
+    const h = harness({limits: {killGraceMs: 400}});
+    const port = await h.mgr.acquire("w1");
+    const body = 'process.on("SIGTERM", () => {}); console.log("helper ready"); setInterval(()=>{}, 1000)';
+    const {jobId} = await port.startJob({command: `"${process.execPath}" -e '${body}' & while [ ! -f release ]; do sleep .05; done; exit 7`});
+    const job = h.mgr.getJobSync(jobId)!;
+    await waitFor(() => readFileSync(job.logPath!, "utf8").includes("helper ready"));
+    let mgr = h.mgr;
+    if (mode !== "live") {
+      h.mgr.close();
+      mgr = h.restart();
+      if (mode === "reattached") await mgr.recover();
+    }
+    writeFileSync(join(port.root!, "release"), "");
+    await waitFor(() => pidGone(job.pid!));
+    expect(groupAlive(job.pid!)).toBe(true);
+    expect(mgr.getJobSync(jobId)!.state).toBe("running");
+    if (mode === "already exited") await mgr.recover();
+    expect(await finished({mgr}, jobId)).toMatchObject({state:"failed", exitCode:7});
+    expect(groupAlive(job.pid!)).toBe(false);
+    expect(h.inbox.list("w1").filter(e => e.type === "job.result")).toHaveLength(1);
   });
 
   it("recover() marks a job whose process died with the old kernel as failed", async () => {

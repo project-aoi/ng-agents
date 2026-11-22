@@ -1,6 +1,7 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   isNgError,
   PAYLOAD,
@@ -12,6 +13,7 @@ import {
 import { boot, cleanupAll, sleep, tempDir, waitFor } from "./helpers";
 
 afterEach(async () => {
+  vi.useRealTimers();
   processInspection.useProc = origUseProc;
   processInspection.readEnvironment = origReadEnv;
   await cleanupAll();
@@ -25,6 +27,64 @@ describe("Phase 0 (@ng/cell) — BUG-020, BUG-027, BUG-028, BUG-034", () => {
     const first = await boot({ start: false });
     const reader = await boot({ dataDir: first.dataDir, start: false });
     expect(reader.kernel.getCell("desk")?.id).toBe("desk");
+  });
+
+  it("preserves a running kernel's claim when another kernel starts in the same process", async () => {
+    const first = await boot();
+    let finish!: () => void;
+    let started!: () => void;
+    const pending = new Promise<void>(r => { finish = r; });
+    const ready = new Promise<void>(r => { started = r; });
+    first.script.add("desk", async () => { started(); await pending; return { text: "finished" }; });
+    first.kernel.inbox.enqueueSync("desk", { id: "work", from: "inbox:desk", principalId: "owner", kind: "event",
+      type: PAYLOAD.userMessage, payload: { text: "work" }, createdAt: first.clock.now() });
+    try {
+      await ready;
+      const second = await boot({ dataDir: first.dataDir, desk: false });
+      expect(second.kernel.inbox.listClaimsSync({cellId: "desk", status:["active"]})).toHaveLength(1);
+      expect(second.of("run.started")).toHaveLength(0);
+    } finally {
+      finish();
+    }
+    await first.kernel.idle();
+    expect(first.kernel.inbox.listMessagesSync({cellId:"desk", envelopeId:"work"})[0]?.status).toBe("done");
+  });
+
+  it("holds a cell during a reap even when an intervening probe would see no registration", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    const h = await boot({ start: false });
+    h.kernel.spawnCell("desk", {id:"w", preset:"worker"});
+    const dir = join(h.dataDir, "cli-procs");
+    mkdirSync(dir, {recursive:true});
+    const leader = spawn(process.execPath, ["-e", [
+      'const {writeFileSync} = require("fs");',
+      'process.on("SIGTERM", () => writeFileSync("stopping", ""));',
+      'process.on("SIGUSR2", () => process.exit(0));',
+      'writeFileSync("ready", ""); setInterval(() => {}, 1000);',
+    ].join(" ")], {cwd:dir, detached:true, stdio:"ignore"});
+    const record = join(dir, `${leader.pid}.json`);
+    const wake = (id: string) => h.kernel.inbox.enqueueSync("w", {id, from:"inbox:desk", principalId:"owner",
+      kind:"event", type:PAYLOAD.userMessage, payload:{text:"work"}, createdAt:h.clock.now()});
+    try {
+      await waitFor(() => existsSync(join(dir, "ready")));
+      writeFileSync(record, JSON.stringify({pid:leader.pid, marker:"reap", runId:"old", cellId:"w", cwd:dir}));
+      processInspection.useProc = false;
+      processInspection.readEnvironment = () => null;
+      await h.kernel.start();
+      processInspection.readEnvironment = () => "node NG_CLI_PROC=reap";
+      wake("first");
+      await waitFor(() => existsSync(join(dir, "stopping")));
+      rmSync(record, {force:true});
+      vi.advanceTimersByTime(2_001);
+      wake("second");
+      await new Promise(resolve => setImmediate(resolve));
+      expect(h.of("run.started").filter(e => e.cellId === "w")).toHaveLength(0);
+      leader.kill("SIGUSR2");
+      await waitFor(() => h.of("run.finished").some(e => e.cellId === "w"));
+      expect(h.of("run.started").filter(e => e.cellId === "w")).toHaveLength(1);
+    } finally {
+      if (leader.exitCode === null && leader.signalCode === null) leader.kill("SIGKILL");
+    }
   });
 
   it("BUG-020: closeCell physically forbids closing the root cell", async () => {

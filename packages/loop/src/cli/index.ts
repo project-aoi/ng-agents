@@ -30,6 +30,8 @@ export { agyAdapter, agyArgs, agyPermissionAllowed } from "./adapters/agy";
 export { renderTranscript, tailText, freshPrompt, forkNoteIndex, FORK_NOTE_PREFIX } from "./render";
 export {
   spawnCli,
+  createCliOwner,
+  isCliOwnerAlive,
   descendants,
   probeVersion,
   reapOrphanedCliProcesses,

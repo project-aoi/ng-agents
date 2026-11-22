@@ -31,7 +31,8 @@ import { startToolBridge, type BridgeCallResult, type ToolBridge } from "./bridg
 import { cliEnvironment } from "./env";
 import { spawnCli, type CliProcess } from "./process";
 import { launchChoice, type CliModelChoice } from "./models";
-import { rebuildFreshPrompt, renderEvidenceInbound, type AppendedInput } from "./input";
+import { rebuildFreshPrompt, renderEvidenceExternal, renderEvidenceInbound, type AppendedInput } from "./input";
+import { CLI_MCP_SERVER, kernelSystem } from "./instructions";
 import { forkNoteIndex, freshPrompt, tailText } from "./render";
 import type { CliAdapter, CliCapabilities, CliDriver, CliEvent, CliModels, CliSessionRecord, DriverIO, LaunchRequest } from "./types";
 
@@ -39,8 +40,7 @@ import type { CliAdapter, CliCapabilities, CliDriver, CliEvent, CliModels, CliSe
 export const CLI_SESSION_KEY = "cli:session";
 /** Set by the kernel on a fork_prefix child: the parent's CliSessionRecord at spawn time. */
 export const CLI_FORK_SESSION_KEY = "cli:session:fork";
-/** MCP server name the kernel tools are published under. */
-export const CLI_MCP_SERVER = "ng";
+export { CLI_MCP_SERVER } from "./instructions";
 
 export const RUN_ENDED_NOTICE =
   "[The kernel ended this run with that result. Stop now: make no further tool calls and do no further work; reply with at most one short sentence. You will be woken with the next message.]";
@@ -94,7 +94,7 @@ export interface CliAgentLoopOptions {
    * Where running CLI processes are put on record (`<dataDir>/cli-procs`), so the next kernel can stop the ones a
    * crashed kernel left behind (reapOrphanedCliProcesses) before it starts another agent in the same directory.
    */
-  procDir?: string;
+  processRegistry?: { dir: string; ownerInstanceId: string };
   /** Replace the adapter (tests). */
   adapter?: CliAdapter;
   /** Diagnostics: invocations, CLI notices, refused permissions, stderr of failed processes. */
@@ -207,7 +207,6 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
     // ---------- input ----------
     const initialBatchIds = new Set(snapshot.batch.envelopes.map((e) => e.id));
     const tracked = new Map<string, AppendedInput>();
-    const steerSeqToEnvelopeId = new Map<number, string>();
     const initialTail = tailText(snapshot);
     const initialSteerItems: AppendedInput[] = [];
     for (const m of ports.drainSteer()) {
@@ -222,20 +221,21 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
     // ---------- session plan ----------
     const own = await ports.context.readState<CliSessionRecord>(cellId, CLI_SESSION_KEY);
     const sameModel = (r: CliSessionRecord) => (r.model ?? "") === (model ?? "");
-    let plan: { session?: LaunchRequest["session"]; prompt: string; forkedFrom?: string };
+    let plan: { session?: LaunchRequest["session"]; prompt: string; forkedFrom?: string; parentHash?: string };
     let releaseParent: (()=>void) | undefined;
     let sessionBaselineSeq = snapshot.historyUptoSeq;
     if (own && own.engine === engine && own.cwd === access.root && own.systemHash === snapshot.system.hash && sameModel(own)) {
       sessionBaselineSeq = own.lastDeliveredEvidenceSeq;
-      const missed = (ports.listEvidence?.({ afterSeq: sessionBaselineSeq }) ?? []).filter(entry =>
-        entry.seq <= snapshot.historyUptoSeq && (entry.record.kind === "system_note" ||
-        (entry.record.kind === "inbound" && !initialBatchIds.has(entry.record.envelope.id))));
-      const seenEnvelopes = new Set<string>();
-      const catchup = missed.flatMap(({ record }) => {
-        if (record.kind === "system_note") return [record.text];
-        if (record.kind !== "inbound" || seenEnvelopes.has(record.envelope.id)) return [];
-        seenEnvelopes.add(record.envelope.id);
-        return [renderEvidenceInbound(record.envelope)];
+      const seenEnvelopes = new Set([...initialBatchIds, ...tracked.keys()]);
+      const missed = ports.listEvidence?.({ afterSeq: sessionBaselineSeq }) ?? [];
+      const catchup = missed.flatMap(({ seq, record }) => {
+        if (seq > snapshot.historyUptoSeq) return [];
+        if (record.kind === "external") return [renderEvidenceExternal(record)];
+        if (record.kind !== "inbound" && record.kind !== "system_note") return [];
+        const id = record.kind === "inbound" ? record.envelope.id : record.envelopeId;
+        if (id && seenEnvelopes.has(id)) return [];
+        if (id) seenEnvelopes.add(id);
+        return [record.kind === "inbound" ? renderEvidenceInbound(record.envelope) : record.text];
       });
       plan = { session: { id: own.sessionId, mode: "resume" }, prompt: [...(catchup.length ? ["[Earlier events already handled while you were asleep — use as context]\n" + catchup.join("\n")] : []), input].join("\n\n") };
     } else {
@@ -244,11 +244,11 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
       if (forkIdx >= 0) {
         const parent = await ports.context.readState<CliSessionRecord>(cellId, CLI_FORK_SESSION_KEY);
         const point = snapshot.spec.fork;
-        if (parent && point && parent.engine === engine && sameModel(parent) && (engine !== "claude" || parent.cwd===access.root)
+        if (parent && point && parent.engine === engine && sameModel(parent) && parent.cwd === access.root
             && !activeCells.has(point.fromCellId) && !readingParent.has(point.fromCellId) &&
-            ports.canForkSession(point.fromCellId,point.uptoSeq,parent.sessionId,parent.lastDeliveredEvidenceSeq)) {
+            ports.canForkSession(point.fromCellId,point.uptoSeq,parent.sessionId,parent.lastDeliveredEvidenceSeq,parent.systemHash)) {
           sessionBaselineSeq = parent.lastDeliveredEvidenceSeq;
-          plan = { session: { id: parent.sessionId, mode: "fork" }, prompt: freshPrompt(snapshot.history.slice(forkIdx), input), forkedFrom: parent.sessionId };
+          plan = { session: { id: parent.sessionId, mode: "fork" }, prompt: freshPrompt(snapshot.history.slice(forkIdx), input), forkedFrom: parent.sessionId, parentHash: parent.systemHash };
           // The fork note is the first "earlier" message the child shows; the parent's part is in the forked session.
           plan.prompt = plan.prompt.replace(/^\[Earlier conversation[^\]]*\]\n\n/, "");
         }
@@ -283,7 +283,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
     let endTimer: ReturnType<typeof setTimeout> | undefined;
     let persist: Promise<unknown> = Promise.resolve();
     const io: DriverIO = {
-      write: (line) => live.proc?.write(line) ?? false,
+      write: (line) => !endOutcome && (live.proc?.write(line) ?? false),
       end: () => live.proc?.endInput(),
     };
 
@@ -365,7 +365,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
         // The CLI demonstrably processed the active turn of this leg to invoke this tool: confirm items belonging to
         // this active turn (including turn_end follow-ups), while leaving any mid-turn queued steers unconfirmed.
         await eventChain;
-        await confirmTurn(leg, live.legTurns + 1);
+        confirmTurn(leg, live.legTurns + 1);
         if (endOutcome === undefined || RUN_END_PRECEDENCE.indexOf(result.endRun) < RUN_END_PRECEDENCE.indexOf(endOutcome)) endOutcome = result.endRun;
         text = `${text}\n\n${RUN_ENDED_NOTICE}`;
         armEndGrace();
@@ -373,16 +373,12 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
       return { text, ...(result.isError ? { isError: true } : {}) };
     }
 
-    async function confirmTurn(legNo: number, turn: number) {
-      if (stopReason === "cancelled" || stopReason === "timeout" || signal.aborted) return;
+    function confirmTurn(legNo: number, turn: number) {
+      if (endOutcome || stopReason === "cancelled" || stopReason === "timeout" || signal.aborted) return;
       sessionProgress = true;
       for (const item of tracked.values()) {
         if (item.status !== "sent" || item.sentInLeg !== legNo || (item.confirmAtTurn ?? 1) !== turn) continue;
         item.status = "confirmed";
-        if (item.kind === "steer") {
-          const ev = await append({kind:"system_note", text:item.text});
-          steerSeqToEnvelopeId.set(ev.seq, item.envelopeId);
-        }
       }
       awaitingSessionConfirmation = !sessionId;
       confirmCursor();
@@ -392,9 +388,9 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
       if (sessionId && ports.confirmCliInput && ports.listEvidence) {
         let through = sessionBaselineSeq;
         for (const { seq, record } of ports.listEvidence({ afterSeq: through })) {
-          if (record.kind !== "inbound" && record.kind !== "system_note") continue;
+          if (record.kind !== "inbound" && record.kind !== "system_note" && record.kind !== "external") continue;
           if (seq > snapshot.historyUptoSeq) {
-            const id = record.kind === "inbound" ? record.envelope.id : steerSeqToEnvelopeId.get(seq);
+            const id = record.kind === "inbound" ? record.envelope.id : record.kind === "system_note" ? record.envelopeId : undefined;
             if (!id || (!initialBatchIds.has(id) && tracked.get(id)?.status !== "confirmed")) break;
           }
           through = seq;
@@ -406,7 +402,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
     async function countStep(): Promise<void> {
       steps++;
       if (maxSteps !== undefined && steps > maxSteps && !endOutcome) {
-        await confirmTurn(leg, live.legTurns + 1);
+        confirmTurn(leg, live.legTurns + 1);
         stop("steps");
       }
     }
@@ -434,7 +430,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
         if (nextSession?.mode === "fork") {
           const point=snapshot.spec.fork!;
           if (activeCells.has(point.fromCellId) || readingParent.has(point.fromCellId) ||
-              !ports.canForkSession(point.fromCellId,point.uptoSeq,nextSession.id,sessionBaselineSeq)) {
+              !plan.parentHash || !ports.canForkSession(point.fromCellId,point.uptoSeq,nextSession.id,sessionBaselineSeq,plan.parentHash)) {
             nextSession=undefined;
             sessionBaselineSeq = snapshot.historyUptoSeq;
             nextPrompt=freshPrompt(snapshot.history,input);
@@ -497,7 +493,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
           delete plan.forkedFrom;
           nextSession = undefined;
           nextPromptItems = out.relaunchItems;
-          nextPrompt = rebuildFreshPrompt(snapshot, initialBatchIds, ports, tracked, steerSeqToEnvelopeId, out.relaunchItems);
+          nextPrompt = rebuildFreshPrompt(snapshot, initialBatchIds, ports, tracked, out.relaunchItems);
           continue;
         }
         const canRelaunch =
@@ -526,7 +522,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
               // No session to continue (the CLI never reported one): rebuild from SQLite evidence + unconfirmed inputs.
               nextSession = undefined;
               nextPromptItems = out.relaunchItems;
-              nextPrompt = rebuildFreshPrompt(snapshot, initialBatchIds, ports, tracked, steerSeqToEnvelopeId, out.relaunchItems);
+              nextPrompt = rebuildFreshPrompt(snapshot, initialBatchIds, ports, tracked, out.relaunchItems);
               continue;
             }
           }
@@ -585,20 +581,25 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
       let nextConfirmTurn = 1;
       eventChain = Promise.resolve();
 
-      for (const item of promptItems) {
-        item.status = "sent";
-        item.sentInLeg = legNo;
-        item.confirmAtTurn = 1;
+      async function recordSent(items: readonly AppendedInput[], turn: number) {
+        for (const item of items) {
+          item.status = "sent";
+          item.sentInLeg = legNo;
+          item.confirmAtTurn = turn;
+          if (item.kind === "steer" && !item.evidenceRecorded) {
+            await append({ kind: "system_note", text: item.text, envelopeId: item.envelopeId });
+            item.evidenceRecorded = true;
+          }
+        }
       }
+      await recordSent(promptItems, 1);
 
       const finishInput = () => {
         if (!finished) {
           finished = true;
           d.finish(io);
-        } else if (legTurns < nextConfirmTurn) {
-          return;
         }
-        if (finishTimer) return;
+        if (legTurns < nextConfirmTurn || finishTimer) return;
         // A CLI that keeps running after its input is done is stopped.
         finishTimer = setTimeout(() => killNow(), Math.max(killGraceMs, 5_000));
       };
@@ -608,17 +609,13 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
        * when `d.steer()` returns `true`, each item stays unconfirmed (`status = "sent"`, `confirmAtTurn`) until its
        * target turn completes cleanly — catching closed-stdin races and queued multi-steer partial exits.
        */
-      const deliver = (items: AppendedInput[], mode: DeliverMode) => {
+      const deliver = async (items: AppendedInput[], mode: DeliverMode) => {
         if (items.length === 0 || finished || stopReason || endOutcome) return;
         const joined = items.map((i) => i.text).join("\n\n");
         if (d.steer(joined, io)) {
           const targetTurn = Math.max(nextConfirmTurn, legTurns + (turnActive ? 1 : 0)) + 1;
           nextConfirmTurn = targetTurn;
-          for (const item of items) {
-            item.status = "sent";
-            item.sentInLeg = legNo;
-            item.confirmAtTurn = targetTurn;
-          }
+          await recordSent(items, targetTurn);
           turnActive = true;
           return;
         }
@@ -658,9 +655,12 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
       };
 
       const handle = async (e: CliEvent): Promise<void> => {
-        if (finishTimer && nextConfirmTurn > legTurns && ["text", "tool_start", "tool_end"].includes(e.type)) {
-          clearTimeout(finishTimer);
-          finishTimer = undefined;
+        if ((endOutcome || refused) && e.type !== "session") {
+          if (e.type === "turn_end") {
+            finished = true;
+            killNow();
+          }
+          return;
         }
         switch (e.type) {
           case "session":
@@ -678,7 +678,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
             if (pendingSteer.length) {
               const items = pendingSteer;
               pendingSteer = [];
-              deliver(items, "interrupt");
+              await deliver(items, "interrupt");
             }
             break;
           case "text":
@@ -713,12 +713,19 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
             live.legTurns = legTurns;
             if (e.ok && !e.stopped) {
               state.turnOk = true;
-              await confirmTurn(legNo, legTurns);
-            } else if (e.stopped && e.ok && !e.refused && stopReason !== "cancelled" && stopReason !== "timeout") {
-              // A stopped turn confirms its original prompt, not a steer queued for a later turn.
-              await confirmTurn(legNo, legTurns);
-            } else if (e.refused) refused = true;
-            else if (!e.ok && !e.stopped) state.turnError = e.error ?? "turn failed";
+              confirmTurn(legNo, legTurns);
+            } else if (e.refused) {
+              refused = true;
+              confirmTurn(legNo, legTurns);
+              finished = true;
+              killNow();
+              break;
+            } else if (e.ok && e.stopped && legTurns === 1 && !signal.aborted && !stopReason) {
+              // The adapter acknowledged the original prompt. A later interrupted correction still needs a retry.
+              sessionProgress = true;
+              awaitingSessionConfirmation = !sessionId;
+              confirmCursor();
+            } else if (!e.ok && (!e.stopped || e.error)) state.turnError = e.error ?? "turn failed";
             turnActive = Boolean(e.more);
             if (e.more) break;
             if (!endOutcome && !stopReason && !refused) {
@@ -731,7 +738,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
               // here on, so they must reach the model before the Run may end (live input, or a resume of the session).
               if (e.ok && !e.stopped) items.push(...absorbInbound());
               if (items.length) {
-                deliver(items, "turn_end");
+                await deliver(items, "turn_end");
                 if (!finished) break;
               }
             }
@@ -751,7 +758,8 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
       const p = spawnCli(d.argv, {
         cwd: req.cwd,
         env,
-        ...(opts.procDir ? { registry: { dir: opts.procDir, runId, cellId } } : {}),
+        killGraceMs,
+        ...(opts.processRegistry ? { registry: { ...opts.processRegistry, runId, cellId } } : {}),
         onLine: (line) => {
           let events: CliEvent[];
           try {
@@ -790,7 +798,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
             tracked.set(item.envelopeId, item);
             items.push(item);
           }
-          if (!ended) deliver(items, "interrupt");
+          if (!ended) await deliver(items, "interrupt");
         });
       }, pollMs);
 
@@ -833,27 +841,4 @@ export function capabilitiesOf(access: WorkspaceAccess, processor: LlmProcessorS
   const edit = has("edit");
   const bash = has("bash");
   return { root: access.root, write, edit, bash, readOnly: !(write || edit || bash), web: true };
-}
-
-/**
- * What a CLI agent must know about being a cell, appended to the cell's frozen system text: a coding CLI arrives with
- * its own habits (its own way of asking the user, a task list nobody sees), so this says which of them do not apply
- * and where the kernel's tools take over. Its own sub-agents are its own business: they run inside this cell's
- * process and are welcome — what a cell may not do is ask a terminal nobody is sitting at.
- */
-function kernelSystem(frozen: string, adapter: CliAdapter, caps: CliCapabilities, tools: readonly ToolDef[]): string {
-  const example = tools[0] ? adapter.mcpToolName(CLI_MCP_SERVER, tools[0].name) : adapter.mcpToolName(CLI_MCP_SERVER, "set_state");
-  const directory = caps.readOnly
-    ? `- Directory: \`${caps.root}\`. This workspace is read-only (its tool permissions allow reading and searching only). ${adapter.readOnlyHowTo(caps)}`
-    : `- Directory: \`${caps.root}\`. You work with this CLI's own file and shell tools, as you normally would, on the owner's real machine with no sandbox — the red lines above are the only guard, so keep to them. Nothing reserves this directory for you: another cell, or the owner, may be working in it at the same time.`;
-  const lines = [
-    frozen.trimEnd(),
-    "",
-    "## How this cell runs",
-    `- Kernel tools: the MCP server "${CLI_MCP_SERVER}" provides them (${tools.map((t) => t.name).join(", ") || "none"}); this client names them like ${example}. They are how what you do reaches the rest of the workbench: reports, waits, messages to cells and people, state, artifacts, reminders, background jobs. Tool names in your instructions (report_to_parent, wait, send_message, …) mean these. Reading files, editing and running commands are not their job — that is what this CLI's own tools are for.`,
-    directory,
-    "- Nobody is at this terminal. Never use this CLI's ask-the-user or plan-approval features: a question put there blocks the run and is never answered. To ask the owner something, use the kernel tools, or simply say it in your reply when the owner is talking to you directly. This CLI's own sub-agents are yours to use for your own work; other cells are reached only through the kernel tools.",
-    "- When a kernel tool result says the run has ended, stop at once: no further tool calls, no further work, no closing summary.",
-  ];
-  return lines.join("\n");
 }

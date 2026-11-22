@@ -23,7 +23,7 @@ import {
 } from "@ng/protocol";
 import type { WorkspaceStore } from "./store";
 import type { CommandRunner, JobObservation, WorkspaceLimits, WorkspaceManagerOptions } from "./types";
-import { processIdentity } from "@ng/protocol";
+import { markedGroupState, processIdentity } from "@ng/protocol";
 import { errorMessage, groupAlive, killGroup, pidAlive, processHasMarker, sleep } from "./util";
 
 export const JOB_MARKER = "NG_JOB_ID";
@@ -44,6 +44,7 @@ type Outcome = { state: Exclude<JobState, "running">; exitCode: number | null; e
 
 interface LiveJob {
   unknownSince?:number;
+  groupConfirmed: boolean;
   jobId: string;
   cellId: string;
   pid: number;
@@ -182,11 +183,6 @@ export class JobManager {
     });
     child.once("exit", (code, signal) => {
       if (this.#closed) return;
-      // Members of the job's process group left behind (`cmd &`) belong to the finished job.
-      if (groupAlive(pid)) {
-        killGroup(pid, "SIGTERM");
-        setTimeout(() => groupAlive(pid) && killGroup(pid, "SIGKILL"), this.d.limits.killGraceMs).unref();
-      }
       if (live.cancelReason !== null) {
         // cancel() records the outcome itself, once the whole process group is confirmed gone (not just the leader).
         this.#markExited(live);
@@ -194,7 +190,7 @@ export class JobManager {
       }
       const outcome: Outcome =
         code === 0 ? { state: "succeeded", exitCode: 0, error: null } : { state: "failed", exitCode: code, error: signal ? `terminated by ${signal}` : null };
-      this.#settle(live, outcome);
+      void this.#finishExit(store.getJob(jobId)!, live, outcome);
     });
     afterCommit(db, () => bus.emit("job.changed", { jobId, cellId, state: "running" }));
     return { jobId };
@@ -217,6 +213,7 @@ export class JobManager {
       pid,
       logPath,
       child,
+      groupConfirmed: child !== null,
       poller: null,
       timeoutTimer: null,
       quietTimer: null,
@@ -369,6 +366,25 @@ export class JobManager {
     this.#complete(live, outcome);
   }
 
+  /** A command can exit while its background children still have the workspace open. */
+  async #finishExit(job: JobRecord, live: LiveJob, outcome: Outcome): Promise<void> {
+    if (live.poller) clearInterval(live.poller);
+    live.poller = null;
+    if (live.timeoutTimer) clearTimeout(live.timeoutTimer);
+    live.timeoutTimer = null;
+    const gone = await this.#terminate(job, live);
+    if (this.#closed || live.cancelReason !== null) return;
+    if (gone) {
+      this.#settle(live, outcome);
+      return;
+    }
+    live.terminationRetry = setTimeout(() => {
+      live.terminationRetry = null;
+      void this.#finishExit(job, live, outcome);
+    }, this.d.limits.jobPollMs);
+    live.terminationRetry.unref();
+  }
+
   #complete(live: LiveJob, outcome: Outcome): void {
     if (this.#closed) return;
     try {
@@ -475,18 +491,17 @@ export class JobManager {
   async #terminate(job: JobRecord, live: LiveJob | undefined): Promise<boolean> {
     const pid = job.pid;
     if (!pid) return true;
-    const ours = !!live?.child;
-    if (!ours) {
-      const state = this.#processState(job);
-      if (state === false) return true; // confirmed gone or PID belongs to another process
-      if (state === null) return false; // unreadable identity: never signal, never falsely claim terminated
+    const state = this.#aliveState(job, live);
+    if (state === false) return true;
+    if (state === null) {
+      // A dying group can outlast its leader for a few ticks. Observe it without signalling unverified PIDs.
+      return !pidAlive(pid) && this.#waitGone(job, live, this.d.limits.killGraceMs);
     }
+    if (live) live.groupConfirmed = true;
     killGroup(pid, "SIGTERM");
     if (await this.#waitGone(job, live, this.d.limits.killGraceMs)) return true;
-    if (!ours && pidAlive(pid)) {
-      const state = this.#processState(job);
-      if (state !== true) return state === false && !groupAlive(pid);
-    }
+    const remaining = this.#aliveState(job, live);
+    if (remaining !== true) return remaining === false;
     killGroup(pid, "SIGKILL");
     return this.#waitGone(job, live, 2000);
   }
@@ -502,17 +517,23 @@ export class JobManager {
   }
 
   #aliveState(job: JobRecord, live: LiveJob | undefined): boolean | null {
-    if (live?.child) return !live.isDone || groupAlive(job.pid!);
-    return this.#processState(job);
+    const pid = job.pid;
+    if (!pid) return false;
+    if (live?.child) {
+      if (live.child.exitCode === null && live.child.signalCode === null) return true;
+    }
+    if (live?.groupConfirmed && !pidAlive(pid)) return groupAlive(pid);
+    return markedGroupState(pid, JOB_MARKER, job.jobId, job.processIdentity);
   }
 
   async #waitGone(job: JobRecord, live: LiveJob | undefined, ms: number): Promise<boolean> {
-    const gone = () => !groupAlive(job.pid!) && (live?.child ? live.isDone : this.#processState(job) === false);
-    for (let waited = 0; waited < ms; waited += 25) {
-      if (gone()) return true;
-      await sleep(25);
+    const deadline = performance.now() + ms;
+    while (this.#aliveState(job, live) !== false) {
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) return false;
+      await sleep(Math.min(25, remaining));
     }
-    return gone();
+    return true;
   }
 
   // ---------- restart ----------
@@ -556,14 +577,13 @@ export class JobManager {
           this.#reattach(job, marked === true);
           continue;
         }
-        this.finalizeSync(
-          job.jobId,
-          this.#outcomeFromExitFile(job) ?? {
-            state: "failed",
-            exitCode: null,
-            error: "the job process ended while no kernel was watching and recorded no exit status",
-          },
-        );
+        const outcome = this.#outcomeFromExitFile(job) ?? {
+          state: "failed" as const, exitCode: null, error: "the job process ended while no kernel was watching and recorded no exit status",
+        };
+        if (groupAlive(job.pid) && !pidAlive(job.pid)) {
+          const ended = this.#register(job.jobId, job.cellId, job.pid, job.logPath ?? "", null);
+          await this.#finishExit(job, ended, outcome);
+        } else this.finalizeSync(job.jobId, outcome);
       } catch (err) {
         errors.push(err);
       }
@@ -590,14 +610,14 @@ export class JobManager {
     };
     // Only arm timeout termination once the process identity has been confirmed (`true`); an unverified `null` pid
     // waits for multi-poll confirmation first so we never misreport an unreadable process as a timeout (exit 124).
-    let identityConfirmed = confirmedAlive;
-    if (identityConfirmed) armIfTimeout();
+    live.groupConfirmed = confirmedAlive;
+    if (live.groupConfirmed) armIfTimeout();
     live.poller = setInterval(() => {
       const marked = this.#processState(job);
       if (marked === true) {
         delete live.unknownSince;
-        if (!identityConfirmed) {
-          identityConfirmed = true;
+        if (!live.groupConfirmed) {
+          live.groupConfirmed = true;
           armIfTimeout();
         }
         return;
@@ -609,7 +629,7 @@ export class JobManager {
         this.#warn(job, "identity_unknown", "The job process is still present but its identity cannot be confirmed.");
         return;
       }
-      this.#settle(live, exit ?? { state: "failed", exitCode: null, error: "the job process ended without recording an exit status" });
+      void this.#finishExit(job, live, exit ?? { state: "failed", exitCode: null, error: "the job process ended without recording an exit status" });
     }, this.d.limits.jobPollMs);
     live.poller.unref();
   }

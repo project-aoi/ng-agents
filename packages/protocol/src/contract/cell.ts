@@ -149,7 +149,7 @@ export interface RunPorts extends CellPorts {
   confirmCliInput?(sessionId: string, throughSeq: number): void;
   listEvidence?(opts?: { afterSeq?: number; limit?: number; runId?: string }): EvidenceEntry[];
   /** Confirm the native parent session still represents exactly the creation-time evidence. */
-  canForkSession(parentId:string, uptoSeq:number, sessionId:string, delivered:number): boolean;
+  canForkSession(parentId:string, uptoSeq:number, sessionId:string, delivered:number, systemHash:string): boolean;
   listOwnDecisions(): Array<{ record: import("./gate").ApprovalRecord; envelope?: Envelope }>;
   /**
    * Commit with inboxOut to `inbox:<parentId>` (envelope from `inbox:<selfId>`, expectedEpoch = parent's epoch). Throws

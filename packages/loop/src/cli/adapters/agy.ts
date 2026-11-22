@@ -187,26 +187,20 @@ class AgyDriver implements CliDriver {
         this.#flushText(out);
         this.#promptId = null;
         const stopped = this.#cancelled || result["stopReason"] === "cancelled";
-        const next = this.#queued.shift();
-        if (next !== undefined) {
-          const sent = this.#prompt(io, next);
-          if (sent) {
-            if (error) {
-              out.push({ type: "turn_end", ok: false, more: true, ...(stopped ? { stopped } : {}), error: str(error["message"]) ?? "prompt failed" });
-            } else if (result["stopReason"] === "refusal") {
-              out.push({ type: "turn_end", ok: false, more: true, refused: true, ...(stopped ? { stopped } : {}) });
-            } else {
-              out.push({ type: "turn_end", ok: !stopped, more: true, ...(stopped ? { stopped } : {}) });
-            }
-          } else {
-            this.#queued.unshift(next);
-            out.push({ type: "turn_end", ok: false, ...(stopped ? { stopped } : {}), error: "stdin closed before queued prompt could be sent" });
-          }
+        if (error || result["stopReason"] === "refusal") {
+          this.#queued.length = 0;
+          out.push(error
+            ? { type: "turn_end", ok: false, more: false, error: str(error["message"]) ?? "prompt failed" }
+            : { type: "turn_end", ok: false, more: false, refused: true });
           break;
         }
-        if (error) out.push({ type: "turn_end", ok: false, error: str(error["message"]) ?? "prompt failed" });
-        else if (result["stopReason"] === "refusal") out.push({ type: "turn_end", ok: false, refused: true });
-        else out.push({ type: "turn_end", ok: !stopped, ...(stopped ? { stopped } : {}) });
+        const next = this.#queued.shift();
+        if (next !== undefined && !this.#prompt(io, next)) {
+          this.#queued.length = 0;
+          out.push({ type: "turn_end", ok: false, more: false, error: "stdin closed before queued prompt could be sent" });
+          break;
+        }
+        out.push({ type: "turn_end", ok: true, ...(stopped ? { stopped } : {}), ...(next !== undefined ? { more: true } : {}) });
         break;
       }
     }

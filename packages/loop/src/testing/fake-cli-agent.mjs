@@ -124,6 +124,7 @@ async function runTurn(turn, emit, mcp, signal) {
       const callId = `tool_${randomUUID().slice(0, 8)}`;
       await emit.native(callId, a);
     } else if (a.item !== undefined) emit.item?.(a.item);
+    else if (a.awaitQueuedInput) await emit.awaitQueuedInput();
     else if (a.sleep !== undefined) await sleep(a.sleep, signal);
     else if (a.exit !== undefined) process.exit(a.exit);
     else if (a.fail !== undefined) return { error: a.fail };
@@ -204,6 +205,10 @@ async function claude() {
     current = new AbortController();
     const mcpPrefix = `mcp__${serverName}__`;
     const emit = {
+      async awaitQueuedInput() {
+        if (!queue.length && !eof) await new Promise(resolve => { wake = resolve; });
+        wake = null;
+      },
       text: (t) => out({ type: "assistant", message: { id: `msg_${++msgN}`, role: "assistant", content: [{ type: "text", text: t }] }, parent_tool_use_id: null, session_id: sessionId }),
       mcpStart: (id, name, args) => out({ type: "assistant", message: { id: `msg_${++msgN}`, role: "assistant", content: [{ type: "tool_use", id, name: `${mcpPrefix}${name}`, input: args }] }, parent_tool_use_id: null, session_id: sessionId }),
       mcpEnd: (id, _name, _args, r) => {
@@ -233,6 +238,7 @@ async function claude() {
       session_id: sessionId,
       ...(turn.omitQueuedTurnCount ? {} : { queued_turn_count: queue.length }),
     });
+    if (turn.exitAfterTurn) break;
     if (r.stopped && !isError) log({ type: "interrupt_ack" });
     msgN = 0;
     current = null;
@@ -348,10 +354,11 @@ async function agy() {
         update({ sessionUpdate: "tool_call_update", toolCallId: cid, name: a.native, status: allowed ? "completed" : "failed", content: [{ type: "content", content: { type: "text", text: allowed ? (a.output ?? "ok") : "denied" } }] });
       },
     };
-    const r = await runTurn(nextTurn(), emit, mcp, signal);
+    const turn = nextTurn();
+    const r = await runTurn(turn, emit, mcp, signal);
     current = null;
     if (r.error) out({ jsonrpc: "2.0", id, error: { code: -32603, message: r.error } });
-    else out({ jsonrpc: "2.0", id, result: { stopReason: signal.aborted ? "cancelled" : "end_turn" } });
+    else out({ jsonrpc: "2.0", id, result: { stopReason: turn.refused ? "refusal" : signal.aborted ? "cancelled" : "end_turn" } });
   }
 
   let buf = "";

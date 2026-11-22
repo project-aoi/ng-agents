@@ -1,9 +1,11 @@
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { processInspection, processIdentity } from "@ng/protocol";
-import { cliProcessAlive, cliProcessStatus, probeOrphanCliCell, reapOrphanedCliProcesses, spawnCli } from "../src";
+import { groupAlive, processInspection, processIdentity } from "@ng/protocol";
+import { createCliOwner, cliProcessAlive, cliProcessStatus, probeOrphanCliCell, reapOrphanedCliProcesses, spawnCli } from "../src";
 
 // docs/05 guard 4 + BUG-027: a CLI agent runs in its own process group, so a kernel that is killed leaves it running.
 // Every CLI process is on record while it lives; the next kernel inspects it cross-platform (Linux /proc or macOS ps -E)
@@ -17,10 +19,12 @@ function tmp(): string {
   return d;
 }
 const origUseProc = processInspection.useProc;
+const origReadIdentity = processInspection.readIdentity;
 const origReadEnv = processInspection.readEnvironment;
 const origListParentChild = processInspection.listParentChild;
 afterEach(() => {
   processInspection.useProc = origUseProc;
+  processInspection.readIdentity = origReadIdentity;
   processInspection.readEnvironment = origReadEnv;
   processInspection.listParentChild = origListParentChild;
   for (const pid of pids.splice(0)) {
@@ -144,32 +148,82 @@ describe("orphaned CLI processes (cross-platform 3-state)", () => {
     expect(readdirSync(dir)).toEqual([]);
   });
 
-  it("BUG-027 review fix: scoped cellId + skipOwnerPid reap kills only the target orphan and spares live CLI agents", async () => {
-    const dir = tmp();
-    const healthy = spawnCli([process.execPath, "-e", "setInterval(() => {}, 1000)"], {
-      cwd: dir,
-      env,
-      onLine: () => undefined,
-      registry: { dir, runId: "run_live", cellId: "cell_healthy" },
-    });
-    const orphan = spawnCli([process.execPath, "-e", "setInterval(() => {}, 1000)"], {
-      cwd: dir,
-      env,
-      onLine: () => undefined,
-      registry: { dir, runId: "run_old", cellId: "cell_orphan" },
-    });
-    pids.push(healthy.pid, orphan.pid);
-    // Simulate orphan belonging to a previous (dead) kernel PID.
-    const orphanPath = join(dir, `${orphan.pid}.json`);
-    const orphanRec = JSON.parse(readFileSync(orphanPath, "utf8")) as Record<string, unknown>;
-    orphanRec["ownerPid"] = 999999;
-    writeFileSync(orphanPath, JSON.stringify(orphanRec));
+  it("uses the same process identity after the system time zone changes", () => {
+    const previous = process.env.TZ;
+    try {
+      process.env.TZ = "Pacific/Honolulu";
+      const first = processIdentity(process.pid);
+      expect(first).toBeTruthy();
+      process.env.TZ = "Asia/Taipei";
+      expect(processIdentity(process.pid)).toBe(first);
+    } finally {
+      if (previous === undefined) delete process.env.TZ;
+      else process.env.TZ = previous;
+    }
+  });
 
-    const reaped = await reapOrphanedCliProcesses(dir, { cellId: "cell_orphan", skipOwnerPid: process.pid, graceMs: 300 });
-    expect(reaped.map((r) => ({ cellId: r.cellId, status: r.status }))).toEqual([{ cellId: "cell_orphan", status: "killed" }]);
-    // Healthy sibling CLI is untouched and still alive!
-    expect(existsSync(join(dir, `${healthy.pid}.json`))).toBe(true);
-    expect(() => process.kill(healthy.pid, 0)).not.toThrow();
-    await healthy.kill(300);
+  it("spares a detached descendant whose recorded identity changes before the hard kill", async () => {
+    const dir = tmp();
+    const helper = [
+      'const fs = require("fs");',
+      'process.on("SIGTERM", () => fs.writeFileSync("replaced", ""));',
+      'fs.writeFileSync("helper", String(process.pid)); setInterval(() => {}, 1000);',
+    ].join(" ");
+    const leader = spawnCli([process.execPath, "-e", `
+      require("child_process").spawn(process.execPath, ["-e", ${JSON.stringify(helper)}], {detached:true, stdio:"ignore"});
+      setInterval(() => {}, 1000);
+    `], { cwd: dir, env, onLine: () => {} });
+    pids.push(leader.pid);
+    await expect.poll(() => existsSync(join(dir, "helper"))).toBe(true);
+    const helperPid = Number(readFileSync(join(dir, "helper"), "utf8"));
+    pids.push(helperPid);
+    processInspection.readIdentity = pid => pid === helperPid && existsSync(join(dir, "replaced"))
+      ? "different process" : origReadIdentity(pid);
+    await leader.kill(150);
+    expect(existsSync(join(dir, "replaced"))).toBe(true);
+    expect(() => process.kill(helperPid, 0)).not.toThrow();
+  });
+
+  it("distinguishes live and stopped kernel instances sharing one process and cell", async () => {
+    const dir = tmp();
+    const active = createCliOwner();
+    const prior = createCliOwner();
+    const launch = (ownerInstanceId: string, runId: string) => spawnCli([process.execPath, "-e", "setInterval(() => {}, 1000)"], {
+      cwd: dir, env, onLine: () => undefined, registry: { dir, runId, cellId: "worker", ownerInstanceId },
+    });
+    const healthy = launch(active.ownerInstanceId, "run_live");
+    const orphan = launch(prior.ownerInstanceId, "run_old");
+    pids.push(healthy.pid, orphan.pid);
+    try {
+      const options = { cellId: "worker", ownerInstanceId: active.ownerInstanceId, graceMs: 100 };
+      expect((await reapOrphanedCliProcesses(dir, options)).map(r => r.status)).toEqual(["owned"]);
+      expect(probeOrphanCliCell(dir, "worker", options)).toBe("unknown");
+      prior.release();
+      expect((await reapOrphanedCliProcesses(dir, options)).map(r => [r.pid, r.status])).toEqual([[orphan.pid, "killed"]]);
+      expect(probeOrphanCliCell(dir, "worker", options)).toBe("clear");
+      expect(existsSync(join(dir, `${healthy.pid}.json`))).toBe(true);
+      await healthy.kill(100);
+    } finally {
+      active.release();
+      prior.release();
+    }
+  });
+
+  it("reaps a marked helper remaining in a group whose leader already exited", async () => {
+    const dir = tmp();
+    const helper = 'process.on("SIGTERM", () => {}); require("fs").writeFileSync("ready", String(process.pid)); setInterval(() => {}, 1000)';
+    const leader = spawn(process.execPath, ["-e", `
+      const child = require("child_process").spawn(process.execPath, ["-e", ${JSON.stringify(helper)}], {stdio:"ignore"});
+      child.unref();
+    `], { cwd: dir, env: {...env, NG_CLI_PROC:"leftover"}, detached:true, stdio:"ignore" });
+    const pid = leader.pid!;
+    pids.push(pid);
+    await once(leader, "exit");
+    await expect.poll(() => existsSync(join(dir, "ready"))).toBe(true);
+    pids.push(Number(readFileSync(join(dir, "ready"), "utf8")));
+    writeFileSync(join(dir, `${pid}.json`), JSON.stringify({pid, marker:"leftover", runId:"run", cellId:"w", cwd:dir}));
+    expect(probeOrphanCliCell(dir, "w")).toBe("alive");
+    expect((await reapOrphanedCliProcesses(dir, { graceMs: 100 }))[0]?.status).toBe("killed");
+    expect(groupAlive(pid)).toBe(false);
   });
 });

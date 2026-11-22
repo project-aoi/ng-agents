@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   finalResultEnvelopeId,
-  isNgError,
+  isNgError, get,
   PAYLOAD,
   serializeBounds,
   type Address,
@@ -156,6 +156,31 @@ describe("spawnCell", () => {
     await h.kernel.idle();
     const [req] = h.script.callsOf("worker");
     expect(req!.tools.map((t) => t.name)).not.toContain("spawn_cell");
+  });
+
+  it("refreshes the parent's role before forked children and refuses the old CLI prefix", async () => {
+    let hash = "";
+    let upto = 0;
+    const checks: Array<{ canFork:boolean; prefix:string }> = [];
+    const probe: CodeProcessor = {name:"test.prefix", async run({ports,snapshot}) {
+      checks.push({ canFork: ports.canForkSession("desk",upto,"parent-run",upto,hash), prefix:snapshot.system.text });
+      return "yielded_waiting";
+    }};
+    const h = await boot({ setup:setupWith(probe) });
+    h.kernel.context.upsertSkillOrNoteSync("desk", {
+      kind:"preference", name:"new-role", description:"Release checklist", body:"Use the release checklist.", scope:"global", mode:"upsert", applies:{roles:["release-lead"]},
+    });
+    await h.ui.capture({text:"prepare work"}); await h.kernel.idle();
+    upto = h.kernel.context.lastEvidenceSeqSync("desk");
+    hash = get<{hash:string}>(h.kernel.db,"SELECT hash FROM prompt_prefixes WHERE cell_id='desk'")!.hash;
+    h.kernel.context.commitSync("desk",{statePatches:{"cli:session":{sessionId:"parent-run",systemHash:hash,lastDeliveredEvidenceSeq:upto}}});
+    h.kernel.spawnCell("desk",{id:"forked",preset:"project",contextMode:"fork_prefix",processor:{kind:"code",entry:probe.name}},"inspect");
+    await h.kernel.idle();
+    expect(checks[0]).toMatchObject({canFork:true});
+    h.kernel.updateCell("desk",{meta:{role:"release-lead"}});
+    h.kernel.sendToCell("forked",{text:"check the role"});
+    await h.kernel.idle();
+    expect(checks[1]).toMatchObject({canFork:false,prefix:expect.stringContaining("Use the release checklist.")});
   });
 
   it("a fork_prefix child records the parent's evidence position; meta.projectCellId is inherited", async () => {

@@ -63,6 +63,7 @@ export interface FakeRunOptions {
   /** The claimed batch. Strings become `user.message` envelopes from `channel:ui:owner`. */
   batch?: Array<Envelope | string>;
   roster?: ChildSummary[];
+  tailNotes?: string[];
   /** Gate stand-in. Explicit decisions defer. */
   authorize?: (action: ProposedAction, opts?: { artifactVersion?: number }) => AuthorizeResult | Promise<AuthorizeResult>;
   exec?: (tool: ToolKind, args: unknown, signal?: AbortSignal) => ExecResult | Promise<ExecResult>;
@@ -299,6 +300,7 @@ export function createFakeRun(opts: FakeRunOptions = {}): FakeRun {
       if (v === null || v === undefined) state.delete(k);
       else state.set(k, structuredClone(v));
     }
+    if (tx.appendReference) log.knowledge.push({ ...tx.appendReference, kind: "reference", scope: "cell", mode: "append" });
     log.inboxOut.push(...(tx.inboxOut ?? []));
     return artifactVersion === undefined ? { ok: true } : { ok: true, artifactVersion };
   }
@@ -533,7 +535,8 @@ export function createFakeRun(opts: FakeRunOptions = {}): FakeRun {
     historyUptoSeq: 0,
     tail: {
       roster: opts.roster ?? [],
-      messages: [...rosterText, ...envelopes.map((e) => ({ role: "user" as const, content: [{ type: "text" as const, text: renderEnvelope(e) }] }))],
+      ...(opts.tailNotes && { notes: opts.tailNotes }),
+      messages: [...rosterText, ...(opts.tailNotes ?? []).map(text => ({ role: "user" as const, content: [{ type: "text" as const, text }] })), ...envelopes.map((e) => ({ role: "user" as const, content: [{ type: "text" as const, text: renderEnvelope(e) }] }))],
     },
     skills: [],
     createdAt: clock.now(),

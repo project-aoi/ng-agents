@@ -11,7 +11,6 @@ import {
   isLeafLifetime,
   isNgError,
   KERNEL_FROM,
-  newId,
   PAYLOAD,
   withTx,
   type CellDirectChatState,
@@ -81,7 +80,6 @@ function isResurface(env: Envelope): boolean {
 
 export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number }): Dispatcher {
   const { inbox, cells, bus, clock, context } = core;
-  const workerId = newId("kernel", clock);
   const runs = new Map<string, RunHandle>();
   const byCell = new Map<string, Set<string>>();
   const due: string[] = [];
@@ -106,16 +104,14 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
     reapingOrphans.add(id);
     // Scope strictly to this cell and never touch CLI children spawned by this live kernel process!
     void core.track(
-      reapOrphanedCliProcesses(core.cliProcDir, { cellId: id, skipOwnerPid: process.pid })
+      reapOrphanedCliProcesses(core.cliProcDir, { cellId: id, ownerInstanceId: core.ownerInstanceId })
+        .finally(() => reapingOrphans.delete(id))
         .then(() => {
-          if (probeOrphanCliCell(core.cliProcDir, id, { skipOwnerPid: process.pid }) === "clear") {
+          if (probeOrphanCliCell(core.cliProcDir, id, { ownerInstanceId: core.ownerInstanceId }) === "clear") {
             unknownOrphans.delete(id);
             clearOrphanTimerIfEmpty();
             notify(id);
           }
-        })
-        .finally(() => {
-          reapingOrphans.delete(id);
         }),
     );
   }
@@ -128,7 +124,8 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
         return;
       }
       for (const id of [...unknownOrphans]) {
-        const probe = probeOrphanCliCell(core.cliProcDir, id, { skipOwnerPid: process.pid });
+        if (reapingOrphans.has(id)) continue;
+        const probe = probeOrphanCliCell(core.cliProcDir, id, { ownerInstanceId: core.ownerInstanceId });
         if (probe === "clear") {
           unknownOrphans.delete(id);
           notify(id);
@@ -224,11 +221,12 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
       if (core.lifecycle.cleaningUp(cellId)) continue; // The previous epoch notifies us when its runtime has stopped.
       // A cell with a Run in flight is re-notified when that Run ends; the claim is the real lock either way.
       if (inFlight(cellId) > 0) continue;
+      if (reapingOrphans.has(cellId)) continue;
       if (cell.spec.processor.kind === "llm") {
         // BUG-027: do not launch a replacement CLI process while an unverified previous process for this cell may still run.
         if (unknownOrphans.has(cellId)) {
           settleKernelMessages(cell);
-          const probe = probeOrphanCliCell(core.cliProcDir, cellId, { skipOwnerPid: process.pid });
+          const probe = probeOrphanCliCell(core.cliProcDir, cellId, { ownerInstanceId: core.ownerInstanceId });
           if (probe === "clear") {
             unknownOrphans.delete(cellId);
             clearOrphanTimerIfEmpty();
@@ -241,7 +239,7 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
       }
       let batch: ClaimedBatch | null;
       try {
-        batch = inbox.claimNextRunSync(cellId, workerId, core.leaseMs, () => settleKernelMessages(cell));
+        batch = inbox.claimNextRunSync(cellId, core.ownerInstanceId, core.leaseMs, () => settleKernelMessages(cell));
       } catch (err) {
         core.onError(err, `claim ${cellId}`);
         continue;
@@ -706,7 +704,7 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
   }
 
   return {
-    workerId,
+    workerId: core.ownerInstanceId,
     start() {
       if (started) return;
       started = true;

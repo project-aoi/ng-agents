@@ -6,6 +6,7 @@ import {
   defineTool,
   gtdKeys,
   PAYLOAD,
+  type CommitTx,
   type CodeProcessor,
   type CodeProcessorInput,
   type Envelope,
@@ -54,7 +55,9 @@ export async function ensureSource(ports: RunPorts, now: number): Promise<Source
  */
 export async function recordCheck(ports: RunPorts, now: number, result: { hit: SensorHit | null; error?: string }, runKey: string): Promise<SourceRecord> {
   const src = await ensureSource(ports, now);
-  const next: SourceRecord = { ...src, runCount: src.runCount + 1, lastRunAt: now, updatedAt: now, status: result.error ? "error" : "ok" };
+  if (src.lastCheckKey === runKey) return src;
+  let appendReference: CommitTx["appendReference"];
+  const next: SourceRecord = { ...src, lastCheckKey: runKey, runCount: src.runCount + 1, lastRunAt: now, updatedAt: now, status: result.error ? "error" : "ok" };
   if (result.error) next.lastError = clip(result.error, 300);
   else delete next.lastError;
   const hit = result.hit;
@@ -63,7 +66,7 @@ export async function recordCheck(ports: RunPorts, now: number, result: { hit: S
     next.lastHitAt = now;
     if (src.mode === "observe") {
       const line = `- ${new Date(now).toISOString()} ${hit.title ?? src.title}：${clip(hit.summary, 500)}${hit.uri ? ` (${hit.uri})` : ""}\n`;
-      await ports.context.upsertSkillOrNote(ports.self.cellId, { kind: "reference", name: OBSERVATION_NOTE, description: `${src.title} 的观察记录（观察模式，不出卡）`, body: line, scope: "cell", mode: "append" });
+      appendReference = { name: OBSERVATION_NOTE, description: `${src.title} 的观察记录`, body: line };
     } else {
       const payload: SourceHitPayload = {
         sourceCellId: ports.self.cellId,
@@ -76,7 +79,7 @@ export async function recordCheck(ports: RunPorts, now: number, result: { hit: S
       await ports.emitToParent(PAYLOAD.sourceHit, payload, { id: `${ports.self.cellId}:hit:${runKey}` });
     }
   }
-  await ports.context.commit(ports.self.cellId, { statePatches: { [gtdKeys.source]: next } });
+  await ports.context.commit(ports.self.cellId, { statePatches: { [gtdKeys.source]: next }, appendReference });
   return next;
 }
 
@@ -104,7 +107,7 @@ export function defineSensorCheck(name: string, check: (input: SensorCheckInput)
       const now = input.clock.now();
       const source = await ensureSource(input.ports, now);
       const due = dueEnvelopes(input.snapshot.batch.envelopes);
-      if (due.length === 0) return "completed";
+      if (due.length === 0 || source.lastCheckKey === due[0]!.id) return "completed";
       let hit: SensorHit | null = null;
       let error: string | undefined;
       try {
@@ -123,10 +126,10 @@ export function defineSensorCheck(name: string, check: (input: SensorCheckInput)
 export function createScriptSensor(): CodeProcessor {
   return defineSensorCheck(
     PROCESSORS.sensorScript,
-    async ({ ports, args, signal, snapshot }) => {
+    async ({ ports, args, signal, snapshot, due }) => {
       const script = args["script"];
-      if (typeof script !== "string" || !script) throw new Error("sensor: args.script is missing");
-      const command = scriptCommand(script, { NG_CELL_ID: ports.self.cellId, NG_RUN_ID: snapshot.runId, NG_ARGS: JSON.stringify(args) });
+      if (typeof script !== "string" || !script.trim()) throw new Error("sensor: args.script is missing");
+      const command = scriptCommand(script, { NG_CELL_ID: ports.self.cellId, NG_RUN_ID: snapshot.runId, NG_ARGS: JSON.stringify(args), NG_TRIGGER_JSON: JSON.stringify(due[0]) });
       const timeoutMs = typeof args["timeoutMs"] === "number" ? args["timeoutMs"] : 120_000;
       const res = await ports.workspace.exec("bash", { command, timeoutMs }, signal);
       const out = res.output.trim();
@@ -173,7 +176,8 @@ export function sensorToolset(): Toolset {
         description: "Nothing worth an item this time. Ends the run silently.",
         input: z.object({ note: z.string().optional() }),
         async handler(_args, ctx) {
-          if (dueEnvelopes(ctx.snapshot.batch.envelopes).length > 0) await recordCheck(ctx.ports, ctx.clock.now(), { hit: null }, ctx.snapshot.runId);
+          const trigger = dueEnvelopes(ctx.snapshot.batch.envelopes)[0];
+          if (trigger) await recordCheck(ctx.ports, ctx.clock.now(), { hit: null }, trigger.id);
           else await ensureSource(ctx.ports, ctx.clock.now());
           return { output: "OK.", endRun: "completed" };
         },
@@ -182,8 +186,11 @@ export function sensorToolset(): Toolset {
   };
 }
 
-export function sensorProcessor(entry:string): Extract<ProcessorSpec,{kind:"code"}> {
-  return entry.startsWith("script:") ? {kind:"code",entry:PROCESSORS.sensorScript,args:{script:entry.slice(7)}} : {kind:"code",entry};
+export function sensorProcessor(entry: string): Extract<ProcessorSpec, { kind: "code" }> {
+  if (!entry.startsWith("script:")) return { kind: "code", entry };
+  const script = entry.slice(7).trim();
+  if (!script) throw new Error("需要脚本路径");
+  return { kind: "code", entry: PROCESSORS.sensorScript, args: { script } };
 }
 export function createSensorSpec(id:string,source:SourceInit,processor:ProcessorSpec = SENSOR_LLM_PROCESSOR,thread?:string): CellSpec {
   return {id,preset:"sensor",title:source.title,processor,meta:{role:"sensor",gtd:{source}},

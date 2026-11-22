@@ -22,11 +22,7 @@ export interface VersionedArtifact {    // human-visible deliverables: reply dra
 export interface ContextStore {
   // 1. Business state (transactional reads/writes relying on the per-Cell serial lock) and version-protected draft Artifact commits
   readState<T = unknown>(cellId: string, key: string): Promise<T | null>;
-  commit(cellId: string, tx: {
-    statePatches?: Record<string, unknown>;
-    artifact?: { artifactId: string; content: Deliverable; updatedBy: "agent" | "human"; expectedVersion?: number };
-    inboxOut?: Array<{ to: InboxAddr; envelope: Envelope; schedule?: ScheduleRule }>; // cross-Cell messages delivered in the same DB transaction
-  }): Promise<CommitResult>; // [ext] doc's inline union, plus the optional `parked` on failure (see CommitResult)
+  commit(cellId: string, tx: CommitTx): Promise<CommitResult>;
 
   // 2. Prefix-stable prompt snapshot (incl. in-flight children summary) and SQLite FTS5 search (code/skill search goes through Workspace ripgrep)
   hydrate(cellId: string, batch: ClaimedBatch, mode: "isolated" | "fork_prefix"): Promise<PromptSnapshot>;
@@ -161,6 +157,8 @@ export type HydrateMode = ContextMode;
  * - Emits `state.changed` / `artifact.changed` after commit.
  */
 export interface CommitTx {
+  /** Append to a reference owned by this cell in the same transaction as state and inbox writes. */
+  appendReference?: { name: string; description: string; body: string };
   statePatches?: Record<string, unknown>;
   artifact?: ArtifactWrite;
   inboxOut?: Array<{ to: InboxAddr; envelope: Envelope; schedule?: ScheduleRule }>;
@@ -250,7 +248,7 @@ export type StepOrExternalEvidence =
   | (EvidenceBase & { kind: "tool_call"; toolUseId: string; name: string; input: unknown })
   | (EvidenceBase & { kind: "tool_result"; toolUseId: string; name: string; output: string; isError?: boolean })
   | (EvidenceBase & { kind: "external"; source: string; title?: string; text: string; uri?: string })
-  | (EvidenceBase & { kind: "system_note"; text: string })
+  | (EvidenceBase & { kind: "system_note"; text: string; envelopeId?: string })
   | (EvidenceBase & { kind: "run_boundary"; phase: "start" | "end"; epoch: number; outcome?: RunOutcome | "error"; error?: string });
 
 export type EvidenceOf<K extends EvidenceKind> = Extract<StepOrExternalEvidence, { kind: K }>;

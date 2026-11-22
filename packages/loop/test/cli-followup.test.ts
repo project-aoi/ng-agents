@@ -1,8 +1,8 @@
-import { chmodSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { createEnvelope, createRegistry, ManualClock, PAYLOAD, type CliEngine, type Registry, type RunOutcome } from "@ng/protocol";
+import { createEnvelope, createRegistry, ManualClock, PAYLOAD, steerNoteText, type CliEngine, type Registry, type RunOutcome } from "@ng/protocol";
 import { cliAdapterFor, createCliAgentLoop, registerStandardToolsets, STANDARD_TOOLSETS, type CliEvent, type LaunchRequest } from "../src";
 import { createFakeRun, installFakeCli, type FakeCliTurn } from "../src/testing";
 
@@ -96,7 +96,10 @@ describe.each(ENGINES)("follow-ups with a fake %s", (engine) => {
     const took = Date.now() - t0;
     expect(s.fake.prompts()[1]).toContain("use the develop branch");
     const said = s.run.ports.log.evidence.filter((e) => e.kind === "assistant_text").map((e) => (e as { text: string }).text).join("\n");
-    expect(said).toContain("corrected");
+    const notes = s.run.ports.log.evidence.filter(e => e.kind === "system_note" && e.text.includes("use the develop branch"));
+    expect(notes).toHaveLength(1);
+    const correction = s.run.ports.log.evidence.findIndex(e => e.kind === "assistant_text" && e.text.includes("corrected"));
+    expect(correction).toBeGreaterThan(s.run.ports.log.evidence.indexOf(notes[0]!));
     if (engine === "claude") {
       // Claude Code takes a mid-turn user message on stdin and answers it after the current turn.
       expect(said).toContain("end of the first turn");
@@ -163,69 +166,43 @@ describe("a refusal is reported as refused by the adapters", () => {
     expect(prompts()).toEqual(["do it","use the other branch"]);
   });
 
-  it("agy: a prompt result with stopReason refusal is a refused turn", () => {
-    const d = cliAdapterFor("agy").createDriver(req("agy"));
+  it.each([
+    { response: {error:{message:"process failed"}}, event: {ok:false, more:false, error:"process failed"} },
+    { response: {result:{stopReason:"refusal"}}, event: {ok:false, more:false, refused:true} },
+    { response: {result:{stopReason:"cancelled"}}, event: {ok:true, more:true, stopped:true} },
+  ])("AGY starts the queued correction only after an acknowledged stop: $event", ({response, event}) => {
+    const driver = cliAdapterFor("agy").createDriver(req("agy"));
     const sent: Array<{ id?: number; method?: string }> = [];
-    const rec = { write: (line: string) => (sent.push(JSON.parse(line) as { id?: number; method?: string }), true), end: () => undefined };
-    d.start(rec);
-    const answer = (method: string, result: unknown) => d.onLine(JSON.stringify({ jsonrpc: "2.0", id: sent.find((m) => m.method === method)!.id, result }), rec);
-    answer("initialize", { protocolVersion: 1 });
-    answer("session/new", { sessionId: "sess-1" });
-    const out = answer("session/prompt", { stopReason: "refusal" });
-    expect(turnEnds(out)).toEqual([{ type: "turn_end", ok: false, refused: true }]);
+    const rec = { write: (line: string) => (sent.push(JSON.parse(line)), true), end() {} };
+    const answer = (method: string, body: object) =>
+      driver.onLine(JSON.stringify({ id: sent.find(m => m.method === method)!.id, ...body }), rec);
+    const prompts = () => sent.filter(m => m.method === "session/prompt");
+    driver.start(rec);
+    answer("initialize", {result:{protocolVersion:1}});
+    answer("session/new", {result:{sessionId:"one"}});
+    expect(driver.steer("correct the current task", rec)).toBe(true);
+    const result = answer("session/prompt", response);
+    expect(turnEnds(result)).toEqual([{type:"turn_end", ...event}]);
+    expect(prompts()).toHaveLength(event.more ? 2 : 1);
   });
 });
 
 describe("BUG-026: CLI steer & follow-up anti-loss and fresh rebuild anti-duplication", () => {
-  it("pitfall #2 (claude): a steer written right as the CLI exits without starting a 2nd turn is never silently lost", async () => {
-    const binDir = tempDir("claude-closing");
-    const wsRoot = tempDir("claude-closing-ws");
-    const bin = join(binDir, "claude");
-    // A fake claude that emits init + turn 1 result after 200ms and exits immediately without reading any 2nd stdin turn!
-    const script = [
-      `#!${process.execPath}`,
-      `const fs = require("node:fs");`,
-      `const logFile = process.env.TEST_LOG;`,
-      `process.stdin.resume();`,
-      `console.log(JSON.stringify({ type: "system", subtype: "init", session_id: "sess-close" }));`,
-      `setTimeout(() => {`,
-      `  fs.appendFileSync(logFile, JSON.stringify({ argv: process.argv.slice(2) }) + "\\n");`,
-      `  console.log(JSON.stringify({ type: "assistant", message: { id: "m1", stop_reason: "end_turn", content: [{ type: "text", text: "turn1-only" }] } }));`,
-      `  console.log(JSON.stringify({ type: "result", subtype: "success", is_error: false, num_turns: 1, session_id: "sess-close" }));`,
-      `  process.exit(0);`,
-      `}, 200);`,
-    ].join("\n");
-    writeFileSync(bin, script);
-    chmodSync(bin, 0o755);
-    const logFile = join(binDir, "runs.jsonl");
-
-    const loop = createCliAgentLoop({
-      engine: "claude",
-      registry: registry(),
-      bin,
-      env: { ...process.env, TEST_LOG: logFile },
-      pollMs: 25,
-      killGraceMs: 300,
-      endRunGraceMs: 2_000,
-    });
-    const run = createFakeRun({
-      workspaceRoot: wsRoot,
-      spec: { processor: { kind: "llm", toolsets: TOOLSETS }, lifetime: "one_shot", parentId: "desk" },
-      batch: ["initial task"],
-    });
-    const done = loop.run(run.snapshot, run.ports, run.controller.signal);
-    // Push steer mid-turn: claude driver writes it to stdin and returns true, then the child exits without answering turn 2!
-    await new Promise((r) => setTimeout(r, 90));
-    run.ports.pushSteer("urgent steer that child ignored before exit");
-    const outcome = await done;
-    expect(outcome).toBe("completed");
-    // Either the CLI loop relaunched and confirmed it on a second process, OR requeued it cleanly via ports.requeueEnvelopes!
-    // In this script every launch only handles 1 turn (never confirms an appended steer in-process), so if relaunched with
-    // the steer as prompt it gets delivered on launch #2, otherwise it is requeued — never silently dropped.
-    const runs = (await import("node:fs")).readFileSync(logFile, "utf8").trim().split("\n");
-    const sawRelaunch = runs.length >= 2;
-    const sawRequeue = run.ports.log.requeued.some((r) => r.envelopeIds.length > 0);
-    expect(sawRelaunch || sawRequeue).toBe(true);
+  it("resumes with the exact steer when Claude exits before starting its queued turn", async () => {
+    const s = setup("claude", [
+      { actions: [{ awaitQueuedInput: true }], exitAfterTurn: true },
+      { actions: [{ text: "correction processed" }] },
+    ]);
+    const done = s.go();
+    await waitFor(() => s.fake.prompts().length === 1, "the first turn");
+    const correction = "use the validated revision";
+    s.run.ports.pushSteer(correction);
+    expect(await done).toBe("completed");
+    expect(s.fake.launches()).toHaveLength(2);
+    expect(s.fake.launches()[1]).toContain("--resume");
+    expect(s.fake.prompts()).toEqual([expect.stringContaining("do the first thing"), steerNoteText(correction)]);
+    expect(s.run.ports.log.evidence.filter(e => e.kind === "system_note" && e.text === steerNoteText(correction))).toHaveLength(1);
+    expect(s.run.ports.log.requeued).toEqual([]);
   });
 
   it.each([true, false])("failed resume rebuilds both absorbed follow-ups exactly once (prior text: %s)", async priorText => {
@@ -243,6 +220,8 @@ describe("BUG-026: CLI steer & follow-up anti-loss and fresh rebuild anti-duplic
       workspaceRoot: root,
       spec: { processor: { kind: "llm", toolsets: TOOLSETS }, lifetime: "one_shot", parentId: "desk" },
       batch: [env1],
+      roster: [{ cellId:"child-proof", title:"查阅记录", preset:"worker", status:"active", epoch:0, lastRunAt:null, statusLine:null }],
+      tailNotes: ["Current board entry: release pending"],
     });
     // Mirror what real dispatcher.ts does before loop.run(): record initial batch inbound in SQLite evidence!
     await run.ports.context.appendEvidence(run.snapshot.cellId, { runId: run.snapshot.runId, at: clock.now(), kind: "inbound", envelope: env1 });
@@ -270,14 +249,16 @@ describe("BUG-026: CLI steer & follow-up anti-loss and fresh rebuild anti-duplic
     expect(fake.launches()[2]).not.toContain("resume");
     const rebuilt = fake.prompts().at(-1)!;
     // env1 appears once in prior conversation (not duplicated), and BOTH identical-text envelopes appear!
+    expect(rebuilt.match(/Current board entry: release pending/g)).toHaveLength(1);
+    expect(rebuilt.match(/child-proof/g)).toHaveLength(1);
     expect(rebuilt.match(/first task/g)?.length).toBe(1);
     expect(rebuilt.match(/same ping text/g)?.length).toBe(2);
   });
 
   it("lets Claude finish a long queued turn when the previous result omitted the queue count", async () => {
     const s = setup("claude", [
-      { actions: [{sleep:400}], omitQueuedTurnCount:true },
-      { actions: [{text:"second turn started"},{sleep:5_400},{text:"second turn complete"}] },
+      { actions: [{awaitQueuedInput:true}], omitQueuedTurnCount:true },
+      { actions: [{sleep:5_400},{text:"second turn complete"}] },
     ]);
     const done = s.go();
     await waitFor(() => s.fake.prompts().length === 1, "the first prompt");

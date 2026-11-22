@@ -303,11 +303,13 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
       return context.listEvidenceSync(cellId, o);
     },
 
-    canForkSession(parentId,uptoSeq,sessionId,delivered) {
+    canForkSession(parentId,uptoSeq,sessionId,delivered,systemHash) {
       if (parentId !== self.parentId || context.lastEvidenceSeqSync(parentId) !== uptoSeq || core.dispatcher.running().some(r=>r.cellId===parentId)) return false;
       const current=context.readStateSync<CliSessionRecord>(parentId, CLI_SESSION_KEY);
-      return current?.sessionId===sessionId && current.lastDeliveredEvidenceSeq===delivered &&
-        !get(core.db,"SELECT 1 FROM evidence WHERE cell_id=? AND seq>? AND seq<=? AND kind IN ('system_note','inbound') LIMIT 1",[parentId,delivered,uptoSeq]);
+      const prefix = get<{hash:string}>(core.db, "SELECT hash FROM prompt_prefixes WHERE cell_id=?", [parentId]);
+      return !!prefix && prefix.hash === systemHash && current?.systemHash === systemHash &&
+        current?.sessionId===sessionId && current.lastDeliveredEvidenceSeq===delivered &&
+        !get(core.db,"SELECT 1 FROM evidence WHERE cell_id=? AND seq>? AND seq<=? AND kind IN ('system_note','inbound','external') LIMIT 1",[parentId,delivered,uptoSeq]);
     },
     listOwnDecisions() {
       return core.gate.listApprovalsSync({cellIds:[cellId]}).map(record => {

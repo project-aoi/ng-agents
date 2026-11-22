@@ -59,7 +59,7 @@ export interface KernelOptions {
   /** The installed CLI to use when the processor does not select its own engine. */
   agentBackend?: AgentBackendSetting;
   /** Per-CLI loop settings (binary, tier models, env pass-through, timeouts, ...). */
-  cli?: Partial<Record<CliEngine, Omit<CliAgentLoopOptions, "engine" | "registry" | "clock">>>;
+  cli?: Partial<Record<CliEngine, Omit<CliAgentLoopOptions, "engine" | "registry" | "clock" | "processRegistry">>>;
   /**
    * The owner's model switch for CLI engines: each Run asks it which model and effort to launch with, the catalogue
    * comes from the CLI itself, and the default ("auto") is the CLI's own first choice. Off unless given — a bare

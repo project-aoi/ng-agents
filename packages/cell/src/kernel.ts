@@ -10,6 +10,8 @@ import { createInbox } from "@ng/inbox";
 import {
   createCodeLoop,
   createCliAgentLoop,
+  createCliOwner,
+  isCliOwnerAlive,
   createRoutingLoop,
   reapOrphanedCliProcesses,
   registerStandardToolsets,
@@ -170,13 +172,14 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
   };
 
   /** Running CLI agent processes are on record here, so a restart can stop the ones a crashed kernel left behind. */
+  const cliOwner = createCliOwner();
   const cliProcDir = join(dataDir, "cli-procs");
   const loop: AgentLoop = createRoutingLoop({
     local: opts.loop ?? createCodeLoop(registry, clock),
     defaultEngine: agentBackend,
     cliLoop: (engine) => {
       const settings = modelSettingsOf(engine);
-      return createCliAgentLoop({ procDir: cliProcDir, ...opts.cli?.[engine], ...(settings ? { resolveModel: (tier) => settings.resolve(tier) } : {}), engine, registry, clock });
+      return createCliAgentLoop({ ...opts.cli?.[engine], processRegistry: { dir: cliProcDir, ownerInstanceId: cliOwner.ownerInstanceId }, ...(settings ? { resolveModel: (tier) => settings.resolve(tier) } : {}), engine, registry, clock });
     },
   });
 
@@ -204,6 +207,7 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     loop,
     dataDir,
     cliProcDir,
+    ownerInstanceId: cliOwner.ownerInstanceId,
     deskCellId,
     ownerPrincipal,
     rootBounds: { ...DEFAULT_ROOT_BOUNDS, ...Object.fromEntries(Object.entries(opts.rootBounds ?? {}).filter(([, v]) => v !== undefined)) },
@@ -297,12 +301,13 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     // Ask the backend CLI for its models now, so the first Run does not have to wait for the list.
     if (agentBackend) modelSettingsOf(agentBackend)?.warm();
     // A previous process's in-flight Runs died with it; their batches go back to the queue (one attempt each).
-    inbox.recoverClaimsSync({ reason: "recovered at startup: the previous kernel stopped during this run" });
+    inbox.recoverClaimsSync({ ownerAlive: isCliOwnerAlive, reason: "recovered at startup: the previous kernel stopped during this run" });
     try {
       // A kernel that was killed leaves its CLI agents running (they have their own process groups) while their
       // batches were just taken back above: stop them before anything is dispatched into the same directories.
-      for (const r of await reapOrphanedCliProcesses(cliProcDir)) {
+      for (const r of await reapOrphanedCliProcesses(cliProcDir, { ownerInstanceId: cliOwner.ownerInstanceId })) {
         if (r.killed) onError(new Error(`stopped a CLI agent (pid ${r.pid}) of cell "${r.cellId}" left running in ${r.cwd} by the previous kernel`), "recovery");
+        else if (r.status === "owned") dispatcher.holdForUnknownOrphan(r.cellId);
         else if (r.status === "unknown") {
           dispatcher.holdForUnknownOrphan(r.cellId);
           onError(new Error(`deferred cell "${r.cellId}": CLI pid ${r.pid} in ${r.cwd} is alive with unreadable identity; checking the recorded identity for up to 30 seconds`), "recovery");
@@ -345,6 +350,7 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     await dispatcher.stop();
     await Promise.allSettled([...tasks]);
     workspace.close();
+    cliOwner.release();
     for (const u of unsubscribe) u();
   }
 

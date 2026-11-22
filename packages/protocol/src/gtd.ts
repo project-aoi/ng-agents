@@ -194,6 +194,7 @@ export interface SourceRecord {
   status: "ok" | "error" | "paused";
   processor: "code" | "llm";
   lastRunAt?: number;
+  lastCheckKey?: string;
   lastHitAt?: number;
   lastError?: string;
   runCount: number;

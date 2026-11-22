@@ -28,6 +28,7 @@ export interface KernelCore {
 
   dataDir: string;
   cliProcDir: string;
+  ownerInstanceId: string;
   deskCellId: string;
   ownerPrincipal: string;
   rootBounds: BoundsInit;

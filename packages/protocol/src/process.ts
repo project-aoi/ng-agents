@@ -28,7 +28,7 @@ export const groupAlive = (pgid: number): boolean => pgid > 0 && probe(-pgid);
 export function processIdentity(pid: number): string | null {
   try {
     return execFileSync("ps", ["-ww", "-o", "lstart=,comm=", "-p", String(pid)], {
-      encoding: "utf8", env: {...process.env, LC_ALL:"C"}, timeout: 2000, stdio:["ignore","pipe","ignore"],
+      encoding: "utf8", env: {...process.env, LC_ALL:"C", TZ:"UTC"}, timeout: 2000, stdio:["ignore","pipe","ignore"],
     }).trim() || null;
   } catch { return null; }
 }
@@ -150,6 +150,25 @@ export function processHasMarker(pid: number, name: string, value: string, ident
   if (command && env.trim().startsWith(command) && env.trim().slice(command.length).trim()) return false;
   const current = identity ? processInspection.readIdentity(pid) : null;
   return current && identity ? current === identity : null;
+}
+
+/** Recheck a detached group after its recorded leader has exited. A recycled leader never authorizes a signal. */
+export function markedGroupState(pid: number, name: string, value: string, identity?: string | null): boolean | null {
+  const leader = processHasMarker(pid, name, value, identity);
+  if (leader !== false || pidAlive(pid) || !groupAlive(pid)) return leader;
+  try {
+    const listing = execFileSync("ps", ["-eo", "pid=,pgid="], { encoding: "utf8", timeout: 2_000, stdio: ["ignore", "pipe", "ignore"] });
+    for (const line of listing.trim().split("\n")) {
+      const [member, group] = line.trim().split(/\s+/).map(Number);
+      if (!member || group !== pid) continue;
+      const state = processHasMarker(member, name, value);
+      if (state === true) return true;
+    }
+    // Descendants may clear the inherited marker. Keep the group under observation until it exits.
+    return groupAlive(pid) ? null : false;
+  } catch {
+    return groupAlive(pid) ? null : false;
+  }
 }
 
 /** Only a process positively identified by its marker counts: one we cannot identify is never signalled as ours. */
