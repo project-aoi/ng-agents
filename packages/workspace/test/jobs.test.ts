@@ -196,6 +196,34 @@ describe("jobs", () => {
     expect(h.inbox.list("w1").filter(e => e.type === "job.result")).toHaveLength(1);
   });
 
+  it("recovers the recorded exit only after a detached system sleep in the original group has gone", async () => {
+    const h = harness();
+    const port = await h.mgr.acquire("w1");
+    const { jobId } = await port.startJob({
+      command: "/bin/sleep 30 & echo $! > child.pid; while [ ! -f release ]; do sleep .05; done; exit 7",
+    });
+    const job = h.mgr.getJobSync(jobId)!;
+    await waitFor(() => existsSync(join(port.root, "child.pid")));
+    const childPid = Number(readFileSync(join(port.root, "child.pid"), "utf8").trim());
+    h.mgr.close();
+    writeFileSync(join(port.root, "release"), "");
+    await waitFor(() => pidGone(job.pid!));
+    expect(pidGone(childPid)).toBe(false);
+    const mgr = h.restart();
+    const initial = { ...processInspection };
+    try {
+      if (process.platform === "darwin") {
+        processInspection.readEnvironment = pid => pid === childPid ? null : initial.readEnvironment(pid);
+      }
+      await mgr.recover();
+      expect(await finished({mgr}, jobId)).toMatchObject({state: "failed", exitCode: 7});
+      expect(pidGone(childPid)).toBe(true);
+      expect(h.inbox.list("w1").filter(e => e.type === "job.result")).toHaveLength(1);
+    } finally {
+      Object.assign(processInspection, initial);
+    }
+  });
+
   it("recover() marks a job whose process died with the old kernel as failed", async () => {
     const h = harness();
     const port = await h.mgr.acquire("w1");
@@ -307,14 +335,16 @@ describe("jobs", () => {
   it("the kernel dies after the kill but before recording it: recover() records cancelled, not a failure", async () => {
     const h = harness();
     const port = await h.mgr.acquire("w1");
-    const { jobId } = await port.startJob({ command: "sleep 30" });
+    const { jobId } = await port.startJob({ command: "sleep 30 & echo ready > started; wait" });
+    await waitFor(() => existsSync(join(port.root, "started")));
     const pid = h.mgr.getJobSync(jobId)!.pid!;
     run(h.db, "UPDATE jobs SET cancel_requested_at = 5, error = 'stopped by the owner' WHERE job_id = ?", [jobId]);
     h.mgr.close();
     process.kill(-pid, "SIGKILL");
-    await waitFor(() => pidGone(pid));
+    await waitFor(() => pidGone(pid) && !groupAlive(pid));
     const next = h.restart();
     await next.recover();
+    await waitFor(() => next.getJobSync(jobId)?.state === "cancelled");
     expect(next.getJobSync(jobId)).toMatchObject({ state: "cancelled", error: "stopped by the owner" });
     expect((h.inbox.list("w1")[0]!.payload as JobResultPayload).state).toBe("cancelled");
   });
@@ -392,7 +422,7 @@ describe("process identity without /proc (macOS)", () => {
     const stranger = spawn("sleep", ["30"], { stdio: "ignore" });
     await once(stranger, "spawn");
     try {
-      withoutProc((pid) => (pid === process.pid ? "node vitest NG_JOB_ID=another PATH=/usr/bin:/bin HOME=/Users/me\n" : null));
+      const probes = withoutProc((pid) => (pid === process.pid ? "node vitest NG_JOB_ID=another PATH=/usr/bin:/bin HOME=/Users/me\n" : null));
       const now = Date.now();
       run(
         h.db,
@@ -404,16 +434,21 @@ describe("process identity without /proc (macOS)", () => {
       await h.mgr.recover();
       expect(h.mgr.getJobSync("job_recycled")).toMatchObject({ state: "failed" });
       await waitFor(() => h.inbox.list("w1").find(e => e.type === "job.warning"));
-      await new Promise(resolve => setTimeout(resolve, 5 * 40));
+
       expect(h.mgr.getJobSync("job_unreadable")).toMatchObject({ state: "running" });
       expect(h.inbox.list("w1").filter(e => e.id === "job_unreadable:result")).toHaveLength(0);
       expect(pidGone(stranger.pid!)).toBe(false);
       const later = Date.now()+31_000;
       const time = vi.spyOn(Date,"now").mockReturnValue(later);
       try {
-        await waitFor(()=>h.mgr.getJobSync("job_unreadable")?.state==="failed");
+        const before = probes.filter(pid => pid === stranger.pid).length;
+        await waitFor(() => probes.filter(pid => pid === stranger.pid).length >= before + 3);
+        expect(h.mgr.getJobSync("job_unreadable")?.state).toBe("running");
         expect(pidGone(stranger.pid!)).toBe(false);
-        expect(h.inbox.list("w1").filter(e=>e.id==="job_unreadable:result")).toHaveLength(1);
+        expect(h.inbox.list("w1").filter(e=>e.id==="job_unreadable:result")).toHaveLength(0);
+        stranger.kill("SIGTERM");
+        await once(stranger, "exit");
+        await waitFor(() => h.mgr.getJobSync("job_unreadable")?.state === "failed");
       } finally { time.mockRestore(); }
     } finally {
       stranger.kill("SIGKILL");

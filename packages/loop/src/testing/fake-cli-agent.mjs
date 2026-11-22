@@ -124,6 +124,10 @@ async function runTurn(turn, emit, mcp, signal) {
       const callId = `tool_${randomUUID().slice(0, 8)}`;
       await emit.native(callId, a);
     } else if (a.item !== undefined) emit.item?.(a.item);
+    else if (a.waitFile) {
+      log({type:"waiting_file", path:a.waitFile});
+      while (!existsSync(a.waitFile) && !signal?.aborted) await sleep(10, signal);
+    }
     else if (a.awaitQueuedInput) await emit.awaitQueuedInput();
     else if (a.sleep !== undefined) await sleep(a.sleep, signal);
     else if (a.exit !== undefined) process.exit(a.exit);
@@ -355,8 +359,11 @@ async function agy() {
       },
     };
     const turn = nextTurn();
-    const r = await runTurn(turn, emit, mcp, signal);
-    current = null;
+    const running = runTurn(turn, emit, mcp, signal);
+    const r = turn.acknowledgeCancelDuringTool ? await Promise.race([
+      running, new Promise(resolve => signal.addEventListener("abort", () => resolve({stopped: true}), {once: true})),
+    ]) : await running;
+    if (current?.signal === signal) current = null;
     if (r.error) out({ jsonrpc: "2.0", id, error: { code: -32603, message: r.error } });
     else out({ jsonrpc: "2.0", id, result: { stopReason: turn.refused ? "refusal" : signal.aborted ? "cancelled" : "end_turn" } });
   }

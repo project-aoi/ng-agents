@@ -12,7 +12,7 @@ describe("project decisions", () => {
   it("a project proposal is approved and handed back to the owning cell", async () => {
     const h = await boot();
     h.script.add("desk", tool("request_approval", { kind: "project", title: "官网改版", summary: "propose a project", proposal: { outcome: "新官网上线", actions: [{ title: "出设计稿", owner: "agent" }] } }));
-    await h.ui.capture({ text: "我想把官网改版" });
+    await h.ui.capture({ text: "我想把官网改版" }, "owner");
     await h.kernel.idle();
     const [card] = h.kernel.gate.listPendingSync();
     expect(card!.action.type).toBe("project.start");

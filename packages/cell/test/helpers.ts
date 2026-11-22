@@ -1,4 +1,4 @@
-import {gtdLifecycle} from "../../../presets/src";
+import { gtdLifecycle } from "../../../presets/src";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -119,13 +119,19 @@ export const TOOLSETS = STANDARD_TOOLSETS;
 /**
  * Minimal ad-hoc presets: just enough processor wiring for kernel tests (the real presets live in @ng/presets).
  * They mirror the real shapes: the desk, projects and hubs coordinate and persist; a worker is a wakeable leaf on the
- * host (isolation "none") — its parent is told when a turn settles and it stays, dormant; a checker is a one-shot
+ * host — its parent is told when a turn settles and it stays, dormant; a checker is a one-shot
  * leaf the kernel closes once it has reported and its inbox is drained.
  */
 export function registerTestPresets(registry: Registry): void {
   const all = [TOOLSETS.context, TOOLSETS.comms, TOOLSETS.schedule, TOOLSETS.cells, TOOLSETS.workspace];
   registry.presets.register({...gtdLifecycle,
     name: "inline",
+    approvedSpawn(record) {
+      if (record.action.type === "project.start") return {
+        spec: { id: `project-${record.actionId}`, preset: "project", processor: {kind:"llm"} },
+        task: { instruction: record.action.proposal?.outcome ?? record.action.summary },
+      };
+    },
     description: "test desk",
     defaults: { processor: { kind: "llm", toolsets: all }, lifetime: "persistent", meta: { role: "desk" } },
   });
@@ -209,7 +215,7 @@ export async function boot(opts: BootOptions = {}): Promise<Harness> {
   cleanups.push(() => kernel.close());
   const events: Harness["events"] = [];
   kernel.bus.on("*", (topic, data) => events.push({ topic, data }));
-  if (opts.desk !== false) kernel.ensureRootCell(opts.desk ?? { id: "desk", preset: "inline" });
+  if (opts.desk !== false) kernel.ensureRootCell(opts.desk ?? { id: "desk", preset: "inline" }, { principalId: kernel.ownerPrincipal });
   if (opts.start !== false) await kernel.start();
   return {
     kernel,

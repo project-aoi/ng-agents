@@ -50,7 +50,7 @@ describe("docs/05 scenario 1 — part of the work waits for the owner; the repor
       },
     );
     h.script.add("project", tool("update_project", { summary: "trae 部分已完成，等 Doubao work 的代码" }));
-    await h.ui.capture({ text: "/todo Harness 对比，会议纪要见共享文档" });
+    await h.ui.capture({ text: "/todo Harness 对比，会议纪要见共享文档" }, "owner");
     await h.kernel.idle();
 
     const [project] = projects(h);
@@ -104,7 +104,7 @@ describe("docs/05 scenario 1 — part of the work waits for the owner; the repor
     ]);
 
     // A closed project is not told anything.
-    await h.kernel.closeCell(project!, "completed");
-    expect(notifyProjectOfOwnerChangeSync(h.kernel, project!, "还有一件事")).toBeNull();
+    await h.kernel.closeCell(project!, "completed", { principalId: h.kernel.ownerPrincipal });
+    expect(notifyProjectOfOwnerChangeSync(h.kernel, project!, "还有一件事", { principalId: h.kernel.ownerPrincipal })).toBeNull();
   });
 });

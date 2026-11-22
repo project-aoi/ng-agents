@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { gtdKeys, projectIdForApproval } from "@ng/presets";
-import { type ProjectProposalCard, type ProjectRecord, type SourceRecord } from "@ng/protocol";
+import type { ProjectRecord, SourceRecord } from "@ng/presets/records";
+import { type ProjectProposalCard } from "@ng/protocol";
 import type { Kernel } from "@ng/cell";
 import type {
   PlanSaveResponse,
@@ -12,7 +13,7 @@ import type {
   WeeklyReviewDTO,
 } from "../src/shared/api";
 import { createDeskServer } from "../src/server/boot";
-import { viewsForBusEvent } from "../src/server/events";
+import { createEventHub, viewsForBusEvent } from "../src/server/events";
 import { SecurityConfigError, isLoopbackHost } from "../src/server/security";
 import { SKILL_SUGGESTION_PREFIX } from "../src/server/projections";
 import { BUILTIN_SKILLS } from "@ng/presets";
@@ -51,9 +52,11 @@ describe("the bearer-token rule (docs/01 坑 1)", () => {
     await sse.body!.cancel();
   });
 
-  it("on loopback without a token, rejects writes a foreign web page could forge", async () => {
+  it("requires the generated owner credential on loopback and rejects foreign origins", async () => {
     const d = await bootDesk();
-    const cap = (headers: Record<string, string>, body = JSON.stringify({ text: "x" })) => d.server.app.request("/api/capture", { method: "POST", body, headers });
+    expect(d.server.security.generatedOwnerToken).toBe(true);
+    expect((await d.server.app.request("/api/status")).status).toBe(401);
+    const cap = (headers: Record<string, string>, body = JSON.stringify({ text: "x" })) => d.server.app.request("/api/capture", { method: "POST", body, headers: { authorization: `Bearer ${d.server.security.token}`, ...headers } });
     expect((await cap({ "content-type": "application/json", origin: "https://evil.example" })).status).toBe(403);
     expect((await cap({ "content-type": "application/json", "sec-fetch-site": "cross-site" })).status).toBe(403);
     expect((await cap({ "content-type": "text/plain", "content-length": "12" })).status).toBe(415);
@@ -90,9 +93,39 @@ describe("live updates", () => {
     expect(viewsForBusEvent("state.changed", { cellId: "desk", keys: ["coord:state"] })).toEqual([]);
   });
 
+  it("broadcasts a claimed decision's correction and a closed project's reopening", async () => {
+    const d = await bootDesk();
+    const project = makeProject(d.kernel, "重开的项目");
+    await d.kernel.closeCell(project, "completed", { principalId: d.kernel.ownerPrincipal });
+    const item = d.kernel.humanItems.create({ title: "核对", subjectKey: "review:confirm",
+      options: [{ id: "yes", label: "同意", effect: "reply" }] }, "desk");
+    const decision = await d.kernel.humanItems.decide(item.id, { optionId: "yes", seenItemRevision: 1 }, "owner");
+    await d.kernel.idle();
+    async function refreshDuring(operation: () => Promise<void>) {
+      const hub = createEventHub(d.kernel, { debounceMs: 0 });
+      try {
+        const next = new Promise<readonly string[]>(resolve => hub.subscribe(event => {
+          if (event.event === "refresh") resolve(event.data.views);
+        }));
+        await operation();
+        return await next;
+      } finally { hub.close(); }
+    }
+    const undo = await refreshDuring(async () => {
+      expect(await d.post(`/api/human-activity/${decision.activityId}/undo`)).toMatchObject({status:"corrected"});
+    });
+    expect(undo).toEqual(expect.arrayContaining(["activity", "inbox", "review"]));
+    await d.kernel.idle();
+    const reopen = await refreshDuring(async () => {
+      await d.post(`/api/projects/${project}/reopen`);
+      expect(d.kernel.getCell(project)?.status).toBe("active");
+    });
+    expect(reopen).toEqual(expect.arrayContaining(["inbox", "radar", "agents", "review"]));
+  });
+
   it("streams hello, then refresh events after a change", async () => {
     const d = await bootDesk();
-    const res = await d.server.app.request("/api/events");
+    const res = await d.server.app.request("/api/events", { headers: {authorization: `Bearer ${d.server.security.token}`} });
     const reader = res.body!.getReader();
     const decoder = new TextDecoder();
     let text = "";
@@ -124,17 +157,22 @@ describe("⚡ sources", () => {
     // a script check runs commands in a directory of its own — never given a cwd (so never the owner's repository),
     // no worktree, no sandbox; nothing about read/write modes is asked any more (docs/05 proposal 03)
     expect(d.kernel.getCell(id)!.spec.cwd).toBeUndefined();
-    expect(d.kernel.getCell(id)!.bounds.isolation).toBe("none");
+
 
     const p = await d.post<SourcesMutationResponse>(`/api/sources/${id}/pause`);
     expect(p.view.sensors[0]).toMatchObject({ status: "paused", statusLabel: "已暂停" });
     expect(d.kernel.getCell(id)!.status).toBe("paused");
     const m = await d.req<SourcesMutationResponse>("PUT", `/api/sources/${id}/mode`, { mode: "observe" });
     expect(m.json.view.sensors[0]).toMatchObject({ mode: "observe" });
-    expect(d.kernel.context.readStateSync<SourceRecord>(id, gtdKeys.source)).toMatchObject({ mode: "observe", status: "paused" });
+    expect(d.kernel.context.readStateSync<SourceRecord>(id, gtdKeys.source)).toMatchObject({mode:"observe"});
+    expect(d.kernel.context.readStateSync(id, gtdKeys.source)).not.toHaveProperty("status");
+    expect(m.json.view.sensors[0]?.status).toBe("paused");
     const del = await d.req<SourcesMutationResponse>("DELETE", `/api/sources/${id}`);
     expect(del.json).toMatchObject({ outcome: "deleted", view: { sensors: [] } });
     expect(d.kernel.getCell(id)!.status).toBe("closed");
+    const notice = d.kernel.inbox.listMessagesSync({cellId:"desk", type:"cell.result"}).find(m =>
+      (m.envelope.payload as {childCellId?:string}).childCellId === id);
+    expect(notice?.envelope).toMatchObject({principalId:"owner", delivery:"silent_inject"});
   });
 
   it("an llm source starts with its instruction as the first task", async () => {
@@ -168,7 +206,8 @@ describe("weekly review actions", () => {
     const r = await d.post<ReviewMutationResponse>(`/api/review/sensors/${c.sensorId}/code`, { entry: "script:checks/metrics.sh" });
     expect(r.outcome).toBe("switched_to_code");
     expect(d.kernel.getCell(c.sensorId!)!.spec.processor).toEqual({ kind: "code", entry: "gtd.sensor_script",args:{script:"checks/metrics.sh"} });
-    expect(d.kernel.context.readStateSync<SourceRecord>(c.sensorId!, gtdKeys.source)!.processor).toBe("code");
+    expect(d.kernel.context.readStateSync(c.sensorId!, gtdKeys.source)).not.toHaveProperty("processor");
+    expect((await d.get<SourcesMutationResponse["view"]>("/api/sources")).sensors[0]?.processor).toBe("code");
     expect((await d.req("POST", `/api/review/sensors/${c.sensorId}/code`, { entry: "not-registered" })).status).toBe(400);
   });
 });
@@ -248,7 +287,7 @@ describe("escalations and completion", () => {
   it("project complete closes the tree and shows up in the weekly review", async () => {
     const d = await bootDesk();
     const p = makeProject(d.kernel, "季度总结");
-    d.kernel.spawnCell(p, { id: "w", preset: "worker", title: "汇总数据" });
+    d.kernel.spawnCell(p, { id: "w", preset: "worker", title: "汇总数据" }, undefined, { principalId: d.kernel.ownerPrincipal });
     const r = await d.post<ProjectMutationResponse>(`/api/projects/${p}/complete`);
     expect(r).toMatchObject({ outcome: "completed", view: { counts: { completedThisWeek: 1 } } });
     expect(r.view.review.completed).toMatchObject([{ kind: "project", title: "季度总结" }]);
@@ -266,7 +305,7 @@ describe("escalations and completion", () => {
     const choice = { optionId: "system.reply", seenArtifactVersion: 1, seenItemRevision: 1 };
     await d.post(`/api/human-items/${actionId}/decide`, choice);
     expect((await d.req("POST", `/api/human-items/${actionId}/decide`, choice)).status).toBe(409);
-    const malformed = await d.server.app.request("/api/capture", { method: "POST", body: "{not json", headers: { "content-type": "application/json" } });
+    const malformed = await d.server.app.request("/api/capture", { method: "POST", body: "{not json", headers: { authorization: `Bearer ${d.server.security.token}`, "content-type": "application/json" } });
     expect(malformed.status).toBe(400);
     expect(await malformed.json()).toEqual({ error: { code: "invalid_json", message: "请求体不是合法的 JSON" } });
   });

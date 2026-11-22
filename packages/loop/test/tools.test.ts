@@ -202,7 +202,7 @@ describe("kernel.comms request_approval / report_to_parent / handback / wait", (
     expect(run.ports.log.settled).toEqual([
       { action: "complete", summary: "官网改版已上线" },
       { action: "cancel", summary: "放弃了" },
-      { action: "pause", summary: "等明年排期" },
+      { action: "pause", pauseReason: "parked", summary: "等明年排期" },
     ]);
     expect(run.ports.state.get(CELL_STATUS_KEY)).toMatchObject({ text: "已停靠：等明年排期" });
   });
@@ -320,7 +320,7 @@ describe("kernel.comms request_approval / report_to_parent / handback / wait", (
     expect(run.ports.log.settled).toEqual([
       { action: "complete", summary: "收尾，子任务不要了", force: true },
       { action: "cancel", summary: "放弃", force: true },
-      { action: "pause", summary: "等排期", force: true },
+      { action: "pause", pauseReason: "parked", summary: "等排期", force: true },
       { action: "complete", summary: "正常收尾" },
     ]);
 

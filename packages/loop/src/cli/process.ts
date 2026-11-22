@@ -1,9 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import { groupAlive, markedGroupState, processInspection, pidAlive, processIdentity, processDescendants, processHasMarker } from "@ng/protocol";
+import { leaderGoneOrZombie, liveGroupMembers, groupAlive, markedGroupState, processInspection, pidAlive, processIdentity, processDescendants, processHasMarker } from "@ng/protocol";
 
 export interface CliProcess {
   readonly child: ChildProcess;
@@ -38,11 +38,17 @@ export function spawnCli(
   // Catch TERM in the marker-bearing shell; exec resets a caught signal to default in the actual CLI.
   const child = spawn(wrapped ? "/bin/sh" : file, wrapped ? ["-c", 'trap ":" TERM; "$@"; exit $?', `${CLI_PROCESS_MARKER}=${marker}`, file, ...args] : args, { cwd: opts.cwd, env, stdio: ["pipe", "pipe", "pipe"], detached: true, windowsHide: true });
   const record = reg && marker && child.pid ? registerCliProcess(reg, { pid: child.pid, marker, cwd: opts.cwd, bin: file }) : null;
+  if (reg && child.pid && !record) {
+    try { process.kill(-child.pid, "SIGKILL"); } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ESRCH") throw err;
+    }
+    throw new Error("Could not register the command-line process for recovery");
+  }
   let stopping: Promise<void> | undefined;
   const pid = child.pid ?? -1;
   const leaderIsOurs = () => child.exitCode === null && child.signalCode === null;
   function stop(graceMs: number): Promise<void> {
-    if (pid <= 0 || (!leaderIsOurs() && (pidAlive(pid) || !groupAlive(pid)))) return stopping ?? Promise.resolve();
+    if (pid <= 0 || (!leaderIsOurs() && (!leaderGoneOrZombie(pid) || !groupAlive(pid)))) return stopping ?? Promise.resolve();
     stopping ??= stopProcessTree(pid, leaderIsOurs, graceMs).then(gone => {
       if (record && gone) rmSync(record, { force: true });
     });
@@ -158,7 +164,7 @@ function identityHash(pid: number): string {
 }
 
 export function createCliOwner(): { ownerInstanceId: string; release(): void } {
-  localIdentity ??= identityHash(process.pid);
+  localIdentity ||= identityHash(process.pid);
   const ownerInstanceId = `${process.pid}:${localIdentity}:${randomUUID()}`;
   liveOwners.add(ownerInstanceId);
   return { ownerInstanceId, release: () => { liveOwners.delete(ownerInstanceId); } };
@@ -184,13 +190,20 @@ interface CliProcessRecord {
   bin: string;
   startedAt: number;
   identity?: string | null;
-  unknownSince?: number;
   ownerInstanceId?: string;
 }
 
+function readRegistration(path: string): CliProcessRecord {
+  const rec: CliProcessRecord = JSON.parse(readFileSync(path, "utf8"));
+  if (!rec || !Number.isSafeInteger(rec.pid) || rec.pid <= 0 ||
+      [rec.marker, rec.runId, rec.cellId, rec.cwd].some(value => typeof value !== "string" || !value)) {
+    throw new Error(`Incomplete CLI process registration at ${path}`);
+  }
+  return rec;
+}
+
 function registrationState(rec: CliProcessRecord): boolean | null {
-  return Number.isSafeInteger(rec.pid) && rec.pid > 0 && typeof rec.marker === "string"
-    ? markedGroupState(rec.pid, CLI_PROCESS_MARKER, rec.marker, rec.identity) : false;
+  return markedGroupState(rec.pid, CLI_PROCESS_MARKER, rec.marker, rec.identity);
 }
 
 function registerCliProcess(reg: CliProcessRegistration, p: { pid: number; marker: string; cwd: string; bin: string }): string | null {
@@ -208,10 +221,16 @@ function registerCliProcess(reg: CliProcessRegistration, p: { pid: number; marke
       ownerInstanceId: reg.ownerInstanceId,
       identity: process.platform === "darwin" ? processIdentity(p.pid) : null,
     };
-    writeFileSync(path, JSON.stringify(rec), { mode: 0o600 });
+    const tmp = `${path}.${randomUUID()}.tmp`;
+    try {
+      writeFileSync(tmp, JSON.stringify(rec), { mode: 0o600, flag: "wx" });
+      renameSync(tmp, path);
+    } finally {
+      rmSync(tmp, { force: true });
+    }
     return path;
   } catch {
-    return null; // a record that cannot be written must not stop the Run
+    return null; // The caller terminates the just-spawned group.
   }
 }
 
@@ -262,8 +281,9 @@ export async function reapOrphanedCliProcesses(
   let files: string[];
   try {
     files = readdirSync(dir).filter((f) => f.endsWith(".json"));
-  } catch {
-    return [];
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw err;
   }
   const out: ReapedCliProcess[] = [];
   await Promise.all(
@@ -271,10 +291,10 @@ export async function reapOrphanedCliProcesses(
       const path = join(dir, f);
       let rec: CliProcessRecord;
       try {
-        rec = JSON.parse(readFileSync(path, "utf8")) as CliProcessRecord;
-      } catch {
-        rmSync(path, { force: true });
-        return;
+        rec = readRegistration(path);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+        throw err;
       }
       if (opts.cellId !== undefined && rec.cellId !== opts.cellId) return;
       if (opts.ownerInstanceId && rec.ownerInstanceId === opts.ownerInstanceId) return;
@@ -284,12 +304,12 @@ export async function reapOrphanedCliProcesses(
         return;
       }
       if (state === null) {
-        // The dispatcher retries unknown registrations within the observation window without sending a signal.
+        // The dispatcher retries unknown registrations until ownership or exit is confirmed without sending a signal.
         out.push({ pid: rec.pid, cellId: rec.cellId, runId: rec.runId, cwd: rec.cwd, status: "unknown", killed: false });
         return;
       }
       if (state === true) {
-        const gone = await stopProcessTree(rec.pid, () => cliProcessStatus(rec.pid, rec.marker, rec.identity) === true, graceMs);
+        const gone = await stopProcessTree(rec.pid, () => cliProcessStatus(rec.pid, rec.marker, rec.identity), graceMs, () => registrationState(rec));
         if (gone) {
           rmSync(path, { force: true });
           out.push({ pid: rec.pid, cellId: rec.cellId, runId: rec.runId, cwd: rec.cwd, status: "killed", killed: true });
@@ -315,18 +335,18 @@ export function probeOrphanCliCell(dir: string, cellId: string, opts: { ownerIns
   let files: string[];
   try {
     files = readdirSync(dir).filter((f) => f.endsWith(".json"));
-  } catch {
-    return "clear";
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ENOENT" ? "clear" : "unknown";
   }
   let sawUnknown = false;
   for (const f of files) {
     const path = join(dir, f);
     let rec: CliProcessRecord;
     try {
-      rec = JSON.parse(readFileSync(path, "utf8")) as CliProcessRecord;
-    } catch {
-      rmSync(path, { force: true });
-      continue;
+      rec = readRegistration(path);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
+      return "unknown";
     }
     if (rec.cellId !== cellId) continue;
     if (opts.ownerInstanceId && rec.ownerInstanceId === opts.ownerInstanceId) continue;
@@ -340,50 +360,45 @@ export function probeOrphanCliCell(dir: string, cellId: string, opts: { ownerIns
       continue;
     }
     if (state === true) return "alive";
-    if (rec.unknownSince === undefined) {
-      rec.unknownSince = Date.now();
-      try {
-        writeFileSync(path, JSON.stringify(rec), { mode: 0o600 });
-      } catch {
-        // Another recovery may have removed the record. Keep the hold until the next probe.
-      }
-    } else if (Date.now() - rec.unknownSince >= 30_000) {
-      // No verifiable process to reap. Retire the stale registration without signalling this PID.
-      rmSync(path, { force: true });
-      continue;
-    }
     sawUnknown = true;
   }
   return sawUnknown ? "unknown" : "clear";
 }
 
 /** Called after identifying the leader. Its descendants can live in independent process groups. */
-async function stopProcessTree(pid: number, leaderIsOurs: () => boolean, graceMs: number): Promise<boolean> {
+async function stopProcessTree(pid: number, leaderIsOurs: () => boolean | null, graceMs: number, probeGroup?: () => boolean | null): Promise<boolean> {
   const tree = new Map<number, string | null>();
   const scan = () => {
     if (!leaderIsOurs()) return;
     for (const child of descendants(pid)) {
-      if (!tree.has(child)) tree.set(child, processInspection.readIdentity(child));
+      if (!tree.get(child)) tree.set(child, processInspection.readIdentity(child));
     }
   };
-  const sameChild = (child: number, before: string | null) =>
-    pidAlive(child) && before !== null && processInspection.readIdentity(child) === before;
-  const ownGroup = () => leaderIsOurs() || !pidAlive(pid);
-  const groupRuns = () => groupAlive(pid) && ownGroup();
+  const childState = (child: number, before: string | null) => {
+    if (leaderGoneOrZombie(child)) return false;
+    const now = processInspection.readIdentity(child);
+    return before && now ? before === now : null;
+  };
+  const groupState = () => {
+    if (!groupAlive(pid)) return false;
+    if (probeGroup) return probeGroup();
+    if (leaderIsOurs()) return true;
+    return leaderGoneOrZombie(pid) && liveGroupMembers(pid)?.length !== 0;
+  };
   function signal(sig: NodeJS.Signals) {
-    if (groupRuns()) {
+    if (groupState() === true) {
       try { process.kill(-pid, sig); } catch { /* group already exited */ }
     } else if (leaderIsOurs()) {
       try { process.kill(pid, sig); } catch { /* leader already exited */ }
     }
     for (const [child, before] of tree) {
-      if (!sameChild(child, before)) continue;
+      if (childState(child, before) !== true) continue;
       try { process.kill(child, sig); } catch { /* descendant already exited */ }
     }
   }
   async function waitGone(ms: number) {
     const deadline = performance.now() + ms;
-    while (groupRuns() || (pidAlive(pid) && leaderIsOurs()) || [...tree].some(([p, before]) => sameChild(p, before))) {
+    while (groupState() !== false || (pidAlive(pid) && leaderIsOurs() !== false) || [...tree].some(([p, before]) => childState(p, before) !== false)) {
       if (performance.now() >= deadline) return false;
       await new Promise(r => setTimeout(r, 25));
     }

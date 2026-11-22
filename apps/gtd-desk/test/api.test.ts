@@ -1,7 +1,10 @@
+import { writeFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
-import { gtdKeys, RESTORE_REASON } from "@ng/presets";
-import { PAYLOAD, type ActionRecord, type ProjectRecord } from "@ng/protocol";
+import { gtdKeys, RESTORE_REASON, writeActionRecordSync } from "@ng/presets";
+import type { ProjectRecord } from "@ng/presets/records";
+import { PAYLOAD, type ActionRecord } from "@ng/protocol";
 import type {
   ActivityMutationResponse,
   ArtifactSaveResponse,
@@ -20,6 +23,7 @@ import {
   makeProject,
   makeReviewCard,
   requestText,
+  tempDir,
   tool,
   writeAction,
   writeActivity,
@@ -115,9 +119,9 @@ describe("review options", () => {
     const d = await bootDesk();
     const projectId = makeProject(d.kernel, "交付项目");
     const workerId = "issuer";
-    d.kernel.spawnCell(projectId, {id:workerId, preset:"worker"});
+    d.kernel.spawnCell(projectId, {id:workerId, preset:"worker"}, undefined, { principalId: d.kernel.ownerPrincipal });
     const {actionId} = makeReviewCard(d.kernel, {cellId:workerId});
-    d.kernel.control(workerId, {action:"pause"});
+    d.kernel.control(workerId, {action:"pause"}, { principalId: d.kernel.ownerPrincipal });
     const item = (await d.get<{items:HumanItemDTO[]}>("/api/human-items")).items.find(i => i.id === actionId)!;
     expect(item.project?.paused).toBe(false);
     expect(item.resumeTarget?.id).toBe(workerId);
@@ -136,7 +140,23 @@ describe("review options", () => {
     const reply = await d.req("POST", `/api/human-items/${actionId}/decide`,
       {optionId:"system.reply", seenItemRevision:1, seenArtifactVersion:1});
     expect(reply.status).toBe(409);
+    expect(d.kernel.gate.getApprovalSync(actionId)?.status).toBe("cancelled");
     expect((await d.req("POST", "/api/human-items/absent/decide", {optionId:"system.someday", seenItemRevision:1})).status).toBe(404);
+  });
+
+  it("moves a personal action to its project and delivers its completion to the new owner", async () => {
+    const d = await bootDesk();
+    const project = makeProject(d.kernel, "文稿整理");
+    const other = makeProject(d.kernel, "另一个项目");
+    const task = writeAction(d.kernel, d.kernel.deskCellId, {title:"提供材料", owner:"human"});
+    const assigned = {...task, projectCellId:project};
+    expect(() => writeActionRecordSync(d.kernel, other, assigned)).toThrow();
+    writeActionRecordSync(d.kernel, d.kernel.deskCellId, assigned);
+    const item = d.kernel.humanItems.get(task.id)!;
+    expect(item).toMatchObject({cellId:project, relatedProjectIds:[project]});
+    await d.kernel.humanItems.decide(item.id,{optionId:"done",seenItemRevision:item.itemRevision},"owner");
+    const messages = d.kernel.inbox.listMessagesSync({type:PAYLOAD.approvalResolved});
+    expect(messages.filter(m => (m.envelope.payload as {actionId: string}).actionId === item.id).map(m => m.cellId)).toEqual([project]);
   });
 
   it("restores a cancelled personal action through HTTP and rejects a second undo", async () => {
@@ -152,7 +172,7 @@ describe("review options", () => {
     expect(result.status).toBe("cancelled");
     expect((await d.get<{ items: HumanItemDTO[] }>("/api/human-items")).items).toHaveLength(0);
     const undo = () => fetch(`${url}/api/human-activity/${result.activityId}/undo`, {
-      method:"POST", headers:{"content-type":"application/json"}, body:"{}",
+      method:"POST", headers:{authorization: `Bearer ${d.server.security.token}`, "content-type":"application/json"}, body:"{}",
     });
     const first = await undo();
     expect(first.status).toBe(200);
@@ -224,16 +244,16 @@ describe("project HTTP routes", () => {
     const project = makeProject(d.kernel,"发布计划");
     const revoked = makeProject(d.kernel,"临时验证");
     d.kernel.gate.revokeSync(revoked);
-    await d.kernel.closeCell(project, "completed");
-    await d.kernel.closeCell(revoked, "cancelled");
+    await d.kernel.closeCell(project, "completed", { principalId: d.kernel.ownerPrincipal });
+    await d.kernel.closeCell(revoked, "cancelled", { principalId: d.kernel.ownerPrincipal });
 
     const closed = async () => {
-      const response = await fetch(url + "/api/projects/closed");
+      const response = await fetch(url + "/api/projects/closed", { headers: {authorization: `Bearer ${d.server.security.token}`} });
       expect(response.status).toBe(200);
       return (await response.json() as {projects: {id:string; title:string}[]}).projects;
     };
     const reopen = (id:string) => fetch(`${url}/api/projects/${id}/reopen`, {
-      method:"POST", headers:{"content-type":"application/json"}, body:"{}",
+      method:"POST", headers:{authorization: `Bearer ${d.server.security.token}`, "content-type":"application/json"}, body:"{}",
     });
     expect(await closed()).toEqual(expect.arrayContaining([
       expect.objectContaining({id:project,title:"发布计划"}), expect.objectContaining({id:revoked,title:"临时验证"}),
@@ -255,13 +275,18 @@ describe("project HTTP routes", () => {
     d.script.add("desk", tool("propose_project", {title:"验收发布", outcome:"发布完成", actions:[{title:"核对清单",owner:"human"}]}));
     await d.post("/api/capture", {text:"为这次发布制定计划"});
     await d.kernel.idle();
-    const list = await fetch(url + "/api/human-items");
+    const list = await fetch(url + "/api/human-items", { headers: {authorization: `Bearer ${d.server.security.token}`} });
     const {items} = await list.json() as {items:HumanItemDTO[]};
     const proposal = items.find(i => i.proposal)!;
     const save = (outcome: string) => fetch(`${url}/api/human-items/${proposal.id}/plan`, {
-      method:"PUT", headers:{"content-type":"application/json"},
+      method:"PUT", headers:{authorization: `Bearer ${d.server.security.token}`, "content-type":"application/json"},
       body:JSON.stringify({expectedVersion:proposal.artifactVersion, proposal:{...proposal.proposal,outcome}}),
     });
+    expect((await save("   ")).status).toBe(400);
+    expect((await d.req("PUT", `/api/human-items/${proposal.id}/plan`, {
+      expectedVersion:proposal.artifactVersion, proposal:{...proposal.proposal, background:{unexpected:true}},
+    })).status).toBe(400);
+    expect((await d.req("PUT", `/api/artifacts/${proposal.artifactId}`, { expectedVersion: proposal.artifactVersion, body: "invalid json" })).status).toBe(400);
     const saved = await save("交付日志并获得验收签字");
     expect(saved.status).toBe(200);
     expect(await saved.json()).toMatchObject({ok:true,outcome:"saved",deskStatus:{generatedAt:d.clock.now()}});
@@ -279,8 +304,8 @@ describe("Radar", () => {
   it("project cancel closes its cell tree and records the cancellation", async () => {
     const d = await bootDesk();
     const p = makeProject(d.kernel, "竞品调研");
-    d.kernel.spawnCell(p, { id: "w1", preset: "inline", title: "扒 A 公司" });
-    d.kernel.spawnCell("w1", { id: "w1a", preset: "worker", title: "扒 A 的定价" });
+    d.kernel.spawnCell(p, { id: "w1", preset: "inline", title: "扒 A 公司" }, undefined, { principalId: d.kernel.ownerPrincipal });
+    d.kernel.spawnCell("w1", { id: "w1a", preset: "worker", title: "扒 A 的定价" }, undefined, { principalId: d.kernel.ownerPrincipal });
     const a = writeAction(d.kernel, "w1", { title: "整理竞品", owner: "agent", progress: { done: 3, total: 15, label: "正在并发整理竞品资料" } });
 
     const radar = await d.get<RadarDTO>("/api/radar");
@@ -318,7 +343,7 @@ describe("Radar", () => {
   it("a waiting watch keeps a project from being stalled; someday pauses it and activate resumes it", async () => {
     const d = await bootDesk();
     const p = makeProject(d.kernel, "供应商比价");
-    d.kernel.spawnCell(p, { id: "watch-c", preset: "checker", title: "等 C 报价", watches: [{ threadOrFilter: { thread: "memory:quote-c" } }] });
+    d.kernel.spawnCell(p, { id: "watch-c", preset: "checker", title: "等 C 报价", watches: [{ threadOrFilter: { thread: "memory:quote-c" } }] }, undefined, { principalId: d.kernel.ownerPrincipal });
     let row = (await d.get<RadarDTO>("/api/radar")).projects.find((x) => x.id === p)!;
     expect(row).toMatchObject({ stalled: false, waitingOn: 1, ball: { owner: "waiting" } });
 
@@ -354,4 +379,78 @@ describe("activity restore", () => {
     const twice = await d.post<ActivityMutationResponse>(restore.endpoint!.path);
     expect(twice).toMatchObject({ ok: false, outcome: "not_restorable" });
   });
+});
+
+
+it("requires the full current subtree for a destructive decision and preserves it on conflict", async () => {
+  const d = await bootDesk();
+  const project = makeProject(d.kernel, "验收项目");
+  d.kernel.spawnCell(project, {id: "child", preset: "worker"}, undefined, { principalId: d.kernel.ownerPrincipal });
+  const item = d.kernel.humanItems.create({
+    title: "结束项目", subjectKey: "arb:close", relatedProjectIds: [project],
+    options: [{id: "close", label: "停止", effect: "terminate", terminateMode: "cancel_task",
+      targetCellIds: [project], confirm: "确认停止"}],
+  }, "desk");
+  const path = `/api/human-items/${item.id}/decide`;
+  const choice = {optionId: "close", seenItemRevision: item.itemRevision, confirmedTargets: [project]};
+  expect((await d.req("POST", path, {...choice, confirmedClosure: [project]})).status).toBe(409);
+  expect(d.kernel.getCell("child")?.status).toBe("active");
+  expect(d.kernel.humanItems.get(item.id)?.itemRevision).toBe(item.itemRevision);
+  expect((await d.req("POST", path, {...choice, confirmedClosure: [project, "child"].sort((a,b) => a.localeCompare(b))})).status).toBe(200);
+  expect(d.kernel.getCell("child")?.status).toBe("closed");
+});
+
+it("reopens the human action cancelled by this closure and leaves an already completed one alone", async () => {
+  const d = await bootDesk();
+  const project = makeProject(d.kernel, "材料校对");
+  const active = writeAction(d.kernel, project, {title:"核对原件", owner:"human"});
+  const completed = writeAction(d.kernel, project, {title:"确认收件", owner:"human", status:"done"});
+  await d.kernel.closeCell(project, "cancelled", { principalId: d.kernel.ownerPrincipal });
+  expect(d.kernel.humanItems.get(active.id)?.status).toBe("cancelled");
+  await d.kernel.reopenProject(project, "owner");
+  expect(d.kernel.humanItems.get(active.id)).toMatchObject({status:"pending", epoch:d.kernel.getCell(project)!.epoch});
+  expect(d.kernel.humanItems.get(completed.id)?.status).toBe("resolved");
+});
+
+it("completes the human and waiting actions together when the owner finishes a project", async () => {
+  const d = await bootRealDesk();
+  const project = makeProject(d.kernel, "发布验收");
+  const add = (owner: string) => d.post<{actionId: string}>(`/api/projects/${project}/actions`, { title: owner, owner });
+  const human = await add("human");
+  await add("waiting");
+  await d.post(`/api/projects/${project}/complete`);
+  expect(d.kernel.humanItems.get(human.actionId)?.status).toBe("resolved");
+  expect((await d.req("POST", `/api/projects/${project}/actions`, { title: "收尾后追加", owner: "waiting" })).status).toBe(409);
+});
+
+it.each(["active","observe"] as const)("runs a batch through the real script source in %s mode and retains every trigger", async mode => {
+  const d = await bootRealDesk();
+  const path = join(tempDir("checks"), "check owner's report.mjs");
+  writeFileSync(path, `
+    import {readFileSync} from "node:fs";
+    const file = process.env.NG_TRIGGER_FILE;
+    const input = JSON.parse(file ? readFileSync(file,"utf8") : process.env.NG_TRIGGER_JSON);
+    console.log(JSON.stringify({id: input.id, ...(file && {file})}));
+  `);
+  const {sensorId} = await d.post<{sensorId:string}>("/api/sources", {
+    title:"报告", schedule:{everyMinutes:1}, check:{kind:"script", path}, mode,
+  });
+  await d.kernel.idle();
+  expect(d.kernel.context.readStateSync(sensorId, gtdKeys.source)).toMatchObject({runCount:0});
+  d.kernel.control(sensorId, {action:"pause"}, { principalId: d.kernel.ownerPrincipal });
+  d.kernel.sendToCell(sensorId, {id:"small-input",text:"资料"}, { principalId: d.kernel.ownerPrincipal });
+  d.kernel.sendToCell(sensorId, {id:"large-input",text:"x".repeat(160_000)}, { principalId: d.kernel.ownerPrincipal });
+  d.kernel.control(sensorId, {action:"resume"}, { principalId: d.kernel.ownerPrincipal });
+  await d.kernel.idle();
+  expect(d.kernel.context.readStateSync(sensorId, gtdKeys.source)).toMatchObject({runCount:2, hitCount:2});
+  expect((await d.get<{sensors:{status:string}[]}>("/api/sources")).sensors[0]?.status).toBe("ok");
+  const hits = d.kernel.inbox.listMessagesSync({cellId:"desk", type:PAYLOAD.sourceHit});
+  expect(hits).toHaveLength(mode === "observe" ? 0 : 2);
+  const text = mode === "observe" ? d.kernel.context.getKnowledgeSync({cellId:sensorId,scope:"cell",kind:"reference",name:"观察笔记"})!.body
+    : hits.map(h => (h.envelope.payload as {summary:string}).summary).join("\n");
+  expect(text).toContain("small-input");
+  expect(text).toContain("large-input");
+  const file = /"file":"([^"]+)"/.exec(text)?.[1];
+  expect(file).toBeTruthy();
+  expect(existsSync(file!)).toBe(false);
 });

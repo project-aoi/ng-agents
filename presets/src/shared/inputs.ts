@@ -11,7 +11,7 @@ export const watchFilterInput = z
   );
 
 export const watchInput = z.object({
-  thread: z.string().optional().describe('external thread id "<channelId>:<threadId>"'),
+  thread: z.string().optional().describe('exact thread identifier from an incoming envelope'),
   filter: watchFilterInput.optional(),
   cancelGroup: z.string().optional(),
 });

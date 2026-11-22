@@ -19,7 +19,7 @@ describe("bash", () => {
     await expect(port.exec("bash", { command: "" })).rejects.toSatisfy((e) => isNgError(e, "invalid_argument"));
   });
 
-  it("isolation none is the owner's own environment (real HOME, PATH, git identity) minus the kernel's NG_* configuration and secrets", async () => {
+  it("uses the owner's host environment (real HOME, PATH, git identity) minus the kernel's NG_* configuration and secrets", async () => {
     process.env.NG_DESK_TOKEN = "s3cr3t-value-123";
     process.env.NGWS_TEST_OWNER_VAR = "owner-setting";
     const h = harness();

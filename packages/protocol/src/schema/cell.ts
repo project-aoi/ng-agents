@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS cells (
   epoch         INTEGER NOT NULL DEFAULT 0,
   status        TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','paused','closed')),
   revoked_at INTEGER,
+  pause_owner TEXT REFERENCES cells(id),
   pause_reason TEXT CHECK(pause_reason IN ('manual','parked') OR pause_reason IS NULL),
   close_reason  TEXT CHECK (close_reason IS NULL OR close_reason IN ('completed','cancelled')),
   principal_id  TEXT NOT NULL,                 -- who created it
@@ -31,7 +32,7 @@ CREATE INDEX IF NOT EXISTS idx_cells_root ON cells(root_id);
 CREATE INDEX IF NOT EXISTS idx_cells_status ON cells(status);
 
 -- In-flight subscriptions used by the ingress router: exact thread match first (indexed), then JSON filters.
-CREATE TABLE IF NOT EXISTS cell_stalls(cell_id TEXT PRIMARY KEY REFERENCES cells(id), since INTEGER NOT NULL, notified_at INTEGER);
+CREATE TABLE IF NOT EXISTS cell_stalls(cell_id TEXT PRIMARY KEY REFERENCES cells(id), since INTEGER NOT NULL, notified_at INTEGER, wake_envelope_id TEXT NOT NULL, deferred_to TEXT);
 CREATE TABLE IF NOT EXISTS cell_watches (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   cell_id       TEXT NOT NULL REFERENCES cells(id),

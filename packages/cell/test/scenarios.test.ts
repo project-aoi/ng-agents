@@ -1,11 +1,11 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import type { ActivityRecord } from "../../../presets/src/shared/product-records";
 import {
   CELL_RESULT_CANDIDATE_KEY,
   PAYLOAD,
   subjectKeys,
-  type ActivityRecord,
   type CellResultCandidate,
   type CellResultPayload,
   type CodeProcessor,
@@ -25,7 +25,7 @@ describe("docs/03 §四 — five granularities through the real primitives", () 
       tool("send_message", { to:"channel:ui:owner", text: "已存入阅读清单", summary: "note saved" }),
       { text: "done" },
     );
-    await h.ui.capture({ text: "把这篇链接存进阅读清单 https://example.com/post" });
+    await h.ui.capture({ text: "把这篇链接存进阅读清单 https://example.com/post" }, "owner");
     await h.kernel.idle();
 
     expect(h.kernel.gate.listPendingSync({ includeSnoozed: true })).toEqual([]);
@@ -54,7 +54,7 @@ describe("docs/03 §四 — five granularities through the real primitives", () 
     // nothing left for the desk to clean up: it just takes note
     h.script.add("desk", { text: "收到" });
 
-    await h.ui.capture({ text: "帮我把全量测试跑一下" });
+    await h.ui.capture({ text: "帮我把全量测试跑一下" }, "owner");
     await h.kernel.idle({ jobs: true });
     await h.kernel.idle();
 
@@ -64,7 +64,7 @@ describe("docs/03 §四 — five granularities through the real primitives", () 
     expect(h.kernel.activityOf([worker.id]).get(worker.id)!.state).toBe("dormant");
     // docs/05: on the host, in the kernel's own directory for it (nobody gave it one) — no scratch repository, no
     // worktree; the directory and the workspace record stay with it
-    expect(worker.bounds.isolation).toBe("none");
+
     expect(existsSync(join(h.dataDir, "base-repo"))).toBe(false);
     const ws = h.kernel.workspace.getWorkspaceSync(worker.id)!;
     expect(ws).toMatchObject({ status: "active", path: join(h.dataDir, "cells", worker.id) });
@@ -144,7 +144,7 @@ describe("docs/03 §四 — five granularities through the real primitives", () 
       "desk",
       // a project coordinates and persists (a one-shot cell would be closed — its card revoked — by its next completed Run)
       { id: "proj1", preset: "project", title: "竞品调研", processor: { kind: "code", entry: "test.join_all", args: { n: N } }, meta: { projectCellId: "proj1" } },
-      "fan out",
+      "fan out", { principalId: h.kernel.ownerPrincipal },
     );
     await h.kernel.idle();
 

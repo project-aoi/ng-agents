@@ -2,7 +2,7 @@ import type { Deliverable } from "./deliverable";
 import type { HumanItemDraft } from "../human-item";
 import type { Clock } from "../clock";
 import type { ContextStore, EvidenceEntry, PromptSnapshot } from "./context";
-import type { Envelope, EnvelopeDraft, EnvelopeKind, InboxAddr, IsolationLevel, PolicyBounds, Delivery, ToolKind } from "./envelope";
+import type { Envelope, EnvelopeDraft, EnvelopeKind, InboxAddr, PolicyBounds, Delivery, ToolKind } from "./envelope";
 import type { AuthorizeResult, ProposedAction } from "./gate";
 import type { ControlAction, ControlResult, EnqueueResult, Inbox, ScheduleRule } from "./inbox";
 import type { ProcessorSpec } from "./loop";
@@ -63,7 +63,7 @@ export interface CellPorts {            // the controlled capability surface a L
   cancelScheduled: Inbox["cancelScheduled"];
   spawnCell(spec: SpawnSpec /* [ext] the processor may come from the preset */, initialPayload?: unknown): Promise<InboxAddr>;
   updateCell(cellId: string, patch: Partial<CellSpec>): Promise<void>; // [ext] own id allowed for watches/schedules/title/meta
-  closeCell(cellId: string, reason?: "completed" | "cancelled"): Promise<void>;
+  closeCell(cellId: string, reason?: "completed" | "cancelled"): Promise<boolean>;
 }
 
 /** [ext] A spec as a spawner writes it: `processor` may be left to the preset's defaults. */
@@ -114,6 +114,7 @@ export interface RunSelf {
 }
 
 export interface ActionStore {
+  ownerPrincipal: string;
   db: import("../db/sqlite").Db;
   clock: Clock;
   bus: import("../bus").Bus;
@@ -150,7 +151,10 @@ export interface RunPorts extends CellPorts {
   listEvidence?(opts?: { afterSeq?: number; limit?: number; runId?: string }): EvidenceEntry[];
   /** Confirm the native parent session still represents exactly the creation-time evidence. */
   canForkSession(parentId:string, uptoSeq:number, sessionId:string, delivered:number, systemHash:string): boolean;
-  listOwnDecisions(): Array<{ record: import("./gate").ApprovalRecord; envelope?: Envelope }>;
+  listOwnDecisions(): Array<{
+    record: Pick<import("./gate").ApprovalRecord, "actionId" | "action" | "card" | "subjectKey" | "artifactId" | "boundVersion" | "updatedAt">;
+    envelope?: Envelope;
+  }>;
   /**
    * Commit with inboxOut to `inbox:<parentId>` (envelope from `inbox:<selfId>`, expectedEpoch = parent's epoch). Throws
    * for root cells. [docs/05] A `cell.result` from a leaf (`one_shot` / `wakeable`) cell is not sent from here: it is
@@ -168,7 +172,7 @@ export interface RunPorts extends CellPorts {
    */
   handback?(envelopeId: string, reason: string): Promise<void>;
   /**
-   * [ext] Acquire the cell's workspace now (idempotent, same isolation and options as `workspace.exec`) and say what an
+   * [ext] Acquire the cell's workspace now (idempotent, same options as `workspace.exec`) and say what an
    * external agent process working directly in it may do. For Loops that hand the directory to another program (CLI
    * agents) instead of going through `workspace.exec`. Optional in the type only so hand-written fakes stay valid.
    */
@@ -355,7 +359,7 @@ export function finalResultEnvelopeId(cellId: string, epoch: number): string {
 export interface WorkspaceAccess {
   /** Absolute host path of the working directory. */
   root: string;
-  isolation: IsolationLevel;
+
   /** Native capabilities granted by the current bounds. */
   tools: ToolKind[];
 }
@@ -372,14 +376,16 @@ export interface EmitOptions {
  * How a preset turns a partial spec into the stored, resolved spec. The kernel merges `defaults` under the caller's
  * spec (caller wins field by field; `processor` is replaced as a whole when given; `meta` is merged shallowly). The
  * bounds request is the preset's (`requestBounds(...)` if defined, else `defaults.bounds`) with the caller's `bounds`
- * fields laid over it field by field — a caller narrowing one field keeps e.g. the preset's isolation — and that
+ * fields laid over it field by field — a caller narrowing one field keeps e.g. the preset's other bounds — and that
  * request goes through Gate.attenuate, so nothing a preset or caller asks for can exceed the parent.
  */
 export interface PresetDef {
+  rootOnly?: boolean;
   /** This preset coordinates an independently reopenable project. */
   projectRoot?: boolean;
-  onCellClosed?(cell:CellRecord, reason:CloseReason, store:ContextStore, clock:Clock):void;
-  onCellReopened?(cell:CellRecord, store:ContextStore, clock:Clock):void;
+  onCellCreated?(cell: CellRecord, store: ContextStore, clock: Clock): void;
+  onCellClosed?(cell:CellRecord, reason:CloseReason, store:ContextStore, clock:Clock, actions:ActionStore):void;
+  onCellReopened?(cell:CellRecord, store:ContextStore, clock:Clock, actions:ActionStore):void;
   actionBooks?(store: ActionStore, cellId: string): ActionBooks;
 
   /** Synchronous preset plan applied in the same transaction as a confirmed action. */

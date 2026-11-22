@@ -23,7 +23,7 @@ import {
 } from "@ng/protocol";
 import type { WorkspaceStore } from "./store";
 import type { CommandRunner, JobObservation, WorkspaceLimits, WorkspaceManagerOptions } from "./types";
-import { markedGroupState, processIdentity } from "@ng/protocol";
+import { leaderGoneOrZombie, markedGroupState, processIdentity } from "@ng/protocol";
 import { errorMessage, groupAlive, killGroup, pidAlive, processHasMarker, sleep } from "./util";
 
 export const JOB_MARKER = "NG_JOB_ID";
@@ -37,13 +37,20 @@ const TIMEOUT_REASON_PREFIX = "job timed out after ";
  * restart) still reports its real outcome to `recover()`.
  */
 // A caught TERM keeps the supervising shell alive and gives the command its normal TERM disposition.
-export const JOB_WRAPPER = 'trap ":" TERM; exitf="$1"; shift; "$@"; s=$?; printf "%s\\n" "$s" > "$exitf.tmp" && mv -f "$exitf.tmp" "$exitf"; exit "$s"';
+export const JOB_WRAPPER = [
+  'trap ":" TERM', 'exitf="$1"', 'shift', '"$@"', 's=$?',
+  // On macOS a background system binary may lose the job marker. Capture only this group's
+  // PID/start/executable witnesses before our marked leader exits.
+  ...(process.platform === "darwin" ? [
+    "(umask 077; LC_ALL=C TZ=UTC /bin/ps -axww -o pid=,pgid=,lstart=,comm= | /usr/bin/awk -v g=\"$$\" '$2 == g {print}' > \"$exitf.group\")",
+  ] : []),
+  'printf "%s\\n" "$s" > "$exitf.tmp" && mv -f "$exitf.tmp" "$exitf"', 'exit "$s"',
+].join("; ");
 
 /** `silent`: the cell cancelled the job itself, so its result rides along with the next batch instead of waking it. */
 type Outcome = { state: Exclude<JobState, "running">; exitCode: number | null; error: string | null; silent?: boolean };
 
 interface LiveJob {
-  unknownSince?:number;
   groupConfirmed: boolean;
   jobId: string;
   cellId: string;
@@ -113,6 +120,8 @@ export class JobManager {
   readonly #live = new Map<string, LiveJob>();
   #closed = false;
 
+  readonly #starting = new Map<string, Promise<void>>();
+
   constructor(private readonly d: JobDeps) {}
 
   // ---------- start ----------
@@ -142,6 +151,8 @@ export class JobManager {
         const cell = this.d.cells.get(cellId);
         if (!cell) throw new NgError("not_found", `cell "${cellId}" not found`);
         if (!this.d.cells.isActiveInTree(cellId)) throw new NgError("conflict", `cell "${cellId}" or an ancestor is paused or closed`);
+        if (store.listJobs({cellId, state: ["running"]}).some(job => job.cancelRequestedAt !== null))
+          throw new NgError("conflict", "上一项后台命令仍在停止");
         if (store.countRunning(cellId) >= this.d.limits.maxJobsPerCell) {
           throw new NgError("conflict", `cell "${cellId}" already has ${this.d.limits.maxJobsPerCell} running jobs; wait for one or cancel one`);
         }
@@ -154,6 +165,8 @@ export class JobManager {
       throw err;
     }
 
+    let started!: () => void;
+    this.#starting.set(jobId, new Promise<void>(resolve => { started = resolve; }));
     let child: ChildProcess;
     try {
       child = this.d.runner.spawn({
@@ -169,6 +182,8 @@ export class JobManager {
       }
     } catch (err) {
       closeSync(fd);
+      this.#starting.delete(jobId);
+      started();
       this.#failStart(jobId, cellId, errorMessage(err));
       throw new NgError("unsupported", `job could not be started: ${errorMessage(err)}`);
     }
@@ -177,6 +192,8 @@ export class JobManager {
     store.setJobPid(jobId, pid, process.platform === "darwin" ? processIdentity(pid) : null);
 
     const live = this.#register(jobId, cellId, pid, logPath, child);
+    this.#starting.delete(jobId);
+    started();
     this.#armTimeout(live, timeoutMs, timeoutMs);
     child.stdin?.on("error", () => {
       // EPIPE when the job exits without reading its input; nothing to report.
@@ -378,6 +395,7 @@ export class JobManager {
       this.#settle(live, outcome);
       return;
     }
+    this.#warn(job, "termination_pending", "Waiting for the remaining job process group to exit.");
     live.terminationRetry = setTimeout(() => {
       live.terminationRetry = null;
       void this.#finishExit(job, live, outcome);
@@ -446,6 +464,8 @@ export class JobManager {
    * finishes the same way. Resolves when the job is recorded; false when it was not running.
    */
   async cancel(jobId: string, reason = "cancelled", opts: { silent?: boolean } = {}): Promise<boolean> {
+    const starting = this.#starting.get(jobId);
+    if (starting) await starting;
     const job = this.d.store.getJob(jobId);
     if (!job || job.state !== "running") return false;
     const live = this.#live.get(jobId) ?? this.#register(jobId, job.cellId, job.pid ?? 0, job.logPath ?? "", null);
@@ -464,7 +484,6 @@ export class JobManager {
     const attempt = async () => {
       if (!await this.#terminate(job, live)) {
         if (this.#closed || live.terminationRetry) return;
-        if (this.#aliveState(job,live) === null && this.#lostIdentity(job,live)) return;
         live.terminationRetry = setTimeout(() => {
           live.terminationRetry = null;
           void this.#finishCancellation(job, live);
@@ -495,7 +514,7 @@ export class JobManager {
     if (state === false) return true;
     if (state === null) {
       // A dying group can outlast its leader for a few ticks. Observe it without signalling unverified PIDs.
-      return !pidAlive(pid) && this.#waitGone(job, live, this.d.limits.killGraceMs);
+      return leaderGoneOrZombie(pid) && this.#waitGone(job, live, this.d.limits.killGraceMs);
     }
     if (live) live.groupConfirmed = true;
     killGroup(pid, "SIGTERM");
@@ -522,8 +541,17 @@ export class JobManager {
     if (live?.child) {
       if (live.child.exitCode === null && live.child.signalCode === null) return true;
     }
-    if (live?.groupConfirmed && !pidAlive(pid)) return groupAlive(pid);
-    return markedGroupState(pid, JOB_MARKER, job.jobId, job.processIdentity);
+    const marker = markedGroupState(pid, JOB_MARKER, job.jobId, job.processIdentity);
+    if (marker === null && live?.groupConfirmed && leaderGoneOrZombie(pid)) return groupAlive(pid);
+    if (marker !== null || !leaderGoneOrZombie(pid) || !job.logPath) return marker;
+    try {
+      const witnesses = new Map<number, string>();
+      for (const line of readFileSync(`${exitFileOf(job.logPath)}.group`, "utf8").split("\n")) {
+        const fields = /^\s*(\d+)\s+(\d+)\s+(.+?)\s*$/.exec(line);
+        if (fields && Number(fields[2]) === pid) witnesses.set(Number(fields[1]), fields[3]!);
+      }
+      return markedGroupState(pid, JOB_MARKER, job.jobId, job.processIdentity, witnesses);
+    } catch { return marker; }
   }
 
   async #waitGone(job: JobRecord, live: LiveJob | undefined, ms: number): Promise<boolean> {
@@ -580,7 +608,7 @@ export class JobManager {
         const outcome = this.#outcomeFromExitFile(job) ?? {
           state: "failed" as const, exitCode: null, error: "the job process ended while no kernel was watching and recorded no exit status",
         };
-        if (groupAlive(job.pid) && !pidAlive(job.pid)) {
+        if (groupAlive(job.pid) && leaderGoneOrZombie(job.pid)) {
           const ended = this.#register(job.jobId, job.cellId, job.pid, job.logPath ?? "", null);
           await this.#finishExit(job, ended, outcome);
         } else this.finalizeSync(job.jobId, outcome);
@@ -591,12 +619,6 @@ export class JobManager {
     if (errors.length) throw new NgError("conflict", `recover: ${errors.length} job(s) could not be completed: ${errors.map(errorMessage).join("; ")}`);
   }
 
-  #lostIdentity(job: JobRecord, live: LiveJob): boolean {
-    live.unknownSince ??= Date.now();
-    if (Date.now() - live.unknownSince < 30_000) return false;
-    this.#settle(live, this.#outcomeFromExitFile(job) ?? {state:"failed", exitCode:null, error:"Job process identity could not be verified; tracking stopped without signalling it."});
-    return true;
-  }
 
   #reattach(job: JobRecord, confirmedAlive: boolean): void {
     const pid = job.pid!;
@@ -615,7 +637,6 @@ export class JobManager {
     live.poller = setInterval(() => {
       const marked = this.#processState(job);
       if (marked === true) {
-        delete live.unknownSince;
         if (!live.groupConfirmed) {
           live.groupConfirmed = true;
           armIfTimeout();
@@ -625,7 +646,6 @@ export class JobManager {
       if (live.cancelReason !== null) return; // the termination request owns its final result
       const exit = this.#outcomeFromExitFile(job);
       if (marked === null && !exit) {
-        if (this.#lostIdentity(job,live)) return;
         this.#warn(job, "identity_unknown", "The job process is still present but its identity cannot be confirmed.");
         return;
       }

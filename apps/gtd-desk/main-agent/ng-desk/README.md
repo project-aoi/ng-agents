@@ -10,6 +10,8 @@ Antigravity (`agy`) native plugin that wires Antigravity as the external main ag
 ## Install / Update
 
 ```bash
+pnpm --dir apps/gtd-desk link --global
+command -v ng-desk-mcp
 agy plugin validate apps/gtd-desk/main-agent/ng-desk --strict
 agy plugin install apps/gtd-desk/main-agent/ng-desk
 ```

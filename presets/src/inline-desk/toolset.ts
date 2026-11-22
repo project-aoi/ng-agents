@@ -1,16 +1,15 @@
-import {createSensorSpec,sensorProcessor} from "../shared/sensor";
+import { createSensorSpec, sensorProcessor } from "../shared/sensor";
 import { z } from "zod";
 import { gtdKeys } from "../shared/keys";
+import type { ActivityRecord, ProjectRecord } from "../shared/product-records";
 import {
   defineTool,
   isNgError,
   newId,
   subjectKeys,
-  type ActivityRecord,
   type CellSpec,
   type ProcessorSpec,
   type ProjectProposal,
-  type ProjectRecord,
   type ProjectStartAction,
   type SendToCellResult,
   type ToolContext,
@@ -161,7 +160,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
 
   const archiveNotification = tool({
     name: "archive_notification",
-    description: "File a pure notification that needs nothing from the owner (FYI, automated status mail). Silent: it only shows in the archived count and can be moved back to the owner's queue.",
+    description: "File a pure notification that needs nothing from the owner (FYI, routine status update). Silent: it only shows in the archived count and can be moved back to the owner's queue.",
     input: z.object({ title: z.string().min(1).describe("short Chinese title"), detail: z.string().optional() }),
     async run(args, ctx) {
       if (isRestored(ctx)) return restoredRefusal;
@@ -228,9 +227,9 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
         if (first) lines.push(`## ${record.card.title ?? record.subjectKey}\n方案初稿：\n${clip(first.content.body, 600)}\n主人修改后的方案：\n${clip(current.content.body, 600)}`);
       }
       for (const child of ctx.snapshot.tail.roster) {
-        if (child.preset !== "sensor") continue;
-        const src = await ports.context.readState<{ title: string; processor: string; runCount: number; hitCount: number; description?: string }>(child.cellId, gtdKeys.source);
-        if (src?.processor === "llm") lines.push(`## 信源 ${child.cellId}：${src.title}\n每次检查都用模型：已检查 ${src.runCount} 次，命中 ${src.hitCount} 次。规则：${src.description ?? "（未写明）"}`);
+        if (child.preset !== "sensor" || child.processorKind !== "llm") continue;
+        const src = await ports.context.readState<{ title: string; runCount: number; hitCount: number; description?: string }>(child.cellId, gtdKeys.source);
+        if (src) lines.push(`## 信源 ${child.cellId}：${src.title}\n每次检查都用模型：已检查 ${src.runCount} 次，命中 ${src.hitCount} 次。规则：${src.description ?? "（未写明）"}`);
       }
       const existing = (await ports.context.listState(self(ctx), "desk:suggestion:")).map((e) => e.key);
       if (existing.length) lines.push(`Already suggested (not yet decided): ${existing.join(", ")}`);
@@ -260,7 +259,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
     description: "Suggest switching a source that runs a model on every check to a fixed zero-cost check (when its rule is mechanical). Shown in the owner's weekly review.",
     input: z.object({
       sourceId: z.string().min(1),
-      entry: z.string().optional().describe("a registered check name or script:<path> that would replace the model"),
+      entry: z.string().optional().describe("a registered check name or script:<path> that would replace the model (exit 0 + empty stdout = no hit; non-empty stdout = hit; non-zero = error)"),
       reason: z.string().min(1).describe("why, in Chinese"),
     }),
     async run(args, ctx) {
@@ -285,7 +284,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
     .describe("first steps, if you already know them (recorded on the project's books; the project plans the rest)");
 
   const cwdRefusal = (err: unknown): ToolResult => ({
-    output: `Not started: ${errorText(err)} Ask the owner for the absolute path of the repository on this machine (send_message to ${owner}, then wait with waitingFor "human") — never guess one.`,
+    output: `Not started: ${errorText(err)} Ask the owner for the absolute path of the repository on this machine (in your chat reply when talking directly, or via send_message to ${owner} when woken asynchronously) — never guess one.`,
     isError: true,
   });
 
@@ -340,7 +339,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
     name: "propose_project",
     description: [
       "Propose a project whose plan needs the owner's sign-off first (large, costly, or built on assumptions): one proposal card where the owner can edit the plan, approve it, or park it for later.",
-      "On approval the project starts with the plan they approved (you are woken; apply_updates shows it).",
+      "On approval the project starts with the plan they approved automatically (apply_updates shows it). When revising an existing proposal after approval.revise, pass its original subjectKey so this updates the existing card instead of creating a duplicate.",
     ].join(" "),
     input: z.object({
       title: z.string().min(1),
@@ -351,12 +350,13 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
       cwd: z.string().optional().describe("absolute path of the directory the work happens in"),
       repos: z.array(repoInput).optional(),
       phases: z.array(z.string().min(1)).optional(),
+      subjectKey: z.string().min(1).optional().describe("when redrafting a pending proposal after approval.revise, reuse the original subjectKey to replace the existing card"),
     }),
     async run(args, ctx) {
       const { ports } = ctx;
       const t = now(ctx);
       const env = currentItem(ctx);
-      const subjectKey = env ? subjectKeys.inbound(env.id) : subjectKeys.cell(self(ctx));
+      const subjectKey = args.subjectKey?.trim() || (env ? subjectKeys.inbound(env.id) : subjectKeys.cell(self(ctx)));
       const proposal: ProjectProposal = {
         title: args.title,
         outcome: args.outcome,
@@ -405,7 +405,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
       case "closed":
         return { output: closedItem(id), isError: true };
       case "not_found":
-        return { output: `There is no item ${id}; check the id in the in-flight list.`, isError: true };
+        return { output: `There is no item ${id}; check the id in the in-flight list at the start of your wake-up message.`, isError: true };
       case "refused":
         return { output: `Not allowed: ${r.reason}.`, isError: true };
     }
@@ -445,16 +445,16 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
     input: z.object({ itemId: z.string().min(1), reason: z.string().optional() }),
     async run(args, ctx) {
       const noItem = { output: `There is no item ${args.itemId} under the desk.`, isError: true };
-      let before: ProjectRecord | null;
       try {
-        before = await ctx.ports.context.readState<ProjectRecord>(args.itemId, gtdKeys.project);
-        await ctx.ports.closeCell(args.itemId, "cancelled");
+        const stopped = await ctx.ports.closeCell(args.itemId, "cancelled");
+        if (!stopped) {
+          const project = await ctx.ports.context.readState<ProjectRecord>(args.itemId, gtdKeys.project);
+          return `${args.itemId} had already ended${project ? ` (${project.lifecycle})` : ""}; nothing changed.`;
+        }
       } catch (err) {
         if (isNgError(err, "bounds_violation") || isNgError(err, "not_found")) return noItem;
         throw err;
       }
-      const ended = before ? before.lifecycle === "completed" || before.lifecycle === "cancelled" : !ctx.snapshot.tail.roster.some((c) => c.cellId === args.itemId);
-      if (ended) return `${args.itemId} had already ended${before ? ` (${before.lifecycle})` : ""}; nothing changed.`;
       return `Stopped ${args.itemId}${args.reason ? `（${args.reason}）` : ""}: everything it had running is cleared and its records say cancelled.`;
     },
   });
@@ -491,7 +491,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
       title: z.string().min(1).describe('short Chinese name, e.g. "代码评审直通"'),
       repos: z.array(repoInput).min(1),
       rules: z.string().min(1).describe("what belongs to it and how each kind of request is handled (review, investigate, fix), in plain words"),
-      watch: z.object({ thread: z.string().optional().describe('"<channelId>:<threadId>"'), filter: watchFilterInput.optional() }),
+      watch: z.object({ thread: z.string().optional().describe('workbench topic thread (must start with "ui:", e.g. "ui:reviews")'), filter: watchFilterInput.optional() }),
       coalesceMinutes: z.number().min(0).max(60).optional().describe("batching window (default 2)"),
     }),
     async run(args, ctx) {
@@ -527,18 +527,18 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
   const addSource = tool({
     name: "add_source",
     description: [
-      "Add a mailbox source: a scheduled or conditional check (e.g. every Monday 9:00 look at the metrics; watch a group for payment complaints).",
+      "Add a source that runs on a schedule or a workbench capture topic (ui:<topic>), for example a weekly metrics check.",
       "It stays silent when nothing is found and posts to you only on a hit. mode observe = only keep observation notes, never create items (for a source the owner does not trust yet).",
-      "check: a registered zero-cost check; script: a script path; otherwise a small model filters with your description.",
+      "check: a registered zero-cost check; script: a local script path (zero-token: exit 0 + empty stdout = no hit; exit 0 + non-empty stdout = hit; non-zero = error; trigger envelope arrives in NG_TRIGGER_JSON or NG_TRIGGER_FILE when >64KB); otherwise a small model filters with your description.",
     ].join(" "),
     input: z.object({
       title: z.string().min(1),
       description: z.string().optional().describe("what counts as a hit"),
       cron: z.string().optional().describe("5-field cron"),
       tz: z.string().optional(),
-      watchThread: z.string().optional().describe('watch messages on this thread, "<channelId>:<threadId>"'),
+      watchThread: z.string().optional().describe('workbench topic thread to watch (must start with "ui:", e.g. "ui:alerts")'),
       check: z.string().optional(),
-      script: z.string().optional(),
+      script: z.string().trim().min(1).optional().describe("path to a local script (~ allowed); exit 0 + empty stdout = no hit, non-empty stdout = hit, non-zero = error"),
       mode: z.enum(["active", "observe"]).optional(),
     }),
     async run(args, ctx) {
@@ -546,7 +546,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
       const processor: ProcessorSpec = args.check
         ? sensorProcessor(args.check)
         : args.script
-          ? { kind: "code", entry: PROCESSORS.sensorScript, args: { script: args.script } }
+          ? sensorProcessor(`script:${args.script}`)
           : SENSOR_LLM_PROCESSOR;
       const source: SourceInit = {
         title: args.title,
@@ -566,7 +566,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
   const applyUpdates = tool({
     name: "apply_updates",
     description:
-      "Background events (reminders that came due, approved proposals, sent replies, finished projects) are applied to the owner's lists automatically when you wake. This shows what was applied and retries anything that failed.",
+      "Background events (approved proposals and finished projects) are applied to the owner's lists automatically when you wake. This shows what was applied and retries anything that failed.",
     input: z.object({}),
     async run(_args, ctx, settled) {
       const lines = [...books.take(ctx.snapshot.runId), ...settled];

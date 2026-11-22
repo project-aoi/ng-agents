@@ -1,6 +1,7 @@
 import type { CellSpecInput, Kernel } from "@ng/cell";
 
 import { type ProjectInit, type ProjectMode } from "@ng/presets";
+import type { ProjectRecord } from "@ng/presets/records";
 import {
   CELL_DIRECT_CHAT_KEY,
   CELL_STATUS_KEY,
@@ -13,14 +14,13 @@ import {
   type CellDirectChatState,
   type CellRecord,
   type CellStatusLine,
-  type ProjectRecord,
   type SendToCellResult,
 } from "@ng/protocol";
 import type { ProjectRowDTO, SendCellMessageRequest, TimelineItemDTO } from "../shared/api";
 import type { Delivery } from "../server/agents";
 import { DeskError, type Desk, type DeskActor, type ProjectOp } from "../server/desk";
 import { isLeafCell, unpulledOf } from "../server/projections/agents";
-import { projectOfAction, readActions, readProjects,  type Located } from "../server/projections/common";
+import { projectOfAction, readActions, readProjects, type Located } from "../server/projections/common";
 import { AGENT_TOOLS, type AgentToolDoc } from "./guide";
 import type { AgentControlPlane, AgentToolResult } from "./routes";
 
@@ -39,10 +39,6 @@ type Principal = `agent:${string}`;
 type Handler = (args: Args, principalId: Principal) => Promise<AgentToolResult> | AgentToolResult;
 
 /** The `text` an agent reads for an owner-only card (project approval). */
-export function ownerOnlyText(cardId: string, why: string): string {
-  return `Refused: only the owner can approve card ${cardId} (${why}). You may not approve or continue it on their behalf, even on their say-so. Tell the owner to confirm it themselves in the workbench UI (待我处理). The card is still pending.`;
-}
-
 const OWNER_TEXT: Readonly<Record<BallOwner, string>> = { human: "主人", agent: "agent", waiting: "等待外部" };
 
 const ok = (text: string, data?: unknown): AgentToolResult => ({ text, ...(data !== undefined ? { data } : {}) });
@@ -353,7 +349,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
 
     async capture(args,principalId) {
       const clientId=str(args["clientId"]);
-      const receipt=await desk.ingest({text:str(args["text"])!,...(clientId ? {clientId} : {})},{principalId});
+      const receipt=await desk.ingest({ ...(args.threads !== undefined && {threads: args.threads as string[]}),text:str(args["text"])!,...(clientId ? {clientId} : {})},{principalId});
       return ok(`Captured message ${receipt.id}. The workbench routes it to the matching subscriber or the desk.`,{envelopeId:receipt.id});
     },
 
@@ -558,7 +554,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const id = str(args["id"])!;
       const text = str(args["text"])!;
       const record = projectRecordOf(id);
-      if (!record && !kernel.getCell(id)) return noProject(id);
+      if (!record && !kernel.registry.presets.get(kernel.getCell(id)?.preset ?? "")?.projectRoot) return noProject(id);
       const mode=args["urgent"]===true ? "steer" : "enqueue";
       const cell=kernel.getCell(id);
       if (cell?.status==="closed") return sendFailure(id,{status:"closed",closeReason:cell.closeReason},true);
@@ -602,7 +598,6 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         ...(Array.isArray(args.confirmedClosure) ? {confirmedClosure:args.confirmedClosure as string[]} : {}),
         ...(Array.isArray(args.confirmedTargets) ? {confirmedTargets:args.confirmedTargets as string[]} : {}),
       },as(principalId));
-      if (["already_cancelled", "not_found", "not_pending", "version_mismatch", "revision_mismatch"].includes(result.status)) return fail(JSON.stringify(result), result);
       return ok(JSON.stringify(result),result);
     },
     async reopen_project(args,principalId) {
@@ -756,7 +751,8 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
     },
 
     spawn_cell(args, principalId) {
-      const preset = str(args["preset"])!; // any registered preset; the kernel says so when it is not one
+      const preset = str(args["preset"])!;
+      if (preset === kernel.getCell(deskId)?.preset) return fail("主台角色只能用于根工作台");
       const title = str(args["title"])!;
       const instruction = str(args["instruction"])!;
       const cwd = str(args["cwd"]);
@@ -823,9 +819,11 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         return fail(`Not delivered: there is no cell "${id}". Check the id with get_project or workbench_overview.`, data);
       case "refused_script":
         return fail(`Not delivered: ${id} is a deterministic script probe, not a model — it takes no conversation. control_cell can pause or resume it; to change what it checks, tell its project or the desk.`, data);
+      case "refused_paused_parent":
+        return fail("Not delivered. Resume the paused parent before messaging its archived worker.", data);
       case "refused_archived":
         return fail(
-          `Not delivered: ${id} was archived with a project that has finished, so it cannot be brought back. To continue that work, chat_with_desk (or create_project) naming what it did — inspect_cell ${id} shows it.`,
+          `Not delivered: ${id} was archived with a project that has finished. Use reopen_project on the project, then retry — inspect_cell ${id} shows it.`,
           data,
         );
       case "duplicate":

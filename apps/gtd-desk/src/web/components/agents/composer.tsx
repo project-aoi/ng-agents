@@ -53,6 +53,11 @@ export function Composer(props: {
   const toast = useToast();
   const navigate = useNavigate();
   const deskId = useDeskId();
+  const mounted = useRef(true);
+  useLayoutEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
 
   useEffect(() => {
     if (text) drafts.set(cellId, text);
@@ -82,6 +87,11 @@ export function Composer(props: {
       ...(props.reply ? { replyToId: props.reply.id } : {}),
     };
     const fail = (message: string) => {
+      if (!mounted.current) {
+        const current = drafts.get(cellId);
+        drafts.set(cellId, current ? `${value}\n\n${current}` : value);
+        return;
+      }
       tl.settlePending(cid, "failed");
       // The text goes back into the box (ahead of anything typed meanwhile) with the reason.
       setText((cur) => (cur.trim() ? `${value}\n\n${cur}` : value));

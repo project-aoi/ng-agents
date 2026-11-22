@@ -149,6 +149,10 @@ export function createEvidence(deps: Deps): EvidenceModule {
   function append(cellId: string, record: StepOrExternalEvidence): EvidenceAppendResult {
     validate(record);
     return withTx(db, () => {
+      if (record.kind === "system_note" && record.envelopeId) {
+        const prior = get<{seq: number}>(db, "SELECT seq FROM evidence WHERE cell_id=? AND kind='system_note' AND json_extract(content,'$.envelopeId')=? LIMIT 1", [cellId, record.envelopeId]);
+        if (prior) return {seq: prior.seq};
+      }
       let stored: StepOrExternalEvidence = record;
       let spill: EvidenceAppendResult["spill"];
       let spilledInline: string | null = null;

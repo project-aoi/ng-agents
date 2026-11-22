@@ -1,4 +1,5 @@
 import { useEffect, useId, useImperativeHandle, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, type Ref, type RefObject } from "react";
+import { serverTimeForLocalDate } from "../state";
 import type { ButtonDTO } from "../../shared/api";
 
 export function Spinner({ label }: { label?: string }) {
@@ -225,7 +226,7 @@ export function ButtonRow(props: {
     }
     let v: unknown = raw;
     if (b.input.kind === "datetime") {
-      const t = new Date(raw).getTime();
+      const t = serverTimeForLocalDate(raw);
       if (!Number.isFinite(t)) return;
       v = t;
     }

@@ -5,7 +5,7 @@ import { boot, childrenOf, cleanupAll, continuesRun, gitRepo, lastToolResult, MI
 
 afterEach(cleanupAll);
 
-const at = (h: Harness, from: string, text: string) => h.ui.capture({ text: `${from}：${text}`, threads: ["ui:reviews"] });
+const at = (h: Harness, from: string, text: string) => h.ui.capture({ text: `${from}：${text}`, threads: ["ui:reviews"] }, "owner");
 
 describe("docs/05 scenario 6 — a hub for direct review requests: batched, routed, follow-ups forwarded", () => {
   it("add_hub with an operator watch and a window; one batch; workers per topic; follow-ups reach the worker still at it and wake the one that has finished — no successor; noise handed back", async () => {
@@ -71,7 +71,7 @@ describe("docs/05 scenario 6 — a hub for direct review requests: batched, rout
       }
       throw new Error(`unexpected worker ${title}`);
     });
-    await h.ui.capture({ text: "把工作台 @bot 的评审请求直接转给评审助手处理" });
+    await h.ui.capture({ text: "把工作台 @bot 的评审请求直接转给评审助手处理" }, "owner");
     await h.kernel.idle();
 
     expect(h.kernel.getCell(hub())).toMatchObject({

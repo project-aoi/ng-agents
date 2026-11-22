@@ -7,10 +7,11 @@ import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { gtdKeys } from "@ng/presets";
-import { type ProjectRecord, type UserMessagePayload } from "@ng/protocol";
+import type { ProjectRecord } from "@ng/presets/records";
+import { type UserMessagePayload } from "@ng/protocol";
 import { AGENT_INSTRUCTIONS, AGENT_SERVER_NAME, AGENT_TOOLS } from "../src/agent/guide";
 import type { AgentToolResult } from "../src/agent/routes";
-import { bootDesk, bootRealDesk, cellMessages, cleanupAll, requestText, requestsOf, tempDir, tool, writeAction, type TestDesk } from "./helpers";
+import { bootDesk, bootRealDesk, cellMessages, cleanupAll, makeProject, requestText, requestsOf, tempDir, tool, writeAction, type TestDesk } from "./helpers";
 
 afterEach(cleanupAll);
 
@@ -73,7 +74,8 @@ describe("auth: a separate credential and a separate identity", () => {
   });
 
   it("token-less is refused once agent tokens exist, and on a non-loopback bind (which needs the owner's token anyway)", async () => {
-    const loop = await bootDesk({ agentTokens: { main: AGENT_TOKEN } });
+    await expect(bootDesk({ agentTokens: { main: AGENT_TOKEN } })).rejects.toThrow(/NG_DESK_TOKEN/);
+    const loop = await bootDesk({ token: OWNER_TOKEN, agentTokens: { main: AGENT_TOKEN } });
     expect((await call(loop, "workbench_overview", {}, null)).status).toBe(401);
     expect((await call(loop, "workbench_overview", {})).status).toBe(200);
     const wide = await bootDesk({ host: "0.0.0.0", token: OWNER_TOKEN });
@@ -83,7 +85,7 @@ describe("auth: a separate credential and a separate identity", () => {
   });
 
   it("lists the tools of guide.ts with the server instructions", async () => {
-    const d = await bootDesk({ agentTokens: { main: AGENT_TOKEN } });
+    const d = await bootDesk({ token: OWNER_TOKEN, agentTokens: { main: AGENT_TOKEN } });
     const r = await d.req<{ server: string; instructions: string; tools: Array<{ name: string }> }>("GET", "/api/agent/tools", undefined, { authorization: `Bearer ${AGENT_TOKEN}` });
     expect(r.json).toMatchObject({ server: AGENT_SERVER_NAME, instructions: AGENT_INSTRUCTIONS });
     expect(r.json.tools.map((t) => t.name)).toEqual(AGENT_TOOLS.map((t) => t.name));
@@ -94,7 +96,7 @@ describe("auth: a separate credential and a separate identity", () => {
 
 describe("tools", () => {
   it("unknown tools and invalid arguments are answers, not errors", async () => {
-    const d = await bootDesk({ agentTokens: { main: AGENT_TOKEN } });
+    const d = await bootDesk({ token: OWNER_TOKEN, agentTokens: { main: AGENT_TOKEN } });
     expect((await refused(d, "delete_everything")).text).toContain('Unknown tool "delete_everything"');
     expect((await refused(d, "create_project", { title: "x" })).text).toMatch(/"outcome" is required; "brief" is required/);
     expect((await refused(d, "set_project_state", { id: "p", state: "archive" })).text).toContain('"state" must be one of "pause", "resume", "someday", "activate", "complete", "cancel"');
@@ -105,7 +107,7 @@ describe("tools", () => {
   });
 
   it("create_project → get_project → message_project → complete_action wakes the project as the agent, which answers its wait on the owner", async () => {
-    const d = await bootRealDesk({ agentTokens: { main: AGENT_TOKEN } });
+    const d = await bootRealDesk({ token: OWNER_TOKEN, agentTokens: { main: AGENT_TOKEN } });
     const repo = tempDir("trae");
     d.script.add(
       "project",
@@ -159,14 +161,14 @@ describe("tools", () => {
   });
 
   it("create_project with a directory that does not exist asks for the right path instead of guessing", async () => {
-    const d = await bootRealDesk({ agentTokens: { main: AGENT_TOKEN } });
+    const d = await bootRealDesk({ token: OWNER_TOKEN, agentTokens: { main: AGENT_TOKEN } });
     const r = await refused(d, "create_project", { title: "改 TUI", outcome: "复制出 Markdown", brief: "改表格复制", cwd: "/definitely/not/here" });
     expect(r.text).toContain("Ask the owner for the correct absolute path");
     expect(d.kernel.listCells({ parentId: "desk" })).toEqual([]);
   });
 
   it("set_project_state: pause, resume, someday, activate (the note reaches the project), cancel; a finished project is not messaged", async () => {
-    const d = await bootRealDesk({ agentTokens: { main: AGENT_TOKEN } });
+    const d = await bootRealDesk({ token: OWNER_TOKEN, agentTokens: { main: AGENT_TOKEN } });
     d.script.add("project", tool("save_artifact", { artifactId: "art_r", title: "调研报告", body: "结论：先做极简档" }), tool("track_action", { title: "看报告", owner: "human", nextStep: "读报告" }));
     const { projectId } = (await ok(d, "create_project", { title: "极简模式", outcome: "调研报告", brief: "先调研", mode: "research_then_park" })).data as { projectId: string };
     await d.kernel.idle();
@@ -198,7 +200,7 @@ describe("tools", () => {
   });
 
   it("get_project lists the reports of its workers, the dormant ones and the archived ones; a message to the finished project names them", async () => {
-    const d = await bootRealDesk({ agentTokens: { main: AGENT_TOKEN } });
+    const d = await bootRealDesk({ token: OWNER_TOKEN, agentTokens: { main: AGENT_TOKEN } });
     d.script.add("project", tool("dispatch", { title: "调研竞品", instruction: "调研 3 家竞品" }));
     d.script.add("worker", tool("save_artifact", { artifactId: "art_w", title: "竞品调研", body: "A、B、C 三家" }), tool("report_to_parent", { kind: "result", text: "报告 art_w", artifactId: "art_w" }));
     const { projectId } = (await ok(d, "create_project", { title: "竞品调研", outcome: "报告", brief: "调研" })).data as { projectId: string };
@@ -219,7 +221,7 @@ describe("tools", () => {
   });
 
   it("add_action records an owner's action (with or without a next step) or a wait on the project's books and tells the project", async () => {
-    const d = await bootRealDesk({ agentTokens: { main: AGENT_TOKEN } });
+    const d = await bootRealDesk({ token: OWNER_TOKEN, agentTokens: { main: AGENT_TOKEN } });
     const { projectId } = (await ok(d, "create_project", { title: "季度总结", outcome: "总结发出", brief: "写季度总结" })).data as { projectId: string };
     await d.kernel.idle();
     // A concrete next step is suggested, not required: without one the action is recorded and its title is the step.
@@ -239,7 +241,7 @@ describe("tools", () => {
   });
 
   it("project proposals require the owner and ordinary review cards check the seen version", async () => {
-    const d = await bootRealDesk({ agentTokens: { main: AGENT_TOKEN } });
+    const d = await bootRealDesk({ token: OWNER_TOKEN, agentTokens: { main: AGENT_TOKEN } });
     // BUG-020: a popped-up project_proposal card is also ownerOnly (external agents cannot self-approve a project card).
     d.script.add("desk", tool("propose_project", { title: "官网改版", outcome: "新版官网上线", actions: [{ title: "出设计稿", owner: "agent" }] }));
     await d.post("/api/capture", { text: "官网该改版了" });
@@ -250,7 +252,7 @@ describe("tools", () => {
     expect((await refused(d, "decide_human_item", { id: proposal.id, optionId: "system.execute", seenArtifactVersion: 1, note: "主人说可以", seenItemRevision: proposal.itemRevision })).text).toMatch(/主人/);
     expect(d.kernel.gate.getApprovalSync(proposal.id)!.status).toBe("pending");
     await expect(d.kernel.humanItems.decide(proposal.id, {optionId:"system.someday",
-      seenArtifactVersion:1, seenItemRevision:proposal.itemRevision}, "owner")).rejects.toThrow(/以后再说/);
+      seenArtifactVersion:1, seenItemRevision:proposal.itemRevision}, "owner")).rejects.toMatchObject({code:"conflict", message:"选项已变动"});
     expect(d.kernel.listCells({ parentId: "desk" }).some(x => x.title === "官网改版")).toBe(false);
     // The owner can approve it via the web UI.
     expect(await d.post(`/api/human-items/${proposal.id}/decide`, { optionId: "system.execute", seenArtifactVersion: 1, seenItemRevision: proposal.itemRevision })).toMatchObject({status:"approved"});
@@ -287,7 +289,7 @@ describe("tools", () => {
   });
 
   it("capture hands the owner's words to the desk as an inbound message signed by the agent", async () => {
-    const d = await bootRealDesk({ agentTokens: { main: AGENT_TOKEN } });
+    const d = await bootRealDesk({ token: OWNER_TOKEN, agentTokens: { main: AGENT_TOKEN } });
     d.script.add("desk", tool("capture_note", { title: "Rust async 文章", url: "https://example.com/rust-async" }));
     const r = await ok(d, "capture", { text: "https://example.com/rust-async 这篇存一下" });
     expect(r.text).toContain("Captured message");
@@ -300,8 +302,8 @@ describe("tools", () => {
   });
 
   it("routes authenticated capture through watches, and retries the same client id once", async () => {
-    const d = await bootDesk({agentTokens:{main:AGENT_TOKEN}});
-    d.kernel.spawnCell("desk", {id:"sub",preset:"checker",lifetime:"persistent",watches:[{threadOrFilter:{type:"user.message",principalId:"agent:main"}}]});
+    const d = await bootDesk({token: OWNER_TOKEN, agentTokens:{main:AGENT_TOKEN}});
+    d.kernel.spawnCell("desk", {id:"sub",preset:"checker",lifetime:"persistent",watches:[{threadOrFilter:{type:"user.message",principalId:"agent:main"}}]}, undefined, { principalId: d.kernel.ownerPrincipal });
     const args={text:"路由给订阅者",clientId:"mcp-retry-1"};
     await ok(d,"capture",args);
     await ok(d,"capture",args);
@@ -312,7 +314,7 @@ describe("tools", () => {
   });
 
   it("the overview shows the owner's actions, cards (ownerOnly marked), projects, parked ones, running cells and workspaces with ids", async () => {
-    const d = await bootRealDesk({ agentTokens: { main: AGENT_TOKEN } });
+    const d = await bootRealDesk({ token: OWNER_TOKEN, agentTokens: { main: AGENT_TOKEN } });
     const repo = tempDir("repo");
     writeAction(d.kernel, "desk", { title: "给牙医回电话", owner: "human", nextStep: "打 010-1234" });
     d.script.add("desk", tool("propose_project", { title: "立项发布计划", outcome: "验证发布流程", actions: [{ title: "检查发布清单", owner: "agent" }] }));
@@ -321,10 +323,15 @@ describe("tools", () => {
     const proposal = d.kernel.humanItems.list().find(item => item.action?.type === "project.start")!;
 
     d.script.add("project", tool("dispatch", { title: "改 a.ts", instruction: "改 a" }));
-    d.script.add("worker", { toolCalls: [{ name: "report_to_parent", input: { kind: "progress", text: "改了一半" } }] }, { delayMs: 60_000 });
+    let started!: () => void;
+    const workerStarted = new Promise<void>(resolve => { started = resolve; });
+    d.script.add("worker", () => {
+      started();
+      return { toolCalls: [{ name: "report_to_parent", input: { kind: "progress", text: "改了一半" } }] };
+    }, { delayMs: 60_000 });
     const { projectId } = (await ok(d, "create_project", { title: "改 a", outcome: "a 改好", brief: "改 a", cwd: repo })).data as { projectId: string };
     const { projectId: parked } = (await ok(d, "create_project", { title: "以后的点子", outcome: "调研", brief: "先记着" })).data as { projectId: string };
-    await new Promise((r) => setTimeout(r, 200));
+    await workerStarted;
     await ok(d, "set_project_state", { id: parked, state: "someday" });
     const o = await ok(d, "workbench_overview");
     for (const head of ["待我处理", "进行中的项目", "已停靠", "正在运行", "工作目录占用"]) expect(o.text).toContain(head);
@@ -350,7 +357,7 @@ describe("tools", () => {
 
 
   it("read_artifact, search, save_preference, get_cell, spawn_cell and control_cell", async () => {
-    const d = await bootRealDesk({ agentTokens: { main: AGENT_TOKEN } });
+    const d = await bootRealDesk({ token: OWNER_TOKEN, agentTokens: { main: AGENT_TOKEN } });
     d.kernel.context.commitSync("desk", { artifact: { artifactId: "art_x", content: { format: "markdown", title: "迁移方案", body: "选双写灰度" }, updatedBy: "agent" } });
     const art = await ok(d, "read_artifact", { id: "art_x" });
     expect(art.text).toContain("artifact art_x v1「迁移方案」");
@@ -417,12 +424,15 @@ describe("tools", () => {
     expect(d.kernel.context.readStateSync<{ lifecycle: string }>(projectId, "gtd:project")?.lifecycle).toBe("cancelled");
 
     // BUG-020: DeskActor principalId is strictly required (never falls back silently to owner).
-    await expect(d.server.desk.decideHumanItem("missing", {optionId:"done",seenItemRevision:1}, {principalId:""})).rejects.toThrow(/principalId/);
-    await expect(d.server.desk.projectOp(projectId, "pause", { principalId: "" })).rejects.toThrow(/principalId/);
-    await expect(d.server.desk.cellControl(projectId, { action: "pause" }, { principalId: "" })).rejects.toThrow(/principalId/);
-    expect(() => d.server.desk.sendCellMessage("desk", { text: "hi", clientId: "c1" }, { principalId: "" })).toThrow(/principalId/);
+    await expect(d.server.desk.decideHumanItem("missing", {optionId:"done",seenItemRevision:1}, {principalId:""})).rejects.toThrow("缺少操作者身份");
+    await expect(d.server.desk.projectOp(projectId, "pause", { principalId: "" })).rejects.toThrow("缺少操作者身份");
+    await expect(d.server.desk.cellControl(projectId, { action: "pause" }, { principalId: "" })).rejects.toThrow("缺少操作者身份");
+    expect(() => d.server.desk.sendCellMessage("desk", { text: "hi", clientId: "c1" }, { principalId: "" })).toThrow("缺少操作者身份");
 
-    // spawn_cell takes any registered preset (no enum in its schema); the kernel answers for one that is not registered
+    await expect(d.server.desk.addProjectAction(projectId, {title:"不能写入"}, {principalId:"cell:stranger"}))
+      .rejects.toMatchObject({code: "bounds_violation", message: "此身份不能操作工作台"});
+
+    // spawn_cell takes any non-root registered preset (no enum in its schema); the kernel answers for one that is not registered
     const presetSchema = (AGENT_TOOLS.find((t) => t.name === "spawn_cell")!.inputSchema as { properties: Record<string, { enum?: unknown }> }).properties["preset"]!;
     expect(presetSchema.enum).toBeUndefined();
     const checker = await ok(d, "spawn_cell", { preset: "checker", title: "盯 CI", instruction: "CI 绿了告诉我" });
@@ -468,7 +478,7 @@ function startMcp(env: Record<string, string>): Rpc {
 
 describe("MCP stdio server (bin/ng-mcp.mjs)", () => {
   it("proxies a session to a running workbench: initialize → tools/list → tools/call", async () => {
-    const d = await bootRealDesk({ agentTokens: { main: AGENT_TOKEN }, port: 0, env:{NG_OWNER_ADDRESSES:"channel:memory:owner"} });
+    const d = await bootRealDesk({ token: OWNER_TOKEN, agentTokens: { main: AGENT_TOKEN }, port: 0, env:{NG_OWNER_ADDRESSES:"channel:memory:owner"} });
     const { url } = await d.server.listen();
     const mcp = startMcp({ NG_DESK_URL: url, NG_AGENT_TOKEN: AGENT_TOKEN });
     try {
@@ -534,7 +544,7 @@ describe("MCP stdio server (bin/ng-mcp.mjs)", () => {
       mcp.send({ id: 3, method: "tools/call", params: { name: "workbench_overview", arguments: {} } });
       const r = (await mcp.next()) as { result: { content: Array<{ text: string }>; isError: boolean } };
       expect(r.result.isError).toBe(true);
-      expect(r.result.content[0]!.text).toContain("pnpm start");
+      expect(r.result.content[0]!.text).toContain("Ask the owner");
     } finally {
       mcp.close();
     }
@@ -554,4 +564,20 @@ describe("agent tools: near-miss argument names", () => {
     // Correct calls and genuinely unknown arguments are left exactly as given (validation still reports the latter).
     expect(normalizeArgs(doc("control_cell"), { id: "c1", action: "message", text: "hi" })).toEqual({ id: "c1", action: "message", text: "hi" });
   });
+});
+
+it("undoes a decision and reopens the original project through the agent command routes", async () => {
+  const d = await bootDesk({token: OWNER_TOKEN, agentTokens: {main: AGENT_TOKEN}});
+  const item = d.kernel.humanItems.create({title: "打电话", category:"action", subjectKey:"reminder:phone",
+    options: [{id:"done", label:"办完", effect:"complete"}]}, null);
+  const result = await ok(d, "decide_human_item", {id:item.id, optionId:"done", seenItemRevision:item.itemRevision});
+  const activity = result.data as {activityId:string};
+  expect(activity.activityId).toBeTruthy();
+  await ok(d, "undo_human_decision", { activityId:activity.activityId });
+  expect(d.kernel.humanItems.get(item.id)?.status).toBe("pending");
+  const project = makeProject(d.kernel, "重开验收");
+  await d.kernel.closeCell(project, "cancelled", { principalId: d.kernel.ownerPrincipal });
+  const epoch = d.kernel.getCell(project)!.epoch;
+  await ok(d, "reopen_project", {projectId:project});
+  expect(d.kernel.getCell(project)).toMatchObject({status:"active", epoch:epoch+1});
 });

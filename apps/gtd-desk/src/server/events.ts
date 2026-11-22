@@ -1,6 +1,6 @@
 import type { Kernel } from "@ng/cell";
 import { gtdKeys } from "@ng/presets";
-import { CELL_DIRECT_CHAT_KEY, CELL_TURN_KEY,  type BusTopic, type BusTopics} from "@ng/protocol";
+import { CELL_DIRECT_CHAT_KEY, CELL_TURN_KEY, type BusTopic, type BusTopics } from "@ng/protocol";
 import type { DeskEvent, NotificationDTO, ViewName } from "../shared/api";
 import { SENSOR_SUGGESTION_PREFIX, SKILL_SUGGESTION_PREFIX } from "./projections/common";
 
@@ -32,7 +32,7 @@ export function viewsForBusEvent<K extends BusTopic>(topic: K, data: BusTopics[K
       return stateViews((data as BusTopics["state.changed"]).keys);
     case "cell.changed":
     case "inbox.control":
-      return ["radar", "agents", "status", "sources"];
+      return ["radar", "agents", "status", "sources", "inbox", "review"];
     case "run.started":
     case "run.finished":
       return ["status", "radar", "agents", "inbox"];
@@ -41,10 +41,10 @@ export function viewsForBusEvent<K extends BusTopic>(topic: K, data: BusTopics[K
     case "owner.notified":
       return ["status"];
     case "knowledge.changed":
-      return ["review", "inbox"];
+      return ["review", "inbox", "agents"];
     case "inbox.enqueued":
       // A queued message changes the activity shown in both the tree and the top bar.
-      return (data as BusTopics["inbox.enqueued"]).reason === "due" ? ["inbox", "status", "radar", "agents"] : ["agents", "status"];
+      return (data as BusTopics["inbox.enqueued"]).reason === "due" ? ["inbox", "status", "radar", "agents"] : ["agents", "status", "radar"];
     default:
       return [];
   }

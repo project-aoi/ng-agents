@@ -27,8 +27,8 @@ export const AGENT_INSTRUCTIONS = `This server is the owner's GTD workbench ("ng
 3. **Anything new, vague, or that might duplicate existing work → \`chat_with_desk\`** with the owner's words unedited. The desk finds what exists, asks what is missing (for code: the absolute path of the repository on this machine) and puts the work in the right place. It answers in the background: read its replies with \`chat_with_desk\` and \`since\` when the owner asks or you have a reason — never in a loop. Relay its questions to the owner, and send the owner's answer with \`replyToId\` = the id of the question it answers (so it lands on the right matter even when several are open).
    When the owner has already given you everything (outcome, complete brief, the absolute path) and \`search\` shows nothing on the subject, you may \`create_project\` yourself — never a second project for the same outcome. An idea only to remember: \`create_project\` with mode "research_then_park".
 4. **Work is asynchronous.** Everything returns at once; results arrive minutes later. Tell the owner it is under way and what will happen; do not poll.
-5. Read \`list_human_items\` for decisions and actions waiting on the owner. Submit the displayed option, reviewed versions and the owner’s note with \`decide_human_item\`. Use \`undo_human_decision\` with the activity ID to undo a reversible decision, and \`reopen_project\` to resume a closed project. For a direct question, send the answer with \`message_cell\` or \`chat_with_desk\` and its \`replyToId\`.
-6. Project confirmation cards require the owner to approve execution in the workbench. On the owner’s instruction you can still defer, decline or request revisions using the displayed options.
+5. Read \`list_human_items\` for BOTH open human actions (owner to-dos) and pending decision cards (snoozed items are hidden until they resurface). To tick off a human action or submit a card decision, call \`decide_human_item\` with the displayed \`optionId\`, \`seenItemRevision\`, and any conditional fields required by the chosen option (\`seenArtifactVersion\`, \`note\`, \`until\`, \`resumeProjectId\`, \`confirmedTargets\`, \`confirmedClosure\`). Use \`undo_human_decision\` with the activity ID to undo a reversible decision, and \`reopen_project\` to resume a closed project. For a direct question, send the answer with \`message_cell\` or \`chat_with_desk\` and its \`replyToId\`.
+6. Project confirmation cards require the owner to approve execution in the workbench. On the owner's instruction you can still defer, decline or request revisions using the displayed options. To add or manage scheduled sources or review weekly suggestions, talk to the desk via \`chat_with_desk\` (or direct the owner to the web UI).
 7. **Never do the workbench's work around it.** Nothing locks a directory: several cells may work in one repository at once, and \`list_workspaces\` shows which cells are active where right now. Before you change files yourself in such a directory, tell its project (\`message_project\`) or pause it, so nobody's work is overwritten.
 
 ## Answering the owner
@@ -66,7 +66,7 @@ export const AGENT_TOOLS: readonly AgentToolDoc[] = [
     name: "capture",
     description:
       "Drop something into the desk's inbox exactly as 随手记 does (a note, a link, a reminder, or an idea to triage) for silent triage, without a conversation. Prefer chat_with_desk when the owner expects an answer or the desk may need to ask something.",
-    inputSchema: obj({ clientId:str("optional stable id for a retried capture"),text: str("the owner's words, unedited; add context after them only if it is needed to understand them") }, ["text"]),
+    inputSchema: obj({ threads: {type: "array", items: {type:"string"}, description: "Workbench topics, e.g. ui:reviews"}, clientId:str("optional stable id for a retried capture"),text: str("the owner's words, unedited; add context after them only if it is needed to understand them") }, ["text"]),
   },
   {
     name: "create_project",
@@ -93,7 +93,7 @@ export const AGENT_TOOLS: readonly AgentToolDoc[] = [
   {
     name: "message_project",
     description:
-      'Give a running (or parked) project a new instruction from the owner: a follow-up step ("用 /ship-mr 提 MR"), an addition ("补一个录屏"), a correction or a change of direction. The project reads it at its next turn and acts with a new worker; with urgent it is interrupted now. If the project has already finished, you are told so — use reopen_project to continue the original project when the owner asks to resume it.',
+      'Give a running (or parked) project a new instruction from the owner: a follow-up step ("用 /ship-mr 提 MR"), an addition ("补一个录屏"), a correction or a change of direction. The project reads it at its next turn and either wakes the dormant worker that already knows the work or dispatches a new one; with urgent it is interrupted now. If the project has already finished, you are told so — use reopen_project to continue the original project when the owner asks to resume it.',
     inputSchema: obj(
       { id: str("project id"), text: str("the owner's instruction, in their words, with any context needed to act on it"), urgent: { type: "boolean", description: "interrupt what it is doing (only when it is going the wrong way)" } },
       ["id", "text"],
@@ -115,27 +115,35 @@ export const AGENT_TOOLS: readonly AgentToolDoc[] = [
   },
   {
     name: "list_human_items",
-    description: "查看待主人处理的事项、当前选项和已见版本。草稿编辑和确认使用同一事项。",
+    description:
+      'List every active item waiting on the owner in 待我处理 — BOTH open human actions (owner to-dos, completed via decide_human_item using their "done" option) and pending decision cards — together with their options, itemRevision, artifactVersion, resumeTarget, closureTargets and ownerOnly flags. Snoozed items are omitted until they resurface.',
     inputSchema: obj({}),
   },
   {
     name: "decide_human_item",
-    description: "提交所见版本的选项和备注。需要主人授权的选项由主人处理。",
+    description:
+      "Complete an open human action or submit a decision on a pending card using the exact option and versions returned by list_human_items. Execution options on ownerOnly cards (such as project confirmation cards) must be approved by the owner in the web UI; you may still submit defer, decline, revision or non-owner-only reply/done options on the owner's instruction.",
     inputSchema: obj({
-      id: str("待处理事项的 ID"), optionId: str("所选选项的 ID"),
-      seenItemRevision: {type:"number", description:"列表中看到的事项修订号 itemRevision"},
-      seenArtifactVersion: {type:"number", description:"事项带草稿时，填写看到的草稿版本 artifactVersion"},
-      until: {type:"number", description:"推迟到的时间，使用 Unix 毫秒时间戳"}, note: str("选项要求的答复、修改意见或备注"),
-      resumeProjectId: str("明确同意恢复的项目或分身 ID，见 resumeTarget.id"),
-      confirmedTargets: {type:"array", items:{type:"string"}, description:"确认中止的目标项目 ID 列表"},
-      confirmedClosure: {type:"array", items:{type:"string"}, description:"按界面顺序填写确认一并关闭的全部任务 ID"},
-    },["id","optionId","seenItemRevision"]),
+      id: str("human item id from list_human_items"),
+      optionId: str('chosen option id from item.options (e.g. "done" to tick off a human action)'),
+      seenItemRevision: { type: "number", description: "exact itemRevision returned by list_human_items (optimistic concurrency lock)" },
+      seenArtifactVersion: { type: "number", description: "required when item.artifactVersion is non-null: the exact draft version reviewed" },
+      until: { type: "number", description: 'for effect "defer" options: Unix timestamp in milliseconds to resurface the item (default: +24h)' },
+      note: str('reply text, revision instructions, or completion context (required when option.input.mode is "required")'),
+      resumeProjectId: str("required when the item carries resumeTarget: pass resumeTarget.id to confirm resuming that paused project or cell"),
+      confirmedTargets: { type: "array", items: { type: "string" }, description: 'required when the chosen option has terminateMode "cancel_task": pass [targetCellId] matching option.targetCellIds' },
+      confirmedClosure: { type: "array", items: { type: "string" }, description: "required when item.closureTargets is non-empty for a closing option: pass all target ids in the exact order shown" },
+    }, ["id", "optionId", "seenItemRevision"]),
   },
   {
-    name: "reopen_project", description:"在原会话中重新打开已结束项目。",inputSchema:obj({projectId:str("项目 ID")},["projectId"]),
+    name: "reopen_project",
+    description: "Reopen a completed or cancelled project in its original session (restoring its wakeable workers and cancelled actions).",
+    inputSchema: obj({ projectId: str("project id") }, ["projectId"]),
   },
   {
-    name: "undo_human_decision",description:"撤销尚未认领的决定，或通知后台更正已读决定。",inputSchema:obj({activityId:str("操作 ID")},["activityId"]),
+    name: "undo_human_decision",
+    description: "Undo a recent reversible decision by its activityId (restores the item if unread, or sends a correction to the background cell if already claimed).",
+    inputSchema: obj({ activityId: str("activity id returned by decide_human_item") }, ["activityId"]),
   },
   {
     name: "read_artifact",

@@ -6,6 +6,12 @@ export const DESK_CELL_ID = "desk";
 /** Default principal of the single human owner (configurable by the app). */
 export const OWNER_PRINCIPAL = "owner";
 
+export function requirePrincipalId(value: unknown): string {
+  if (typeof value !== "string" || !value.trim() || value !== value.trim())
+    throw new NgError("bounds_violation", "需要明确的操作身份");
+  return value;
+}
+
 export function inboxAddr(cellId: string): InboxAddr {
   if (!cellId) throw new NgError("invalid_argument", "inboxAddr: empty cellId");
   return `inbox:${cellId}`;

@@ -64,7 +64,7 @@ describe("docs/05 scenario 4 — several workers blocked by the same CI failure:
         return tool("wait", { reason: "修复中" });
       },
     );
-    const p1 = startProjectSync(h.kernel, { title: "服务一的 feature", outcome: "feature 上线", brief: "实现 feature", cwd: repo1 }).projectId;
+    const p1 = startProjectSync(h.kernel, { title: "服务一的 feature", outcome: "feature 上线", brief: "实现 feature", cwd: repo1 }, { principalId: h.kernel.ownerPrincipal }).projectId;
     await h.kernel.idle();
     const w1 = childrenOf(h, p1)[0]!;
     expect(h.kernel.listWaits([w1])).toEqual([expect.objectContaining({ waitingFor: "inbox:desk" })]);
@@ -82,7 +82,7 @@ describe("docs/05 scenario 4 — several workers blocked by the same CI failure:
         return tool("wait", { reason: "joined" });
       },
     );
-    const p2 = startProjectSync(h.kernel, { title: "服务二的 bugfix", outcome: "bug 修复", brief: "修 bug", cwd: repo2 }).projectId;
+    const p2 = startProjectSync(h.kernel, { title: "服务二的 bugfix", outcome: "bug 修复", brief: "修 bug", cwd: repo2 }, { principalId: h.kernel.ownerPrincipal }).projectId;
     await h.kernel.idle();
     const w2 = childrenOf(h, p2)[0]!;
     expect(h.kernel.listWaits([w2])).toEqual([expect.objectContaining({ waitingFor: "inbox:desk" })]);
@@ -91,7 +91,7 @@ describe("docs/05 scenario 4 — several workers blocked by the same CI failure:
     expect(childrenOf(h, "desk", "worker")).toEqual(fixers);
 
     // 3. Meanwhile the owner stops the second worker; its project keeps the action open for a successor.
-    await h.kernel.closeCell(w2, "cancelled");
+    await h.kernel.closeCell(w2, "cancelled", { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     expect(h.actions(p2)).toEqual([expect.objectContaining({ status: "open", owner: "agent" })]);
     expect(h.actions(p2)[0]!.cellId).toBeUndefined();
@@ -114,7 +114,7 @@ describe("docs/05 scenario 4 — several workers blocked by the same CI failure:
         return tool("wait", { reason:"resolved" });
       },
     );
-    expect(h.kernel.sendToCell(fixers[0]!, { text: "主人：CI 已经绿了，收尾吧" })).toMatchObject({ status: "delivered" });
+    expect(h.kernel.sendToCell(fixers[0]!, { text: "主人：CI 已经绿了，收尾吧" }, { principalId: h.kernel.ownerPrincipal })).toMatchObject({ status: "delivered" });
     await h.kernel.idle();
 
     expect(h.script.pending("desk")).toBe(0);
@@ -155,7 +155,7 @@ describe("docs/05 scenario 4 — several workers blocked by the same CI failure:
         return tool("wait",{reason:"done"});
       },
     );
-    await h.ui.capture({ text: "测试一下仲裁笔记" });
+    await h.ui.capture({ text: "测试一下仲裁笔记" }, "owner");
     await h.kernel.idle();
     expect(h.script.pending("desk")).toBe(0);
     expect(childrenOf(h, "desk", "worker")).toEqual([]);

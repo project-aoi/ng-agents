@@ -247,7 +247,7 @@ function Canvas(props: ViewProps) {
     if (el) cards.current.set(id, el);
     else cards.current.delete(id);
   };
-  const drawnWaits = new Set(geo.edges.filter((e) => e.kind === "wait").map((e) => e.key.slice(2).split(">")[0]!));
+  const drawnWaits = new Set(geo.edges.filter((e) => e.kind === "wait").map((e) => e.key));
 
   return (
     <div className="topo-scroll">
@@ -283,7 +283,7 @@ function Canvas(props: ViewProps) {
               {groups.map((g) => (
                 <div key={g.key} className="topo-group">
                   {g.entries.map((e) => (
-                    <NodeCard key={e.node.cellId} {...props} node={e.node} tabStop={keys.stop === e.node.cellId} onFocusNode={keys.setFocusId} cardRef={register(e.node.cellId)} waitDrawn={drawnWaits.has(e.node.cellId)} />
+                    <NodeCard key={e.node.cellId} {...props} node={e.node} tabStop={keys.stop === e.node.cellId} onFocusNode={keys.setFocusId} cardRef={register(e.node.cellId)} drawnWaits={drawnWaits} />
                   ))}
                 </div>
               ))}
@@ -303,7 +303,7 @@ function TreeList(props: ViewProps) {
     <ul className="topo-list" onKeyDown={keys.onKeyDown}>
       {props.entries.map((e) => (
         <li key={e.node.cellId} style={{ paddingLeft: `${Math.min(e.depth, 6) * 18}px` }}>
-          <NodeCard {...props} node={e.node} row tabStop={keys.stop === e.node.cellId} onFocusNode={keys.setFocusId} waitDrawn={false} />
+          <NodeCard {...props} node={e.node} row tabStop={keys.stop === e.node.cellId} onFocusNode={keys.setFocusId} />
         </li>
       ))}
     </ul>
@@ -317,7 +317,7 @@ function NodeCard(
     node: TopologyNodeDTO;
     row?: boolean;
     tabStop: boolean;
-    waitDrawn: boolean;
+    drawnWaits?: ReadonlySet<string>;
     onFocusNode(id: string): void;
     cardRef?: (el: HTMLElement | null) => void;
   },
@@ -327,7 +327,7 @@ function NodeCard(
   const selected = props.selectedId === n.cellId;
   const dir = n.gitRoot ?? n.cwd;
   const lit = n.gitRoot !== null && props.highlight.has(n.gitRoot);
-  const waits = props.waitDrawn ? [] : props.topo.waits.filter((w) => w.fromCellId === n.cellId);
+  const waits = props.topo.waits.filter(w => w.fromCellId === n.cellId && !props.drawnWaits?.has(`w:${w.fromCellId}>${w.targetCellId}`));
   const dirTitle = n.cwd && n.gitRoot && n.cwd !== n.gitRoot ? `${n.cwd}\n（仓库 ${n.gitRoot}）` : (dir ?? undefined);
   const hasLinks = n.pendingCardId !== null || n.humanItemId !== null || (n.archivedChildren > 0 && !props.includeArchived);
 

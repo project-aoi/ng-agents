@@ -1,4 +1,4 @@
-import { mkdtempSync, readdirSync, realpathSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -53,18 +53,20 @@ const ENGINES: CliEngine[] = ["claude", "codex", "agy"];
 
 describe.each(ENGINES)("follow-ups with a fake %s", (engine) => {
   it("a message that arrives mid-turn is delivered when the turn ends by itself — on the same session, without interrupting anything", async () => {
+    const release = join(tempDir("first-turn"), "release");
     const s = setup(engine, [
-      { actions: [{ text: "working on the first thing" }, { sleep: 400 }, { text: "first thing done" }] },
+      { actions: [{ text: "working on the first thing" }, { waitFile: release }, { text: "first thing done" }] },
       { actions: [{ text: "follow-up handled too" }] },
     ]);
     const done = s.go();
     await waitFor(() => s.fake.prompts().length === 1, "the first prompt");
     s.run.ports.pushInbound("also do the second thing");
     // Still mid-turn after several poll intervals: the follow-up has not been taken, nothing was signalled.
-    await new Promise((r) => setTimeout(r, 150));
+    await waitFor(() => s.fake.log().some(e => e.type === "waiting_file"), "first turn is blocked");
     expect(s.run.ports.log.drained).toHaveLength(0);
     expect(s.fake.prompts()).toHaveLength(1);
 
+    writeFileSync(release, "go");
     expect(await done).toBe("completed");
     const log = s.fake.log();
     expect(log.filter((e) => e.type === "interrupt" || e.type === "cancel" || e.type === "sigterm")).toEqual([]);
@@ -86,14 +88,17 @@ describe.each(ENGINES)("follow-ups with a fake %s", (engine) => {
   });
 
   it("a steer is the urgent channel: codex and agy cut the turn short, claude queues it on its live input — and it always reaches the model", async () => {
-    const s = setup(engine, [{ actions: [{ text: "heading the wrong way" }, { sleep: 1_500 }, { text: "end of the first turn" }] }, { actions: [{ text: "corrected" }] }]);
+    const release = join(tempDir("steer"), "release");
+    const s = setup(engine, [{ actions: [{ text: "heading the wrong way" }, { waitFile: release }, { text: "end of the first turn" }] }, { actions: [{ text: "corrected" }] }]);
     const done = s.go();
     await waitFor(() => s.fake.prompts().length === 1, "the first prompt");
-    await new Promise((r) => setTimeout(r, 100));
-    const t0 = Date.now();
+    await waitFor(() => s.fake.log().some(e => e.type === "waiting_file"), "first turn is blocked");
     s.run.ports.pushSteer("stop: use the develop branch");
+    if (engine === "claude") {
+      await waitFor(() => s.run.ports.log.evidence.some(e => e.kind === "system_note" && e.envelopeId === "steer_1"), "steer written");
+      writeFileSync(release, "go");
+    }
     expect(await done).toBe("completed");
-    const took = Date.now() - t0;
     expect(s.fake.prompts()[1]).toContain("use the develop branch");
     const said = s.run.ports.log.evidence.filter((e) => e.kind === "assistant_text").map((e) => (e as { text: string }).text).join("\n");
     const notes = s.run.ports.log.evidence.filter(e => e.kind === "system_note" && e.text.includes("use the develop branch"));
@@ -106,7 +111,7 @@ describe.each(ENGINES)("follow-ups with a fake %s", (engine) => {
     } else {
       // No live input (codex) or cancel-then-prompt (agy): the turn in flight is abandoned for the correction.
       expect(said).not.toContain("end of the first turn");
-      expect(took).toBeLessThan(1_400);
+      expect(s.fake.log().some(e => engine === "agy" ? e.type === "cancel" : e.type === "sigterm")).toBe(true);
     }
   });
 
@@ -207,9 +212,10 @@ describe("BUG-026: CLI steer & follow-up anti-loss and fresh rebuild anti-duplic
 
   it.each([true, false])("failed resume rebuilds both absorbed follow-ups exactly once (prior text: %s)", async priorText => {
     const clock = new ManualClock(1_000);
+    const release = join(tempDir("codex-rebuild-gate"),"release");
     const fake = installFakeCli(tempDir("codex-rebuild-bin"), "codex", [
       // Turn 1: fresh session works, produces session id.
-      { actions: [...(priorText ? [{ text: "step 1 done" }] : []), { sleep: 300 }] },
+      { actions: [...(priorText ? [{ text: "step 1 done" }] : []), { waitFile: release }] },
       // Turn 2 (after we wipe the session store, resume fails with unknown session → fresh rebuild runs Turn 2!):
       { actions: [{ text: "rebuilt and handled all" }] },
     ]);
@@ -242,6 +248,7 @@ describe("BUG-026: CLI steer & follow-up anti-loss and fresh rebuild anti-duplic
     const dupB = createEnvelope({ id: "env_dup_b", from: "inbox:desk", principalId: "owner", kind: "event", type: PAYLOAD.userMessage, payload: { text: "same ping text" } }, clock);
     run.ports.pushInbound(dupA);
     run.ports.pushInbound(dupB);
+    writeFileSync(release,"go");
     expect(await done).toBe("completed");
     // Launch 1 = initial fresh, Launch 2 = failed resume, Launch 3 = fresh rebuild!
     expect(fake.launches()).toHaveLength(3);
@@ -269,9 +276,10 @@ describe("BUG-026: CLI steer & follow-up anti-loss and fresh rebuild anti-duplic
   }, 15_000);
 
   it("does not acknowledge a cancelled AGY correction when a later correction succeeds", async () => {
+    const waiting = join(tempDir("agy-cancel"), "until-cancelled");
     const s = setup("agy", [
-      { actions: [{ sleep: 1_500 }] },
-      { actions: [{ sleep: 1_500 }, { text: "first correction completed" }] },
+      { actions: [{waitFile: waiting}] },
+      { actions: [{waitFile: waiting}, { text: "first correction completed" }] },
       { actions: [{ text: "second correction completed" }] },
       { actions: [{ text: "retried first correction" }] },
     ]);
@@ -287,14 +295,16 @@ describe("BUG-026: CLI steer & follow-up anti-loss and fresh rebuild anti-duplic
   });
 
   it("Review fix (agy): multiple follow-ups arriving in one turn are joined into a single steer prompt without self-cancellation", async () => {
+    const release = join(tempDir("agy-batch"), "release");
     const s = setup("agy", [
-      { actions: [{ text: "turn 1" }, { sleep: 250 }] },
+      { actions: [{ text: "turn 1" }, { waitFile: release }] },
       { actions: [{ text: "handled both follow-ups" }] },
     ]);
     const done = s.go();
     await waitFor(() => s.fake.prompts().length === 1, "first prompt");
     s.run.ports.pushInbound("follow-up alpha");
     s.run.ports.pushInbound("follow-up beta");
+    writeFileSync(release,"go");
     expect(await done).toBe("completed");
     expect(s.fake.log().filter((e) => e.type === "cancel")).toEqual([]);
     const prompts = s.fake.prompts();

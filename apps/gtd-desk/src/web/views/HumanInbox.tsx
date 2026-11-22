@@ -2,15 +2,15 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { CardOption } from "@ng/protocol";
 import { EFFORT_LABELS, type Effort, type HumanItemDTO as Item, type StatusDTO } from "../../shared/api";
 import { References } from "../components/bits";
-import { PlanEditor } from "../components/PlanEditor";
+import { PlanEditor, hasUnsavedPlan, retainUnsavedPlans } from "../components/PlanEditor";
 import { Parked } from "../components/Parked";
 import { dueText } from "../text";
-import { request } from "../api";
+import { api } from "../api";
 import { DraftEditor, DraftRefreshNotice, retainUnsaved, useDraft } from "../components/draft";
 import { Empty, ErrorState, Loading } from "../components/states";
 import { serverTimeForLocalDate, toFailure, useNavigate, useNow, useResource, useStatus, useToast, useViewKeys } from "../state";
 
-const pool = () => request<{ items: Item[]; openArtifactIds: string[] }>("GET", "/api/human-items");
+const pool = api.humanItems;
 
 export function HumanInbox({ cardId }: { cardId?: string | undefined }) {
   const res = useResource("human-inbox", pool, ["inbox", "radar", "status"]);
@@ -18,14 +18,22 @@ export function HumanInbox({ cardId }: { cardId?: string | undefined }) {
   const [filter, setFilter] = useState("all");
   const [editing, setEditing] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(cardId ?? null);
+  const editingItem = useRef<Item | null>(null);
+  useLayoutEffect(() => {
+    if (cardId) setSelectedId(cardId);
+  }, [cardId]);
   const items = (res.data?.items ?? [])
     .filter(i => filter === "all" || i.category === filter || i.id === cardId)
     .sort((a, b) => b.category.localeCompare(a.category) || (a.dueAt ?? Infinity) - (b.dueAt ?? Infinity));
-  const item = items.find(i => i.id === cardId) ?? items.find(i => i.id === selectedId) ?? items[0];
-  useLayoutEffect(() => setSelectedId(item?.id ?? null), [item?.id]);
+  const editingFallback = editing && editingItem.current?.proposal && editingItem.current.id === editing ? editingItem.current : undefined;
+  const item = items.find(i => i.id === selectedId) ?? editingFallback ?? items[0];
+  useLayoutEffect(() => { if (item) setSelectedId(item.id); }, [item?.id]);
   useEffect(() => {
-    if (res.data) retainUnsaved(res.data.openArtifactIds);
-  }, [res.data]);
+    if (res.data) {
+      retainUnsaved(res.data.openArtifactIds);
+      retainUnsavedPlans(res.data.openArtifactIds, editing);
+    }
+  }, [res.data, editing]);
   const focused = !!item && editing === item.id;
   const choose = (id: string) => {
     setEditing(null);
@@ -33,7 +41,7 @@ export function HumanInbox({ cardId }: { cardId?: string | undefined }) {
     navigate({ view: "inbox", cardId: id });
   };
   useViewKeys((e) => {
-    if (e.key === "Escape" && focused) {
+    if (e.key === "Escape" && focused && !item?.proposal && !e.isComposing) {
       setEditing(null);
       return true;
     }
@@ -88,7 +96,10 @@ export function HumanInbox({ cardId }: { cardId?: string | undefined }) {
           key={item.id}
           item={item}
           focused={focused}
-          toggle={() => setEditing(focused ? null : item.id)}
+          toggle={() => {
+            editingItem.current = focused ? null : item;
+            setEditing(focused ? null : item.id);
+          }}
           refresh={res.reload}
           reloadItem={async () => {
             const latest = await pool();
@@ -122,7 +133,7 @@ function Detail({
   const { setStatus } = useStatus();
   const [editingChoice, setEditingChoice] = useState<{ itemId: string; optionId: string } | null>(null);
   const [reviewedRevision, setReviewedRevision] = useState(item.itemRevision);
-  const itemChanged = reviewedRevision !== item.itemRevision;
+  const itemChanged = reviewedRevision < item.itemRevision;
   const [notes, setNotes] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
   const submitting = useRef(false);
@@ -132,7 +143,7 @@ function Detail({
   useEffect(() => {
     if (!focused || plan) return;
     const save = (e: KeyboardEvent) => {
-      if (e.defaultPrevented) return;
+      if (e.defaultPrevented || document.querySelector('dialog[open], [role="dialog"]')) return;
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
         e.preventDefault();
         void draft?.save();
@@ -155,6 +166,10 @@ function Detail({
       setMessage("请先核对最新事项");
       return;
     }
+    if (o.effect === "defer" && postponeTo && !(serverTimeForLocalDate(postponeTo) > now)) {
+      setMessage("请选择将来的提醒时间");
+      return;
+    }
     const note = notes[o.id] ?? "";
     if ((o.effect === "defer" || (o.input && o.input.mode !== "none")) && (editingChoice?.itemId !== item.id || editingChoice.optionId !== o.id)) {
       setEditingChoice({ itemId: item.id, optionId: o.id });
@@ -166,7 +181,7 @@ function Detail({
       setMessage("请填写说明");
       return;
     }
-    if (draft?.dirty || draft?.conflict || draft?.saving) {
+    if (hasUnsavedPlan(item.id) || draft?.dirty || draft?.conflict || draft?.saving) {
       setMessage("请先保存并核对当前版本");
       return;
     }
@@ -192,7 +207,7 @@ function Detail({
     submitting.current = true;
     setBusy(true);
     try {
-      const result = await request<{ status: string; activityId?: string; deskStatus: StatusDTO }>("POST", `/api/human-items/${encodeURIComponent(item.id)}/decide`, {
+      const result = await api.decide(item.id, {
         optionId: o.id,
         seenItemRevision: item.itemRevision,
         ...(draft ? { seenArtifactVersion: draft.base.version } : {}),
@@ -204,6 +219,7 @@ function Detail({
           : {}),
       });
       setStatus(result.deskStatus);
+      if (result.status === "revising") setReviewedRevision(item.itemRevision + 1);
       const id = result.activityId;
       toast({
         tone: "success",
@@ -213,7 +229,7 @@ function Detail({
               action: {
                 label: "撤销",
                 run: () => {
-                  void request<{ message: string; deskStatus: StatusDTO }>("POST", `/api/human-activity/${encodeURIComponent(id)}/undo`)
+                  void api.undo(id)
                     .then((r) => {
                       setStatus(r.deskStatus);
                       toast({ tone: "info", text: r.message });
@@ -228,10 +244,10 @@ function Detail({
       cancelChoice();
     } catch (err) {
       const failure = toFailure(err);
-      const text = failure.status === 403 || failure.code === "bounds_violation"
+      const text = failure.code === "bounds_violation"
         ? "此操作需要主人确认"
         : failure.status === 404 ? "事项已移除"
-        : failure.status === 409 && failure.message === "item changed" ? "事项已经更新，请核对最新选项后重新提交。"
+        : failure.status === 409 && failure.message === "事项已变动" ? "事项已经更新，请核对最新选项后重新提交。"
         : /[㐀-鿿]/.test(failure.message) ? failure.message
         : failure.status === 409 ? "事项内容已变动，请核对后重新提交"
         : failure.status === 400 ? "请检查填写的说明和选项" : "提交失败，请稍后重试";
@@ -345,6 +361,7 @@ function Detail({
         {plan && (
           <section>
             <p>{plan.outcome}</p>
+            {plan.background && <p>{plan.background}</p>}
             {plan.cwd && (
               <p>
                 工作目录 <code>{plan.cwd}</code>
@@ -358,7 +375,7 @@ function Detail({
             {plan.phases?.join(" → ")}
             <ol>
               {plan.actions?.map((a, i) => (
-                <li key={i}>{a.title}</li>
+                <li key={i}>{a.title} · {{ human: "主人", agent: "分身", waiting: "等回复" }[a.owner]}{a.effort && ` · ${EFFORT_LABELS[a.effort]}`}{a.nextStep && ` · ${a.nextStep}`}</li>
               ))}
             </ol>
           </section>
@@ -368,13 +385,15 @@ function Detail({
             <button className="btn" type="button" onClick={toggle}>
               {focused ? "回到事项" : "展开专注编辑"}
             </button>
+            {!focused && hasUnsavedPlan(item.id) && <p role="status">方案有未保存的修改，请展开编辑后保存或放弃。</p>}
             {!focused && draft && <DraftRefreshNotice draft={draft} />}
             {plan ? (
               focused && (
                 <PlanEditor
                   item={item}
                   onClose={toggle}
-                  onSaved={() => {
+                  onSaved={(result) => {
+                    if (result.ok) draft?.saved(result.artifact);
                     cancelChoice();
                     toggle();
                     refresh();
@@ -397,7 +416,7 @@ function Detail({
             {reference}
           </>
         )}
-        {draft && !plan && <Parked draft={draft} />}
+        {draft && <Parked draft={draft} structured={!!plan} />}
         {!(focused && plan) && item.options.filter((o) => o.group !== "more").map(renderChoice)}
         {!(focused && plan) && item.options.some((o) => o.group === "more") && (
           <details>

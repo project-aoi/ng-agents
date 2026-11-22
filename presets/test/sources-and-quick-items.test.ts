@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { gtdKeys } from "../src/shared/keys";
-import {  PAYLOAD, type ProjectProposal} from "@ng/protocol";
+import { PAYLOAD, type ProjectProposal } from "@ng/protocol";
 import { defineSensorCheck, OBSERVATION_NOTE, type SensorHit } from "../src";
 import { boot, cleanupAll, DAY, projects, T0, tool, type Harness } from "./helpers";
 
@@ -12,6 +12,22 @@ const MONDAY_9 = Date.UTC(2026, 10, 23, 1, 0, 0);
 function sensorsOf(h: Harness): string[] {
   return h.kernel.listCells({ parentId: "desk", preset: "sensor" }).map((c) => c.id);
 }
+
+it.each(["", "先核对数据，再讨论立项"])("passes the owner's explanation on a declined proposal through desk bookkeeping", async note => {
+  const h = await boot();
+  const deferred = h.kernel.gate.authorizeSync({type:"project.start", subjectKey:"proposal:review", summary:"确认安排",
+    sideEffect:"external", proposal:{title:"核对记录", outcome:"交付记录", actions:[]}}, {cellId:"desk", principalId:"cell:desk", epoch:h.kernel.getCell("desk")!.epoch});
+  if (deferred.type !== "defer") throw Error("expected a proposal");
+  const item = h.kernel.humanItems.get(deferred.actionId)!;
+  const decline = item.options.find(o => o.effect === "terminate")!;
+  const before = h.script.callsOf("desk").length;
+  await h.kernel.humanItems.decide(item.id, {optionId:decline.id, seenItemRevision:item.itemRevision, note}, "owner");
+  await h.kernel.idle();
+  const calls = h.script.callsOf("desk").slice(before);
+  if (note) expect(calls.some(call => JSON.stringify(call.messages).includes(note))).toBe(true);
+  else expect(calls).toHaveLength(0);
+  expect(projects(h)).toHaveLength(0);
+});
 
 describe("docs/03 §四 row 1 — a sensor is a source, not a task", () => {
   it("stays silent on a normal run, posts one hit to the desk, which turns it into a project proposal; approving starts the project", async () => {
@@ -26,7 +42,7 @@ describe("docs/03 §四 row 1 — a sensor is a source, not a task", () => {
       tool("add_source", { title: "核心指标巡检", description: "注册转化率环比下跌超过 10% 才算", cron: "0 9 * * 1", tz: "Asia/Shanghai", check: "test.metrics" }),
       tool("wait", { reason: "done" }),
     );
-    await h.ui.capture({ text: "每周一早 9 点帮我看下核心指标有没有掉" });
+    await h.ui.capture({ text: "每周一早 9 点帮我看下核心指标有没有掉" }, "owner");
     await h.kernel.idle();
 
     const [sensor] = sensorsOf(h);
@@ -117,7 +133,7 @@ describe("docs/03 §四 row 1 — a sensor is a source, not a task", () => {
       setup: (r) => r.codeProcessors.register(defineSensorCheck("test.group", () => ({ title: "支付报错", summary: "有人说付款页面白屏" }))),
     });
     h.script.add("desk", tool("add_source", { title: "研发群反馈", watchThread: "memory:dev-group", check: "test.group", mode: "observe" }), tool("wait", { reason: "ok" }));
-    await h.ui.capture({ text: "盯一下研发群有没有人反馈支付报错，先观察两天别弹卡" });
+    await h.ui.capture({ text: "盯一下研发群有没有人反馈支付报错，先观察两天别弹卡" }, "owner");
     await h.kernel.idle();
     const [sensor] = sensorsOf(h);
     const deskRuns = h.deskRuns();
@@ -144,7 +160,7 @@ describe("docs/03 §四 row 1 — a sensor is a source, not a task", () => {
         ),
     });
     h.script.add("desk", tool("add_source", { title: "指标", cron: "0 9 * * 1", tz: "Asia/Shanghai", check: "test.broken" }), tool("wait", { reason: "ok" }));
-    await h.ui.capture({ text: "每周一查指标" });
+    await h.ui.capture({ text: "每周一查指标" }, "owner");
     await h.kernel.idle();
     const [sensor] = sensorsOf(h);
     h.clock.set(MONDAY_9);
@@ -162,7 +178,7 @@ describe("docs/03 §四 row 2 — personal zero-side-effect items: done at once,
       tool("capture_note", { title: "Agent 架构长文", url: "https://example.com/post", list: "阅读清单" }),
       tool("wait", { reason: "saved" }),
     );
-    const env = await h.ui.capture({ text: "把这篇链接存进阅读清单 https://example.com/post" });
+    const env = await h.ui.capture({ text: "把这篇链接存进阅读清单 https://example.com/post" }, "owner");
     await h.kernel.idle();
 
     expect(h.cards()).toEqual([]);
@@ -184,7 +200,7 @@ describe("docs/03 §四 row 2 — personal zero-side-effect items: done at once,
   it("a reminder: set at once with a light notice; when it fires it becomes a quick to-do, still no card", async () => {
     const h = await boot();
     h.script.add("desk", tool("remind_me", { text: "给牙医打电话约时间", at: "2026-11-20T15:00:00+08:00" }), tool("wait", { reason: "set" }));
-    await h.ui.capture({ text: "周五下午 3 点提醒我给牙医打电话" });
+    await h.ui.capture({ text: "周五下午 3 点提醒我给牙医打电话" }, "owner");
     await h.kernel.idle();
 
     const remindAt = Date.parse("2026-11-20T15:00:00+08:00");
@@ -213,7 +229,7 @@ describe("docs/03 §四 row 2 — personal zero-side-effect items: done at once,
   it("a reminder becomes a to-do when it fires even if the model ignores the wake-up it shares with a new item", async () => {
     const h = await boot();
     h.script.add("desk", tool("remind_me", { text: "交房租", inMinutes: 60 }), tool("wait", { reason: "set" }));
-    await h.ui.capture({ text: "一小时后提醒我交房租" });
+    await h.ui.capture({ text: "一小时后提醒我交房租" }, "owner");
     await h.kernel.idle();
     // The desk is busy with one item while the reminder comes due and another message arrives: both land in one batch,
     // and the model answers it with a bare wait (no desk tool at all).
@@ -227,10 +243,10 @@ describe("docs/03 §四 row 2 — personal zero-side-effect items: done at once,
       expect(JSON.stringify(req.messages)).toContain("下午开会记得带电脑");
       return tool("wait", { reason: "ignored" });
     });
-    await h.ui.capture({ text: "帮我想想周报怎么写" });
+    await h.ui.capture({ text: "帮我想想周报怎么写" }, "owner");
     while (h.script.callsOf("desk").length < 3) await new Promise((r) => setTimeout(r, 5));
     h.clock.advance(60 * 60_000);
-    await h.ui.capture({ text: "下午开会记得带电脑" });
+    await h.ui.capture({ text: "下午开会记得带电脑" }, "owner");
     release();
     await h.kernel.idle();
     expect(h.script.callsOf("desk")).toHaveLength(4);

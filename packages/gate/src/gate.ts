@@ -1,5 +1,5 @@
 import {
-  checkCardOptions, projectCellIdOf, NgError, OWNER_PRINCIPAL, afterCommit, all, artifactsRepo,
+  checkCardOptions, NgError, OWNER_PRINCIPAL, afterCommit, all, artifactsRepo,
   boundsViolations, cellsRepo, fromJson, get, hashAction, newId, parsePrincipal, run, systemClock,
   toBool, toJson, withTx, type ApprovalFilter, type ApprovalOutcome, type ApprovalRecord,
   type ApprovalStatus, type ApproveResult, type AuthorizeMeta, type AuthorizeResult,
@@ -8,12 +8,13 @@ import {
 } from "@ng/protocol";
 import { attenuateBounds, meetBounds } from "./attenuate";
 import { approvalCardFor } from "./card";
-import { actionShapeFeedback, ownerOnlyApproval } from "./policy";
+import { actionShapeFeedback, ownerOnlyApproval, requiresApproval } from "./policy";
 
 const CONTROL_ACTIONS: readonly ControlAction[] = ["cancel", "pause", "resume", "steer"];
 
 export interface GateOptions {
   isProjectRoot?(cell: CellRecord): boolean;
+  onSnooze?(id: string, until: number, principalId: string): void;
   onSuperseded?(old: ApprovalRecord, principalId: string): void;
   db: Db;
   bus: Bus;
@@ -165,17 +166,23 @@ export function createGate(opts: GateOptions): GateService {
     const actionHash = hashAction(action);
     const artifactId = action.artifactId ?? null;
     const related = new Set(action.relatedProjectIds ?? []);
-    const issuerProject = opts.isProjectRoot?.(cell) ? cell.id : projectCellIdOf(cell.spec);
+    const issuerProject = chainOf(cell).find(c => opts.isProjectRoot?.(c))?.id;
     if (issuerProject) related.add(issuerProject);
     if (action.cardOptions) {
-      checkCardOptions(action.cardOptions, { callback: true, controlled: action.type !== "custom" || !!ownerOnlyApproval(action) });
+      checkCardOptions(action.cardOptions, { callback: true, controlled: requiresApproval(action) });
       for (const option of action.cardOptions) {
-        if (option.terminateMode === "cancel_task" && !related.has(option.targetCellIds![0]!)) throw new NgError("invalid_argument", "unrelated cancel target");
+        if (option.terminateMode === "cancel_task") {
+          const target = option.targetCellIds![0]!;
+          if (!related.has(target) || (target !== cell.id && !isStrictDescendant(cell.id, target)))
+            throw new NgError("bounds_violation", "取消范围超出发起任务的权限");
+        }
       }
     }
     for (const id of action.relatedProjectIds ?? []) {
       const target = cells.get(id);
       if (!target || !opts.isProjectRoot?.(target)) throw new NgError("invalid_argument", "unknown related project");
+      if (cell.id !== id && !isStrictDescendant(id, cell.id) && !isStrictDescendant(cell.id, id))
+        throw new NgError("bounds_violation", "关联项目超出发起任务的权限");
     }
     const existing = pendingBySubject(action.subjectKey, cell.id);
     if (existing && !existing.action_hash) return {type:"deny", feedback:`Subject ${action.subjectKey} already has a pending card from ${existing.cell_id}`};
@@ -299,7 +306,7 @@ export function createGate(opts: GateOptions): GateService {
           boundVersion = v;
         }
 
-        if (action.type === "project.start" || kernelEscalation || action.sideEffect === "external") return deferAction(action, meta, cell, boundVersion);
+        if (requiresApproval(action)) return deferAction(action, meta, cell, boundVersion);
         return { type: "allow" };
       });
     },
@@ -438,10 +445,10 @@ export function createGate(opts: GateOptions): GateService {
     },
 
     snoozeSync(actionId, until, snoozeOpts = {}) {
-      if (typeof until !== "number" || !Number.isFinite(until)) throw new NgError("invalid_argument", "snooze: until must be a timestamp");
       return withTx(db, () => {
         const row = approvalRow(actionId);
         if (!row || row.status !== "pending") return "not_pending";
+        if (!Number.isFinite(until) || until <= clock.now()) throw new NgError("invalid_argument", "请选择未来的提醒时间");
         if (snoozeOpts.seenItemRevision !== undefined && snoozeOpts.seenItemRevision !== row.item_revision) return "revision_mismatch";
         run(db, "UPDATE human_items SET snoozed_until = ?, item_revision = item_revision + 1, updated_at = ? WHERE action_id = ?", [
           until,
@@ -449,6 +456,7 @@ export function createGate(opts: GateOptions): GateService {
           actionId,
         ]);
         emitApproval(row, "pending");
+        opts.onSnooze?.(actionId, until, snoozeOpts.approverId ?? row.principal_id);
         return "snoozed";
       });
     },
@@ -477,7 +485,7 @@ export function createGate(opts: GateOptions): GateService {
         const row = approvalRow(actionId);
         if (!row || row.status !== "pending") return "not_pending";
         if (reviseOpts.seenItemRevision !== undefined && reviseOpts.seenItemRevision !== row.item_revision) return "revision_mismatch";
-        if (reviseOpts.seenArtifactVersion !== undefined && row.artifact_id !== null) {
+        if (row.artifact_id !== null) {
           const current = artifacts.currentVersion(row.artifact_id);
           if (current !== undefined && reviseOpts.seenArtifactVersion !== current) {
             if (row.bound_version !== current) {

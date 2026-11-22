@@ -9,7 +9,7 @@ describe("reminders and input attribution", () => {
   it("BUG-021: remind_me writes NO desk:reminder:* shadow state (Inbox timer envelope is sole SSOT)", async () => {
     const h = await boot();
     h.script.add("desk", tool("remind_me", { text: "记得喝水", inMinutes: 10 }), { text: "好的" });
-    await h.ui.capture({ text: "10 分钟后提醒我喝水" });
+    await h.ui.capture({ text: "10 分钟后提醒我喝水" }, "owner");
     await h.kernel.idle();
 
     const reminderState = h.kernel.context.listStateSync("desk", "desk:reminder:");

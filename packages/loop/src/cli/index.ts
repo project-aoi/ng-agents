@@ -27,6 +27,7 @@ export {
 export { claudeAdapter, claudeArgs, claudeBuiltinTools } from "./adapters/claude";
 export { codexAdapter, codexArgs, codexSandboxMode } from "./adapters/codex";
 export { agyAdapter, agyArgs, agyPermissionAllowed } from "./adapters/agy";
+export { kernelSystem } from "./instructions";
 export { renderTranscript, tailText, freshPrompt, forkNoteIndex, FORK_NOTE_PREFIX } from "./render";
 export {
   spawnCli,

@@ -13,7 +13,6 @@ import {
 const desk: PolicyBounds = makeBounds({
   tools: ["read", "write", "edit", "bash"],
   canSendTo: ["inbox:*", "channel:web:owner", "channel:memory:*"],
-  isolation: "none",
   maxConcurrentChildren: 5,
   maxDepth: 3,
 });
@@ -22,7 +21,6 @@ const worker = (over: Parameters<typeof makeBounds>[0] = {}) =>
   makeBounds({
     tools: ["read", "edit", "bash"],
     canSendTo: ["inbox:desk"],
-    isolation: "none",
     maxConcurrentChildren: 2,
     maxDepth: 2,
     ...over,
@@ -97,7 +95,6 @@ describe("bounds serialization", () => {
     expect(serializeBounds(makeBounds())).toEqual({
       tools: [],
       canSendTo: [],
-      isolation: "none",
       maxConcurrentChildren: 0,
       maxDepth: 0,
     });

@@ -15,7 +15,6 @@ import { createDesk, type Desk } from "./desk";
 import { createEventHub, type EventHub } from "./events";
 import { DEFAULT_SETTINGS, type DeskSettings } from "./projections/common";
 import { agentTokensFromEnv, securityPolicyFor, type SecurityPolicy } from "./security";
-import { createModelSwitch } from "./models";
 
 export const DEFAULT_PORT = 8790;
 const APP_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -135,7 +134,7 @@ export async function createDeskServer(opts: DeskServerOptions = {}): Promise<De
 
   let events: EventHub | undefined;
   try {
-    kernel.ensureRootCell({ id: deskCellId, preset: "inline", title: "主台" });
+    kernel.ensureRootCell({ id: deskCellId, preset: "inline", title: "主台" }, {principalId: kernel.ownerPrincipal});
     // The playbooks the presets' prompts refer to (an owner-edited SKILL.md of the same name is kept).
     const seeded = seedBuiltinSkills(kernel.context, deskCellId);
     if (seeded.length) log(`installed built-in skills: ${seeded.join(", ")}`);
@@ -150,11 +149,11 @@ export async function createDeskServer(opts: DeskServerOptions = {}): Promise<De
     events = createEventHub(kernel);
     const webDir = opts.webDir === undefined ? resolve(APP_ROOT, "dist/web") : opts.webDir;
     const agent = createAgentControlPlane({ kernel, desk });
-    const app = createDeskApp({ desk, events, security, agent, models: createModelSwitch(kernel), webDir, onError });
+    const app = createDeskApp({ desk, events, security, agent, webDir, onError });
     const agentAccess =
       security.agentTokens.size > 0
         ? `token for ${[...security.agentTokens.keys()].map((id) => `agent:${id}`).join(", ")}`
-        : security.loopback && security.token === null
+        : security.loopback && security.generatedOwnerToken
           ? "open on loopback as agent:local"
           : "closed (set NG_AGENT_TOKEN)";
     log(`data ${dataDir} · agents: ${choice.engine} · main-agent API /api/agent/*: ${agentAccess}`);

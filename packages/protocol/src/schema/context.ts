@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS evidence (
   at         INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_evidence_cell ON evidence(cell_id, seq);
+CREATE INDEX IF NOT EXISTS idx_evidence_steer ON evidence(cell_id,json_extract(content,\'$.envelopeId\')) WHERE kind=\'system_note\';
 CREATE INDEX IF NOT EXISTS idx_evidence_run ON evidence(run_id) WHERE run_id IS NOT NULL;
 CREATE TRIGGER IF NOT EXISTS evidence_append_only BEFORE UPDATE ON evidence
 BEGIN

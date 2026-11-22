@@ -17,13 +17,14 @@ export interface CaptureInput {
 }
 
 export class UiChannel extends BaseChannel {
+  readonly workbenchIngress = true;
   constructor(opts: UiChannelOptions = {}) {
     super({ ...opts, id: opts.id ?? UI_CHANNEL_ID });
   }
 
   /** Persists a 随手记 entry through the hub's ingress sink; resolves once it is durably enqueued. */
-  async capture(input: CaptureInput): Promise<Omit<Envelope,"to">> {
-    const env=this.captureEnvelope(input,this.ownerPrincipal);
+  async capture(input: CaptureInput, principalId: string): Promise<Omit<Envelope,"to">> {
+    const env=this.captureEnvelope(input,principalId);
     await this.emitIngress(env);
     return env;
   }
@@ -31,9 +32,9 @@ export class UiChannel extends BaseChannel {
   captureEnvelope(input: CaptureInput, principalId: string): Omit<Envelope,"to"> {
     const text = input.text.trim();
     if (!text && !input.attachments?.length) throw new NgError("invalid_argument", "capture: empty input");
-    if (!principalId.trim()) throw new NgError("invalid_argument","capture requires principalId");
+    if (typeof principalId !== "string" || !principalId.trim() || principalId !== principalId.trim()) throw new NgError("invalid_argument","capture requires principalId");
     const replyTo = this.addr(UI_OWNER_TARGET);
-    const payload: UserMessagePayload = { text, replyTo, sender: { id: principalId, ...(principalId.startsWith("agent:") ? {displayName:"主 Agent"} : {}) } };
+    const payload: UserMessagePayload = { text, replyTo, sender: { id: principalId } };
     if (input.attachments?.length) payload.attachments = input.attachments;
     if (input.voice) payload.voice = true;
     const env: Omit<Envelope, "to"> = {

@@ -1,4 +1,5 @@
-import { CHANNEL_LABELS, BALL_OWNER_LABEL, parseAddress, type ItemSource, type Progress, type WaitingSet } from "@ng/protocol";
+import { BALL_LABEL } from "../../shared/api";
+import { CHANNEL_LABELS, parseAddress, type ItemSource, type Progress, type WaitingSet } from "@ng/protocol";
 import { relativeTimeZh, type ArtifactDTO, type ButtonDTO, type DecisionDTO, type ProgressDTO, type SourceInfoDTO, type WaitingDTO } from "../../shared/api";
 import type { DeskKernel } from "./common";
 import { dueText } from "./time";
@@ -23,7 +24,7 @@ export function sourceInfo(s: ItemSource | undefined | null): SourceInfoDTO | nu
   };
 }
 
-export const ownerLabel = (o: keyof typeof BALL_OWNER_LABEL): string => BALL_OWNER_LABEL[o];
+export const ownerLabel = (o: keyof typeof BALL_LABEL): string => BALL_LABEL[o];
 
 export function progressDTO(p: Progress | undefined | null, fallbackLabel?: string): ProgressDTO | null {
   if (!p || typeof p.done !== "number" || typeof p.total !== "number" || p.total <= 0) return null;

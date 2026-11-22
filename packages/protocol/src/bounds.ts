@@ -2,10 +2,9 @@ import { z } from "zod";
 import { addressCovers, parseAddress } from "./address";
 import { NgError } from "./errors";
 import {
-  ISOLATION_LEVELS,
   TOOL_KINDS,
   type Address,
-  type IsolationLevel,
+
   type PolicyBounds,
   type ToolKind,
 } from "./contract/envelope";
@@ -14,7 +13,6 @@ import {
 export interface SerializedBounds {
   tools: ToolKind[];
   canSendTo: Address[];
-  isolation: IsolationLevel;
   maxConcurrentChildren: number;
   maxDepth: number;
 }
@@ -26,7 +24,6 @@ const addressPattern = z.string().refine((s) => (s.endsWith("*") ? /^(inbox:|cha
 export const serializedBoundsSchema = z.object({
   tools: z.array(z.enum(TOOL_KINDS)),
   canSendTo: z.array(addressPattern),
-  isolation: z.enum(ISOLATION_LEVELS),
   maxConcurrentChildren: z.number().int().min(0),
   maxDepth: z.number().int().min(0),
 });
@@ -35,7 +32,6 @@ export function serializeBounds(b: PolicyBounds): SerializedBounds {
   return {
     tools: [...b.tools].sort(),
     canSendTo: [...new Set(b.canSendTo)].sort(),
-    isolation: b.isolation,
     maxConcurrentChildren: b.maxConcurrentChildren,
     maxDepth: b.maxDepth,
   };
@@ -50,7 +46,6 @@ export function deserializeBounds(input: string | unknown): PolicyBounds {
   return {
     tools: new Set(s.tools),
     canSendTo: s.canSendTo as Address[],
-    isolation: s.isolation,
     maxConcurrentChildren: s.maxConcurrentChildren,
     maxDepth: s.maxDepth,
   };
@@ -59,17 +54,15 @@ export function deserializeBounds(input: string | unknown): PolicyBounds {
 export interface BoundsInit {
   tools?: Iterable<ToolKind>;
   canSendTo?: readonly Address[];
-  isolation?: IsolationLevel;
   maxConcurrentChildren?: number;
   maxDepth?: number;
 }
 
-/** Builds bounds from a partial description; every omitted field takes its most restrictive value (isolation "none"). */
+/** Builds bounds from a partial description; every omitted field takes its most restrictive value. */
 export function makeBounds(init: BoundsInit = {}): PolicyBounds {
   return deserializeBounds({
     tools: [...(init.tools ?? [])],
     canSendTo: [...(init.canSendTo ?? [])],
-    isolation: init.isolation ?? "none",
     maxConcurrentChildren: init.maxConcurrentChildren ?? 0,
     maxDepth: init.maxDepth ?? 0,
   });
@@ -122,7 +115,7 @@ export function describeBounds(b: PolicyBounds): string {
   return [
     `Tools: ${list(b.tools)}.`,
     `May send to: ${list(b.canSendTo)}.`,
-    `Isolation: ${b.isolation}.`,
+
     `Children: up to ${b.maxConcurrentChildren} concurrent, ${b.maxDepth} more level(s) of spawning.`,
   ].join("\n");
 }

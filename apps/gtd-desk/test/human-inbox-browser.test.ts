@@ -86,6 +86,7 @@ async function mount(
   readItems: () => HumanItemDTO[],
   write: (path: string, body: Record<string, unknown>) => Response,
   openIds: () => string[] = () => ["draft"],
+  cardId?: string,
 ) {
   vi.stubGlobal("fetch", async (path: string, init: RequestInit) => {
     const method = init.method ?? "GET";
@@ -94,7 +95,7 @@ async function mount(
     if (path === "/api/human-items" && method === "GET") return Response.json({ items: readItems(), openArtifactIds: openIds() });
     return write(path, body);
   });
-  await renderAt();
+  await renderAt(cardId);
 }
 
 async function renderAt(cardId?: string) {
@@ -129,6 +130,28 @@ function beforeUnloadPrevented() {
 }
 const writes = () => requests.filter((x) => x.method !== "GET");
 
+it("opens the linked card on first load and prevents confirming over a hidden unsaved plan", async () => {
+  const proposal = {title: "原稿", outcome: "交付", actions: []};
+  let visible = true;
+  const plan = {...card("selected", "待审方案", artifact(1, JSON.stringify(proposal))), proposal,
+    options:[{id:"system.execute",label:"确认立项",effect:"execute" as const}]};
+  await mount(() => visible ? [card("first","另一件事"), plan] : [], () => { throw Error("unexpected write"); },
+    () => visible ? ["draft"] : [], "selected");
+  expect(document.querySelector("h1")?.textContent).toBe("待审方案");
+  await click("展开专注编辑");
+  await typeText(document.querySelector<HTMLInputElement>(".plan-editor input")!, "保留这个标题");
+  await click("回到事项");
+  await click("确认立项");
+  expect(writes()).toEqual([]);
+  expect(beforeUnloadPrevented()).toBe(true);
+  await click("展开专注编辑");
+  expect(document.querySelector<HTMLInputElement>(".plan-editor input")!.value).toBe("保留这个标题");
+  await click("回到事项");
+  visible = false;
+  await refresh();
+  expect(beforeUnloadPrevented()).toBe(false);
+});
+
 it("opens a linked decision outside the current filter and shows parked additions in its preview", async () => {
   const draft = artifact(1, "主人草稿");
   draft.parked.push({
@@ -162,7 +185,7 @@ it("keeps the active card and text on stream updates, saves the typed text once 
     expect(path).toBe("/api/artifacts/draft");
     const next = artifact(2, String(body.body));
     current = { ...current, artifact: next, artifactVersion: next.version };
-    return Response.json({ ok: true, outcome: "saved", artifact: next, deskStatus: status, message: "已保存" });
+    return Response.json({ ok: true, outcome: "saved", artifact: next, message: "已保存" });
   };
   await mount(
     () => (hidden ? urgent : [...urgent, current]),
@@ -214,7 +237,7 @@ it("requires review after the open decision changes and sends only the reviewed 
       if (++attempts === 1) {
         current = { ...current, itemRevision: 3, title: "再次修改的事项" };
         items = [other, current];
-        return Response.json({ error: { code: "conflict", message: "item changed" } }, { status: 409 });
+        return Response.json({ error: { code: "conflict", message: "事项已变动" } }, { status: 409 });
       }
       if (attempts === 2) return Response.json({ error: { code: "bounds_violation", message: "仅主人可确认" } }, { status: 403 });
       if (attempts === 3) return Response.json({ error: { code: "conflict", message: "待关闭的任务清单已变动" } }, { status: 409 });
@@ -253,6 +276,57 @@ it("requires review after the open decision changes and sends only the reviewed 
   expect(setStatus).toHaveBeenCalledWith({ marker: "完成" });
 });
 
+it("accepts a locally saved plan immediately using the version that the server committed", async () => {
+  const first = {title:"初稿", outcome:"交付报告", actions:[]};
+  let plan: HumanItemDTO = {...card("own-plan", "立项", artifact(1, JSON.stringify(first))), proposal:first,
+    options:[{id:"system.execute", label:"确认立项", effect:"execute"}]};
+  const decisions: Record<string, unknown>[] = [];
+  await mount(() => [plan], (path, body) => {
+    if (path.endsWith("/plan")) {
+      const proposal = {...first, title: "保存后的标题"};
+      expect(body.proposal).toMatchObject(proposal);
+      const saved = artifact(2, JSON.stringify(proposal));
+      plan = {...plan, proposal, artifact:saved, artifactVersion:2};
+      return Response.json({ok:true, outcome:"saved", message:"已保存", artifact:saved, deskStatus:{}});
+    }
+    decisions.push(body);
+    return Response.json({status:"approved", deskStatus:{}});
+  });
+  await click("展开专注编辑");
+  const form = document.querySelector<HTMLFormElement>(".plan-editor")!;
+  await typeText(form.querySelector("input")!, "保存后的标题");
+  await submit(form);
+  expect(document.querySelector(".plan-editor")).toBeNull();
+  expect(document.body.textContent).not.toContain("请核对后再确认");
+  await click("确认立项");
+  expect(decisions).toEqual([expect.objectContaining({optionId:"system.execute", seenItemRevision:1, seenArtifactVersion:2})]);
+});
+
+it("keeps the edited plan after a remote removal and an input method's Escape", async () => {
+  const proposal = {title: "原方案", outcome: "交付", actions: []};
+  const plan = {...card("removed-plan", "立项", artifact(1, JSON.stringify(proposal))), proposal};
+  let items: HumanItemDTO[] = [plan];
+  await mount(() => items, () => Response.json({error:{code:"conflict", message:"事项已变动"}}, {status:409}));
+  await click("展开专注编辑");
+  const form = document.querySelector<HTMLFormElement>(".plan-editor")!;
+  const title = form.querySelector("input")!;
+  await typeText(title, "尚未保存的标题");
+  await act(async () => {
+    const escape = new KeyboardEvent("keydown", {key:"Escape", bubbles:true});
+    Object.defineProperty(escape, "isComposing", {value:true});
+    title.dispatchEvent(escape);
+  });
+  expect(document.querySelector(".plan-editor")).toBe(form);
+  items = [];
+  await refresh();
+  await submit(form);
+  expect(document.querySelector(".plan-editor input")).toBe(title);
+  expect(title.value).toBe("尚未保存的标题");
+  expect(beforeUnloadPrevented()).toBe(true);
+  await click("取消");
+  expect(beforeUnloadPrevented()).toBe(false);
+});
+
 it("compares the reloaded plan after HTTP 409 and keeps that baseline when a retry fails", async () => {
   const first = { title: "初版方案", outcome: "初版目标", actions: [] };
   let current = { ...card("plan", "方案", artifact(1, JSON.stringify(first))), proposal: first };
@@ -270,7 +344,7 @@ it("compares the reloaded plan after HTTP 409 and keeps that baseline when a ret
         );
       }
       if (attempts === 2) return Response.json({ error: { code: "busy", message: "稍后重试" } }, { status: 503 });
-      return Response.json({ ok: true, outcome: "saved", message: "已保存方案", deskStatus: { marker: "已保存方案" } });
+      return Response.json({ ok: true, outcome: "saved", artifact: artifact(4, JSON.stringify(current.proposal)), message: "已保存方案", deskStatus: { marker: "已保存方案" } });
     },
   );
   await click("展开专注编辑");

@@ -4,7 +4,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { gtdKeys } from "../src/shared/keys";
-import { run,  PAYLOAD, type ActionRecord, type ProjectRecord } from "@ng/protocol";
+import type { ProjectRecord } from "../src/shared/product-records";
+import { run, PAYLOAD, type ActionRecord } from "@ng/protocol";
 import { BUILTIN_SKILLS, seedBuiltinSkills, startApprovedProjectSync, startProjectSync } from "../src";
 import { boot, childrenOf, cleanupAll, gitRepo, lastToolResult, projects, systemOf, tool } from "./helpers";
 
@@ -44,7 +45,7 @@ describe("project tools", () => {
       },
       {}, // woken by the worker's result
     );
-    const { projectId } = startProjectSync(h.kernel, { title: "t", outcome: "o", brief: "b" });
+    const { projectId } = startProjectSync(h.kernel, { title: "t", outcome: "o", brief: "b" }, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     expect(h.script.pending("project")).toBe(0);
     expect(h.script.pending("worker")).toBe(0);
@@ -82,7 +83,7 @@ describe("project tools", () => {
       },
       {}, // woken by the worker's result
     );
-    const { projectId } = startProjectSync(h.kernel, { title: "t", outcome: "o", brief: "b" });
+    const { projectId } = startProjectSync(h.kernel, { title: "t", outcome: "o", brief: "b" }, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     expect(h.script.pending("project")).toBe(0);
     expect(childrenOf(h, projectId)).toEqual([worker]);
@@ -119,7 +120,7 @@ describe("project tools", () => {
     );
     h.script.setDefault("worker", () => tool("wait", { reason: "reading" }));
     h.script.setDefault("checker", () => tool("wait", { reason: "not yet", waitingFor: "external" }));
-    const { projectId } = startProjectSync(h.kernel, { title: "t", outcome: "o", brief: "b", cwd: repo });
+    const { projectId } = startProjectSync(h.kernel, { title: "t", outcome: "o", brief: "b", cwd: repo }, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     expect(h.script.pending("project")).toBe(0);
     const [byDefault, explicit, reader] = started.map((id) => h.kernel.getCell(id)!);
@@ -155,13 +156,13 @@ describe("project tools", () => {
         return {};
       },
     );
-    const { projectId } = startProjectSync(h.kernel, { title: "t", outcome: "o", brief: "b" });
+    const { projectId } = startProjectSync(h.kernel, { title: "t", outcome: "o", brief: "b" }, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     expect(h.script.pending("project")).toBe(0);
     expect(h.actions(projectId)).toEqual([expect.objectContaining({ id, owner: "human", nextStep: "回复邮件确认需求范围", status: "open" })]);
   });
 
-  it("finish_project completed: open actions do not stop it — settlement reports the unfinished work and closes the issuer’s card; retro is optional", async () => {
+  it("keeps a project and its owner action open when the coordinator requests completion with work outstanding", async () => {
     const h = await boot();
     h.script.add(
       "project",
@@ -169,31 +170,15 @@ describe("project tools", () => {
       tool("track_action", { title: "写文档", owner: "agent" }),
       tool("finish_project", { outcome: "completed", summary: "改版上线了\n细节见 MR" }),
     );
-    const { projectId } = startProjectSync(h.kernel, { title: "官网改版", outcome: "o", brief: "b" });
+    const { projectId } = startProjectSync(h.kernel, { title: "官网改版", outcome: "o", brief: "b" }, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     expect(h.script.pending("project")).toBe(0);
-    expect(h.kernel.getCell(projectId)).toMatchObject({ status: "closed", closeReason: "completed" });
-    const record = h.project(projectId)! as ProjectRecord & { retro?: string };
-    expect(record).toMatchObject({ lifecycle: "completed", summary: "改版上线了\n细节见 MR" });
-    expect(record.retro).toBeUndefined();
-    const open = h.actions(projectId);
-    const human = open.find(a => a.title === "确认需求")!;
-    const writing = open.find(a => a.title === "写文档")!;
-    expect(h.kernel.humanItems.get(human.id)).toMatchObject({ status: "cancelled" });
-    expect(writing.status).toBe("open");
-    const result = h.kernel.context
-      .listEvidenceSync(projectId)
-      .map((e) => e.record)
-      .find((r) => r.kind === "tool_result" && r.name === "finish_project");
-    const output = result && "output" in result ? String(result.output) : "";
-    expect(output).toBe(
-      "Requested project settlement after this run drains; stop here." +
-        ` Note: these actions were still open on the books — ${writing.id}「写文档」(agent); ${human.id}「确认需求」(the owner).`,
-    );
-    expect(h.notices().at(-1)).toBe("「官网改版」已完成：改版上线了");
-    expect(h.kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.cellResult }).map((m) => m.envelope.payload)).toEqual([
-      expect.objectContaining({ childCellId: projectId, status: "completed", summary: "改版上线了\n细节见 MR" }),
-    ]);
+    expect(h.kernel.getCell(projectId)?.status).toBe("active");
+    expect(h.project(projectId)?.lifecycle).toBe("active");
+    const actions = h.actions(projectId);
+    expect(actions.map(a => a.status)).toEqual(["open", "open"]);
+    expect(h.kernel.humanItems.get(actions.find(a => a.owner === "human")!.id)?.status).toBe("pending");
+    expect(h.kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.cellResult })).toHaveLength(0);
   });
 
   it("finish_project: refused only while a child cell is still at work (nothing recorded); closeChildren or cancelled stops it; cancelled closes the books", async () => {
@@ -238,10 +223,10 @@ describe("project tools", () => {
         return tool("finish_project", { outcome: "cancelled", summary: "主人不要了", retro: "none：没有新习惯" });
       },
     );
-    const { projectId } = startProjectSync(h.kernel, { title: "取消测试", outcome: "o", brief: "b", cwd: repo });
+    const { projectId } = startProjectSync(h.kernel, { title: "取消测试", outcome: "o", brief: "b", cwd: repo }, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     expect(h.kernel.getCell(worker)).toMatchObject({ status: "active" });
-    h.kernel.sendToCell(projectId, { text: "主人：这个不做了" });
+    h.kernel.sendToCell(projectId, { text: "主人：这个不做了" }, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     expect(h.script.pending("project")).toBe(0);
     expect(childrenOf(h, projectId)).toEqual([worker]);
@@ -268,9 +253,9 @@ describe("project tools", () => {
       },
       tool("finish_project", { outcome: "completed", summary: "够用了", closeChildren: true }),
     );
-    const { projectId } = startProjectSync(h.kernel, { title: "收尾测试", outcome: "o", brief: "b", cwd: repo });
+    const { projectId } = startProjectSync(h.kernel, { title: "收尾测试", outcome: "o", brief: "b", cwd: repo }, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
-    h.kernel.sendToCell(projectId, { text: "主人：够用了，收尾吧" });
+    h.kernel.sendToCell(projectId, { text: "主人：够用了，收尾吧" }, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     expect(h.script.pending("project")).toBe(0);
     expect(h.kernel.getCell(worker)).toMatchObject({ status: "closed", closeReason: "cancelled" });
@@ -293,7 +278,7 @@ describe("project tools", () => {
       () => tool("track_action", { id, status: "open", owner: "human", nextStep: "看一下测试", dueAt: "2026-11-20T15:00:00+08:00" }),
       {},
     );
-    const { projectId } = startProjectSync(h.kernel, { title: "旧标题", outcome: "o", brief: "b" });
+    const { projectId } = startProjectSync(h.kernel, { title: "旧标题", outcome: "o", brief: "b" }, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     expect(h.project(projectId)).toMatchObject({ title: "新标题", summary: "方案已定" });
     expect(h.kernel.getCell(projectId)?.spec.cwd).toBe(repo);
@@ -316,16 +301,16 @@ describe("desk tools for projects in flight", () => {
         return tool("wait", { reason: "asked" });
       },
     );
-    await h.ui.capture({ text: "改一下 TUI" });
+    await h.ui.capture({ text: "改一下 TUI" }, "owner");
     await h.kernel.idle();
     expect(projects(h)).toEqual([]);
     // The control plane gets the kernel's own refusal to word for its audience.
     expect(() => startProjectSync(h.kernel, { title: "改 TUI", outcome: "o", brief: "b", cwd: "/no/such/tui" }, { principalId: "agent:main" })).toThrow(/not an existing directory/);
 
-    const done = startProjectSync(h.kernel, { title: "已完成的", outcome: "o", brief: "b" }).projectId;
+    const done = startProjectSync(h.kernel, { title: "已完成的", outcome: "o", brief: "b" }, { principalId: h.kernel.ownerPrincipal }).projectId;
     await h.kernel.idle();
-    await h.kernel.closeCell(done, "completed");
-    const live = startProjectSync(h.kernel, { title: "进行中的", outcome: "o", brief: "b" }).projectId;
+    await h.kernel.closeCell(done, "completed", { principalId: h.kernel.ownerPrincipal });
+    const live = startProjectSync(h.kernel, { title: "进行中的", outcome: "o", brief: "b" }, { principalId: h.kernel.ownerPrincipal }).projectId;
     await h.kernel.idle();
 
     h.script.add(
@@ -353,7 +338,7 @@ describe("desk tools for projects in flight", () => {
         return tool("wait", { reason: "done" });
       },
     );
-    await h.ui.capture({ text: "几件事" });
+    await h.ui.capture({ text: "几件事" }, "owner");
     await h.kernel.idle();
     expect(h.script.pending("desk")).toBe(0);
     expect(h.kernel.getCell(live)).toMatchObject({ status: "closed", closeReason: "cancelled" });
@@ -364,13 +349,13 @@ describe("desk tools for projects in flight", () => {
     const h = await boot();
     const repo = gitRepo("site");
     h.script.add("desk", tool("propose_project", { title: "官网改版", outcome: "新版官网上线", actions: [{ title: "盘点页面", owner: "agent" }, { title: "对齐风格", owner: "human", nextStep: "约市场部" }], cwd: repo, phases: ["盘点", "上线"] }));
-    await h.ui.capture({ text: "官网该改版了" });
+    await h.ui.capture({ text: "官网该改版了" }, "owner");
     await h.kernel.idle();
     const [card] = h.cards();
     expect(card?.decision.cardType).toBe("project_proposal");
     const deskCalls = h.script.callsOf("desk").length;
     // Root cell cannot be paused (BUG-020); approve and synchronously start before the desk's microtask runs, then verify idempotency + desk wakeup.
-    expect(h.kernel.control("desk", { action: "pause" })).toMatchObject({ applied: false });
+    expect(h.kernel.control("desk", { action: "pause" }, { principalId: h.kernel.ownerPrincipal })).toMatchObject({ applied: false });
     const resolving = h.kernel.humanItems.decide(card!.actionId, { optionId: "system.execute", seenItemRevision: h.kernel.humanItems.get(card!.actionId)!.itemRevision, seenArtifactVersion: 1 }, "owner");
     const id = h.kernel.gate.getApprovalSync(card!.actionId)!.artifactId!;
     h.kernel.context.commitSync("desk",{artifact:{artifactId:id,expectedVersion:1,updatedBy:"human",content:{format:"json",body:"{}",data:{}}}});
@@ -402,13 +387,13 @@ describe("built-in skills", () => {
     expect(h.kernel.context.getKnowledgeSync({ kind: "skill", name: "domain-hub", scope: "global" })).toMatchObject({ description: "我自己的版本", body: "# 我的评审路由" });
 
     // A project carries its playbook inline; the desk sees the index.
-    const { projectId } = startProjectSync(h.kernel, { title: "p", outcome: "o", brief: "b" });
+    const { projectId } = startProjectSync(h.kernel, { title: "p", outcome: "o", brief: "b" }, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     expect(systemOf(h, projectId)).toContain("# Skill: project-relay");
     const relay = BUILTIN_SKILLS.find((skill) => skill.name === "project-relay")!;
     expect(systemOf(h, projectId)).toContain(relay.body.trim());
     h.script.add("desk", tool("wait", { reason: "ok" }));
-    await h.ui.capture({ text: "hi" });
+    await h.ui.capture({ text: "hi" }, "owner");
     await h.kernel.idle();
     expect(systemOf(h, "desk")).toContain("- workspace-arbitration:");
     expect(systemOf(h, "desk")).not.toContain("# Skill: workspace-arbitration");
@@ -420,7 +405,7 @@ describe("built-in skills", () => {
 
 it("reopens the same reassigned human action in the project's current epoch and clears its snooze", async () => {
   const h = await boot();
-  const {projectId} = startProjectSync(h.kernel, {id:"reassign", title:"跟进", outcome:"办妥", brief:"跟进"});
+  const {projectId} = startProjectSync(h.kernel, {id:"reassign", title:"跟进", outcome:"办妥", brief:"跟进"}, { principalId: h.kernel.ownerPrincipal });
   await h.kernel.idle();
   const record: ActionRecord = {id:"call", title:"打电话", owner:"human", status:"open", projectCellId:projectId, createdAt:h.clock.now(), updatedAt:h.clock.now()};
   const write = (owner:ActionRecord["owner"]) => writeActionRecordSync(h.kernel, projectId, {...record, owner});
@@ -428,7 +413,7 @@ it("reopens the same reassigned human action in the project's current epoch and 
   const item = h.kernel.humanItems.list().find(i => i.title === record.title)!;
   await h.kernel.humanItems.decide(item.id, {optionId:"system.defer", seenItemRevision:item.itemRevision, until:h.clock.now()+60_000}, "owner");
   write("agent");
-  await h.kernel.closeCell(projectId, "cancelled");
+  await h.kernel.closeCell(projectId, "cancelled", { principalId: h.kernel.ownerPrincipal });
   await h.kernel.reopenProject(projectId, "owner");
   write("human");
   const reopened = h.kernel.humanItems.get(item.id)!;

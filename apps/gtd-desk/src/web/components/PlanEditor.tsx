@@ -8,7 +8,7 @@ import {
   type PlanSaveResponse,
   type HumanItemDTO,
 } from "../../shared/api";
-import { request } from "../api";
+import { api } from "../api";
 import { useStatus, useToast, toFailure } from "../state";
 import { Spinner } from "./controls";
 
@@ -28,6 +28,20 @@ function formOf(p: NonNullable<HumanItemDTO["proposal"]>): PlanForm {
   };
 }
 
+const unsavedPlans = new Map<string, {initial: PlanForm; form: PlanForm; version: number | null; artifactId: string}>();
+const warnAboutPlan = (e: BeforeUnloadEvent) => { if (unsavedPlans.size) e.preventDefault(); };
+function forgetPlan(id: string) {
+  unsavedPlans.delete(id);
+  if (!unsavedPlans.size) window.removeEventListener("beforeunload", warnAboutPlan);
+}
+
+export function hasUnsavedPlan(id: string): boolean { return unsavedPlans.has(id); }
+export function retainUnsavedPlans(openArtifacts: string[], editing: string | null) {
+  const open = new Set(openArtifacts);
+  for (const [id, draft] of unsavedPlans)
+    if (id !== editing && !open.has(draft.artifactId)) forgetPlan(id);
+}
+
 const OWNERS: BallOwner[] = ["human", "agent", "waiting"];
 const EFFORTS: Effort[] = ["15m", "45m", "low_energy"];
 
@@ -41,9 +55,10 @@ export function PlanEditor(props: {
   const card = props.item;
   const toast = useToast();
   const { setStatus } = useStatus();
-  const [initial] = useState(() => formOf(card.proposal!));
-  const [form, setForm] = useState<PlanForm>(initial);
-  const [expected] = useState(card.artifactVersion);
+  const [seed] = useState(() => unsavedPlans.get(card.id));
+  const [initial] = useState(() => seed?.initial ?? formOf(card.proposal!));
+  const [form, setForm] = useState<PlanForm>(seed?.form ?? initial);
+  const [expected] = useState(seed ? seed.version : card.artifactVersion);
   const [conflict, setConflict] = useState<{ artifact: ArtifactDTO; proposal: HumanItemDTO["proposal"] } | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -53,11 +68,14 @@ export function PlanEditor(props: {
 
   const dirty = JSON.stringify(form) !== JSON.stringify(initial);
   useEffect(() => {
-    if (!dirty) return;
-    const warn = (event: BeforeUnloadEvent) => event.preventDefault();
-    window.addEventListener("beforeunload", warn);
-    return () => window.removeEventListener("beforeunload", warn);
-  }, [dirty]);
+    if (!dirty) { forgetPlan(card.id); return; }
+    unsavedPlans.set(card.id, {initial, form, version: expected, artifactId: card.artifact!.artifactId});
+    window.addEventListener("beforeunload", warnAboutPlan);
+  }, [dirty, card.id, initial, form, expected]);
+  function discard() {
+    forgetPlan(card.id);
+    props.onClose();
+  }
 
   async function loadComparison() {
     setError(null);
@@ -87,10 +105,10 @@ export function PlanEditor(props: {
     setSaving(true);
     setError(null);
     try {
-      const r = await request<PlanSaveResponse>("PUT", `/api/human-items/${encodeURIComponent(card.id)}/plan`, {
+      const r = await api.savePlan(card.id, {
         expectedVersion: version,
         proposal: {
-          title: form.title.trim() || undefined,
+          ...(form.title.trim() && {title: form.title.trim()}),
           outcome: form.outcome.trim(),
           background: form.background.trim(),
           actions: actions.map((a) => ({
@@ -107,6 +125,7 @@ export function PlanEditor(props: {
         return;
       }
       setStatus(r.deskStatus);
+      forgetPlan(card.id);
       props.onSaved(r);
     } catch (err) {
       const f = toFailure(err);
@@ -134,8 +153,10 @@ export function PlanEditor(props: {
           if (!saving && !conflict) void save(expected);
         }
         if (e.key === "Escape") {
+          if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) { e.stopPropagation(); return; }
           e.preventDefault();
-          props.onClose();
+          e.stopPropagation();
+          if (!dirty || window.confirm("放弃这次对方案的修改？")) discard();
         }
       }}
     >
@@ -169,7 +190,7 @@ export function PlanEditor(props: {
             </details>
           )}
           <div className="banner-actions">
-            <button type="button" className="btn sm ghost" onClick={props.onClose}>
+            <button type="button" className="btn sm ghost" onClick={discard}>
               放弃我的修改
             </button>
             {conflict.proposal ? (
@@ -260,7 +281,7 @@ export function PlanEditor(props: {
         </p>
       )}
       <div className="plan-editor-foot">
-        <button type="button" className="btn" onClick={props.onClose}>
+        <button type="button" className="btn" onClick={discard}>
           取消
         </button>
         <button type="submit" className="btn primary" disabled={saving || conflict !== null}>

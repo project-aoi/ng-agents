@@ -1,15 +1,11 @@
-import { gtdKeys } from "./keys";
+import type { ActivityRecord, ProjectRecord, SourceState } from "./product-records";
 import {
-  CELL_STATUS_KEY,
   isEnvelopeOfType,
   type ActionRecord,
-  type ActivityRecord,
   type CellStatusLine,
   type DecisionCard,
   type Envelope,
   type Progress,
-  type ProjectRecord,
-  type SourceRecord,
 } from "@ng/protocol";
 
 // GTD record helpers. Records are plain Context state (gtd.ts); everything here writes through the running cell's
@@ -71,19 +67,13 @@ export function newActivity(init: Omit<ActivityRecord, "at"> & { at?: number }, 
   return { ...init, at: init.at ?? now };
 }
 
-export function newSource(init: Omit<SourceRecord, "createdAt" | "updatedAt" | "runCount" | "hitCount" | "status"> & Partial<Pick<SourceRecord, "status">>, now: number): SourceRecord {
-  return { status: "ok", ...init, runCount: 0, hitCount: 0, createdAt: now, updatedAt: now };
+export function newSource({title, mode, description}: Pick<SourceState, "title" | "mode" | "description">, now: number): SourceState {
+  return { title, mode, ...(description && {description}), runCount: 0, hitCount: 0, createdAt: now, updatedAt: now };
 }
 
 export function statusLine(text: string, now: number, progress?: Progress): CellStatusLine {
   return { text, at: now, ...(progress ? { progress } : {}) };
 }
-
-export const keyOf = {
-  action: (a: Pick<ActionRecord, "id">) => gtdKeys.action(a.id),
-  activity: (a: Pick<ActivityRecord, "id">) => gtdKeys.activity(a.id),
-  status: CELL_STATUS_KEY,
-};
 
 // ---------- owner-facing text ----------
 

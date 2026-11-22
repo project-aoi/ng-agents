@@ -1,11 +1,11 @@
 import type { Kernel } from "@ng/cell";
 import { gtdKeys } from "../shared/keys";
+import type { ActivityRecord, ProjectRecord } from "../shared/product-records";
 import {
   asDecisionCard, cellPrincipal,
-  PAYLOAD,
+  NgError, PAYLOAD,
   isEnvelopeOfType,
   isNgError,
-  type ActivityRecord,
   type ApprovalResolvedPayload,
   type CellResultPayload,
   type Clock,
@@ -13,7 +13,6 @@ import {
   type ItemSource,
   type PrepareRunInput,
   isProjectProposal,
-  type ProjectRecord,
   type ProjectStartAction,
   type RunPorts,
   type ToolContext,
@@ -81,7 +80,7 @@ export function approvedProjectInit(
 ): ProjectInit {
   const card = asDecisionCard(action.card?.data);
   const proposal = action.artifactId ? art?.content.data : action.proposal;
-  if (!isProjectProposal(proposal)) throw new Error("立项方案的内容不完整，请修改方案后再确认");
+  if (!isProjectProposal(proposal)) throw new NgError("conflict", "立项方案的内容不完整，请修改方案后再确认");
   const brief = ["主人在立项卡上确认了这份方案（可能亲手改过），按它开始推进。", proposal.background ?? ""].filter(Boolean).join("\n");
   return {
     id: projectIdForApproval(approvalId),
@@ -141,7 +140,7 @@ export function createDeskBooks(cfg: PresetsConfig) {
     personalReminder(env: Envelope) {
       if (!isEnvelopeOfType(env, "timer.fired")) return;
       const data = (env.payload.data as { gtd?: ReminderData } | undefined)?.gtd;
-      if (data?.kind !== "reminder" || !data.id || !data.text || env.id !== `gtd-reminder:${data.id}`) return;
+      if (data?.kind !== "reminder" || !data.id || !data.text || env.id.split("#retry:", 1)[0] !== `gtd-reminder:${data.id}`) return;
       return {
         id: data.id, draft: {
           source: { label: "定时提醒", envelopeId: env.id, at: env.createdAt },
@@ -212,17 +211,15 @@ export async function settleDeskBatch(cfg: PresetsConfig, ctx: ToolContext): Pro
     if (isEnvelopeOfType(env, "approval.resolved")) {
       const p = env.payload as ApprovalResolvedPayload;
       if (p.action.type === "project.start") {
-        if (p.status !== "approved") return true;
+        if (p.status !== "approved") return !p.note?.trim();
         const decision = ports.listOwnDecisions().find(d=>d.record.actionId===p.actionId);
         const action = {...p.action,...(decision ? {card:decision.record.card} : {})} as ProjectStartAction;
         const version = p.artifactVersion ?? decision?.record.boundVersion;
         const art = action.artifactId && version ? await ports.context.getArtifactVersion(action.artifactId,version) : null;
         const init = approvedProjectInit(p.actionId, action, art, null, clock);
         const r = await launchProject(ports, init, clock);
-        {
-          await notifyOwner(ports, `已立项：${init.title}，后台开始推进`, `project:${p.actionId}`);
-          out.push(`项目「${init.title}」已按确认的安排启动（${r.projectId}）`);
-        }
+        await notifyOwner(ports, `已立项：${init.title}，后台开始推进`, `project:${p.actionId}`);
+        if (r.started) out.push(`项目「${init.title}」已按确认的安排启动（${r.projectId}）`);
         return true;
       }
       return false;

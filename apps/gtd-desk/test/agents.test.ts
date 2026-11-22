@@ -5,6 +5,7 @@ import { execFileSync } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
 import { forgetWorkTreeKeys, type CellSpecInput } from "@ng/cell";
 import { gtdKeys } from "@ng/presets";
+import type { ProjectRecord } from "@ng/presets/records";
 import {
   createBus,
   KERNEL_FROM,
@@ -14,7 +15,6 @@ import {
   type CellMessagePayload,
   type CodeProcessor,
   type Envelope,
-  type ProjectRecord,
   type Registry,
   type StepOrExternalEvidence,
 } from "@ng/protocol";
@@ -41,6 +41,7 @@ import { bootDesk, cleanupAll, HOUR, makeReviewCard, registerTestPresets, reques
 
 afterEach(cleanupAll);
 
+const OWNER_TOKEN = "owner-token-0123456789abcdef";
 const AGENT_TOKEN = "agent-token-0123456789abcdef";
 const noop: CodeProcessor = { name: "test.noop", run: async () => "completed" };
 
@@ -65,13 +66,13 @@ function gitRepo(): string {
 
 /** A coordinating cell holding a project record (scripted as role "project"; it may inspect_cell its workers). */
 function project(d: TestDesk, id: string, title: string, extra: Partial<CellSpecInput> = {}): void {
-  d.kernel.spawnCell("desk", { id, preset: "project", title, ...extra, meta: { role: "project", projectCellId: id } });
+  d.kernel.spawnCell("desk", { id, preset: "project", title, ...extra, meta: { role: "project", projectCellId: id } }, undefined, { principalId: d.kernel.ownerPrincipal });
   writeProject(d.kernel, id, { title, ...(extra.cwd ? { cwd: extra.cwd } : {}) });
 }
 
 /** A wakeable worker (scripted by its own id). */
 function worker(d: TestDesk, id: string, parent: string, title: string, task?: string, extra: Partial<CellSpecInput> = {}): void {
-  d.kernel.spawnCell(parent, { id, preset: "worker", title, lifetime: "wakeable", meta: { role: id }, ...extra }, task);
+  d.kernel.spawnCell(parent, { id, preset: "worker", title, lifetime: "wakeable", meta: { role: id }, ...extra }, task, { principalId: d.kernel.ownerPrincipal });
 }
 
 async function waitFor(cond: () => boolean, ms = 5_000): Promise<void> {
@@ -117,20 +118,20 @@ describe("GET /api/agents/topology", () => {
     worker(d, "w1", "proj", "核心退避编码", "实现指数退避");
     d.script.add("w2", tool("wait", { reason: "目录里有陌生改动，等项目指示", waitingFor: "inbox:proj" }));
     worker(d, "w2", "proj", "压测脚本", "写压测脚本");
-    k.spawnCell("proj", { id: "wt", preset: "checker", title: "等 CI", lifetime: "one_shot", schedules: [{ deliverAt: k.clock.now() + HOUR }] });
+    k.spawnCell("proj", { id: "wt", preset: "checker", title: "等 CI", lifetime: "one_shot", schedules: [{ deliverAt: k.clock.now() + HOUR }] }, undefined, { principalId: k.ownerPrincipal });
     d.clock.advance(1); // siblings are listed in creation order
-    k.spawnCell("desk", { id: "s1", preset: "sensor", title: "报错巡检", schedules: [{ cron: "*/30 * * * *" }] });
+    k.spawnCell("desk", { id: "s1", preset: "sensor", title: "报错巡检", schedules: [{ cron: "*/30 * * * *" }] }, undefined, { principalId: k.ownerPrincipal });
     d.clock.advance(1);
     project(d, "old", "旧项目");
     worker(d, "ow", "old", "旧分身");
     await k.idle();
-    await k.closeCell("old", "completed");
+    await k.closeCell("old", "completed", { principalId: k.ownerPrincipal });
 
     const t = await d.get<TopologyDTO>("/api/agents/topology");
     expect(t.deskCellId).toBe("desk");
     expect(t.nodes.map((n) => n.cellId)).toEqual(["desk", "proj", "w1", "w2", "wt", "s1"]);
     expect(nodeOf(t, "desk")).toMatchObject({ roleLabel: "总助理", layer: 0, parentId: null, projectId: null, archivedChildren: 1, engine: null, processorType: "llm", canChat: true, stateLabel: "待命" });
-    expect(nodeOf(t, "proj")).toMatchObject({ roleLabel: "项目协调", layer: 1, projectId: "proj", title: "支付重试改造", state: "waiting", stateLabel: "待命", cwd: repo, gitRoot: repo, unpulledCount: 0 });
+    expect(nodeOf(t, "proj")).toMatchObject({ roleLabel: "项目协调", layer: 1, projectId: "proj", title: "支付重试改造", state: "idle", stateLabel: "待命", cwd: repo, gitRoot: repo, unpulledCount: 0 });
     expect(nodeOf(t, "w1")).toMatchObject({
       roleLabel: "执行分身",
       layer: 2,
@@ -372,12 +373,12 @@ describe("GET /api/cells/:cellId/timeline", () => {
     const d = await boot();
     const k = d.kernel;
     project(d, "proj", "支付重试改造");
-    k.spawnCell("proj", { id: "probe", preset: "checker", title: "MR 探针", processor: { kind: "code", entry: "test.noop" }, lifetime: "persistent" });
+    k.spawnCell("proj", { id: "probe", preset: "checker", title: "MR 探针", processor: { kind: "code", entry: "test.noop" }, lifetime: "persistent" }, undefined, { principalId: k.ownerPrincipal });
     project(d, "old", "旧项目");
     worker(d, "ow", "old", "旧分身");
     worker(d, "wp", "proj", "暂停的分身");
-    await k.closeCell("old", "completed");
-    k.control("wp", { action: "pause" });
+    await k.closeCell("old", "completed", { principalId: k.ownerPrincipal });
+    k.control("wp", { action: "pause" }, { principalId: k.ownerPrincipal });
 
     const desk = await d.get<CellTimelineDTO>("/api/cells/desk/timeline");
     expect(desk.composer).toMatchObject({ mode: "desk", enabled: true, syncTo: null });
@@ -450,9 +451,9 @@ describe("POST /api/cells/:cellId/messages", () => {
     project(d, "proj", "支付重试改造");
     d.script.add("w1", { text: "v1" });
     worker(d, "w1", "proj", "核心退避编码", "实现退避");
-    k.spawnCell("proj", { id: "probe", preset: "checker", processor: { kind: "code", entry: "test.noop" }, lifetime: "persistent" });
+    k.spawnCell("proj", { id: "probe", preset: "checker", processor: { kind: "code", entry: "test.noop" }, lifetime: "persistent" }, undefined, { principalId: k.ownerPrincipal });
     await k.idle();
-    await k.closeCell("w1", "completed");
+    await k.closeCell("w1", "completed", { principalId: k.ownerPrincipal });
     d.script.add("w1", { text: "v2" });
     const back = await d.post<SendCellMessageResponse>("/api/cells/w1/messages", { text: "再改一处", clientId: "c-1" });
     expect(back).toMatchObject({ ok: true, outcome: "reopened", message: "分身已重新打开，会沿原上下文接着做；已同步给所属项目「支付重试改造」" });
@@ -460,7 +461,7 @@ describe("POST /api/cells/:cellId/messages", () => {
     expect(k.getCell("w1")!.status).toBe("active");
 
     expect(await d.post<SendCellMessageResponse>("/api/cells/probe/messages", { text: "hi", clientId: "c-2" })).toMatchObject({ ok: false, outcome: "refused_script", message: expect.stringContaining("零算力确定性脚本探针") });
-    await k.closeCell("proj", "completed");
+    await k.closeCell("proj", "completed", { principalId: k.ownerPrincipal });
     expect(await d.post<SendCellMessageResponse>("/api/cells/w1/messages", { text: "还在吗", clientId: "c-3" })).toMatchObject({ ok: false, outcome: "refused_archived", message: expect.stringContaining("已随所属项目归档") });
     expect(await d.post<SendCellMessageResponse>("/api/cells/nope/messages", { text: "x", clientId: "c-4" })).toMatchObject({ ok: false, outcome: "not_found", timeline: null });
 
@@ -561,7 +562,7 @@ describe("Radar: reports and the way into the Agents view (BUG-010); BUG-011", (
     worker(d, "w1", "proj", "调研 A", "调研三家");
     await k.idle();
     worker(d, "w2", "proj", "调研 B");
-    await k.closeCell("w2", "completed");
+    await k.closeCell("w2", "completed", { principalId: k.ownerPrincipal });
     const row = (await d.get<RadarDTO>("/api/radar")).projects[0]!;
     expect(row.artifacts.map((a) => [a.artifactId, a.title, a.version])).toEqual([
       ["art_w", "竞品调研报告", 1],
@@ -577,7 +578,7 @@ describe("Radar: reports and the way into the Agents view (BUG-010); BUG-011", (
     const d = await boot();
     const k = d.kernel;
     project(d, "proj", "发版");
-    k.spawnCell("proj", { id: "wt", preset: "checker", title: "等 CI", lifetime: "one_shot", schedules: [{ deliverAt: k.clock.now() + HOUR }] });
+    k.spawnCell("proj", { id: "wt", preset: "checker", title: "等 CI", lifetime: "one_shot", schedules: [{ deliverAt: k.clock.now() + HOUR }] }, undefined, { principalId: k.ownerPrincipal });
     const row = (await d.get<RadarDTO>("/api/radar")).projects[0]!;
     expect(row.ball).toMatchObject({ owner: "waiting", label: "🟡 等待外部", text: expect.stringMatching(/^「等 CI」下次检查 /) });
 
@@ -595,7 +596,7 @@ describe("Radar: reports and the way into the Agents view (BUG-010); BUG-011", (
   });
 
   it("011.3: a parked project is not also paused — no double badge, not counted as paused; get_project says activate", async () => {
-    const d = await boot({ agentTokens: { main: AGENT_TOKEN } });
+    const d = await boot({ token: OWNER_TOKEN, agentTokens: { main: AGENT_TOKEN } });
     const k = d.kernel;
     project(d, "park", "极简模式");
     project(d, "hold", "周报");
@@ -619,7 +620,7 @@ describe("Radar: reports and the way into the Agents view (BUG-010); BUG-011", (
 
 describe("control plane: chat_with_desk, message_cell, inspect_cell, read_resource / read_artifact paging, get_project", () => {
   it("chat_with_desk: the owner's words reach the desk as the agent's; its replies are read back from a cursor; an answer carries replyToId", async () => {
-    const d = await boot({ agentTokens: { main: AGENT_TOKEN } });
+    const d = await boot({ token: OWNER_TOKEN, agentTokens: { main: AGENT_TOKEN } });
     const k = d.kernel;
     d.script.add("desk", tool("send_message", { to: "channel:ui:owner", text: "代码在哪个本地目录下呀？", summary: "问路径" }));
     const sent = await agentOk(d, "chat_with_desk", { text: "帮我把支付重试改成指数退避" });
@@ -652,12 +653,12 @@ describe("control plane: chat_with_desk, message_cell, inspect_cell, read_resour
   });
 
   it("message_cell wakes a dormant worker and says its project got a copy; refusals are plain; inspect_cell reads without moving the project's cursor", async () => {
-    const d = await boot({ agentTokens: { main: AGENT_TOKEN } });
+    const d = await boot({ token: OWNER_TOKEN, agentTokens: { main: AGENT_TOKEN } });
     const k = d.kernel;
     project(d, "proj", "支付重试改造");
     d.script.add("w1", { text: "退避已实现" });
     worker(d, "w1", "proj", "核心退避编码", "实现指数退避");
-    k.spawnCell("proj", { id: "probe", preset: "checker", processor: { kind: "code", entry: "test.noop" }, lifetime: "persistent" });
+    k.spawnCell("proj", { id: "probe", preset: "checker", processor: { kind: "code", entry: "test.noop" }, lifetime: "persistent" }, undefined, { principalId: k.ownerPrincipal });
     await k.idle();
     d.script.add("w1", { text: "改成 3 次了" });
     const r = await agentOk(d, "message_cell", { id: "w1", text: "最大重试改成 3" });
@@ -683,12 +684,12 @@ describe("control plane: chat_with_desk, message_cell, inspect_cell, read_resour
     await k.idle();
     expect((await agentOk(d, "get_project", { id: "proj" })).text).not.toContain("尚未汇总至项目的 Worker 最新动态");
 
-    await k.closeCell("proj", "completed");
+    await k.closeCell("proj", "completed", { principalId: k.ownerPrincipal });
     expect((await agentRefused(d, "message_cell", { id: "w1", text: "还在吗" })).text).toContain("archived with a project that has finished");
   });
 
   it("read_resource and read_artifact page through long text; versions can be read", async () => {
-    const d = await boot({ agentTokens: { main: AGENT_TOKEN } });
+    const d = await boot({ token: OWNER_TOKEN, agentTokens: { main: AGENT_TOKEN } });
     const k = d.kernel;
     const uri = k.context.writeResourceSync("desk", "a".repeat(10_000) + "b".repeat(10_000));
     const p1 = await agentOk(d, "read_resource", { uri });

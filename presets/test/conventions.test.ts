@@ -50,7 +50,7 @@ describe("conventions the workbench app relies on", () => {
   it("weekly review reads a plan edited by the owner in its original and current versions", async () => {
     const h = await boot({ presets: { weeklyReview: "0 16 * * 5" } });
     h.script.add("desk", tool("propose_project", { title: "接口交付", outcome: "完成测试", actions: [{ title: "验证", owner: "agent" }] }));
-    await h.ui.capture({ text: "安排接口交付" });
+    await h.ui.capture({ text: "安排接口交付" }, "owner");
     await h.kernel.idle();
     const card = h.cards()[0]!;
     const first = h.kernel.context.getArtifactSync(card.artifactId!)!;
@@ -73,14 +73,14 @@ describe("conventions the workbench app relies on", () => {
     h.script.add("project", tool("dispatch", { title: "整理名单", instruction: "整理客户名单" }), {});
     // Still at work: it waits for an answer (a bare wait would end its turn).
     h.script.add("worker", tool("wait", { reason: "thinking", waitingFor: "inbox:desk" }));
-    await h.ui.capture({ text: "整理一下客户名单" });
+    await h.ui.capture({ text: "整理一下客户名单" }, "owner");
     await h.kernel.idle();
     const [project] = projects(h);
     const [worker] = childrenOf(h, project!);
-    expect(h.kernel.control(project!, { action: "pause" })).toMatchObject({ applied: true });
+    expect(h.kernel.control(project!, { action: "pause" }, { principalId: h.kernel.ownerPrincipal })).toMatchObject({ applied: true });
 
     h.script.add("desk", tool("stop_item", { itemId: project, reason: "不需要了" }), tool("wait", { reason: "ok" }));
-    await h.ui.capture({ text: "客户名单不用整理了" });
+    await h.ui.capture({ text: "客户名单不用整理了" }, "owner");
     await h.kernel.idle();
     expect(h.project(project!)).toMatchObject({ lifecycle: "cancelled" });
     expect(h.actions(project)).toEqual([expect.objectContaining({ status: "cancelled" })]);
@@ -97,7 +97,7 @@ describe("conventions the workbench app relies on", () => {
  * (`cell.direct_chat`), the sample cell names of the project's board note, and the subject-matter terms COMMON gives
  * as examples of words that are never translated (`code_cell.rs`, `token`, `queue`, `epoch`).
  */
-const NOT_TOOLS = new Set(["working_note", "research_then_park", "diff", "show", "check", "direct_chat", "worker_a1", "worker_b2", "code_cell", "token", "queue", "epoch"]);
+const NOT_TOOLS = new Set(["working_note", "research_then_park", "diff", "show", "check", "direct_chat", "worker_a1", "worker_b2", "code_cell", "token", "queue", "epoch", "restored_by_owner", "arbitration_unanswered", "stalled_check"]);
 
 /**
  * Names a prompt mentions that its role does not have, reported to the prompts' owner (see the presets report). The
@@ -129,7 +129,7 @@ it("enforces scope at the run port even when a processor calls it directly", asy
       },
     });
   } });
-  h.kernel.spawnCell("desk", { id: "child", preset: "worker", processor: { kind: "code", entry: "test.knowledge" } }, "整理笔记");
+  h.kernel.spawnCell("desk", { id: "child", preset: "worker", processor: { kind: "code", entry: "test.knowledge" } }, "整理笔记", { principalId: h.kernel.ownerPrincipal });
   await h.kernel.idle();
   expect(results).toMatchObject([
     {status:"rejected", reason:{code:"bounds_violation"}},
@@ -148,12 +148,12 @@ it("protects preset records from model writes while leaving its own topic notes 
       expect(lastToolResult(req)).toContain("reserved");
       return {};
     });
-    await h.ui.capture({ text: key });
+    await h.ui.capture({ text: key }, "owner");
     await h.kernel.idle();
     expect(h.kernel.context.readStateSync("desk", key)).toBeNull();
   }
   h.script.add("desk", tool("set_state", { patches: { "hub:topics": ["weekly"] } }), {});
-  await h.ui.capture({ text: "设置主题" });
+  await h.ui.capture({ text: "设置主题" }, "owner");
   await h.kernel.idle();
   expect(h.kernel.context.readStateSync("desk", "hub:topics")).toEqual(["weekly"]);
 });
@@ -161,11 +161,11 @@ it("protects preset records from model writes while leaving its own topic notes 
 describe("conventions: every prompt names only tools its role has", () => {
   it("role prompts and the playbooks they rely on", async () => {
     const h = await boot();
-    const { projectId } = startProjectSync(h.kernel, { title: "p", outcome: "o", brief: "b" });
-    h.kernel.spawnCell(projectId, { preset: "worker", title: "w" });
-    h.kernel.spawnCell(projectId, { preset: "checker", title: "c" });
-    h.kernel.spawnCell("desk", { preset: "sensor", title: "s" });
-    h.kernel.spawnCell("desk", { preset: "hub", title: "h" });
+    const { projectId } = startProjectSync(h.kernel, { title: "p", outcome: "o", brief: "b" }, { principalId: h.kernel.ownerPrincipal });
+    h.kernel.spawnCell(projectId, { preset: "worker", title: "w" }, undefined, { principalId: h.kernel.ownerPrincipal });
+    h.kernel.spawnCell(projectId, { preset: "checker", title: "c" }, undefined, { principalId: h.kernel.ownerPrincipal });
+    h.kernel.spawnCell("desk", { preset: "sensor", title: "s" }, undefined, { principalId: h.kernel.ownerPrincipal });
+    h.kernel.spawnCell("desk", { preset: "hub", title: "h" }, undefined, { principalId: h.kernel.ownerPrincipal });
     const cells = h.kernel.listCells({ status: ["active"] });
     const toolsOf = (prompt: string): string[] => {
       const cell = cells.find((c) => c.spec.processor.kind === "llm" && c.spec.processor.prompt === prompt);
@@ -198,5 +198,85 @@ describe("conventions: every prompt names only tools its role has", () => {
     for (const prompt of [PROMPTS.desk, PROMPTS.project, PROMPTS.hub]) expect(toolsOf(prompt)).toContain("inspect_cell");
     // Every registered role prompt was checked.
     expect(new Set(checks.map((c) => c.prompt))).toEqual(new Set(Object.values(PROMPTS)));
+    // Non-modifying roles must not receive the worker's "creating a branch, committing..." permission line, and all roles know the owner's timezone.
+    const defs = Object.fromEntries(promptDefs(resolveConfig({ timeZone: "Asia/Shanghai" })).map((p) => [p.name, p.text]));
+    for (const name of [PROMPTS.desk, PROMPTS.project, PROMPTS.hub, PROMPTS.checker, PROMPTS.sensor]) {
+      expect(defs[name]).not.toContain("creating a branch, committing on your branch");
+      expect(defs[name]).toContain("Asia/Shanghai");
+    }
+    expect(defs[PROMPTS.worker]).toContain("Asia/Shanghai");
+  });
+
+  it("includes deterministic seeded actionIds in the project brief and open human actions in project wake-up tail notes", async () => {
+    const h = await boot();
+    let firstPrompt = "";
+    let secondPrompt = "";
+    h.script.add(
+      "project",
+      (req) => {
+        firstPrompt = JSON.stringify(req.messages);
+        return {};
+      },
+      (req) => {
+        secondPrompt = JSON.stringify(req.messages);
+        return {};
+      },
+    );
+    const { projectId } = startProjectSync(h.kernel, {
+      id: "proj_brief_ids",
+      title: "接口整理",
+      outcome: "完成整理并验收",
+      brief: "整理接口并请主人验收",
+      plan: [
+        { title: "拉取接口清单", owner: "agent" },
+        { title: "确认对外字段", owner: "human", nextStep: "核对字段列表" },
+      ],
+    }, { principalId: h.kernel.ownerPrincipal });
+    await h.kernel.idle();
+    const acts = h.actions(projectId);
+    expect(acts).toHaveLength(2);
+    for (const a of acts) expect(firstPrompt).toContain(a.id);
+
+    h.kernel.sendToCell(projectId, { text: "继续看下进度" }, { principalId: h.kernel.ownerPrincipal });
+    await h.kernel.idle();
+    const human = acts.find((a) => a.owner === "human")!;
+    expect(secondPrompt).toContain("[your open actions]");
+    expect(secondPrompt).toContain(human.id);
+    expect(secondPrompt).toContain("确认对外字段");
+    expect(secondPrompt).toContain("核对字段列表");
+  });
+
+  it("propose_project reuses subjectKey on approval.revise instead of creating a duplicate card", async () => {
+    const h = await boot();
+    h.script.add(
+      "desk",
+      tool("propose_project", { title: "初版方案", outcome: "完成 A", actions: [{ title: "做 A", owner: "agent" }] }),
+    );
+    await h.ui.capture({ text: "规划一下 A" }, "owner");
+    await h.kernel.idle();
+    const [initial] = h.kernel.humanItems.list();
+    expect(initial).toBeDefined();
+
+    let revisePrompt = "";
+    h.script.add("desk", (req) => {
+      revisePrompt = JSON.stringify(req.messages);
+      return tool("propose_project", {
+        title: "修订方案",
+        outcome: "完成 A 和 B",
+        actions: [{ title: "做 A 和 B", owner: "agent" }],
+        subjectKey: initial!.subjectKey,
+      });
+    });
+    const reviseOpt = initial!.options.find((o) => o.effect === "revise")!;
+    await h.kernel.humanItems.decide(
+      initial!.id,
+      { optionId: reviseOpt.id, seenItemRevision: initial!.itemRevision, seenArtifactVersion: initial!.artifactVersion ?? undefined, note: "加上 B" },
+      "owner",
+    );
+    await h.kernel.idle();
+    expect(revisePrompt).toContain("The owner asked for a revision to the pending card below");
+    const open = h.kernel.humanItems.list();
+    expect(open).toHaveLength(1);
+    expect(open[0]).toMatchObject({ title: "修订方案", subjectKey: initial!.subjectKey });
   });
 });

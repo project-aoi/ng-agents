@@ -170,7 +170,6 @@ function defaultFakeBounds(): PolicyBounds {
   return makeBounds({
     tools: TOOL_KINDS,
     canSendTo: ["channel:*", "inbox:*"] as Address[],
-    isolation: "none",
     maxConcurrentChildren: 4,
     maxDepth: 2,
   });
@@ -413,7 +412,9 @@ export function createFakeRun(opts: FakeRunOptions = {}): FakeRun {
       log.updated.push({ cellId: id, patch });
     },
     async closeCell(id, reason) {
+      if (log.closed.some(c => c.cellId === id) || opts.roster?.some(c => c.cellId === id && c.status === "closed")) return false;
       log.closed.push({ cellId: id, ...(reason ? { reason } : {}) });
+      return true;
     },
     async authorize(action, o) {
       const result = await (opts.authorize ?? defaultAuthorize)(action, o);
@@ -505,7 +506,7 @@ export function createFakeRun(opts: FakeRunOptions = {}): FakeRun {
       return artifacts.get(artifactId)!;
     },
     async workspaceAccess() {
-      return { root: workspace.root, isolation: bounds.isolation, tools: opts.workspaceTools ?? [...bounds.tools] };
+      return { root: workspace.root, tools: opts.workspaceTools ?? [...bounds.tools] };
     },
   };
 

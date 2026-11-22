@@ -60,7 +60,7 @@ describe("workspace port", () => {
   it("a coordinator works in the owner's real directory with all its tools: nothing is refused, and while its Run is in flight it is listed as active there", async () => {
     const repo = initRepo();
     const h = await boot({ setup, desk: false, kernel: { repoPath: repo } });
-    h.kernel.createRootCell({ id: "desk", preset: "inline", processor: { kind: "code", entry: "test.try_tools", args: { ops: OPS } } });
+    h.kernel.createRootCell({ id: "desk", preset: "inline", processor: { kind: "code", entry: "test.try_tools", args: { ops: OPS } } }, { principalId: h.kernel.ownerPrincipal });
     h.kernel.inbox.enqueueSync("desk", { id: "go", from: "channel:ui:owner", principalId: "owner", kind: "event", type: PAYLOAD.userMessage, payload: { text: "go" }, createdAt: h.clock.now() });
     await h.kernel.idle();
     const s = (k: string) => h.kernel.context.readStateSync<string>("desk", `op:${k}`)!;
@@ -73,8 +73,8 @@ describe("workspace port", () => {
     await waitFor(() => h.kernel.context.readStateSync("desk", "woken") === PAYLOAD.jobResult, 10_000, "the job result");
     expect(h.kernel.workspace.listJobsSync({ cellId: "desk" })).toHaveLength(1);
     // reported: every tool in bounds, and nothing about a mode
-    const access = h.kernel.context.readStateSync<{ root: string; isolation: string; tools: ToolKind[] }>("desk", "access")!;
-    expect(access).toEqual({ root: repo, isolation: "none", tools: expect.arrayContaining(["read", "write", "edit", "bash"]) });
+    const access = h.kernel.context.readStateSync<{ root: string; tools: ToolKind[] }>("desk", "access")!;
+    expect(access).toEqual({ root: repo, tools: expect.arrayContaining(["read", "write", "edit", "bash"]) });
     // while it ran, it was the one cell active in that work tree
     const occ = h.kernel.context.readStateSync<WorkspaceOccupancy[]>("desk", "occupancy")!;
     expect(occ).toEqual([{ key: repo, active: [expect.objectContaining({ cellId: "desk", state: "running", cwd: repo, projectCellId: null, projectTitle: null })] }]);
@@ -88,7 +88,7 @@ describe("workspace port", () => {
     h.kernel.spawnCell(
       "desk",
       { id: "ro", preset: "worker", processor: { kind: "code", entry: "test.try_tools", args: { ops: OPS } }, bounds: { tools: new Set<ToolKind>(["read"]) } },
-      "go",
+      "go", { principalId: h.kernel.ownerPrincipal },
     );
     await h.kernel.idle();
     const s = (k: string) => h.kernel.context.readStateSync<string>("ro", `op:${k}`)!;
@@ -99,9 +99,9 @@ describe("workspace port", () => {
   it("a worker writes in the configured repository itself by default (host, no automatic worktree)", async () => {
     const repo = initRepo();
     const h = await boot({ setup, kernel: { repoPath: repo } });
-    h.kernel.spawnCell("desk", { id: "fix", preset: "worker", processor: { kind: "code", entry: "test.try_tools", args: { ops: OPS.slice(0, 1) } } }, "go");
+    h.kernel.spawnCell("desk", { id: "fix", preset: "worker", processor: { kind: "code", entry: "test.try_tools", args: { ops: OPS.slice(0, 1) } } }, "go", { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
-    expect(h.kernel.getCell("fix")!.bounds.isolation).toBe("none");
+
     expect(h.kernel.context.readStateSync<string>("fix", "root")).toBe(repo);
     expect(readFileSync(join(repo, "note.txt"), "utf8")).toBe("y");
     expect(git(repo, "rev-parse", "--abbrev-ref", "HEAD")).toBe("main");

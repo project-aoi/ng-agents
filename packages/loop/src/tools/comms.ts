@@ -121,12 +121,12 @@ async function sendToInbox(ctx: ToolContext, to: `inbox:${string}`, args: { text
       };
     case "closed":
       return {
-        output: `NOT DELIVERED — ${target} is closed (${r.closeReason === "cancelled" ? "it was cancelled" : "it was closed, or its project ended"}). Nothing was stored. If the work still needs doing, start a new worker with spawn_cell and give it the context it needs (what the previous one did, the branch or artifact it left).`,
+        output: `NOT DELIVERED — ${target} is closed (${r.closeReason === "cancelled" ? "it was cancelled" : "it was closed, or its project ended"}). Nothing was stored. If the work still needs doing, start a new worker (use dispatch inside a project, or spawn_cell otherwise) and give it the context it needs (what the previous one did, the branch or artifact it left).`,
         isError: true,
         data: r,
       };
     case "not_found":
-      return { output: `NOT DELIVERED — there is no cell "${target}". Check the id in the in-flight list at the end of your wake-up message.`, isError: true, data: r };
+      return { output: `NOT DELIVERED — there is no cell "${target}". Check the id in the in-flight list at the start of your wake-up message.`, isError: true, data: r };
     case "refused":
       return { output: `Not allowed: ${r.reason}.`, isError: true, data: r };
   }
@@ -163,23 +163,29 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
     name: "request_approval",
     kind: "kernel",
     description: [
-      "Ask the owner to decide before you go on (not for sending messages — send_message handles that).",
-      "project: propose a multi-step project with its actions; escalation: you are blocked or out of retries and need a decision; action: approve one specific operation (e.g. merging a PR).",
-      "Usually becomes an approval card and the run ends; you are woken with approval.resolved.",
+      "Ask the owner to decide before you go on (not for plain notifications — send_message handles those).",
+      "project: propose a multi-step project (on the desk, prefer propose_project so cwd, repos and phases are preserved); escalation: you are blocked or out of retries and need a decision; action: approve one specific operation (e.g. merging a PR or advancing a phase).",
+      "When you pass custom options or relatedProjectIds on an escalation (or an action without execute/action), this creates a workbench decision card with those explicit reply choices. Usually ends the run; you are woken with approval.resolved (or approval.revise if the owner asks for a revision).",
     ].join(" "),
     input: z.object({
       kind: z.enum(["project", "escalation", "action"]),
       options: z.array(z.object({
-        id: z.string().min(1), label: z.string().min(1), effect: z.enum(["reply","revise","execute","defer","terminate","complete"]),
-        primary: z.boolean().optional(), group: z.enum(["main","more"]).optional(), hint: z.string().optional(),
-        input: z.object({ mode: z.enum(["none","optional","required"]), placeholder: z.string().optional() }).optional(),
-        payload: z.record(z.string(), z.unknown()).optional(), terminateMode: z.enum(["deny","cancel_task"]).optional(),
-        targetCellIds: z.array(z.string()).optional(), confirm: z.string().optional(),
-      })).optional(),
-      relatedProjectIds: z.array(z.string().min(1)).optional(),
+        id: z.string().min(1).describe("stable option id returned in approval.resolved.optionId"),
+        label: z.string().min(1).describe("short Chinese button label shown to the owner"),
+        effect: z.enum(["reply","revise","execute","defer","terminate","complete"]).describe('reply: return the owner\'s choice/note to you; execute: approve a protected action; terminate: decline or cancel a project; revise: ask you to redraft; defer: snooze'),
+        primary: z.boolean().optional().describe("highlight as the primary button"),
+        group: z.enum(["main","more"]).optional().describe("main button bar or secondary overflow menu"),
+        hint: z.string().optional().describe("short Chinese explanation under the choice"),
+        input: z.object({ mode: z.enum(["none","optional","required"]), placeholder: z.string().optional() }).optional().describe("whether this option asks the owner for a note"),
+        payload: z.record(z.string(), z.unknown()).optional().describe("structured data echoed back to you when chosen"),
+        terminateMode: z.enum(["deny","cancel_task"]).optional().describe('for effect "terminate": deny (default) or cancel_task (closes targetCellIds[0], which must be listed in relatedProjectIds)'),
+        targetCellIds: z.array(z.string()).optional().describe('for terminateMode "cancel_task": single project cell id to close'),
+        confirm: z.string().optional().describe("extra confirmation prompt before executing a destructive choice"),
+      })).optional().describe("explicit decision choices shown on the card"),
+      relatedProjectIds: z.array(z.string().min(1)).optional().describe("project cell ids this decision affects (links the card to those projects and required for cancel_task targets)"),
       title: z.string().min(1),
       summary: z.string().min(1).describe("one line for the card and the audit log"),
-      subjectKey: z.string().optional(),
+      subjectKey: z.string().optional().describe('stable dedup key (e.g. "arb:<cause>"); reusing the same subjectKey updates an existing open card instead of creating a duplicate'),
       prep: prepInput.optional(),
       proposal: z
         .object({
@@ -207,7 +213,7 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
     async handler(args, ctx) {
       const subjectKey = args.subjectKey ?? defaultSubjectKey(ctx);
       const protectedAction = args.kind === "project";
-      if (!protectedAction && args.kind !== "action" && (args.options || args.relatedProjectIds)) {
+      if (!protectedAction && (args.kind !== "action" || (!args.action && !args.options?.some(o => o.effect === "execute"))) && (args.options || args.relatedProjectIds)) {
         if (!ctx.ports.createHumanItem) return { output: "Custom cards are unavailable.", isError: true };
         const item = ctx.ports.createHumanItem({
           title: args.title, description: args.escalation?.explanation ?? args.summary, prep:prepOf(args.prep), source:itemSource(ctx.snapshot), rawInput:itemRawInput(ctx.snapshot), subjectKey: args.subjectKey ?? `arb:${primaryEnvelope(ctx.snapshot)?.id ?? ctx.snapshot.runId}`,
@@ -355,7 +361,7 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
       };
       await ctx.ports.emitToParent(PAYLOAD.cellResult, payload);
       await ctx.ports.context.commit(childCellId, { statePatches: { [CELL_STATUS_KEY]: status } });
-      return "Result delivered to your parent. You stay open; call complete_self when this cell's whole job is finished.";
+      return "Result delivered to your parent. You stay open; call finish_project (for a project) or complete_self when this cell's whole job is finished.";
     },
   });
   const handback = defineTool({
@@ -425,15 +431,15 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
     name: "wait",
     kind: "kernel",
     description: [
-      "End this run and sleep until the next message wakes you. Sleeping costs nothing.",
-      "Say who you are waiting for with waitingFor, so the wait is on record until exactly that party answers (other wake-ups do not clear it): an address such as \"inbox:desk\" (you asked the desk to arbitrate) or a child's \"inbox:<cellId>\"; \"human\" (the owner must do or decide something — only after you raised a card or recorded an action for them); \"external\" (an outside event — only with a watch or a timer set).",
+      "End this run and sleep until the next message wakes you. Sleeping costs nothing. Because wait ends the run immediately, write any chat reply or send any message before calling wait.",
+      "Say who you are waiting for with waitingFor, so the wait is on record until exactly that party answers (other wake-ups do not clear it): an address such as \"inbox:desk\" (you asked the desk to arbitrate) or a child's \"inbox:<cellId>\"; \"human\" (the owner must do, decide or answer something — after you raised a card, recorded a human action, or asked the owner a concrete question); \"external\" (an outside event — only with a watch, background job, or reminder/schedule set).",
       "timeoutMinutes wakes you if nothing came by then. Without waitingFor it simply ends the run (a job, a reminder or a reply you already arranged will wake you).",
     ].join(" "),
     input: z.object({
       reason: z.string().min(1).describe("what you are waiting for, in one line"),
       waitId: z.string().trim().min(1).optional(),
       refId: z.string().trim().min(1).optional(),
-      waitingFor: z.string().min(1).optional().describe('"inbox:<cellId>", "human", "external", or a channel address'),
+      waitingFor: z.string().min(1).optional().describe('"inbox:<cellId>", "human", or "external"'),
       timeoutMinutes: z.number().positive().max(60 * 24 * 30).optional(),
     }),
     async handler(args, ctx) {
@@ -501,7 +507,7 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
     async handler(args, ctx) {
       const settle = ctx.ports.settleSelf;
       if (!settle) return { output: "This environment cannot park a cell from inside.", isError: true };
-      await settle.call(ctx.ports, { action: "pause", summary: args.reason, ...(args.closeChildren ? { force: true } : {}) });
+      await settle.call(ctx.ports, { action: "pause", pauseReason: "parked", summary: args.reason, ...(args.closeChildren ? { force: true } : {}) });
       const status: CellStatusLine = { text: `已停靠：${args.reason}`.slice(0, 200), at: ctx.clock.now() };
       await ctx.ports.context.commit(selfId(ctx), { statePatches: { [CELL_STATUS_KEY]: status } });
       return { output: "Parked after this run. Stop here.", endRun: "completed", data: { action: "pause" } };
@@ -509,7 +515,7 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
   });
   return {
     name: COMMS_TOOLSET,
-    description: "Messages to people (Gate-checked) and to other cells, approval requests, reports to the parent, handback, wait, complete_self / pause_self.",
+    description: "Workbench notifications and messages to other cells, approval requests, reports to the parent, handback, wait, complete_self / pause_self.",
     tools: [sendMessage, requestApproval, reportToParent, handback, wait, clearWait, completeSelf, pauseSelf],
   };
 }

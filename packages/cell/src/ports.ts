@@ -1,8 +1,8 @@
 import { renderEnvelope } from "@ng/context";
 import { CLI_SESSION_KEY, type CliSessionRecord } from "@ng/loop";
-import { deliveryAllowed } from "@ng/gate";
+import { deliveryAllowed, ownerOnlyApproval } from "@ng/gate";
 import {
-  get, asDecisionCard, CELL_RESULT_CANDIDATE_KEY,
+  acceptsApprovalDraft, all, get, CELL_RESULT_CANDIDATE_KEY,
   cellPrincipal,
   createEnvelope,
   inboxAddr,
@@ -23,12 +23,13 @@ import {
   type Envelope,
   type ExecResult,
   type PromptSnapshot,
+  type ProposedAction,
   type RunPorts,
   type RunSelf,
   type ToolKind,
 } from "@ng/protocol";
 import type { ManagedWorkspacePort } from "@ng/workspace";
-import type { KernelCore } from "./core";
+import { isProjectRoot, type KernelCore } from "./core";
 import type { RunHandle } from "./dispatcher";
 import { inspectCell } from "./inspect";
 import { sendCellMessage } from "./messages";
@@ -149,7 +150,9 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
     async startJob(spec) {
       assertLive("job_start");
       checkTool("bash", "starting a job");
-      return (await acquire()).startJob(spec);
+      const port = await acquire();
+      assertLive("job_start");
+      return port.startJob(spec);
     },
     async observeJob(jobId) {
       return (await acquire()).observeJob(jobId);
@@ -189,7 +192,29 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
     async commit(id, tx) {
       pinned(id, "commit");
       assertLive("commit");
-      return context.commitSync(cellId, sanitizeOut(tx));
+      return withTx(core.db, () => {
+        if (tx.artifact) {
+          const { artifactId, updatedBy } = tx.artifact;
+          if (updatedBy !== "agent") throw new NgError("bounds_violation", "分身只能以自己的身份保存文稿");
+          const current = context.getArtifactSync(artifactId);
+          if (current && current.cellId !== cellId) {
+            const lineage = isDescendant(current.cellId) || cells.ancestors(cellId).some(a => a.id === current.cellId);
+            const projectOf = (id: string) => [cells.require(id), ...cells.ancestors(id)].find(c => isProjectRoot(core.registry, c))?.id;
+            const project = projectOf(cellId);
+            if (!lineage && (!project || projectOf(current.cellId) !== project)) throw new NgError("bounds_violation", "文稿属于无关任务");
+          }
+          const bindings = all<{ action: string; cell_id: string }>(core.db,
+            "SELECT action, cell_id FROM human_items WHERE artifact_id=? AND disposition='pending'", [artifactId]);
+          for (const binding of bindings) {
+            const action = JSON.parse(binding.action) as ProposedAction;
+            if (binding.cell_id !== cellId && ownerOnlyApproval(action))
+              throw new NgError("bounds_violation", "只有发起任务和主人可以修改这份待批文稿");
+            if (!acceptsApprovalDraft(action.type, tx.artifact.content.format, tx.artifact.content.data))
+              throw new NgError("invalid_argument", "文稿内容不符合待批方案的要求");
+          }
+        }
+        return context.commitSync(cellId, sanitizeOut(tx));
+      });
     },
     async appendEvidence(id, record) {
       pinned(id, "appendEvidence");
@@ -264,9 +289,11 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
       requireDescendant(targetId, "closeCell");
       const closed = core.lifecycle.closeCellSync(targetId, reason ?? "completed", { principalId });
       void core.track(core.lifecycle.cleanupClosed(closed));
+      return closed.length > 0;
     },
 
     async authorize(action, o) {
+      assertLive("authorize");
       return gate.authorizeSync(action, {
         cellId,
         principalId,
@@ -312,11 +339,18 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
         !get(core.db,"SELECT 1 FROM evidence WHERE cell_id=? AND seq>? AND seq<=? AND kind IN ('system_note','inbound','external') LIMIT 1",[parentId,delivered,uptoSeq]);
     },
     listOwnDecisions() {
-      return core.gate.listApprovalsSync({cellIds:[cellId]}).map(record => {
-        const source = asDecisionCard(record.card.data)?.source.envelopeId;
-        const row = source && get<{envelope:string}>(core.db, "SELECT envelope FROM inbox_messages WHERE envelope_id=? ORDER BY (cell_id=?) DESC, seq LIMIT 1", [source,cellId]);
-        return {record, ...(row ? {envelope:JSON.parse(row.envelope) as Envelope} : {})};
-      });
+      const rows = all<{
+        actionId: string; subjectKey: string; action: string; card: string;
+        artifactId: string | null; boundVersion: number | null; updatedAt: number; envelope: string | null;
+      }>(core.db, `SELECT h.action_id AS actionId, h.subject_key AS subjectKey, h.action, h.card,
+        h.artifact_id AS artifactId, h.bound_version AS boundVersion, h.updated_at AS updatedAt, m.envelope
+        FROM human_items h LEFT JOIN inbox_messages m ON m.cell_id=h.cell_id
+          AND m.envelope_id=json_extract(h.card,'$.data.source.envelopeId')
+        WHERE h.cell_id=? AND h.category='decision' ORDER BY h.updated_at DESC, h.action_id`, [cellId]);
+      return rows.map(({ action, card, envelope, ...fields }) => ({
+        record: { ...fields, action: JSON.parse(action), card: JSON.parse(card) },
+        ...(envelope ? { envelope: JSON.parse(envelope) as Envelope } : {}),
+      }));
     },
     async emitToParent(type, payload, o = {}) {
       if (!cell.parentId) throw new NgError("invalid_argument", "a root cell has no parent to report to");
@@ -398,7 +432,7 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
       const port = await acquire();
       const b = liveBounds();
       const tools = TOOL_KINDS.filter((t) => b.tools.has(t));
-      return { root: port.root, isolation: b.isolation, tools };
+      return { root: port.root, tools };
     },
 
     // ---------- docs/05 ----------
@@ -471,10 +505,12 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
           throw new NgError(
             "conflict",
             `${open.length} child cell(s) are still at work (${open.map((b) => `${b.cell.id}${b.cell.title ? ` "${b.cell.title}"` : ""}: ${b.why}`).join("; ")}). ` +
-              `Wait for them (or close the ones that are no longer needed) before you ${request.action === "pause" ? "park" : "finish"}.`,
+              `Wait for them (or close the ones that are no longer needed) before you ${request.action === "pause" ? "park" : "finish"}. Call again with closeChildren: true if stopping them is what you mean.`,
           );
         }
       }
+      const pending = request.action === "complete" ? core.readModel.pendingSettlement(cellId, request.force) : [];
+      if (pending.length) throw new NgError("conflict", `请先处理项目尚未结束的工作：${pending.join("、")}`);
       handle.selfSettle = { ...request };
     },
 

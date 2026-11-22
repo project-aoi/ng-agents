@@ -18,7 +18,6 @@ import {
   parsePrincipal,
   selectRunTools,
   stableStringify,
-  topBallOwner,
   type ToolContext,
 } from "../src";
 
@@ -134,14 +133,5 @@ describe("mergeAdjacentMessages", () => {
     ]);
     expect(merged.map((m) => m.role)).toEqual(["user", "assistant", "user"]);
     expect(merged[2]!.content.map((b) => b.type)).toEqual(["tool_result", "tool_result", "text", "text"]);
-  });
-});
-
-describe("gtd conventions", () => {
-  it("aggregates the ball owner by priority human > agent > waiting over open actions", () => {
-    expect(topBallOwner([{ owner: "waiting", status: "open" }, { owner: "agent", status: "open" }])).toBe("agent");
-    expect(topBallOwner([{ owner: "agent", status: "open" }, { owner: "human", status: "open" }])).toBe("human");
-    expect(topBallOwner([{ owner: "human", status: "done" }, { owner: "waiting", status: "open" }])).toBe("waiting");
-    expect(topBallOwner([{ owner: "human", status: "cancelled" }])).toBeNull();
   });
 });

@@ -283,7 +283,8 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
     let endTimer: ReturnType<typeof setTimeout> | undefined;
     let persist: Promise<unknown> = Promise.resolve();
     const io: DriverIO = {
-      write: (line) => !endOutcome && (live.proc?.write(line) ?? false),
+      acceptingPrompts: () => !endOutcome && !stopReason,
+      write: (line) => live.proc?.write(line) ?? false,
       end: () => live.proc?.endInput(),
     };
 
@@ -341,6 +342,11 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
         if (endOutcome) interruptAndKill();
         return { text: RUN_ALREADY_ENDED, isError: true };
       }
+      const callLeg = leg;
+      const callTurn = live.legTurns + 1;
+      const callSignal = AbortSignal.any([signal, meta.signal]);
+      const stale = () => callSignal.aborted || callLeg !== leg;
+      if (stale()) return {text: RUN_ALREADY_ENDED, isError: true};
       sessionProgress = true;
       const tool = byName.get(name)!;
       const toolUseId = `mcp_${runId}_${++callCounter}`;
@@ -350,22 +356,25 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
         await append({ kind:"tool_result", toolUseId, name, output:RUN_ALREADY_ENDED, isError:true });
         return {text:RUN_ALREADY_ENDED, isError:true};
       }
+      if (stale()) return {text: RUN_ALREADY_ENDED, isError: true};
       let result: ToolResult;
       try {
         result = normalizeToolResult(
-          await raceAbort(Promise.resolve(tool.handler(args, { ports, snapshot, signal, toolUseId, clock })), AbortSignal.any([signal, meta.signal])),
+          await raceAbort(Promise.resolve(tool.handler(args, { ports, snapshot, signal: callSignal, toolUseId, clock })), callSignal),
         );
       } catch (err) {
         result = { output: `Error: ${err instanceof Error ? err.message : String(err)}`, isError: true };
       }
       const ev = await append({ kind: "tool_result", toolUseId, name, output: result.output, ...(result.isError ? { isError: true } : {}) });
       let text = ev.modelText ?? result.output;
+      if (stale()) return {text: RUN_ALREADY_ENDED, isError: true};
       if (result.awaitsWakeup) awaitsWakeup = true;
       if (result.endRun) {
         // The CLI demonstrably processed the active turn of this leg to invoke this tool: confirm items belonging to
         // this active turn (including turn_end follow-ups), while leaving any mid-turn queued steers unconfirmed.
         await eventChain;
-        confirmTurn(leg, live.legTurns + 1);
+        if (stale()) return {text: RUN_ALREADY_ENDED, isError: true};
+        confirmTurn(callLeg, callTurn);
         if (endOutcome === undefined || RUN_END_PRECEDENCE.indexOf(result.endRun) < RUN_END_PRECEDENCE.indexOf(endOutcome)) endOutcome = result.endRun;
         text = `${text}\n\n${RUN_ENDED_NOTICE}`;
         armEndGrace();
@@ -579,6 +588,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
       let legTurns = 0;
       let turnActive = true;
       let nextConfirmTurn = 1;
+      let claudeQueuedThrough = 0;
       eventChain = Promise.resolve();
 
       async function recordSent(items: readonly AppendedInput[], turn: number) {
@@ -599,7 +609,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
           finished = true;
           d.finish(io);
         }
-        if (legTurns < nextConfirmTurn || finishTimer) return;
+        if (finishTimer) return;
         // A CLI that keeps running after its input is done is stopped.
         finishTimer = setTimeout(() => killNow(), Math.max(killGraceMs, 5_000));
       };
@@ -611,10 +621,15 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
        */
       const deliver = async (items: AppendedInput[], mode: DeliverMode) => {
         if (items.length === 0 || finished || stopReason || endOutcome) return;
+        if (engine === "claude" && claudeQueuedThrough > legTurns) {
+          pendingSteer.push(...items);
+          return;
+        }
         const joined = items.map((i) => i.text).join("\n\n");
         if (d.steer(joined, io)) {
           const targetTurn = Math.max(nextConfirmTurn, legTurns + (turnActive ? 1 : 0)) + 1;
           nextConfirmTurn = targetTurn;
+          if (engine === "claude") claudeQueuedThrough = targetTurn;
           await recordSent(items, targetTurn);
           turnActive = true;
           return;
@@ -656,6 +671,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
 
       const handle = async (e: CliEvent): Promise<void> => {
         if ((endOutcome || refused) && e.type !== "session") {
+          if (e.type === "tool_start") interruptAndKill();
           if (e.type === "turn_end") {
             finished = true;
             killNow();
@@ -725,10 +741,15 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
               sessionProgress = true;
               awaitingSessionConfirmation = !sessionId;
               confirmCursor();
-            } else if (!e.ok && (!e.stopped || e.error)) state.turnError = e.error ?? "turn failed";
-            turnActive = Boolean(e.more);
-            if (e.more) break;
-            if (!endOutcome && !stopReason && !refused) {
+            } else if (!e.ok && (!e.stopped || e.error)) {
+              state.turnError = e.error ?? "turn failed";
+              finished = true;
+              killNow();
+              break;
+            }
+            turnActive = Boolean(e.more) || (engine === "claude" && e.ok && claudeQueuedThrough > legTurns);
+            if (turnActive) break;
+            if (e.ok && !endOutcome && !stopReason && !refused) {
               const items: AppendedInput[] = [];
               if (pendingSteer.length && state.sawSession) {
                 items.push(...pendingSteer);

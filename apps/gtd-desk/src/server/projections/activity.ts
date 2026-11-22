@@ -1,4 +1,5 @@
-import { all as rows, type ActivityRecord } from "@ng/protocol";
+import type { ActivityRecord } from "@ng/presets/records";
+import { all as rows } from "@ng/protocol";
 import type { ActivityKind, ActivityListDTO } from "../../shared/api";
 import { readActivities, type ProjectionInput } from "./common";
 import { button, enc, post, sourceInfo } from "./format";
@@ -17,7 +18,7 @@ export function projectActivity(input: ProjectionInput, kind?: ActivityKind): Ac
   const { kernel, now } = input;
   const decisions = rows<{id:string; item_id:string; at:number; undone_at:number|null; title:string; disposition:string; cell_id:string|null; revision:number; after_revision:number}>(kernel.db, `
     SELECT a.id,a.item_id,a.at,a.undone_at,a.after_revision,h.item_revision AS revision,h.cell_id,
-      COALESCE(json_extract(h.card,'$.title'), json_extract(h.action,'$.summary'), h.subject_key) AS title,h.disposition FROM human_item_activity a JOIN human_items h ON h.action_id=a.item_id
+      COALESCE(json_extract(h.card,'$.title'), json_extract(h.action,'$.summary'), h.subject_key) AS title,a.after_disposition AS disposition FROM human_item_activity a JOIN human_items h ON h.action_id=a.item_id
     ORDER BY a.at DESC`).map(r => {
     const record:ActivityRecord = {id:r.id,title:r.title,at:r.at,actionId:r.item_id,
       kind:["cancelled","denied"].includes(r.disposition) ? "card_withdrawn" : "action_completed",

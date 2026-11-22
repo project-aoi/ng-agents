@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import type { CommandRunner, SpawnRequest } from "../types";
+import { leaderGoneOrZombie, liveGroupMembers } from "@ng/protocol";
 import { groupAlive, killGroup } from "../util";
 
 export const defaultCommandRunner: CommandRunner = {
@@ -82,6 +83,9 @@ export function supervise(child: ChildProcess, opts: SuperviseOptions): Promise<
     let aborted = false;
     let exited: { code: number | null; signal: NodeJS.Signals | null } | null = null;
     let settled = false;
+    let groupPoll: NodeJS.Timeout | undefined;
+    let pollDelay = 50;
+    let warned = false;
     const timers: NodeJS.Timeout[] = [];
     const decOut = new StringDecoder("utf8");
     const decErr = new StringDecoder("utf8");
@@ -89,18 +93,38 @@ export function supervise(child: ChildProcess, opts: SuperviseOptions): Promise<
     child.stdout?.on("data", (b: Buffer) => opts.onData(decOut.write(b), "stdout"));
     child.stderr?.on("data", (b: Buffer) => opts.onData(decErr.write(b), "stderr"));
 
+    const ownedGroupAlive = () => {
+      if (pid === undefined || !groupAlive(pid)) return false;
+      if (!exited) return true;
+      return leaderGoneOrZombie(pid) && liveGroupMembers(pid)?.length !== 0;
+    };
     const terminate = () => {
-      if (pid !== undefined) killGroup(pid, "SIGTERM");
+      if (pid !== undefined && ownedGroupAlive()) killGroup(pid, "SIGTERM");
       timers.push(
         setTimeout(() => {
-          if (pid !== undefined && groupAlive(pid)) killGroup(pid, "SIGKILL");
+          if (pid !== undefined && ownedGroupAlive()) killGroup(pid, "SIGKILL");
         }, opts.killGraceMs),
       );
     };
 
     const finish = (spawnError?: Error) => {
       if (settled) return;
+      if (!spawnError && ownedGroupAlive()) {
+        if (!warned && pollDelay >= 1000) {
+          warned = true;
+          opts.onData("Waiting for the remaining process group to exit after termination.\n", "stderr");
+        }
+        if (!groupPoll) {
+          groupPoll = setTimeout(() => {
+            groupPoll = undefined;
+            finish();
+          }, pollDelay);
+          pollDelay = Math.min(pollDelay * 2, 1000);
+        }
+        return;
+      }
       settled = true;
+      clearTimeout(groupPoll);
       for (const t of timers) clearTimeout(t);
       opts.signal?.removeEventListener("abort", onAbort);
       opts.onData(decOut.end(), "stdout");
@@ -129,7 +153,7 @@ export function supervise(child: ChildProcess, opts: SuperviseOptions): Promise<
     });
     child.once("exit", (code, signal) => {
       exited = { code, signal };
-      if (pid !== undefined && groupAlive(pid)) terminate();
+      if (ownedGroupAlive()) terminate();
       // Pipes normally close right after exit; the deadline covers a straggler that ignores SIGTERM.
       timers.push(
         setTimeout(() => {

@@ -23,12 +23,12 @@ const results = (h: Harness, parent = "desk") =>
 
 /** A worker (wakeable leaf) with its own script queue (the role is what RoleScript keys on). */
 function worker(h: Harness, id: string, task = "do it", extra: Record<string, unknown> = {}): void {
-  h.kernel.spawnCell("desk", { id, preset: "worker", title: id, meta: { role: id }, ...extra }, task);
+  h.kernel.spawnCell("desk", { id, preset: "worker", title: id, meta: { role: id }, ...extra }, task, { principalId: h.kernel.ownerPrincipal });
 }
 
 /** A one-shot probe (the checker preset) with its own script queue. */
 function probe(h: Harness, id: string, task = "check it"): void {
-  h.kernel.spawnCell("desk", { id, preset: "checker", title: id, meta: { role: id } }, task);
+  h.kernel.spawnCell("desk", { id, preset: "checker", title: id, meta: { role: id } }, task, { principalId: h.kernel.ownerPrincipal });
 }
 
 const runsOf = (h: Harness, cellId: string) => h.of("run.started").filter((e) => e.cellId === cellId).map((e) => e.runId);
@@ -75,9 +75,9 @@ describe("leaf settlement", () => {
   it.each(["worker", "checker"] as const)("keeps a new %s wait when a previous run left a report", async preset => {
     const h = await boot();
     const id = "reporter";
-    h.kernel.spawnCell("desk", {id, preset, meta: {role: id}}, "first task");
+    h.kernel.spawnCell("desk", {id, preset, meta: {role: id}}, "first task", { principalId: h.kernel.ownerPrincipal });
     h.script.add(id, () => {
-      h.kernel.sendToCell(id, {text: "new task", id: "follow-up"});
+      h.kernel.sendToCell(id, {text: "new task", id: "follow-up"}, { principalId: h.kernel.ownerPrincipal });
       return tool("report_to_parent", {kind: "result", text: "first result"});
     }, tool("wait", {waitingFor: "human", waitId: "confirm", reason: "need a decision"}));
     await h.kernel.idle();
@@ -97,7 +97,7 @@ describe("leaf settlement", () => {
     await h.kernel.idle();
     expect(h.kernel.listWaits(["reply"])).toHaveLength(1);
     h.script.add("reply", { text: "I cannot proceed", stopReason: "refusal" });
-    h.kernel.directMessage("reply", {text: "结束检查", replyToId: "review"});
+    h.kernel.directMessage("reply", {text: "结束检查", replyToId: "review"}, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     expect(h.kernel.listWaits(["reply"])).toEqual([]);
     expect(results(h)).toMatchObject([{status: "failed", turn: {outcome: "refused"}}]);
@@ -108,7 +108,7 @@ describe("leaf settlement", () => {
     probe(h, "p1");
     h.script.add("p1", () => {
       // More to check arrives while the probe is producing its report (delivered: the probe is still open).
-      expect(h.kernel.sendToCell("p1", { text: "also check the staging deploy" })).toMatchObject({ status: "delivered", targetStatus: "active" });
+      expect(h.kernel.sendToCell("p1", { text: "also check the staging deploy" }, { principalId: h.kernel.ownerPrincipal })).toMatchObject({ status: "delivered", targetStatus: "active" });
       return tool("report_to_parent", { kind: "result", text: "v1: prod deploy is green" });
     });
     h.script.add("p1", (req) => {
@@ -129,7 +129,7 @@ describe("leaf settlement", () => {
     const h = await boot();
     worker(h, "w1");
     h.script.add("w1", () => {
-      h.kernel.sendToCell("w1", { text: "use the develop branch", id: "follow-1" });
+      h.kernel.sendToCell("w1", { text: "use the develop branch", id: "follow-1" }, { principalId: h.kernel.ownerPrincipal });
       return tool("set_state", { patches: { step: 1 } });
     });
     h.script.add("w1", (req) => {
@@ -158,8 +158,8 @@ describe("leaf settlement", () => {
     expect(h.kernel.getCell("w1")!.status).toBe("closed");
     const before = h.kernel.inbox.listMessagesSync({ cellId: "w1" }).length;
 
-    expect(h.kernel.sendToCell("w1", { text: "one more thing" })).toEqual({ status: "closed", closeReason: "completed" });
-    expect(h.kernel.sendToCell("ghost", { text: "?" })).toEqual({ status: "not_found" });
+    expect(h.kernel.sendToCell("w1", { text: "one more thing" }, { principalId: h.kernel.ownerPrincipal })).toEqual({ status: "closed", closeReason: "completed" });
+    expect(h.kernel.sendToCell("ghost", { text: "?" }, { principalId: h.kernel.ownerPrincipal })).toEqual({ status: "not_found" });
 
     let told = "";
     h.script.add("desk", tool("send_message", { to: "inbox:w1", text: "please also add tests", summary: "follow-up" }));
@@ -167,14 +167,14 @@ describe("leaf settlement", () => {
       told = lastToolResult(req);
       return { text: "ok" };
     });
-    await h.ui.capture({ text: "让 w1 再补一下测试" });
+    await h.ui.capture({ text: "让 w1 再补一下测试" }, "owner");
     await h.kernel.idle();
     expect(told).toMatch(/NOT DELIVERED/);
     expect(told).toMatch(/closed/);
     expect(told).toMatch(/spawn_cell/);
     expect(h.kernel.inbox.listMessagesSync({ cellId: "w1" })).toHaveLength(before);
     // control is refused the same way
-    expect(h.kernel.control("w1", { action: "steer", steerMessage: "x" })).toMatchObject({ applied: false });
+    expect(h.kernel.control("w1", { action: "steer", steerMessage: "x" }, { principalId: h.kernel.ownerPrincipal })).toMatchObject({ applied: false });
   });
 
   it("a worker whose turn simply ends is reported with its last words as the result and rests; one that set up a wait is not reported", async () => {
@@ -205,7 +205,7 @@ describe("step limit and refusal are never 'completed'", () => {
   it("queues the continuation before deciding whether a stalled project needs the owner", async () => {
     const h = await boot({kernel: {stallGraceMs: 500}});
     h.kernel.spawnCell("desk", {id:"p", preset:"project", meta:{role:"p"},
-      processor:{kind:"llm", maxSteps:1, toolsets:["kernel.context","kernel.comms"]}});
+      processor:{kind:"llm", maxSteps:1, toolsets:["kernel.context","kernel.comms"]}}, undefined, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     h.script.add("p", tool("set_state", {patches: {step: 1}}), tool("wait", {reason:"等人审阅", waitingFor:"human"}));
     h.clock.advance(500);
@@ -217,7 +217,7 @@ describe("step limit and refusal are never 'completed'", () => {
 
   it("step_limit: the kernel queues a continuation each time, then asks the owner instead of looping; 'continue' grants one more", async () => {
     const h = await boot({ kernel: { maxStepContinuations: 2 } });
-    h.kernel.spawnCell("desk", { id: "w1", preset: "worker", meta: { role: "w1" }, processor: { kind: "llm", toolsets: ["kernel.context", "kernel.comms"], maxSteps: 1 } }, "long job");
+    h.kernel.spawnCell("desk", { id: "w1", preset: "worker", meta: { role: "w1" }, processor: { kind: "llm", toolsets: ["kernel.context", "kernel.comms"], maxSteps: 1 } }, "long job", { principalId: h.kernel.ownerPrincipal });
     // Every Run uses its single step on a tool call and is cut off before it can say anything.
     for (let i = 0; i < 6; i++) h.script.add("w1", tool("set_state", { patches: { n: i } }));
     await h.kernel.idle();
@@ -248,7 +248,7 @@ describe("step limit and refusal are never 'completed'", () => {
     const h = await boot();
     worker(h, "w1");
     probe(h, "p1");
-    h.kernel.spawnCell("desk", { id: "proj", preset: "project", title: "对比任务", meta: { role: "proj" } }, "coordinate");
+    h.kernel.spawnCell("desk", { id: "proj", preset: "project", title: "对比任务", meta: { role: "proj" } }, "coordinate", { principalId: h.kernel.ownerPrincipal });
     h.script.add("w1", { text: "I can't help with that.", stopReason: "refusal" });
     h.script.add("p1", { text: "I can't check that.", stopReason: "refusal" });
     h.script.add("proj", { text: "I won't do this.", stopReason: "refusal" });
@@ -279,7 +279,7 @@ describe("complete_self / pause_self (persistent cells)", () => {
 
   it("complete_self is refused while a child is at work; once its turn is over the project closes after its Run with one result, archiving the dormant worker", async () => {
     const h = await boot({ setup });
-    h.kernel.spawnCell("desk", { id: "proj", preset: "project", title: "TUI 表格复制", meta: { role: "proj" } }, "coordinate");
+    h.kernel.spawnCell("desk", { id: "proj", preset: "project", title: "TUI 表格复制", meta: { role: "proj" } }, "coordinate", { principalId: h.kernel.ownerPrincipal });
     let refusal = "";
     h.script.add("proj", tool("spawn_cell", { preset: "worker", title: "改代码", instruction: "fix", meta: { role: "w" } }));
     h.script.add("proj", tool("complete_self", { summary: "too early" }));
@@ -309,9 +309,9 @@ describe("complete_self / pause_self (persistent cells)", () => {
 
   it("complete_self with a message already waiting does not close: the project handles it first", async () => {
     const h = await boot({ setup });
-    h.kernel.spawnCell("desk", { id: "proj", preset: "project", meta: { role: "proj" } }, "coordinate");
+    h.kernel.spawnCell("desk", { id: "proj", preset: "project", meta: { role: "proj" } }, "coordinate", { principalId: h.kernel.ownerPrincipal });
     h.script.add("proj", () => {
-      h.kernel.sendToCell("proj", { text: "等等，还要补一个录屏" });
+      h.kernel.sendToCell("proj", { text: "等等，还要补一个录屏" }, { principalId: h.kernel.ownerPrincipal });
       return tool("complete_self", { summary: "done" });
     });
     h.script.add("proj", (req) => {
@@ -325,7 +325,7 @@ describe("complete_self / pause_self (persistent cells)", () => {
 
   it("pause_self parks the cell after its Run (everything kept); resume brings it back and what arrived meanwhile is delivered", async () => {
     const h = await boot({ setup });
-    h.kernel.spawnCell("desk", { id: "idea", preset: "project", title: "极简模式", meta: { role: "idea" } }, "research then park");
+    h.kernel.spawnCell("desk", { id: "idea", preset: "project", title: "极简模式", meta: { role: "idea" } }, "research then park", { principalId: h.kernel.ownerPrincipal });
     h.script.add("idea", tool("save_artifact", { title: "竞品调研", body: "# 调研\n…" }));
     h.script.add("idea", tool("pause_self", { reason: "调研完成，等主人决定是否开做" }));
     await h.kernel.idle();
@@ -335,19 +335,19 @@ describe("complete_self / pause_self (persistent cells)", () => {
     expect(results(h)).toEqual([]);
     // Parked cells cost nothing and take no child slot: sixteen of them do not block the next one.
     for (let i = 0; i < 20; i++) {
-      h.kernel.spawnCell("desk", { id: `parked${i}`, preset: "project", processor: { kind: "code", entry: "test.idle" } });
-      h.kernel.control(`parked${i}`, { action: "pause" });
+      h.kernel.spawnCell("desk", { id: `parked${i}`, preset: "project", processor: { kind: "code", entry: "test.idle" } }, undefined, { principalId: h.kernel.ownerPrincipal });
+      h.kernel.control(`parked${i}`, { action: "pause" }, { principalId: h.kernel.ownerPrincipal });
     }
-    h.kernel.spawnCell("desk", { id: "one-more", preset: "worker", processor: { kind: "code", entry: "test.idle" } });
+    h.kernel.spawnCell("desk", { id: "one-more", preset: "worker", processor: { kind: "code", entry: "test.idle" } }, undefined, { principalId: h.kernel.ownerPrincipal });
 
-    expect(h.kernel.sendToCell("idea", { text: "要做个极简模式，现在开做" })).toMatchObject({ status: "delivered", targetStatus: "paused" });
+    expect(h.kernel.sendToCell("idea", { text: "要做个极简模式，现在开做" }, { principalId: h.kernel.ownerPrincipal })).toMatchObject({ status: "delivered", targetStatus: "paused" });
     await h.kernel.idle();
     expect(h.script.callsOf("idea")).toHaveLength(2);
     h.script.add("idea", (req) => {
       expect(requestText(req)).toContain("现在开做");
       return tool("wait", { reason: "拆阶段" });
     });
-    h.kernel.control("idea", { action: "resume" });
+    h.kernel.control("idea", { action: "resume" }, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     expect(h.kernel.getCell("idea")!.status).toBe("active");
     expect(h.script.callsOf("idea")).toHaveLength(3);
@@ -356,7 +356,7 @@ describe("complete_self / pause_self (persistent cells)", () => {
   it("an explicit finish stands even when the same turn arranged a wake-up, and kernel notices on the way never keep a finished cell open", async () => {
     const h = await boot({ setup });
     // (a) dispatch-then-cancel in one turn: the Run is reported as waiting (it spawned), the request still applies.
-    h.kernel.spawnCell("desk", { id: "p1", preset: "project", meta: { role: "p1" } }, "go");
+    h.kernel.spawnCell("desk", { id: "p1", preset: "project", meta: { role: "p1" } }, "go", { principalId: h.kernel.ownerPrincipal });
     // The child is a persistent cell: it settles nothing by itself, so only the cancel below ends it.
     h.script.add("p1", tool("spawn_cell", { preset: "hub", title: "w", instruction: "x", code: { entry: "test.idle" } }));
     h.script.add("p1", (req) => {
@@ -370,18 +370,18 @@ describe("complete_self / pause_self (persistent cells)", () => {
     expect(results(h).filter((r) => r.childCellId === "p1")).toMatchObject([{ status: "cancelled", summary: "主人说不做了" }]);
 
     // (b) a wait's timeout and a stall notice are still on their way when the cell finishes: neither counts as work.
-    h.kernel.spawnCell("desk", { id: "p2", preset: "project", meta: { role: "p2", projectCellId: "p2" } });
+    h.kernel.spawnCell("desk", { id: "p2", preset: "project", meta: { role: "p2", projectCellId: "p2" } }, undefined, { principalId: h.kernel.ownerPrincipal });
     h.kernel.context.commitSync("p2", { statePatches: { "gtd:project": { title: "p2", lifecycle: "active", createdAt: 1, updatedAt: 1 } } });
     await h.kernel.idle();
     expect(h.kernel.inbox.listMessagesSync({ cellId: "p2", type: PAYLOAD.stalledCheck, status: ["pending"] })).toHaveLength(1);
     h.script.add("p2", tool("wait", { reason: "等 desk", waitingFor: "inbox:desk", timeoutMinutes: 60 }));
-    h.kernel.sendToCell("p2", { text: "start" });
+    h.kernel.sendToCell("p2", { text: "start" }, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     // The wait is an anchor again, so the stall notice was withdrawn with the stall.
     expect(h.kernel.inbox.listMessagesSync({ cellId: "p2", type: PAYLOAD.stalledCheck }).map((m) => m.status)).toEqual(["cancelled"]);
     expect(h.kernel.inbox.listMessagesSync({ cellId: "p2", type: PAYLOAD.waitTimeout, status: ["pending"] })).toHaveLength(1);
     h.script.add("p2", tool("complete_self", { summary: "done after all" }));
-    h.kernel.sendToCell("p2", { text: "其实已经做完了，收尾吧" });
+    h.kernel.sendToCell("p2", { text: "其实已经做完了，收尾吧" }, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     expect(h.kernel.getCell("p2")).toMatchObject({ status: "closed", closeReason: "completed" });
     expect(h.kernel.context.readStateSync<{ lifecycle: string }>("p2", "gtd:project")!.lifecycle).toBe("completed");
@@ -416,7 +416,7 @@ describe("complete_self / pause_self (persistent cells)", () => {
       workerTools = ctx.toolNames;
       return { text: "done" };
     });
-    await h.ui.capture({ text: "hi" });
+    await h.ui.capture({ text: "hi" }, "owner");
     await h.kernel.idle();
     expect(deskTools).not.toContain("complete_self");
     expect(workerTools).not.toContain("complete_self");

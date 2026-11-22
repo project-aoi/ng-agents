@@ -12,6 +12,8 @@
 
 **`INV-UC01-04`**　按权限检索历史能覆盖已关闭分身及长输出溢存的文本。
 
+脚本每次收到一个触发信封。脚本从 `NG_TRIGGER_JSON` 读取内容。转义后超过 64 KiB 的信封通过 `NG_TRIGGER_FILE` 提供，文件在本次检查结束后回收。
+
 ## 回归入口
 
 [sources-and-quick-items.test.ts](../../presets/test/sources-and-quick-items.test.ts)、[script-sensor.test.ts](../../presets/test/script-sensor.test.ts)。

@@ -11,12 +11,13 @@
     "test": "vitest run --root ../../ --project @ng/cell"
   },
   "dependencies": {
-    "@ng/protocol": "workspace:*",
     "@ng/channel": "workspace:*",
-    "@ng/inbox": "workspace:*",
     "@ng/context": "workspace:*",
+    "@ng/gate": "workspace:*",
+    "@ng/inbox": "workspace:*",
     "@ng/loop": "workspace:*",
+    "@ng/protocol": "workspace:*",
     "@ng/workspace": "workspace:*",
-    "@ng/gate": "workspace:*"
+    "esbuild": "0.28.2"
   }
 }

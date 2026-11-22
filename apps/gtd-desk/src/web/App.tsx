@@ -53,8 +53,13 @@ function Shell() {
   const quickRef = useRef<HTMLInputElement>(null);
   const mainRef = useRef<HTMLElement>(null);
 
-  const setStatus = statusRes.set;
   const status = statusRes.data;
+  const newestStatus = useRef(status?.generatedAt ?? -Infinity);
+  if (status) newestStatus.current = Math.max(newestStatus.current, status.generatedAt);
+  const setStatus = useCallback((next: StatusDTO) => {
+    newestStatus.current = next.generatedAt;
+    statusRes.set(next);
+  }, [statusRes.set]);
   useEffect(() => {
     if (status) syncServerClock(status.generatedAt);
   }, [status]);
@@ -81,7 +86,7 @@ function Shell() {
 
   const connected = useDeskEvents({
     hello(s, reconnected) {
-      setStatus(s);
+      if (s.generatedAt >= newestStatus.current) setStatus(s);
       // Events may have been missed while the stream was down.
       if (reconnected) bump(ALL_VIEWS);
     },

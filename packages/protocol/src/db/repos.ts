@@ -198,10 +198,10 @@ export function cellsRepo(db: Db, clock: Clock = systemClock): CellsRepo {
         status === "closed"
           ? run(
               db,
-              "UPDATE cells SET status = 'closed', pause_reason=NULL, close_reason = ?, closed_at = COALESCE(closed_at, ?), updated_at = ? WHERE id = ?",
+              "UPDATE cells SET status = 'closed', pause_owner=NULL, pause_reason=NULL, close_reason = ?, closed_at = COALESCE(closed_at, ?), updated_at = ? WHERE id = ?",
               [closeReason ?? "completed", now, now, id],
             )
-          : run(db, "UPDATE cells SET status = ?, pause_reason=?, close_reason = NULL, closed_at = NULL, updated_at = ? WHERE id = ?", [status,status==="paused" ? pauseReason : null, now, id]);
+          : run(db, "UPDATE cells SET status = ?, pause_owner=NULL, pause_reason=?, close_reason = NULL, closed_at = NULL, updated_at = ? WHERE id = ?", [status,status==="paused" ? pauseReason : null, now, id]);
       if (r.changes === 0) throw new NgError("not_found", `cell "${id}" not found`);
     },
     insert(init) {

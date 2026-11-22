@@ -1,6 +1,5 @@
 // The contract between the GTD desk server and its web client: every request body, response body and SSE event.
-// Self-contained on purpose (no imports): the web bundle can import it without pulling in server code, and nothing
-// here uses kernel vocabulary — the client draws every view from these shapes alone (docs/03 铁律 1).
+// Wire types for human decisions and plans are shared with the protocol. Runtime display labels belong to the desk.
 //
 // Conventions:
 // - Times are epoch milliseconds from the server clock. Every view carries `generatedAt` (the server's "now"), so
@@ -14,7 +13,13 @@
 //   messages / control / trigger (always 200, the outcome — not_found included — is in the body), and the two
 //   version-protected saves (409 with ArtifactSaveResponse / PlanSaveResponse).
 
-import type { HumanItem, ProjectProposal } from "@ng/protocol";
+import type { HumanItem, ProjectProposal, HumanDecision } from "@ng/protocol";
+
+export type HumanDecisionRequest = HumanDecision;
+export interface HumanItemsResponse { items: HumanItemDTO[]; openArtifactIds: string[] }
+export interface HumanDecisionResponse { status: string; activityId?: string; deskStatus: StatusDTO }
+export interface UndoResponse { message: string; deskStatus: StatusDTO }
+export interface ClosedProjectsResponse { projects: Array<{id: string; title: string}> }
 
 export interface HumanItemDTO extends HumanItem {
   resumeTarget: {id:string; title:string} | null;
@@ -234,6 +239,7 @@ export interface StatusDTO {
 // ==================== ⚡ 随手记 (POST /api/capture) ====================
 
 export interface CaptureRequest {
+  threads?: string[];
   text: string;
   /** The text is a voice transcript. */
   voice?: boolean;
@@ -270,7 +276,7 @@ export interface PlanSaveRequest {
 }
 
 export type PlanSaveResponse =
-  | { ok: true; outcome: "saved"; message: string; deskStatus: StatusDTO }
+  | { ok: true; outcome: "saved"; message: string; artifact: ArtifactDTO; deskStatus: StatusDTO }
   | { ok: false; outcome: "conflict"; message: string; current: ArtifactDTO };
 
 // ==================== drafts (GET/PUT /api/artifacts/:artifactId) ====================
@@ -386,7 +392,6 @@ export interface AddActionRequest {
 }
 
 // ==================== 分身实况 Agents (GET /api/agents/topology, /api/cells/:cellId/timeline, …) ====================
-// The fourth view: who is there, what each one did, and a box to talk to it. Three views are about matters and
 // decisions; this one is about the cells and what is happening. Everything is projected into plain words — a state is
 // "待命可唤醒", never the machinery behind it — while what a cell actually touched (paths, branches, commits, file
 // names, commands, test output) is passed through verbatim for monospace display.
@@ -404,7 +409,7 @@ export interface ArtifactRefDTO {
  * watch, an answer from another cell · blocked_human: a card or an action of the owner's · dormant: its turn is over,
  * nothing runs, a message wakes it with everything it knows · paused · archived: closed (with its project, or done).
  */
-export type AgentVisualState = "running" | "waiting" | "blocked_human" | "dormant" | "paused" | "archived";
+export type AgentVisualState = "idle" | "running" | "waiting" | "blocked_human" | "dormant" | "paused" | "archived";
 
 export interface TopologyNodeDTO {
   cellId: string;
@@ -583,7 +588,7 @@ export interface SendCellMessageRequest {
   replyToId?: string;
 }
 
-export type SendCellMessageOutcome = "delivered" | "duplicate" | "reopened" | "refused_script" | "refused_archived" | "not_found";
+export type SendCellMessageOutcome = "delivered" | "duplicate" | "reopened" | "refused_script" | "refused_archived" | "refused_paused_parent" | "not_found";
 
 export interface SendCellMessageResponse {
   ok: boolean;
@@ -635,7 +640,6 @@ export interface WeeklyReviewDTO {
   sensorSuggestions: Array<{ sensorId: string; title: string; runCount: number; hitCount: number; reason: string; entry: string | null; buttons: ButtonDTO[] }>;
 }
 
-/** POST /api/review/rules */
 export interface SensorToCodeRequest {
   /** `script:<path>` run in the source's workspace, or a registered check name. */
   entry: string;

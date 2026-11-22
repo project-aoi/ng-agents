@@ -96,6 +96,7 @@ class ClaudeDriver implements CliDriver {
   readonly #seenText = new Set<string>();
   #controlSeq = 0;
   #stopping = false;
+  #completedTurns = 0;
   /** stop_reason of the latest top-level assistant message ("refusal" → the turn is reported as refused). */
   #lastStop: string | null = null;
 
@@ -175,11 +176,12 @@ class ClaudeDriver implements CliDriver {
       case "result": {
         const isError = msg["is_error"] === true;
         const subtype = str(msg["subtype"]) ?? "";
-        if (isError && this.#req.session && num(msg["num_turns"]) === 0 && subtype === "error_during_execution") {
+        if (isError && this.#completedTurns === 0 && this.#req.session && num(msg["num_turns"]) === 0 && subtype === "error_during_execution") {
           out.push({ type: "resume_failed", message: `claude could not ${this.#req.session.mode} session ${this.#req.session.id}` });
           break;
         }
-        const more = num(msg["queued_turn_count"]) > 0;
+        this.#completedTurns++;
+        const more = !isError && num(msg["queued_turn_count"]) > 0;
         const stopped = this.#stopping;
         this.#stopping = false;
         const refused = this.#lastStop === "refusal" || str(msg["stop_reason"]) === "refusal";

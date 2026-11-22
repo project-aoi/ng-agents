@@ -45,8 +45,8 @@ export interface ProbeState {
   last?: string;
   lastExit?: number;
   lastAt?: number;
-  /** The result has been handed over: a later wake-up before the close only repeats "completed". */
-  done?: boolean;
+  /** Re-publish the terminal report if another claim drains before the checker closes. */
+  result?: CellResultPayload;
 }
 
 export const PROBE = {
@@ -107,15 +107,19 @@ export function createCheckProbe(cfg: PresetsConfig): CodeProcessor {
       const self = ports.self.cellId;
       const prev = (await ports.context.readState<ProbeState>(self, KEYS.probe)) ?? { v: 1, checks: 0, cannotRun: 0 };
       // Already reported (a message arrived before the close): the stored result still stands.
-      if (prev.done) return "completed";
+      async function deliver(result: CellResultPayload): Promise<"completed"> {
+        await ports.cancelScheduled({ cellId: self, cancelGroup: PROBE.timers });
+        await ports.emitToParent(PAYLOAD.cellResult, result);
+        return "completed";
+      }
+      if (prev.result) return deliver(prev.result);
 
       const report = async (status: CellResultPayload["status"], summary: string, st: ProbeState, data: Record<string, unknown>, line: string): Promise<"completed"> => {
         const now = clock.now();
         // A leaf's result is stored as the candidate the kernel delivers when this Run settles — exactly once.
-        await ports.emitToParent(PAYLOAD.cellResult, { childCellId: self, status, summary, data: { check: data } } satisfies CellResultPayload);
-        await ports.cancelScheduled({ cellId: self, cancelGroup: PROBE.timers });
-        await ports.context.commit(self, { statePatches: { [KEYS.probe]: { ...st, done: true } satisfies ProbeState, [CELL_STATUS_KEY]: statusLine(line, now) } });
-        return "completed";
+        const result: CellResultPayload = { childCellId: self, status, summary, data: { check: data } };
+        await ports.context.commit(self, { statePatches: { [KEYS.probe]: { ...st, result } satisfies ProbeState, [CELL_STATUS_KEY]: statusLine(line, now) } });
+        return deliver(result);
       };
 
       const a = parseArgs(args);

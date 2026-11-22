@@ -97,12 +97,7 @@ async function waitFor(cond: () => boolean, what: string, ms = 10_000): Promise<
 }
 
 function writerBounds(): PolicyBounds {
-  return makeBounds({ tools: TOOL_KINDS, canSendTo: ["channel:*", "inbox:*"] as Address[], isolation: "none", maxConcurrentChildren: 4, maxDepth: 2 });
-}
-
-/** A writing cell on the owner's machine (isolation none, docs/05 default). */
-function hostBounds(): PolicyBounds {
-  return makeBounds({ ...writerBounds(), tools: [...writerBounds().tools], isolation: "none" });
+  return makeBounds({ tools: TOOL_KINDS, canSendTo: ["channel:*", "inbox:*"] as Address[], maxConcurrentChildren: 4, maxDepth: 2 });
 }
 
 /**
@@ -184,7 +179,7 @@ describe.each(ENGINES)("CLI loop with a fake %s", (engine) => {
   });
 
 
-  it("runs a writing cell on the host (isolation none) unsandboxed with web tools, keeping job tools on MCP", async () => {
+  it("runs a writing cell on the host unsandboxed with web tools, keeping job tools on MCP", async () => {
     const s = setup(engine, [
       {
         actions: [
@@ -194,7 +189,7 @@ describe.each(ENGINES)("CLI loop with a fake %s", (engine) => {
         ],
       },
     ]);
-    const r = s.run({ bounds: hostBounds(), spec: { processor: { kind: "llm", toolsets: TOOLSETS } } });
+    const r = s.run({ bounds: writerBounds(), spec: { processor: { kind: "llm", toolsets: TOOLSETS } } });
     expect(await runOf(s, r)).toBe("yielded_waiting");
     expect(r.ports.log.jobs.map((j) => j.command)).toEqual(["sleep 1"]);
     const launch = launches(s)[0]!;
@@ -220,7 +215,7 @@ describe.each(ENGINES)("CLI loop with a fake %s", (engine) => {
 
   it("tells the CLI how it runs as a cell: kernel tools over MCP, no ask-the-user or plan approval, its own sub-agents allowed, a shared directory", async () => {
     const s = setup(engine, [{ actions: [{ text: "ok" }] }]);
-    const r = s.run({ bounds: hostBounds(), spec: { processor: { kind: "llm", toolsets: TOOLSETS } } });
+    const r = s.run({ bounds: writerBounds(), spec: { processor: { kind: "llm", toolsets: TOOLSETS } } });
     expect(await runOf(s, r)).toBe("completed");
     const [system] = systemTexts(s);
     expect(system).toBeDefined();
@@ -613,17 +608,24 @@ describe("CLI loop errors", () => {
     expect(first.ports.state.get(CLI_SESSION_KEY)).toBeFalsy();
   });
 
-});
-
-  it("requeues an unconfirmed live steer and delivers it once on the next resume", async () => {
-    const s = setup("claude", [{ actions: [{awaitQueuedInput:true}, {mcp:"wait",args:{reason:"waiting for input"}}] },
-      {actions:[{text:"continued"}]}],{endRunGraceMs:100});
+  it.each(["claude", "agy"] as const)("%s requeues an unconfirmed live steer and delivers it once on resume", async engine => {
+    const hold = join(tempDir("cancelled-turn"), "release");
+    const turns: FakeCliTurn[] = [{acknowledgeCancelDuringTool: true, actions:[{mcp:"wait",args:{reason:"waiting for input", waitingFor:"human"}}]}];
+    if (engine === "agy") turns.push({actions: [{waitFile: hold}]});
+    turns.push({actions: [{text: "continued"}]});
+    const s = setup(engine, turns, {endRunGraceMs:100});
     const first = s.run();
     await recordBatch(first);
     const cursor = watchCursor(first);
+    let releaseWait!: () => void;
+    const waitBarrier = new Promise<void>(resolve => { releaseWait = resolve; });
+    first.ports.registerWait = () => waitBarrier;
     const outcome = runOf(s,first);
-    await waitFor(()=>s.fake.prompts().length>0,"the first prompt");
+    await waitFor(() => first.ports.log.evidence.some(e => e.kind === "tool_call" && e.name === "wait"), "wait tool entered");
     first.ports.pushSteer("review the red folder");
+    await waitFor(() => first.ports.log.evidence.some(e => e.kind === "system_note" && e.envelopeId === "steer_1"), "steer written during wait");
+    if (engine === "agy") await waitFor(() => s.fake.log().some(e => e.type === "waiting_file" && e.path === hold), "steer started its next turn");
+    releaseWait();
     expect(await outcome).toBe("yielded_waiting");
     expect(first.ports.log.requeued.flatMap(r=>r.envelopeIds)).toEqual(["steer_1"]);
     expect(cursor.at(-1)).toBe(1);
@@ -639,3 +641,4 @@ describe("CLI loop errors", () => {
     expect(launches(s).at(-1)?.session?.mode).toBe("resume");
     expect(s.fake.prompts().at(-1)?.match(/review the red folder/g)).toHaveLength(1);
   });
+});

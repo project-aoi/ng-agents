@@ -80,6 +80,10 @@ export function psStat(pid: number): string | null {
   }
 }
 
+export function leaderGoneOrZombie(pid: number): boolean {
+  return !pidAlive(pid) || psStat(pid)?.includes("Z") === true;
+}
+
 /** Snapshot of `(pid, ppid)` pairs via POSIX `ps` (used for descendant lookup when `/proc` is absent, e.g. macOS). */
 export function psParentChild(): Array<{ pid: number; ppid: number }> | null {
   try {
@@ -152,23 +156,34 @@ export function processHasMarker(pid: number, name: string, value: string, ident
   return current && identity ? current === identity : null;
 }
 
-/** Recheck a detached group after its recorded leader has exited. A recycled leader never authorizes a signal. */
-export function markedGroupState(pid: number, name: string, value: string, identity?: string | null): boolean | null {
-  const leader = processHasMarker(pid, name, value, identity);
-  if (leader !== false || pidAlive(pid) || !groupAlive(pid)) return leader;
+/** Non-zombie members of a process group. A failed inspection leaves liveness unknown. */
+export function liveGroupMembers(pgid: number): number[] | null {
+  if (!groupAlive(pgid)) return [];
   try {
-    const listing = execFileSync("ps", ["-eo", "pid=,pgid="], { encoding: "utf8", timeout: 2_000, stdio: ["ignore", "pipe", "ignore"] });
+    const listing = execFileSync("ps", ["-eo", "pid=,pgid=,stat="], { encoding: "utf8", timeout: 2_000, stdio: ["ignore", "pipe", "ignore"] });
+    const members: number[] = [];
     for (const line of listing.trim().split("\n")) {
-      const [member, group] = line.trim().split(/\s+/).map(Number);
-      if (!member || group !== pid) continue;
-      const state = processHasMarker(member, name, value);
-      if (state === true) return true;
+      const [pidText, groupText, stat] = line.trim().split(/\s+/);
+      if (Number(groupText) === pgid && stat && !stat.includes("Z")) members.push(Number(pidText));
     }
-    // Descendants may clear the inherited marker. Keep the group under observation until it exits.
-    return groupAlive(pid) ? null : false;
+    return members;
   } catch {
-    return groupAlive(pid) ? null : false;
+    return groupAlive(pgid) ? null : [];
   }
+}
+
+/** Recheck a detached group after its recorded leader has exited. A recycled leader never authorizes a signal. */
+export function markedGroupState(pid: number, name: string, value: string, identity?: string | null, witnesses?: ReadonlyMap<number, string>): boolean | null {
+  const leader = processHasMarker(pid, name, value, identity);
+  if (leader === true || !leaderGoneOrZombie(pid)) return leader;
+  const members = liveGroupMembers(pid);
+  if (!members) return null;
+  for (const member of members) {
+    const witness = witnesses?.get(member);
+    if (witness && processInspection.readIdentity(member) === witness) return true;
+    if (processHasMarker(member, name, value) === true) return true;
+  }
+  return members.length ? null : false;
 }
 
 /** Only a process positively identified by its marker counts: one we cannot identify is never signalled as ours. */

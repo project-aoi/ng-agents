@@ -1,4 +1,4 @@
-import type { ProcessorSpec, ToolKind } from "@ng/protocol";
+import type { ProcessorSpec } from "@ng/protocol";
 import { PROMPTS, STD, TOOLSETS } from "./config";
 import { SKILL_DOMAIN_HUB, SKILL_PROJECT_RELAY } from "./skills";
 
@@ -54,11 +54,3 @@ export const SENSOR_LLM_PROCESSOR: ProcessorSpec = {
   modelTier: "fast",
   toolsets: [TOOLSETS.sensor, STD.context, STD.workspace],
 };
-
-/**
- * Tool kinds for a bounds *request* that travels as JSON (inside a task payload or a stored spec): a Set would
- * serialize to `{}`, so the request carries an array, which attenuation accepts.
- */
-export function toolKinds(...kinds: ToolKind[]): ReadonlySet<ToolKind> {
-  return kinds as unknown as ReadonlySet<ToolKind>;
-}

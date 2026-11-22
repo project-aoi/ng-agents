@@ -4,7 +4,7 @@ import {
   defineTool,
   isAddress,
   TOOL_KINDS,
-  ISOLATION_LEVELS,
+
   type Address,
   type CellSpec,
   type PolicyBounds,
@@ -17,12 +17,12 @@ import {
 export const CELLS_TOOLSET = "kernel.cells";
 
 const watchInput = z.object({
-  thread: z.string().optional().describe('external thread id "<channelId>:<threadId>", e.g. "github:org/repo#108"'),
+  thread: z.string().optional().describe('exact workbench topic thread from an incoming envelope (must start with "ui:", e.g. "ui:reviews")'),
   filter: z
     .record(z.string(), z.unknown())
     .optional()
     .describe(
-      'match on envelope fields (type, principalId, from) or payload.<key> (payload.text, payload.eventKind, payload.mentions, payload.tags, payload.sender.id). A value is compared for equality, or use one operator: {"$in": [..]}, {"$contains": "x"} (substring of a string / element of a list, case-insensitive), {"$anyKeyword": ["a", "b"]}',
+      'match on envelope fields (type, principalId, from) or payload.<key> (such as payload.text). A value is compared for equality, or use one operator: {"$in": [..]}, {"$contains": "x"} (substring of a string / element of a list, case-insensitive), {"$anyKeyword": ["a", "b"]}',
     ),
   cancelGroup: z.string().optional(),
   coalesceMinutes: z
@@ -42,7 +42,6 @@ const scheduleInput = z.object({
 const boundsInput = z.object({
   tools: z.array(z.enum(TOOL_KINDS)).optional(),
   canSendTo: z.array(z.string()).optional().describe("addresses the child can notify (channel:ui:owner for the owner; internal inboxes are always reachable)"),
-  isolation: z.enum(ISOLATION_LEVELS).optional(),
   maxConcurrentChildren: z.number().int().min(0).optional(),
   maxDepth: z.number().int().min(0).optional(),
 });
@@ -81,7 +80,7 @@ function toBounds(b: z.infer<typeof boundsInput>): Partial<PolicyBounds> {
     if (bad.length) throw new Error(`not addresses: ${bad.join(", ")}`);
     out.canSendTo = b.canSendTo as Address[];
   }
-  if (b.isolation) out.isolation = b.isolation;
+
   if (b.maxConcurrentChildren !== undefined) out.maxConcurrentChildren = b.maxConcurrentChildren;
   if (b.maxDepth !== undefined) out.maxDepth = b.maxDepth;
   return out;
@@ -101,8 +100,8 @@ export function cellsToolset(registry: Registry): Toolset {
     kind: "kernel",
     availableFor: canSpawn,
     description: [
-      "Start a child cell for work that should not block you. It runs in the background and reports to your inbox (cell.result / cell.progress); your in-flight cells are listed at the end of every wake-up message.",
-      "cwd is the directory on this machine the child works in (an absolute path that exists; ask the owner when you do not know it — never guess). A child without cwd inherits yours. It starts at once: nothing queues or locks a directory. The note \"active workspaces\" at the end of your wake-up message shows who is working where right now — if someone is already changing that repository, say in the instruction how to share it (only look; or work in a `git worktree` of its own), or send the work to the cell that is already there.",
+      "Start a child cell for work that should not block you. It runs in the background and reports to your inbox (cell.result / cell.progress); your in-flight cells are listed at the start of every wake-up message.",
+      "cwd is the directory on this machine the child works in (an absolute path that exists; ask the owner when you do not know it — never guess). A child without cwd inherits yours. It starts at once: nothing queues or locks a directory. The note \"active workspaces\" at the start of your wake-up message shows who is working where right now — if someone is already changing that repository, say in the instruction how to share it (only look; or work in a `git worktree` of its own), or send the work to the cell that is already there.",
       "Its permissions are always a subset of yours. Give it everything it needs in the instruction: it does not see your conversation (unless contextMode fork_prefix).",
     ].join(" "),
     input: z.object({
@@ -222,7 +221,7 @@ export function cellsToolset(registry: Registry): Toolset {
       const closed = /closed/i.test(r.reason ?? "");
       return {
         output: closed
-          ? `NOT APPLIED — ${args.cellId} is closed. If the work still needs doing, start a new worker with spawn_cell and give it the context.`
+          ? `NOT APPLIED — ${args.cellId} is closed. If the work still needs doing, start a new worker (use dispatch inside a project, or spawn_cell otherwise) and give it the context.`
           : `Not applied to ${args.cellId}: ${r.reason ?? "refused"}.`,
         isError: true,
         data: r,

@@ -98,7 +98,7 @@ export function createArtifacts(deps: Deps): ArtifactsModule {
       }
       return { kind: "create" };
     }
-    // [docs/05 §3.4 guard 3] Any cell may revise an artifact, but only from the version it read: an update without
+    // [docs/05 §3.4 guard 3] An authorized writer may revise an artifact from the version it read: an update without
     // expectedVersion is a conflict like a stale one, so concurrent revisers can never silently overwrite each other.
     if (w.expectedVersion === current.version) return { kind: "update", current };
     return { kind: "conflict", current, park: w.updatedBy === "agent" && current.updatedBy === "human" };

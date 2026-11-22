@@ -1,4 +1,4 @@
-import {runtimeVersion} from "./release";
+import { runtimeVersion } from "./release";
 import { createHumanItems } from "./human-items";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -21,7 +21,7 @@ import {
 import {
   cellsRepo,
   KERNEL_FROM,
-  newId,
+  newId, requirePrincipalId,
   createBus,
   createRegistry,
   NgError,
@@ -65,7 +65,7 @@ function isSubscribable(clock: Clock): clock is SubscribableClock {
  *
  *   const kernel = createKernel({ dataDir, agentBackend: "auto" });
  *   registerPresets(kernel.registry);
- *   kernel.ensureRootCell({ id: "desk", preset: "inline", processor: … });
+ *   kernel.ensureRootCell({ id: "desk", preset: "inline", processor: … }, { principalId: kernel.ownerPrincipal });
  *   await kernel.start();
  */
 export function createKernel(opts: KernelOptions = {}): Kernel {
@@ -107,6 +107,7 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     bus,
     clock,
     ownerPrincipal,
+    onSnooze: (id, until, actor) => core.humanItems.armResurface(id, until, actor),
     onSuperseded: (record, actor) => core.humanItems.superseded(record, actor),
   });
   const inbox = createInbox({
@@ -253,6 +254,7 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
 
   // ---------- wiring ----------
   const unsubscribe: Array<() => void> = [];
+  unsubscribe.push(bus.on("job.changed", e => { if (e.state !== "running") dispatcher.notify(e.cellId); }));
   unsubscribe.push(bus.on("inbox.enqueued", (e) => dispatcher.notify(e.cellId)));
   unsubscribe.push(
     bus.on("inbox.dead", (e) => {
@@ -267,9 +269,7 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
         dispatcher.abortCells(ids, "cancel");
       } else if (ev.action === "pause") {
         dispatcher.abortCells(ids, "pause");
-        void track(
-          Promise.all(ids.map((id) => workspace.cancelJobsForCell(id).catch((err: unknown) => onError(err, `cancel jobs of paused ${id}`)))),
-        );
+        void track(lifecycle.cleanupPaused(ids));
       }
     }),
   );
@@ -310,11 +310,12 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
         else if (r.status === "owned") dispatcher.holdForUnknownOrphan(r.cellId);
         else if (r.status === "unknown") {
           dispatcher.holdForUnknownOrphan(r.cellId);
-          onError(new Error(`deferred cell "${r.cellId}": CLI pid ${r.pid} in ${r.cwd} is alive with unreadable identity; checking the recorded identity for up to 30 seconds`), "recovery");
+          onError(new Error(`deferred cell "${r.cellId}": CLI pid ${r.pid} in ${r.cwd} is alive with unreadable identity; dispatch remains blocked until ownership or exit is confirmed`), "recovery");
         }
       }
     } catch (err) {
       onError(err, "CLI process recovery");
+      throw err;
     }
     try {
       // Resume interrupted cancellations. Jobs whose exit cannot be verified remain active in the workspace.
@@ -407,14 +408,15 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     updateCell: (cellId, patch, o) => lifecycle.updateCell(cellId, patch, o),
     closeCell: (cellId, reason, o) => lifecycle.closeCell(cellId, reason, o),
     control: (cellId, cmd, o) => {
-      const principalId = o?.principalId ?? ownerPrincipal;
+      const principalId = requirePrincipalId(o?.principalId);
       const command = { action: cmd.action, principalId,...(cmd.pauseReason ? {pauseReason:cmd.pauseReason} : {}), ...(cmd.steerMessage !== undefined ? { steerMessage: cmd.steerMessage } : {}) };
       if (cmd.action !== "steer" || !isPersonPrincipal(core, principalId)) return inbox.controlSync(cellId, command);
       // A person's steer is a direct message like any other: the worker's parent gets the words in the same transaction.
       return withTx(db, () => {
-        const r = inbox.controlSync(cellId, command);
+        const messageId = newId("steer", clock);
+        const r = inbox.controlSync(cellId, {...command, steerEnvelopeId: messageId});
         const target = cells.get(cellId);
-        if (r.applied && target) ccDirectChat(core, target, { text: cmd.steerMessage ?? "", mode: "steer", messageId: newId("msg", clock), principalId });
+        if (r.applied && target) ccDirectChat(core, target, { text: cmd.steerMessage ?? "", mode: "steer", messageId, principalId });
         return r;
       });
     },
@@ -429,12 +431,12 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     activeRuns: () => dispatcher.activeRuns(),
     activeWorkspaces: () => core.readModel.activeWorkspaces(),
     activityOf: (cellIds) => core.readModel.activityOf(cellIds),
-    directMessage: (cellId, message, o) => directMessage(core, cellId, message, o?.principalId ?? ownerPrincipal),
+    directMessage: (cellId, message, o) => directMessage(core, cellId, message, requirePrincipalId(o?.principalId)),
     inspectCell: (cellId, o) => inspectCell(core, cellId, o),
     anchorsOf: (cellId) => core.readModel.anchorsOf(cellId),
     listWaits: (cellIds) => core.waits.list(cellIds),
     sendToCell: (cellId, message, o) => {
-      const principalId = o?.principalId ?? ownerPrincipal;
+      const principalId = requirePrincipalId(o?.principalId);
       return sendCellMessage(core, { from: KERNEL_FROM.control, principalId, sender: principalId, toCellId: cellId, id: message.id ?? newId("msg", clock), message });
     },
     checkStalls: () => void core.stall.evaluate(),

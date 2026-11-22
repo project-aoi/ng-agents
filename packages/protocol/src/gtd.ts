@@ -1,15 +1,10 @@
 import type { CellSpec } from "./contract/cell";
-import type { Envelope } from "./contract/envelope";
 
-// GTD records are Context state under conventional keys (IMPL_BRIEF §2.8) — the kernel has no project/task tables.
-// The three UI views are projections over cells + cell_state + human_items + artifacts + inbox_messages.
+// Wire contracts shared by the workbench, its presets and the kernel.
 
 // ==================== keys ====================
 
-/**
- * Gate keeps at most one pending card per subjectKey ("同一事项至多一张卡"). Everything inside a project shares the
- * project's subject, so a project never shows two cards at once; a one-off inbound item uses its envelope id.
- */
+/** The issuer and subject identify an active decision together. */
 export const subjectKeys = {
   project: (projectCellId: string) => `project:${projectCellId}`,
   inbound: (envelopeId: string) => `msg:${envelopeId}`,
@@ -28,38 +23,10 @@ export function projectCellIdOf(spec: Pick<CellSpec, "meta">): string | undefine
 
 // ==================== ball owner (docs/03 principle 3, docs/04 §4) ====================
 
-/**
- * human = 🔵 我来处理 (@Human) · agent = 🟢 Agent 处理中 (@Agent) · waiting = 🟡 等待外部 (@Waiting: a CI gate, a merge, a
- * colleague's reply, a lock to be released — the action's own title says what exactly is awaited).
- */
 export type BallOwner = "human" | "agent" | "waiting";
-
-/** Display priority when aggregating a project's open actions: 🔵 > 🟢 > 🟡. */
-const BALL_OWNER_PRIORITY: readonly BallOwner[] = ["human", "agent", "waiting"];
-
-export const BALL_OWNER_LABEL: Readonly<Record<BallOwner, string>> = {
-  human: "🔵 我来处理",
-  agent: "🟢 Agent 处理中",
-  waiting: "🟡 等待外部",
-};
-
-export function compareBallOwner(a: BallOwner, b: BallOwner): number {
-  return BALL_OWNER_PRIORITY.indexOf(a) - BALL_OWNER_PRIORITY.indexOf(b);
-}
-
-/** The ball owner a project row shows: the highest-priority owner among its open actions (null if none open). */
-export function topBallOwner(actions: Iterable<Pick<ActionRecord, "owner" | "status">>): BallOwner | null {
-  let best: BallOwner | null = null;
-  for (const a of actions) {
-    if (a.status !== "open") continue;
-    if (best === null || compareBallOwner(a.owner, best) < 0) best = a.owner;
-  }
-  return best;
-}
 
 // ==================== records ====================
 
-export type ProjectLifecycle = "active" | "completed" | "cancelled";
 export type Effort = "15m" | "45m" | "low_energy";
 
 export interface Progress {
@@ -82,21 +49,6 @@ export interface ReferenceLink {
   label: string;
   uri: string;
   detail?: string;
-}
-
-/** In a project root cell. */
-export interface ProjectRecord {
-  title: string;
-  outcome?: string;                     // what "done" looks like
-  lifecycle: ProjectLifecycle;
-  source?: ItemSource;
-  createdAt: number;
-  updatedAt: number;
-  completedAt?: number;
-  /** [docs/05] One line on where things stand, kept by the project cell. */
-  summary?: string;
-  /** [docs/05] The approved plan the project was started from (kept so a someday project can be reactivated as is). */
-  proposal?: ProjectProposal;
 }
 
 export interface WaitingParty {
@@ -136,52 +88,12 @@ export interface ActionRecord {
   createdAt: number;
   updatedAt: number;
   completedAt?: number;
+  /** The project closure that cancelled this previously open action. */
+  closedEpoch?: number;
   /** [docs/05] The child cell (worker / checker) carrying this action while its owner is "agent" or "waiting". */
   cellId?: string;
   /** [docs/05] Phase of a staged project this action belongs to (1-based); later phases start after the owner's go-ahead. */
   phase?: number;
-}
-
-export type ActivityKind =
-  | "notification_archived"             // pure notification filtered silently
-  | "note_saved"                        // zero-side-effect capture stored directly
-  | "reminder_set"
-  | "card_withdrawn"                    // e.g. someone already answered in the group
-  | "action_completed";
-
-/** In the desk cell — the "后台已静默归档 N 条通知" drawer; records the original item for restoration. */
-export interface ActivityRecord {
-  id: string;
-  kind: ActivityKind;
-  title: string;
-  detail?: string;
-  at: number;
-  source?: ItemSource;
-  rawInput?: string;
-  envelope?: Envelope;                  // original inbound envelope, re-enqueued to the desk on "交回主台"
-  actionId?: string;                    // the withdrawn approval, for card_withdrawn
-  remindAt?: number;                    // for reminder_set
-  restorable: boolean;
-  restoredAt?: number;
-}
-
-/** In a sensor cell — shown in the 信源 drawer, never in the project list. */
-export interface SourceRecord {
-  title: string;
-  description?: string;
-  kind: "cron" | "watch";
-  schedule?: { cron?: string; tz?: string };
-  mode: "active" | "observe";           // observe = write observation notes only, never post to the desk
-  status: "ok" | "error" | "paused";
-  processor: "code" | "llm";
-  lastRunAt?: number;
-  lastCheckKey?: string;
-  lastHitAt?: number;
-  lastError?: string;
-  runCount: number;
-  hitCount: number;
-  createdAt: number;
-  updatedAt: number;
 }
 
 // ==================== Project proposals and escalations ====================
@@ -237,7 +149,8 @@ export function isProjectProposal(value: unknown): value is ProjectProposal {
   const p = value as Partial<ProjectProposal>;
   const text = (v:unknown): v is string => typeof v==="string" && v.trim().length>0;
   return text(p.title) && text(p.outcome) && Array.isArray(p.actions) &&
-    p.actions.every(a=>a && text(a.title) && ["human","agent","waiting"].includes(a.owner) && (a.nextStep===undefined || typeof a.nextStep==="string")) &&
+    p.actions.every(a=>a && text(a.title) && ["human","agent","waiting"].includes(a.owner) &&
+      (a.effort === undefined || ["15m", "45m", "low_energy"].includes(a.effort)) && (a.nextStep===undefined || typeof a.nextStep==="string")) &&
     (p.cwd===undefined || text(p.cwd)) && (p.background===undefined || typeof p.background==="string") &&
     (p.phases===undefined || Array.isArray(p.phases) && p.phases.every(text)) &&
     (p.repos===undefined || Array.isArray(p.repos) && p.repos.every(r=>r && text(r.name) && text(r.cwd) && (r.defaultBranch===undefined || text(r.defaultBranch))));

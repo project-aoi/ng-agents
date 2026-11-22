@@ -1,11 +1,9 @@
 import { gtdKeys, readHumanActionRecords } from "@ng/presets";
 import { isProjectRoot, type Kernel } from "@ng/cell";
+import { sourceRecordFor, type ActivityRecord, type ProjectRecord, type SourceRecord, type SourceState } from "@ng/presets/records";
 import {
   type ActionRecord,
-  type ActivityRecord,
   type BallOwner,
-  type ProjectRecord,
-  type SourceRecord,
 } from "@ng/protocol";
 
 /** What the projections read: the kernel's stores and read models, never its mutating methods. */
@@ -126,21 +124,6 @@ export function asActivity(key: string, value: unknown, updatedAt: number): Acti
   return { ...(value as unknown as ActivityRecord), id, at: num(value["at"], updatedAt), restorable: value["restorable"] === true };
 }
 
-export function asSource(value: unknown, updatedAt: number): SourceRecord | null {
-  if (!isObj(value) || typeof value["title"] !== "string") return null;
-  return {
-    ...(value as unknown as SourceRecord),
-    kind: (["cron", "watch"] as const).includes(value["kind"] as never) ? (value["kind"] as SourceRecord["kind"]) : "cron",
-    mode: value["mode"] === "observe" ? "observe" : "active",
-    status: value["status"] === "error" || value["status"] === "paused" ? value["status"] : "ok",
-    processor: value["processor"] === "code" ? "code" : "llm",
-    runCount: num(value["runCount"], 0),
-    hitCount: num(value["hitCount"], 0),
-    createdAt: num(value["createdAt"], updatedAt),
-    updatedAt: num(value["updatedAt"], updatedAt),
-  };
-}
-
 export function readActions(kernel: DeskKernel): Array<Located<ActionRecord>> {
   const out: Array<Located<ActionRecord>> = [];
   for (const e of kernel.context.queryStateSync({ keyPrefix: gtdKeys.actionPrefix })) {
@@ -177,14 +160,10 @@ export function readSources(kernel: DeskKernel): Array<Located<SourceRecord>> {
   const out: Array<Located<SourceRecord>> = [];
   for (const e of kernel.context.queryStateSync({ keyPrefix: gtdKeys.source })) {
     if (e.key !== gtdKeys.source) continue;
-    const record = asSource(e.value, e.updatedAt);
     const cell = kernel.getCell(e.cellId);
-    if (record && cell) {
-      record.status = cell.status === "paused" ? "paused" : record.lastError ? "error" : "ok";
-      record.processor = cell.spec.processor.kind === "llm" ? "llm" : "code";
-      const rule = cell.spec.schedules?.find(rule => rule.cron);
-      if (rule?.cron) record.schedule = { cron: rule.cron, ...(rule.tz && { tz: rule.tz }) };
-      out.push({ cellId: e.cellId, key: e.key, record, updatedAt: e.updatedAt });
+    if (cell && isObj(e.value) && typeof e.value.title === "string") {
+      const record = sourceRecordFor(cell, e.value as unknown as SourceState);
+      out.push({cellId: cell.id, key: e.key, record, updatedAt: e.updatedAt});
     }
   }
   return out;

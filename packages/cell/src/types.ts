@@ -106,12 +106,12 @@ export interface KernelOptions {
 }
 
 /**
- * Who is asking. Default: the owner. Cells act as `cell:<id>` and may only touch their own descendants (and, for
+ * Who is asking. All entry points require an explicit principal. Cells act as `cell:<id>` and may only touch their own descendants (and, for
  * watches/schedules/title/meta, themselves). An external main agent acts as `agent:<id>`: it may orchestrate any cell
  * but never widens bounds or approves a project proposal (docs/05 §5.3).
  */
 export interface ActorOptions {
-  principalId?: string;
+  principalId: string;
 }
 
 export interface RootCellOptions extends ActorOptions {
@@ -120,6 +120,11 @@ export interface RootCellOptions extends ActorOptions {
 }
 
 export interface SpawnOptions extends ActorOptions {}
+
+export interface CloseActorOptions extends ActorOptions {
+  /** Keep the parent informed without waking it for a routine closure. */
+  parentDelivery?: "wakeup" | "silent_inject";
+}
 
 export interface CloseResult {
   /** Cells closed by this call (target first, then descendants), empty when the target was already closed. */
@@ -239,19 +244,19 @@ export interface Kernel {
   idle(opts?: IdleOptions): Promise<void>;
 
   // ---------- cell lifecycle (the DB part commits before these return) ----------
-  createRootCell(spec: CellSpecInput, opts?: RootCellOptions): CellRecord;
+  createRootCell(spec: CellSpecInput, opts: RootCellOptions): CellRecord;
   /** createRootCell unless a cell with `spec.id` exists (then it is returned unchanged). */
-  ensureRootCell(spec: CellSpecInput & { id: string }, opts?: RootCellOptions): CellRecord;
-  spawnCell(parentId: string, spec: CellSpecInput, initialPayload?: unknown, opts?: SpawnOptions): InboxAddr;
-  updateCell(cellId: string, patch: Partial<CellSpec>, opts?: ActorOptions): CellRecord;
+  ensureRootCell(spec: CellSpecInput & { id: string }, opts: RootCellOptions): CellRecord;
+  spawnCell(parentId: string, spec: CellSpecInput, initialPayload: unknown, opts: SpawnOptions): InboxAddr;
+  updateCell(cellId: string, patch: Partial<CellSpec>, opts: ActorOptions): CellRecord;
   /**
    * Cascade over the subtree in one transaction (epochs, status, pending messages, schedules, watches, waits,
    * pending decisions and project records); the returned promise settles after Runs are aborted and the runtime is stopped
    * (jobs cancelled and their processes confirmed gone). Nothing on disk is touched.
    */
-  closeCell(cellId: string, reason?: CloseReason, opts?: ActorOptions): Promise<CloseResult>;
-  /** Inbox.control as the owner (or `opts.principalId`); the kernel aborts Runs / cancels Jobs / closes on cancel. */
-  control(cellId: string, cmd: { action: ControlAction; steerMessage?: string;pauseReason?:"manual"|"parked" }, opts?: ActorOptions): ControlResult;
+  closeCell(cellId: string, reason: CloseReason | undefined, opts: CloseActorOptions): Promise<CloseResult>;
+  /** Inbox.control as `opts.principalId`; the kernel aborts Runs / cancels Jobs / closes on cancel. */
+  control(cellId: string, cmd: { action: ControlAction; steerMessage?: string;pauseReason?:"manual"|"parked" }, opts: ActorOptions): ControlResult;
 
   // ---------- ingress and approvals ----------
   /** The hub's ingress sink: route by watches (thread / filter), else to the desk; durably enqueued before it resolves. */
@@ -278,7 +283,7 @@ export interface Kernel {
    * owner's words — background by default — so it is never behind on what its worker was told. Script cells and cells
    * archived with a finished project are refused.
    */
-  directMessage(cellId: string, message: DirectMessage, opts?: ActorOptions): DirectMessageResult;
+  directMessage(cellId: string, message: DirectMessage, opts: ActorOptions): DirectMessageResult;
   /** RunPorts.inspectCell for the control plane: nobody's cursor moves. */
   inspectCell(cellId: string, opts?: InspectCellOptions): CellInspection;
   /** The five anchors of a (project) cell's subtree; `stalled` = none of them holds. */
@@ -286,11 +291,11 @@ export interface Kernel {
   /** Open waits of these cells (all cells when omitted). */
   listWaits(cellIds?: readonly string[]): WaitRecord[];
   /**
-   * Cell-to-cell message as `principalId` (default: the owner) — the control plane's twin of RunPorts.sendToCell:
+   * Cell-to-cell message as the explicit `principalId` — the control plane's twin of RunPorts.sendToCell:
    * `closed` / `not_found` are answers, not errors. From the owner or an agent to a leaf below a coordinator, the
    * coordinator gets the same carbon copy as with directMessage (which is what a chat surface should call).
    */
-  sendToCell(cellId: string, message: CellMessageDraft, opts?: ActorOptions): SendToCellResult;
+  sendToCell(cellId: string, message: CellMessageDraft, opts: ActorOptions): SendToCellResult;
   /** Re-evaluate the stall check now (tests, and the app after it changed GTD records itself). */
   checkStalls(): void;
 
@@ -353,7 +358,7 @@ export type DirectMessageResult =
     }
   | { status: "not_found" }
   /** `code`: a deterministic script cell takes no conversation; `archived`: closed with a closed or finished parent. */
-  | { status: "refused"; reason: "code" | "archived" | "not_allowed"; detail: string };
+  | { status: "refused"; reason: "code" | "archived" | "paused_parent" | "not_allowed"; detail: string };
 
 /** RunOutcome plus "error" (the Run threw), as reported on `run.finished`. */
 export type RunResult = RunOutcome | "error";

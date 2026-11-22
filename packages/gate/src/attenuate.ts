@@ -73,7 +73,6 @@ export function meetBounds(a: PolicyBounds, b: PolicyBounds): PolicyBounds {
   return {
     tools: new Set(members(a.tools).filter((t): t is ToolKind => isToolKind(t) && bTools.has(t))),
     canSendTo: intersectPatterns(members(a.canSendTo), members(b.canSendTo)),
-    isolation: "none",
     maxConcurrentChildren: Math.min(nonNegInt(a.maxConcurrentChildren), nonNegInt(b.maxConcurrentChildren)),
     maxDepth: Math.min(nonNegInt(a.maxDepth), nonNegInt(b.maxDepth)),
   };
@@ -117,7 +116,6 @@ export function attenuateBounds(
   const result: PolicyBounds = {
     tools: new Set(tools),
     canSendTo,
-    isolation: "none",
     maxConcurrentChildren: clampInt(req.maxConcurrentChildren, nonNegInt(parent.maxConcurrentChildren)),
     maxDepth: clampInt(req.maxDepth, parentDepth - 1),
   };

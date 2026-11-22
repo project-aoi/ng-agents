@@ -1,4 +1,4 @@
-import type { ProjectProposal } from "../gtd";
+import { isProjectProposal, type ProjectProposal } from "../gtd";
 import { sha256Hex, stableStringify } from "../json";
 import type { Deliverable } from "./deliverable";
 import type { PolicyBounds } from "./envelope";
@@ -13,7 +13,7 @@ export interface Gate {
   listPendingSync(filter?: PendingFilter): ApprovalRecord[];
   getApprovalSync(actionId: string): ApprovalRecord | undefined;
   findPendingBySubjectSync(subjectKey: string, cellId: string): ApprovalRecord | undefined;
-  snoozeSync(actionId: string, until: number, opts?: { seenItemRevision?: number }): "snoozed" | "not_pending" | "revision_mismatch";
+  snoozeSync(actionId: string, until: number, opts?: { seenItemRevision?: number; approverId?: string }): "snoozed" | "not_pending" | "revision_mismatch";
   denySync(actionId: string, approverId: string, reason?: string, opts?: { seenItemRevision?: number }): "denied" | "not_pending" | "revision_mismatch";
   /** Record an accepted revise instruction against a pending card: checks & increments itemRevision in the same tx. */
   reviseSync(
@@ -52,6 +52,34 @@ export interface CustomAction extends ActionBase {
 
 export type ProposedAction = ProjectStartAction | CustomAction;
 export type ProposedActionType = ProposedAction["type"];
+
+const ACTION_TYPES = ["project.start", "custom"];
+const SIDE_EFFECTS = ["none", "internal", "notify_owner", "external"];
+const isObject = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
+const isNonEmptyString = (v: unknown): v is string => typeof v === "string" && v.length > 0;
+
+/** Shape check of the common fields; returns model-facing feedback, or null when well-formed. */
+export function actionShapeFeedback(action: unknown): string | null {
+  if (!isObject(action)) return "invalid action: expected an object";
+  if (!(ACTION_TYPES as readonly unknown[]).includes(action["type"])) return `invalid action: unknown type ${JSON.stringify(action["type"])}`;
+  if (typeof action["summary"] !== "string") return "invalid action: summary must be a string";
+  if (!isNonEmptyString(action["subjectKey"])) return "invalid action: subjectKey must be a non-empty string (the item this action belongs to)";
+  if (!(SIDE_EFFECTS as readonly unknown[]).includes(action["sideEffect"])) {
+    return `invalid action: sideEffect must be one of ${SIDE_EFFECTS.join(", ")}`;
+  }
+  if (action["artifactId"] !== undefined && !isNonEmptyString(action["artifactId"])) return "invalid action: artifactId must be a non-empty string";
+  if (action["type"] === "project.start" && !isProjectProposal(action["proposal"])) return "project.start needs a valid proposal with a title, outcome and actions";
+  if (action["type"] === "custom" && !isNonEmptyString(action["name"])) return "custom action needs a name";
+  return null;
+}
+
+export function acceptsApprovalDraft(type: ProposedAction["type"], format: Deliverable["format"], data: unknown): boolean {
+  return type !== "project.start" || (format === "json" && isProjectProposal(data));
+}
+
+export function ownerOnlyApproval(action: ProposedAction): string | null {
+  return action["type"] === "project.start" ? "it starts a new project" : null;
+}
 
 export interface AuthorizeMeta {
   cellId: string;

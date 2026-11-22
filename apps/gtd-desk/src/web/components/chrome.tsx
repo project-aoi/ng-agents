@@ -210,7 +210,8 @@ function StatusPanel({ view, status }: { view: ViewKey; status: StatusDTO }) {
                           return;
                         }
                         const r = await api.restoreActivity(b);
-                        res.set(r.view);
+                        if (kind === "all") res.set(r.view);
+                        else res.reload();
                         setStatus(r.status);
                         toast({ tone: r.ok ? "success" : "warn", text: r.message });
                       } catch (err) {

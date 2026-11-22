@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { gtdKeys } from "../src/shared/keys";
-import {  PAYLOAD, type ProjectRecord} from "@ng/protocol";
+import type { ProjectRecord } from "../src/shared/product-records";
+import { PAYLOAD } from "@ng/protocol";
 import { startProjectSync } from "../src";
 import { boot, childrenOf, cleanupAll, gitRepo, lastToolResult, projects, requestText, systemOf, tool } from "./helpers";
 
@@ -50,7 +51,7 @@ describe("docs/05 scenario 2 — a small code change, follow-ups in the same dir
       tool("track_action", { title: "看一下改动，决定下一步", owner: "human", nextStep: "看一下分支 feat/md-copy 的改动，决定要不要提 MR" }),
       tool("wait", { reason: "等主人看改动", waitingFor: "human" }),
     );
-    await h.ui.capture({ text: `/todo 修改markdown表格复制的时候复制markdown格式而不是Unicode字符，代码在 ${repo}` });
+    await h.ui.capture({ text: `/todo 修改markdown表格复制的时候复制markdown格式而不是Unicode字符，代码在 ${repo}` }, "owner");
     await h.kernel.idle();
 
     const [project] = projects(h);
@@ -60,7 +61,7 @@ describe("docs/05 scenario 2 — a small code change, follow-ups in the same dir
     // The worker is not closed: it rests, with everything it knows about the change.
     expect(h.kernel.getCell(writer1)).toMatchObject({ preset: "worker", status: "active", parentId: project, spec: { cwd: repo, lifetime: "wakeable" } });
     expect(h.kernel.activityOf([writer1]).get(writer1)!.state).toBe("dormant");
-    expect(h.kernel.getCell(writer1)!.bounds).toMatchObject({ isolation: "none", maxDepth: 0 });
+    expect(h.kernel.getCell(writer1)!.bounds).toMatchObject({ maxDepth: 0 });
     expect(h.actions(project)).toEqual([
       expect.objectContaining({ title: "修改表格复制逻辑", owner: "agent", status: "done", cellId: writer1, projectCellId: project }),
       expect.objectContaining({ title: "看一下改动，决定下一步", owner: "human", status: "open", nextStep: "看一下分支 feat/md-copy 的改动，决定要不要提 MR" }),
@@ -143,7 +144,7 @@ describe("docs/05 scenario 2 — a small code change, follow-ups in the same dir
         return {};
       },
     );
-    await h.ui.capture({ text: "继续用 /ship-mr 跟进，另外补个录屏。记住以后改完代码也这样处理。" });
+    await h.ui.capture({ text: "继续用 /ship-mr 跟进，另外补个录屏。记住以后改完代码也这样处理。" }, "owner");
     await h.kernel.idle();
 
     // One worker did both the change and the MR, in two turns.
@@ -185,7 +186,7 @@ describe("docs/05 scenario 2 — a small code change, follow-ups in the same dir
     expect(h.activities()).toContainEqual(expect.objectContaining({ kind: "action_completed", title: "已完成：表格复制改为 Markdown 源码" }));
 
     // 6. The habit reaches the next cell: a new project's system prompt carries it.
-    const next = startProjectSync(h.kernel, { title: "另一个改动", outcome: "改完", brief: "再改一处", cwd: repo });
+    const next = startProjectSync(h.kernel, { title: "另一个改动", outcome: "改完", brief: "再改一处", cwd: repo }, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     expect(systemOf(h, next.projectId)).toContain("改完代码后直接用 /ship-mr 提 MR");
     expect(childrenOf(h, project!)).toEqual([writer1, checker, screencast]);

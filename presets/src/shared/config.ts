@@ -41,7 +41,7 @@ export const ROLES = {
 
 export const STD = STANDARD_TOOLSETS;
 
-/** Internal (non-GTD) state keys. GTD records use `gtdKeys` from @ng/protocol. */
+/** Internal (non-GTD) state keys. GTD records use `gtdKeys` from ./keys. */
 export const KEYS = {
   /** In a checker with a check command: ProbeState. */
   probe: "probe:state",
@@ -74,7 +74,6 @@ export interface PresetsConfig {
   weeklyReview: string | false;
 }
 
-export const DAY_MS = 24 * 3_600_000;
 
 export function resolveConfig(opts: RegisterPresetsOptions = {}): PresetsConfig {
   return {

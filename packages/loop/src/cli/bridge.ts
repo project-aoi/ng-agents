@@ -94,7 +94,7 @@ export async function startToolBridge(opts: ToolBridgeOptions): Promise<ToolBrid
   writeFileSync(tokenFile, token, { mode: 0o600 });
 
   const sockets = new Set<Socket>();
-  const callAborts = new Map<string, AbortController>();
+  const clients = new Set<Map<string, AbortController>>();
   let sessions = 0;
   let refusal: string | null = null;
   let closed = false;
@@ -112,6 +112,8 @@ export async function startToolBridge(opts: ToolBridgeOptions): Promise<ToolBrid
       socket.destroy();
       return;
     }
+    const callAborts = new Map<string, AbortController>();
+    clients.add(callAborts);
     sockets.add(socket);
     socket.setNoDelay(true);
     socket.setEncoding("utf8");
@@ -125,6 +127,8 @@ export async function startToolBridge(opts: ToolBridgeOptions): Promise<ToolBrid
     }, AUTH_TIMEOUT_MS);
     socket.on("close", () => {
       clearTimeout(authTimer);
+      for (const ac of callAborts.values()) ac.abort(new Error("client disconnected"));
+      clients.delete(callAborts);
       sockets.delete(socket);
     });
     socket.on("error", () => undefined);
@@ -169,12 +173,12 @@ export async function startToolBridge(opts: ToolBridgeOptions): Promise<ToolBrid
           log({ type: "connected", connections: sessions });
           continue;
         }
-        handle(msg, send);
+        handle(msg, send, callAborts);
       }
     });
   });
 
-  function handle(msg: JsonRpcMessage, send: (m: object) => void): void {
+  function handle(msg: JsonRpcMessage, send: (m: object) => void, callAborts: Map<string, AbortController>): void {
     const { id, method } = msg;
     if (method === undefined) return; // a response to nothing we asked: ignore
     const isRequest = id !== undefined && id !== null;
@@ -222,9 +226,14 @@ export async function startToolBridge(opts: ToolBridgeOptions): Promise<ToolBrid
         const params = (msg.params ?? {}) as { name?: unknown; arguments?: unknown };
         const name = typeof params.name === "string" ? params.name : "";
         const requestId = String(id);
+        if (callAborts.has(requestId)) {
+          send({id, error: {code: -32600, message: "Request already pending"}});
+          return;
+        }
         const ac = new AbortController();
         callAborts.set(requestId, ac);
         const run = async (): Promise<BridgeCallResult> => {
+          if (ac.signal.aborted) return {text: "Request cancelled", isError: true};
           if (refusal !== null) return { text: refusal, isError: true };
           if (!opts.tools.some((t) => t.name === name)) {
             return { text: `Unknown tool "${name}". Available: ${opts.tools.map((t) => t.name).join(", ") || "none"}.`, isError: true };
@@ -276,7 +285,7 @@ export async function startToolBridge(opts: ToolBridgeOptions): Promise<ToolBrid
     async close() {
       if (closed) return;
       closed = true;
-      for (const ac of callAborts.values()) ac.abort(new Error("run ended"));
+      for (const calls of clients) for (const ac of calls.values()) ac.abort(new Error("run ended"));
       for (const s of sockets) s.destroy();
       await new Promise<void>((resolve) => server.close(() => resolve()));
       rmSync(dir, { recursive: true, force: true });

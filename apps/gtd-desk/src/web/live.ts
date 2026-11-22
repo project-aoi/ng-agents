@@ -43,8 +43,11 @@ export function useDeskEvents(handlers: DeskEventHandlers): boolean {
 
     const connect = () => {
       if (stopped) return;
-      es = new EventSource(eventsUrl());
+      const source = new EventSource(eventsUrl());
+      es = source;
+      timer = null;
       es.addEventListener("hello", (e) => {
+        if (stopped || es !== source) return;
         const d = parse<{ status: StatusDTO }>(e);
         attempt = 0;
         setConnected(true);
@@ -52,22 +55,29 @@ export function useDeskEvents(handlers: DeskEventHandlers): boolean {
         everConnected = true;
       });
       es.addEventListener("refresh", (e) => {
+        if (stopped || es !== source) return;
         const d = parse<{ views: ViewName[] }>(e);
         if (d && Array.isArray(d.views)) ref.current.refresh(d.views);
       });
       es.addEventListener("artifact", (e) => {
+        if (stopped || es !== source) return;
         const d = parse<ArtifactEvent>(e);
         if (d) ref.current.artifact(d);
       });
       es.addEventListener("notification", (e) => {
+        if (stopped || es !== source) return;
         const d = parse<NotificationDTO>(e);
         if (d) ref.current.notification(d);
       });
       es.addEventListener("cell_tail", (e) => {
+        if (stopped || es !== source) return;
         const d = parse<CellTailEvent>(e);
         if (d && typeof d.cellId === "string" && typeof d.lastSeq === "number") ref.current.cellTail(d);
       });
       es.onerror = () => {
+        if (stopped || es !== source) return;
+        if (timer) clearTimeout(timer);
+        everConnected = true;
         es?.close();
         es = null;
         setConnected(false);

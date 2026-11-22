@@ -52,7 +52,8 @@ export interface Inbox {
   /** Returns how many pending messages + schedules were cancelled. */
   cancelScheduledSync(scope: CancelScope): number;
   claimNextRunSync(cellId: string, workerId: string, leaseMs?: number): ClaimedBatch | null;
-  completeSync(claimId: string): void;
+  /** The settlement callback runs exactly once for an active claim and may pause its own cell in this transaction. */
+  completeSync(claimId: string, settle?: (pauseSelf: (reason?: "manual" | "parked") => ControlResult) => void): void;
   handbackSync(claimId: string, envelopeId: string, reason: string): void;
   controlSync(cellId: string, cmd: ControlCommand): ControlResult;
 
@@ -110,6 +111,7 @@ export interface Inbox {
   start(): void;
   stop(): void;
 
+  retryPendingSync(cellId: string, envelopeId: string, reason: string, delayMs: number): void;
   consumePendingSync(cellId: string, envelopeId: string, epoch: number, settle?: () => void): boolean;
   listMessagesSync(filter?: InboxMessageFilter): InboxMessageRecord[];
   listSchedulesSync(filter?: { cellId?: string; activeOnly?: boolean }): InboxScheduleRecord[];

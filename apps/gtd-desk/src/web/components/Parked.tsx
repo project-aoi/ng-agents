@@ -4,8 +4,8 @@ import { request } from "../api";
 import { toFailure, useNow, useToast } from "../state";
 import type { DraftApi } from "./draft";
 import { Spinner } from "./controls";
-export function Parked(props: { draft: DraftApi }) {
-  const parked = props.draft.base.parked;
+export function Parked(props: { draft: DraftApi; structured?: boolean }) {
+  const parked = (props.draft.conflict ?? props.draft.base).parked;
   const toast = useToast();
   const now = useNow();
   const [busy, setBusy] = useState<string | null>(null);
@@ -40,14 +40,14 @@ export function Parked(props: { draft: DraftApi }) {
           {p.note && <p className="parked-note">{p.note}</p>}
           <pre className="parked-body">{p.body}</pre>
           <div className="parked-actions">
-            <button
+            {!props.structured && <button
               type="button"
               className="btn sm ghost"
               onClick={() => props.draft.setText(`${props.draft.text.replace(/\s*$/, "")}\n\n${p.body}\n`)}
               disabled={props.draft.conflict !== null}
             >
               追加到草稿末尾
-            </button>
+            </button>}
             <button type="button" className="btn sm" disabled={busy !== null} onClick={() => void dismiss(p.id, p.dismiss)}>
               {busy === p.id && <Spinner />}
               {p.dismiss.label}

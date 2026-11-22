@@ -27,3 +27,5 @@ pnpm start
 - [产品、工作流与缺陷台账](docs/README.md)
 
 在仓库根目录运行 `pnpm typecheck && pnpm test && pnpm build`。
+
+工作台在默认回环地址启动时生成本次主人的登录链接。配置 `NG_AGENT_TOKEN` 或 `NG_AGENT_TOKENS` 时，同时为主人配置独立的 `NG_DESK_TOKEN`。助手凭据只用于助手接口。

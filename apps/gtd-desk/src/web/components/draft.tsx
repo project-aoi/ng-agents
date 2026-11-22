@@ -30,6 +30,7 @@ export interface DraftApi {
   acknowledgeRefresh(): void;
   /** A server copy of this draft (e.g. after removing a parked addition). */
   accept(a: ArtifactDTO): void;
+  saved(a: ArtifactDTO): void;
 }
 
 interface DraftInner {
@@ -160,6 +161,7 @@ export function useDraft(artifact: ArtifactDTO | null): DraftApi | null {
       setMessage(null);
     },
     acknowledgeRefresh: () => setInner((s) => (s ? { ...s, refreshedTo: null } : s)),
+    saved: (a) => setInner(s => s && Math.max(s.base.version, s.conflict?.version ?? 0) > a.version ? s : { base: a, text: a.body, conflict: null, refreshedTo: null }),
     accept: (a) => setInner((s) => (s ? reconcile(s, a) : restore(a))),
   };
 }
@@ -243,7 +245,8 @@ export function HighlightedTextarea(props: {
 // ==================== the editor block ====================
 
 export function DraftRefreshNotice({draft}: {draft: DraftApi}) {
-  if (draft.refreshedTo === null || draft.conflict) return null;
+  if (draft.conflict || draft.dirty) return <div className="banner warn" role="status">{draft.conflict ? "草稿有新版，请展开编辑核对差异" : "草稿有尚未保存的修改"}</div>;
+  if (draft.refreshedTo === null) return null;
   return <div className="banner warn" role="status">
     <span>草稿已更新到 v{draft.refreshedTo}，请核对后再确认。</span>
     <button type="button" className="btn sm ghost" onClick={draft.acknowledgeRefresh}>已核对新版</button>

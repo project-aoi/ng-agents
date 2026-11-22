@@ -1,12 +1,12 @@
 import { afterEach, expect, it } from "vitest";
 import { PAYLOAD } from "@ng/protocol";
-import { boot, cleanupAll, HOUR } from "./helpers";
+import { boot, cleanupAll, HOUR, registerTestPresets } from "./helpers";
 
 afterEach(cleanupAll);
 
 it("scopes matching subjects to their issuer when refreshing or undoing a decision", async () => {
   const { kernel } = await boot({ start: false });
-  kernel.spawnCell("desk", { id: "sibling", preset: "worker" });
+  kernel.spawnCell("desk", { id: "sibling", preset: "worker" }, undefined, { principalId: kernel.ownerPrincipal });
   const draft = { title: "确认", subjectKey: "shared", options: [{ id: "yes", label: "同意", effect: "reply" as const }] };
   const first = kernel.humanItems.create(draft, "desk");
   const other = kernel.humanItems.create({ ...draft, title: "另一项确认" }, "sibling");
@@ -52,16 +52,43 @@ it("shares simultaneous identical decisions and rejects other actors and stale d
   if (gateResult.type !== "defer") throw Error("expected a proposal card");
   const item = kernel.humanItems.get(gateResult.actionId)!;
   const choice = { optionId: "system.execute", seenItemRevision: item.itemRevision, seenArtifactVersion: 1 };
-  const calls = [
-    kernel.humanItems.decide(item.id, choice, "owner"),
-    kernel.humanItems.decide(item.id, choice, "owner"),
-    kernel.humanItems.decide(item.id, choice, "agent:helper"),
-  ];
+  await expect(kernel.humanItems.decide(item.id, choice, "agent:helper")).rejects.toMatchObject({ code: "bounds_violation" });
   kernel.context.commitSync("desk", { artifact: { artifactId: "plan", expectedVersion: 1, content: { format: "text", body: "revised" }, updatedBy: "human" } });
-  calls.push(kernel.humanItems.decide(item.id, choice, "owner"));
-  const results = await Promise.allSettled(calls);
-  expect(results.map(r => r.status)).toEqual(["fulfilled", "fulfilled", "rejected", "rejected"]);
+  await expect(kernel.humanItems.decide(item.id, choice, "owner")).rejects.toMatchObject({ code: "conflict", message: "草稿已变动" });
+  const reviewed = { ...choice, seenArtifactVersion: 2 };
+  const results = await Promise.all([
+    kernel.humanItems.decide(item.id, reviewed, "owner"),
+    kernel.humanItems.decide(item.id, reviewed, "owner"),
+  ]);
+  expect(results.map(r => r.status)).toEqual(["approved", "approved"]);
+  expect(kernel.getCell(`project-${item.id}`)?.parentId).toBe("desk");
   expect(kernel.inbox.listMessagesSync({ type: PAYLOAD.approvalResolved })).toHaveLength(1);
+});
+
+it("reserves undo for the owner when undo would reverse a decision on a project proposal", async () => {
+  const { kernel } = await boot({start:false});
+  const approval = kernel.gate.authorizeSync({ type: "project.start", subjectKey: "proposal:undo",
+    summary: "立项", sideEffect: "external", proposal: {title: "项目", outcome: "交付记录", actions: []} },
+    {cellId: "desk", epoch: 0, principalId: "cell:desk"});
+  if (approval.type !== "defer") throw Error("expected a pending proposal");
+  const denied = await kernel.humanItems.decide(approval.actionId, { optionId: "system.deny", seenItemRevision: 1 }, "owner");
+  expect(denied.activityId).toBeTruthy();
+  await expect(kernel.humanItems.undo(denied.activityId!, "agent:helper")).rejects.toMatchObject({ code: "bounds_violation" });
+  expect(kernel.humanItems.get(approval.actionId)?.status).toBe("cancelled");
+  await expect(kernel.humanItems.undo(denied.activityId!, "owner")).resolves.toMatchObject({status:"undone"});
+});
+
+it("undoes a completed item whose old snooze expired before the scheduler ran", async () => {
+  const {kernel, clock} = await boot({start:false});
+  const item = kernel.humanItems.create({title:"核对记录", subjectKey:"review:record",
+    options:[{id:"done",label:"完成",effect:"complete"}]}, null);
+  const until = clock.now() + HOUR;
+  await kernel.humanItems.decide(item.id, {optionId:"system.defer", seenItemRevision:1, until}, "owner");
+  clock.set(until + 1);
+  const done = await kernel.humanItems.decide(item.id, {optionId:"done", seenItemRevision:2}, "owner");
+  expect((await kernel.humanItems.undo(done.activityId!, "owner")).status).toBe("undone");
+  expect(kernel.humanItems.list()).toContainEqual(expect.objectContaining({id:item.id, status:"pending", snoozedUntil:null}));
+  expect(kernel.inbox.listMessagesSync({cellId:"desk", type:PAYLOAD.timerFired, status:["pending"]})).toHaveLength(0);
 });
 
 it("resurfaces a snoozed personal reminder on time without a model turn, then completes it without a callback", async () => {
@@ -129,10 +156,10 @@ it("withdraws an unread reply; after a claim and crash release it sends one corr
 
 it("reopens only worker generations that closed with the project", async () => {
   const { kernel } = await boot({ start: false });
-  kernel.spawnCell("desk", { id: "project", preset: "project" });
-  for (const id of ["old", "together"]) kernel.spawnCell("project", { id, preset: "worker", lifetime: "wakeable" });
-  await kernel.closeCell("old", "cancelled");
-  await kernel.closeCell("project", "completed");
+  kernel.spawnCell("desk", { id: "project", preset: "project" }, undefined, { principalId: kernel.ownerPrincipal });
+  for (const id of ["old", "together"]) kernel.spawnCell("project", { id, preset: "worker", lifetime: "wakeable" }, undefined, { principalId: kernel.ownerPrincipal });
+  await kernel.closeCell("old", "cancelled", { principalId: kernel.ownerPrincipal });
+  await kernel.closeCell("project", "completed", { principalId: kernel.ownerPrincipal });
   expect(await kernel.reopenProject("project", "owner")).toEqual(["project", "together"]);
   expect(kernel.getCell("old")?.status).toBe("closed");
   expect(kernel.getCell("together")?.status).toBe("active");
@@ -141,7 +168,7 @@ it("reopens only worker generations that closed with the project", async () => {
 
 it("finishes old epoch cleanup without killing a job started after reopening, then sends a second closure notice", async () => {
   const { kernel, dataDir } = await boot({ start: false });
-  kernel.spawnCell("desk", { id: "project", preset: "project", cwd: dataDir });
+  kernel.spawnCell("desk", { id: "project", preset: "project", cwd: dataDir }, undefined, { principalId: kernel.ownerPrincipal });
   const priorEpoch = kernel.getCell("project")!.epoch;
   const priorWorkspace = await kernel.workspace.acquire("project", { cwd: dataDir });
   const oldJob = await priorWorkspace.startJob({ command: "sleep 30" });
@@ -158,7 +185,7 @@ it("finishes old epoch cleanup without killing a job started after reopening, th
     order.push("old jobs stopped");
     return result;
   };
-  const closing = kernel.closeCell("project", "completed");
+  const closing = kernel.closeCell("project", "completed", { principalId: kernel.ownerPrincipal });
   await entered;
   const opening = kernel.reopenProject("project", "owner").then(() => { order.push("project reopened"); });
   try {
@@ -177,7 +204,7 @@ it("finishes old epoch cleanup without killing a job started after reopening, th
   const reopenedWorkspace = await kernel.workspace.acquire("project", {cwd:dataDir});
   const newJob = await reopenedWorkspace.startJob({command:"sleep 30"});
   expect(kernel.workspace.getJobSync(newJob.jobId)?.state).toBe("running");
-  await kernel.closeCell("project", "cancelled");
+  await kernel.closeCell("project", "cancelled", { principalId: kernel.ownerPrincipal });
   const ids = kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.cellResult }).map((m) => m.envelope.id);
   expect(new Set(ids).size).toBe(2);
 });
@@ -185,7 +212,7 @@ it("finishes old epoch cleanup without killing a job started after reopening, th
 it("resolves one referenced wait and escalates the unanswered one exactly once across both monitors", async () => {
   const { kernel, script, clock } = await boot();
   script.add("project", { toolCalls: [{ name: "wait", input: { reason: "等 A", waitingFor: "inbox:desk", waitId: "a", refId: "ra" } }] });
-  kernel.spawnCell("desk", { id: "project", preset: "project" }, "等待材料");
+  kernel.spawnCell("desk", { id: "project", preset: "project" }, "等待材料", { principalId: kernel.ownerPrincipal });
   await kernel.idle();
   script.add("project", { toolCalls: [{ name: "wait", input: { reason: "等 B", waitingFor: "inbox:desk", waitId: "b", refId: "rb" } }] });
   kernel.inbox.enqueueSync("project", {
@@ -229,7 +256,7 @@ it("resolves one referenced wait and escalates the unanswered one exactly once a
 it("a direct owner message clears one named wait even when its reference is absent", async () => {
   const { kernel, script } = await boot();
   script.add("worker", {toolCalls:[{name:"wait",input:{reason:"等负责人",waitingFor:"inbox:desk",waitId:"material",refId:"ref-material"}}]});
-  kernel.spawnCell("desk",{id:"helper",preset:"worker",lifetime:"wakeable"},"准备材料");
+  kernel.spawnCell("desk",{id:"helper",preset:"worker",lifetime:"wakeable"},"准备材料", { principalId: kernel.ownerPrincipal });
   await kernel.idle();
   expect(kernel.listWaits(["helper"])).toMatchObject([{waitId:"material"}]);
   kernel.directMessage("helper",{text:"我确认这份材料可以用"},{principalId:"owner"});
@@ -240,52 +267,52 @@ it("a direct owner message clears one named wait even when its reference is abse
 it("keeps human waits through silent copies and ignores replies addressed to another wait", async () => {
   const {kernel, script, clock} = await boot();
   script.add("project", {toolCalls: [{name: "wait", input: {waitingFor: "human", waitId: "review", reason: "等评审"}}]});
-  kernel.spawnCell("desk", {id: "project", preset: "project"}, "review changes");
-  kernel.spawnCell("project", {id: "leaf", preset: "worker"});
+  kernel.spawnCell("desk", {id: "project", preset: "project"}, "review changes", { principalId: kernel.ownerPrincipal });
+  kernel.spawnCell("project", {id: "leaf", preset: "worker"}, undefined, { principalId: kernel.ownerPrincipal });
   await kernel.idle();
-  kernel.directMessage("leaf", {text: "先继续", clientId: "chat"});
+  kernel.directMessage("leaf", {text: "先继续", clientId: "chat"}, { principalId: kernel.ownerPrincipal });
   kernel.inbox.enqueueSync("project", {id: "wake", from: "timer:project", principalId: "owner", kind: "event",
     type: PAYLOAD.timerFired, payload: {label: "check"}, createdAt: clock.now()});
   await kernel.idle();
   expect(kernel.listWaits(["project"])).toMatchObject([{waitId: "review"}]);
   for (const mode of ["enqueue", "steer"] as const) {
-    kernel.directMessage("project", {mode, text: "这是另一件事", replyToId: "another"});
+    kernel.directMessage("project", {mode, text: "这是另一件事", replyToId: "another"}, { principalId: kernel.ownerPrincipal });
     await kernel.idle();
     expect(kernel.listWaits(["project"])).toMatchObject([{waitId: "review"}]);
   }
-  kernel.directMessage("project", {mode: "steer", text: "评审完了", replyToId: "review"});
+  kernel.directMessage("project", {mode: "steer", text: "评审完了", replyToId: "review"}, { principalId: kernel.ownerPrincipal });
   await kernel.idle();
   expect(kernel.listWaits(["project"])).toEqual([]);
 });
 
 it("acknowledges a retried message after the worker closed without reopening it", async () => {
   const {kernel} = await boot({start:false});
-  kernel.spawnCell("desk", {id: "worker", preset: "worker"});
+  kernel.spawnCell("desk", {id: "worker", preset: "worker"}, undefined, { principalId: kernel.ownerPrincipal });
   const message = {text: "核对交付物", clientId: "same-message"};
-  expect(kernel.directMessage("worker", message)).toMatchObject({duplicate: false});
-  await kernel.closeCell("worker", "completed");
+  expect(kernel.directMessage("worker", message, { principalId: kernel.ownerPrincipal })).toMatchObject({duplicate: false});
+  await kernel.closeCell("worker", "completed", { principalId: kernel.ownerPrincipal });
   const closed = kernel.getCell("worker")!;
-  expect(kernel.directMessage("worker", message)).toMatchObject({duplicate:true, reopened:false, targetStatus:"closed"});
+  expect(kernel.directMessage("worker", message, { principalId: kernel.ownerPrincipal })).toMatchObject({duplicate:true, reopened:false, targetStatus:"closed"});
   expect(kernel.getCell("worker")).toMatchObject({epoch:closed.epoch, status:"closed"});
   expect(kernel.inbox.listMessagesSync({cellId:"desk",type:PAYLOAD.cellDirectChat})).toHaveLength(1);
 });
 
 it("copies a direct message according to ccParent independently of lifetime", async () => {
   const { kernel } = await boot({ start: false });
-  kernel.spawnCell("desk", { id: "listener", preset: "inline", ccParent: true, lifetime: "persistent" });
-  kernel.spawnCell("desk", { id: "solo", preset: "worker", ccParent: false, lifetime: "wakeable" });
+  kernel.spawnCell("desk", { id: "listener", preset: "inline", ccParent: true, lifetime: "persistent" }, undefined, { principalId: kernel.ownerPrincipal });
+  kernel.spawnCell("desk", { id: "solo", preset: "worker", ccParent: false, lifetime: "wakeable" }, undefined, { principalId: kernel.ownerPrincipal });
   expect(kernel.directMessage("listener", { text: "保持监听" }, { principalId: "owner" })).toMatchObject({ ccTo: "desk" });
   expect(kernel.directMessage("solo", { text: "收到" }, { principalId: "owner" })).toMatchObject({ ccTo: null });
 });
 
 it("routes a subtree's cancel receipt to desk, restores the reopened epoch, and reports a claimed cancel", async () => {
   const {kernel} = await boot({start:false});
-  kernel.spawnCell("desk", {id:"project", preset:"project"});
-  kernel.spawnCell("project", {id:"worker", preset:"worker", lifetime:"wakeable"});
+  kernel.spawnCell("desk", {id:"project", preset:"project"}, undefined, { principalId: kernel.ownerPrincipal });
+  kernel.spawnCell("project", {id:"worker", preset:"worker", lifetime:"wakeable"}, undefined, { principalId: kernel.ownerPrincipal });
   const item = kernel.humanItems.create({
     title:"结束项目", subjectKey:"arb:close", relatedProjectIds:["project"],
     options:[{id:"close", label:"中止", effect:"terminate", terminateMode:"cancel_task", targetCellIds:["project"], confirm:"确认中止项目"}],
-  }, "worker");
+  }, "project");
   async function cancel() {
     const result = await kernel.humanItems.decide(item.id, {
       optionId:"close", seenItemRevision:kernel.humanItems.get(item.id)!.itemRevision, confirmedTargets:["project"],
@@ -297,36 +324,130 @@ it("routes a subtree's cancel receipt to desk, restores the reopened epoch, and 
   expect(kernel.inbox.listMessagesSync({cellId:"desk", type:PAYLOAD.approvalResolved, status:["pending"]})).toHaveLength(1);
   expect(await kernel.humanItems.undo(first, "owner")).toMatchObject({status:"undone"});
   expect(kernel.getCell("worker")?.status).toBe("active");
-  expect(kernel.humanItems.get(item.id)?.epoch).toBe(kernel.getCell("worker")!.epoch);
+  expect(kernel.humanItems.get(item.id)?.epoch).toBe(kernel.getCell("project")!.epoch);
   const again = await cancel();
   expect(kernel.inbox.claimNextRunSync("desk", "test", 10_000)).toBeTruthy();
-  await expect(kernel.humanItems.undo(again, "owner")).rejects.toThrow("reopen_project");
+  await expect(kernel.humanItems.undo(again, "owner")).rejects.toThrow("重新打开");
   expect(kernel.getCell("project")?.status).toBe("closed");
 });
 
-it("issues a correction when undo reopens the project but its issuing probe is archived", async () => {
-  const {kernel, of} = await boot({start: false});
-  kernel.spawnCell("desk", {id: "project", preset: "project"});
-  kernel.spawnCell("project", {id: "probe", preset: "checker"});
-  const other = kernel.humanItems.create({title: "另一项决定", subjectKey: "review:scope", options: [{id:"reply",label:"回答",effect:"reply"}]}, "probe");
-  const item = kernel.humanItems.create({title: "结束项目", subjectKey: "review:end", relatedProjectIds: ["project"],
-    options: [{id:"end",label:"结束",effect:"terminate",terminateMode:"cancel_task",targetCellIds:["project"],confirm:"确认结束"}]}, "probe");
+it("requires the project or its ancestor to propose cancellation and preserves independently closed probes on undo", async () => {
+  const {kernel} = await boot({start: false});
+  kernel.spawnCell("desk", {id: "project", preset: "project"}, undefined, { principalId: kernel.ownerPrincipal });
+  kernel.spawnCell("project", {id: "probe", preset: "checker"}, undefined, { principalId: kernel.ownerPrincipal });
+  const draft = {title: "结束项目", subjectKey: "review:end", relatedProjectIds: ["project"],
+    options: [{id:"end",label:"结束",effect:"terminate" as const,terminateMode:"cancel_task" as const,targetCellIds:["project"],confirm:"确认结束"}]};
+  expect(() => kernel.humanItems.create(draft, "probe")).toThrow();
+  await kernel.closeCell("probe", "completed", { principalId: kernel.ownerPrincipal });
+  const item = kernel.humanItems.create(draft, "project");
   const decision = await kernel.humanItems.decide(item.id, {optionId:"end", seenItemRevision:item.itemRevision, confirmedTargets:["project"]}, "owner");
-  expect(of("approval.changed")).toContainEqual(expect.objectContaining({actionId:other.id, cellId:"probe", status:"cancelled"}));
-  const result = await kernel.humanItems.undo(decision.activityId!, "owner");
-  expect(result.status).toBe("corrected");
+  expect((await kernel.humanItems.undo(decision.activityId!, "owner")).status).toBe("undone");
   expect(kernel.getCell("project")?.status).toBe("active");
   expect(kernel.getCell("probe")?.status).toBe("closed");
-  expect(kernel.humanItems.get(item.id)?.status).toBe("cancelled");
-  expect(kernel.inbox.listMessagesSync({cellId:"desk", envelopeId:`${decision.activityId}:correction`, status:["pending"]})).toHaveLength(1);
 });
 
 it("keeps a closed worker archived when its parent lost spawn authority", async () => {
   const {kernel} = await boot({start:false});
-  kernel.spawnCell("desk",{id:"project",preset:"project"});
-  kernel.spawnCell("project",{id:"worker",preset:"worker"});
-  await kernel.closeCell("worker","completed");
-  kernel.updateCell("project", {bounds: {maxDepth: 0}});
-  expect(kernel.directMessage("worker", {text:"再做一轮"})).toMatchObject({status:"refused", reason:"archived"});
+  kernel.spawnCell("desk",{id:"project",preset:"project"}, undefined, { principalId: kernel.ownerPrincipal });
+  kernel.spawnCell("project",{id:"worker",preset:"worker"}, undefined, { principalId: kernel.ownerPrincipal });
+  await kernel.closeCell("worker","completed", { principalId: kernel.ownerPrincipal });
+  kernel.updateCell("project", {bounds: {maxDepth: 0}}, { principalId: kernel.ownerPrincipal });
+  expect(kernel.directMessage("worker", {text:"再做一轮"}, { principalId: kernel.ownerPrincipal })).toMatchObject({status:"refused", reason:"archived"});
   expect(kernel.getCell("worker")?.status).toBe("closed");
+});
+
+it("removes an early-settled reminder's scheduled resurfacing", async () => {
+  const { kernel, clock } = await boot({start:false});
+  const item = kernel.humanItems.create({title:"提醒",category:"action",subjectKey:"reminder:early",
+    options:[{id:"done",label:"办完",effect:"complete"}]}, null);
+  await kernel.humanItems.decide(item.id, {optionId:"system.defer", seenItemRevision:1, until:clock.now()+HOUR}, "owner");
+  expect(kernel.inbox.listMessagesSync({cellId:"desk", type:PAYLOAD.timerFired, status:["pending"]})).toHaveLength(1);
+  await kernel.humanItems.decide(item.id, {optionId:"done", seenItemRevision:2}, "owner");
+  expect(kernel.inbox.listMessagesSync({cellId:"desk", type:PAYLOAD.timerFired, status:["pending"]})).toHaveLength(0);
+});
+
+it("retries a failed kernel timer without delivering it to the model", async () => {
+  const {kernel,clock,script} = await boot();
+  const item = kernel.humanItems.create({title:"提醒",category:"action",subjectKey:"reminder:retry",
+    options:[{id:"done", label:"办完",effect:"complete"}]}, null);
+  await kernel.humanItems.decide(item.id,{optionId:"system.defer",seenItemRevision:1,until:clock.now()+HOUR},"owner");
+  kernel.db.exec("CREATE TEMP TRIGGER fail_resurface BEFORE UPDATE OF snoozed_until ON human_items BEGIN SELECT RAISE(ABORT,'temporary failure'); END");
+  clock.advance(HOUR);
+  await kernel.idle();
+  const [timer] = kernel.inbox.listMessagesSync({cellId:"desk",type:PAYLOAD.timerFired,status:["pending"]});
+  expect(timer).toMatchObject({attempts:1});
+  expect(timer!.deliverAt).toBeGreaterThan(clock.now());
+  expect(script.callsOf("desk")).toHaveLength(0);
+  kernel.db.exec("DROP TRIGGER fail_resurface");
+  clock.advance(timer!.deliverAt-clock.now());
+  await kernel.idle();
+  expect(kernel.humanItems.get(item.id)?.status).toBe("pending");
+  expect(script.callsOf("desk")).toHaveLength(0);
+});
+
+it("retains independent parked branches during an ancestor's pause and resume", async () => {
+  const {kernel} = await boot({start:false});
+  kernel.spawnCell("desk", {id:"parent", preset:"project"}, undefined, { principalId: kernel.ownerPrincipal });
+  kernel.spawnCell("parent", {id:"parked", preset:"project"}, undefined, { principalId: kernel.ownerPrincipal });
+  kernel.spawnCell("parked", {id:"inside", preset:"worker"}, undefined, { principalId: kernel.ownerPrincipal });
+  kernel.spawnCell("parent", {id:"sibling", preset:"worker"}, undefined, { principalId: kernel.ownerPrincipal });
+  kernel.control("parked", {action:"pause",pauseReason:"parked"}, { principalId: kernel.ownerPrincipal });
+  kernel.control("parent", {action:"pause"}, { principalId: kernel.ownerPrincipal });
+  kernel.control("parent", {action:"resume"}, { principalId: kernel.ownerPrincipal });
+  expect(kernel.getCell("sibling")?.status).toBe("active");
+  expect(kernel.getCell("parked")).toMatchObject({status:"paused",pauseReason:"parked"});
+  expect(kernel.getCell("inside")?.status).toBe("paused");
+});
+
+it("binds artifact writes and project associations to the issuing cell's actual tree", async () => {
+  const results: string[] = [];
+  const {kernel} = await boot({setup(registry) {
+    registerTestPresets(registry);
+    registry.codeProcessors.register({name:"check.scope", async run({ports}) {
+      const proposal = {title: "自己的方案", outcome: "交付记录", actions: []};
+      await ports.context.commit(ports.self.cellId, {artifact: {artifactId:"own-plan", updatedBy:"agent",
+        content:{format:"json", body: JSON.stringify(proposal), data: proposal}}});
+      const own = await ports.authorize({type:"project.start", subjectKey:"own-plan", summary:"立项", sideEffect:"external",
+        proposal, artifactId:"own-plan"});
+      if (own.type !== "defer") throw Error("expected a bound approval");
+      for (const artifactId of ["shared","separate","proposal","own-plan"]) {
+        try {
+          await ports.context.commit(ports.self.cellId, {artifact:{artifactId, expectedVersion:1, updatedBy:"agent", content:{format:"text",body:"revision"}}});
+          results.push("saved");
+        } catch (err) { results.push((err as {code:string}).code); }
+      }
+      return "completed";
+    }});
+  }});
+  for (const id of ["first","second"]) kernel.spawnCell("desk",{id,preset:"project"}, undefined, { principalId: kernel.ownerPrincipal });
+  kernel.spawnCell("first",{id:"author",preset:"worker"}, undefined, { principalId: kernel.ownerPrincipal });
+  for (const [cellId,artifactId] of [["author","shared"],["second","separate"],["desk","proposal"]] as const)
+    kernel.context.commitSync(cellId,{artifact:{artifactId,updatedBy:"agent",content:{format:"text",body:"initial"}}});
+  expect(kernel.gate.authorizeSync({type:"project.start", subjectKey:"proposal", summary:"立项", sideEffect:"external",
+    proposal:{title:"项目",outcome:"交付",actions:[]}, artifactId:"proposal"}, {cellId:"desk",principalId:"cell:desk",epoch:0}).type).toBe("defer");
+  kernel.spawnCell("first",{id:"editor",preset:"worker",processor:{kind:"code",entry:"check.scope"}}, "review", { principalId: kernel.ownerPrincipal });
+  await kernel.idle();
+  expect(results).toEqual(["saved","bounds_violation","bounds_violation","invalid_argument"]);
+  expect(kernel.context.getArtifactSync("own-plan")?.version).toBe(1);
+  expect(kernel.context.getArtifactSync("separate")?.version).toBe(1);
+  expect(kernel.context.getArtifactSync("proposal")?.version).toBe(1);
+  const draft = {title:"核对",subjectKey:"review",relatedProjectIds:["second"],options:[{id:"yes",label:"同意",effect:"reply" as const}]};
+  expect(() => kernel.humanItems.create(draft, "author")).toThrow(expect.objectContaining({code:"bounds_violation"}));
+  expect(() => kernel.gate.authorizeSync({type:"custom",name:"review",summary:"核对",subjectKey:"review",sideEffect:"external",
+    relatedProjectIds:["second"]},{cellId:"author",principalId:"cell:author",epoch:0})).toThrow(expect.objectContaining({code:"bounds_violation"}));
+});
+
+it("withdraws a normal card of an earlier generation and refuses reopening beneath a paused parent", async () => {
+  const {kernel} = await boot({start:false});
+  kernel.spawnCell("desk",{id:"project",preset:"project"}, undefined, { principalId: kernel.ownerPrincipal });
+  kernel.spawnCell("project",{id:"leaf",preset:"worker"}, undefined, { principalId: kernel.ownerPrincipal });
+  const item = kernel.humanItems.create({subjectKey:"review",title:"核对",options:[{id:"yes",label:"完成",effect:"reply"}]}, "leaf");
+  kernel.db.prepare("UPDATE human_items SET epoch=epoch-1 WHERE action_id=?").run(item.id);
+  await expect(kernel.humanItems.decide(item.id,{seenItemRevision:1,optionId:"system.defer"},"owner")).rejects.toMatchObject({code:"conflict"});
+  expect(kernel.humanItems.get(item.id)?.status).toBe("cancelled");
+  expect(kernel.inbox.listMessagesSync({type:PAYLOAD.timerFired})).toEqual([]);
+  await kernel.closeCell("leaf","completed", { principalId: kernel.ownerPrincipal });
+  kernel.control("project",{action:"pause"}, { principalId: kernel.ownerPrincipal });
+  kernel.directMessage("leaf",{text:"继续"}, { principalId: kernel.ownerPrincipal });
+  expect(kernel.getCell("leaf")?.status).toBe("closed");
 });

@@ -7,15 +7,17 @@ export function shellQuote(s: string): string {
 
 /** Picks an interpreter by extension so the script need not be executable. */
 export function scriptCommand(script: string, env: Record<string, string>): string {
-  if (!script.trim()) throw new Error("需要脚本路径");
+  script = script.trim();
+  if (!script) throw new Error("需要脚本路径");
   const path = script.startsWith("~/") ? join(homedir(), script.slice(2)) : script;
   const ext = /\.([a-z]+)$/i.exec(path)?.[1]?.toLowerCase();
-  const q = shellQuote(path);
+  const q = shellQuote(path.startsWith("-") ? `./${path}` : path);
   let runner: string;
   if (ext === "sh" || ext === "bash") runner = `bash ${q}`;
   else if (ext === "js" || ext === "mjs" || ext === "cjs" || ext === "ts" || ext === "mts") runner = `node ${q}`;
   else if (ext === "py") runner = `python3 ${q}`;
   else runner = shellQuote(path.startsWith("/") || path.startsWith("./") || path.startsWith("../") ? path : `./${path}`);
+  if (Object.keys(env).some(key => !/^[A-Za-z_][A-Za-z_0-9]*$/.test(key))) throw new Error("无效的环境变量名");
   const assignments = Object.entries(env).map(([k, v]) => `${k}=${shellQuote(v)}`);
   return [...assignments, runner].join(" ");
 }

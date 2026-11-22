@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { normalizeCwd } from "@ng/cell";
 import { gtdKeys } from "../shared/keys";
+import type { ProjectRecord } from "../shared/product-records";
 import {
   CELL_STATUS_KEY,
   cellIdOf,
@@ -12,7 +13,6 @@ import {
   type CellSpec,
   type InboxAddr,
   type ProcessorSpec,
-  type ProjectRecord,
   type ToolContext,
   type ToolDef,
   type ToolResult,
@@ -207,7 +207,7 @@ export function projectToolset(): Toolset {
       const due = args.dueAt !== undefined ? parseIso(args.dueAt, "dueAt") : undefined;
       if (typeof due === "string") return { output: due, isError: true };
       if (args.cellId !== undefined && !ctx.ports.isDirectChild(args.cellId)) {
-        return { output: `${args.cellId} is not one of your cells (see the list at the end of your wake-up message).`, isError: true };
+        return { output: `${args.cellId} is not one of your cells (see the list at the start of your wake-up message).`, isError: true };
       }
       const fields = {
         ...(args.title ? { title: args.title } : {}),
@@ -231,6 +231,7 @@ export function projectToolset(): Toolset {
         if (!cur) return { output: `There is no action ${args.id}; leave id out to create one.`, isError: true };
         action = patchAction(cur, { ...fields, ...(args.status ? { status: args.status } : {}), ...(args.status === "open" ? { completedAt: null } : {}) }, now);
       }
+      if (action.owner === "human") delete action.cellId;
       ctx.ports.actionBooks!.write(action);
       const next =
         action.status !== "open"
@@ -275,7 +276,7 @@ export function projectToolset(): Toolset {
     description: [
       "Record the project's end on the owner's board and close (or park) the project cell in one step.",
       '"completed": done and accepted. "someday": parked with everything kept, to be brought back later. "cancelled": stopped; what is still running under the project is stopped with it.',
-      "Check owner acceptance and results for every promised step. Active children and jobs can block settlement. Use closeChildren only when the owner intends to stop outstanding work. The result lists open actions.",
+      'For outcome "completed", every open action (including a human review action that the owner accepted verbally in chat without ticking it off) must be closed with track_action first — otherwise settlement is refused with a conflict listing the unfinished work. Active children and jobs also block settlement unless closeChildren is true (for cancelled, open work is stopped automatically).',
     ].join(" "),
     input: z.object({
       outcome: z.enum(["completed", "cancelled", "someday"]),
@@ -302,7 +303,7 @@ export function projectToolset(): Toolset {
         if (!ports.settleSelf) return { output: "Project settlement is unavailable.", isError: true };
         await ports.settleSelf({ action: args.outcome === "completed" ? "complete" : args.outcome === "cancelled" ? "cancel" : "pause", summary: args.summary, ...(args.outcome==="someday" ? {pauseReason:"parked" as const} : {}), statePatches: patches, ...(force ? { force: true } : {}) });
       } catch (err) {
-        if (isNgError(err, "conflict")) return { output: `Nothing was recorded or closed: ${errorText(err)} Call again with closeChildren: true if stopping them is what you mean.`, isError: true };
+        if (isNgError(err, "conflict")) return { output: `Nothing was recorded or closed: ${errorText(err)}`, isError: true };
         throw err;
       }
       const what = "Requested project settlement after this run drains";

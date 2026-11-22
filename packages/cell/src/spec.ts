@@ -1,6 +1,6 @@
 import {
   CLI_ENGINES,
-  ISOLATION_LEVELS,
+
   NgError,
   sha256Hex,
   stableStringify,
@@ -39,7 +39,7 @@ export function jsonSafeBounds(b: Partial<PolicyBounds> | undefined): Partial<Po
 /**
  * Preset defaults merged under the caller's spec: caller wins field by field, `processor` is replaced as a whole,
  * `meta` is merged shallowly, and the bounds *request* is merged field by field over the preset's (requestBounds() or
- * defaults.bounds) — so a caller that only narrows one field keeps the preset's isolation. The merged request is still
+ * defaults.bounds) — so a caller that only narrows one field keeps the preset's other bounds. The merged request is still
  * clamped by Gate.attenuate, so the merge can never widen anything. `fork` and `parentId` are the kernel's to set.
  * `meta.projectCellId` is inherited from the parent unless the caller sets it.
  */
@@ -119,10 +119,6 @@ export function validateSpec(registry: Registry, spec: CellSpec): void {
       const v = (ws as Record<string, unknown>)[k];
       if (v !== undefined && typeof v !== "string") throw new NgError("invalid_argument", `meta.workspace.${k} must be a string`);
     }
-  }
-  const iso = spec.bounds?.isolation;
-  if (iso !== undefined && !(ISOLATION_LEVELS as readonly string[]).includes(iso)) {
-    throw new NgError("invalid_argument", `unknown isolation "${String(iso)}"`);
   }
 }
 

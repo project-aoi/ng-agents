@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { gtdKeys } from "../src/shared/keys";
-import { CELL_STATUS_KEY,  type ProjectRecord} from "@ng/protocol";
+import type { ProjectRecord } from "../src/shared/product-records";
+import { CELL_STATUS_KEY } from "@ng/protocol";
 import { startProjectSync, type ProjectTaskInput } from "../src";
 import { boot, childrenOf, cleanupAll, continuesRun, gitRepo, lastToolResult, requestText, tool } from "./helpers";
 
@@ -36,9 +37,9 @@ describe("a project's books are kept before its model runs", () => {
         { title: "等设计稿", owner: "waiting" },
       ],
       source: { label: "工作台收件箱", at: h.clock.now() },
-    });
+    }, { principalId: h.kernel.ownerPrincipal });
     expect({ projectId, started }).toEqual({ projectId: "proj_site", started: true });
-    expect(startProjectSync(h.kernel, { id: "proj_site", title: "官网改版", outcome: "x", brief: "x" })).toEqual({ projectId: "proj_site", started: false });
+    expect(startProjectSync(h.kernel, { id: "proj_site", title: "官网改版", outcome: "x", brief: "x" }, { principalId: h.kernel.ownerPrincipal })).toEqual({ projectId: "proj_site", started: false });
     const task = h.kernel.inbox.listMessagesSync({ cellId: "proj_site" })[0]!.envelope.payload as { input: ProjectTaskInput };
     expect(h.kernel.getCell(projectId)?.spec.cwd).toBe(repo);
     expect(task.input).toMatchObject({ mode: "now", phases: ["盘点现有页面", "改版上线"], project: { title: "官网改版", proposal: { actions: expect.any(Array) } } });
@@ -88,10 +89,10 @@ describe("a project's books are kept before its model runs", () => {
       return tool("wait", { reason: "还在查" });
     });
     h.script.setDefault("checker", () => tool("wait", { reason: "CI 还没跑完", waitingFor: "external" }));
-    const { projectId } = startProjectSync(h.kernel, { title: "性能优化", outcome: "p99 降一半", brief: "做性能优化" });
+    const { projectId } = startProjectSync(h.kernel, { title: "性能优化", outcome: "p99 降一半", brief: "做性能优化" }, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     // Its next wake-up: the books have caught up with the children it started without dispatch.
-    h.kernel.sendToCell(projectId, { text: "进展如何？" });
+    h.kernel.sendToCell(projectId, { text: "进展如何？" }, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
 
     const byTitle = Object.fromEntries(h.actions(projectId).map((a) => [a.title, a]));
@@ -112,7 +113,7 @@ describe("a project's books are kept before its model runs", () => {
       "project",
       () => {
         // The owner's follow-up lands while the project is finishing: it must not close over it.
-        expect(h.kernel.sendToCell(projectId, { text: "等等，再补一个导出功能" })).toMatchObject({ status: "delivered" });
+        expect(h.kernel.sendToCell(projectId, { text: "等等，再补一个导出功能" }, { principalId: h.kernel.ownerPrincipal })).toMatchObject({ status: "delivered" });
         return tool("finish_project", { outcome: "completed", summary: "都做完了", retro: "none" });
       },
       (req) => {
@@ -127,15 +128,15 @@ describe("a project's books are kept before its model runs", () => {
         return {};
       },
     );
-    projectId = startProjectSync(h.kernel, { title: "报表", outcome: "报表上线", brief: "做报表" }).projectId;
+    projectId = startProjectSync(h.kernel, { title: "报表", outcome: "报表上线", brief: "做报表" }, { principalId: h.kernel.ownerPrincipal }).projectId;
     await h.kernel.idle();
     expect(h.kernel.getCell(projectId)?.status).toBe("paused");
     expect(h.kernel.getCell(projectId)).toMatchObject({status:"paused",pauseReason:"parked"});
 
-    expect(h.kernel.sendToCell(projectId, { text: "现在做导出" })).toMatchObject({ status: "delivered", targetStatus: "paused" });
+    expect(h.kernel.sendToCell(projectId, { text: "现在做导出" }, { principalId: h.kernel.ownerPrincipal })).toMatchObject({ status: "delivered", targetStatus: "paused" });
     await h.kernel.idle();
     expect(h.script.pending("project")).toBe(1); // parked: the message waits
-    h.kernel.control(projectId, { action: "resume" });
+    h.kernel.control(projectId, { action: "resume" }, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     expect(h.script.pending("project")).toBe(0);
     expect(h.state<ProjectRecord>(projectId, gtdKeys.project)).toMatchObject({ lifecycle: "active" });
@@ -149,13 +150,13 @@ it("tracks a worker spawned during the same project turn", async () => {
     const [worker] = childrenOf(h, "project", "worker");
     return tool("track_action", {title:"记录排查", owner:"agent", cellId:worker!});
   }, {});
-  startProjectSync(h.kernel, {id:"project", title:"排查", outcome:"确认原因", brief:"核对日志"});
+  startProjectSync(h.kernel, {id:"project", title:"排查", outcome:"确认原因", brief:"核对日志"}, { principalId: h.kernel.ownerPrincipal });
   await h.kernel.idle();
   const [worker] = childrenOf(h, "project", "worker");
   expect(h.actions("project")).toContainEqual(expect.objectContaining({title:"记录排查", cellId:worker!}));
-  await h.kernel.closeCell(worker!, "completed");
+  await h.kernel.closeCell(worker!, "completed", { principalId: h.kernel.ownerPrincipal });
   h.script.add("project", tool("track_action", {title:"过期派工", owner:"agent", cellId:worker!}), {});
-  h.kernel.sendToCell("project", {text:"记录新动作"});
+  h.kernel.sendToCell("project", {text:"记录新动作"}, { principalId: h.kernel.ownerPrincipal });
   await h.kernel.idle();
   expect(h.actions("project").some(a => a.title === "过期派工")).toBe(false);
 });

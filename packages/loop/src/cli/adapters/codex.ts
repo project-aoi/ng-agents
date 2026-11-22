@@ -10,7 +10,7 @@ import { asRecord, contentText, HOST_UNSANDBOXED, str, tomlInlineTable, tomlValu
  * - Sandbox (`-s` on a fresh exec, `-c sandbox_mode` on resume/fork, which take no `-s`), enforced by Codex's Linux
  *   sandbox (bubblewrap + seccomp) for every shell command and patch. Codex's shell and patch tools cannot be switched
  *   off separately, so the mode follows the whole cell:
- *   - read-only cells (both access modes): `read-only` — reads anywhere, no writes, no network for commands.
+ *   - read-only cells: `read-only` — reads anywhere, no writes, no network for commands.
  *   - host access, writing (docs/05 default): `danger-full-access` — no sandbox: writes, commands and network
  *     anywhere, the owner's execpolicy rules in effect.
  * - `--ignore-rules` whenever a sandbox is on: no user/project execpolicy rules, since a matching allow rule runs its

@@ -27,6 +27,7 @@ import {
   type TimerFiredPayload,
 } from "@ng/protocol";
 import { RESURFACE_MARKER } from "./constants";
+import { effectiveCwd } from "./workdir";
 import type { KernelCore } from "./core";
 import { buildRunPorts } from "./ports";
 import type { IdleOptions, RunInfo, RunResult } from "./types";
@@ -35,6 +36,7 @@ import type { IdleOptions, RunInfo, RunResult } from "./types";
 export type StopReason = "cancel" | "pause" | "close" | "shutdown";
 
 export interface RunHandle {
+  cwd: string | null;
   claimId: string;
   cellId: string;
   epoch: number;
@@ -67,7 +69,7 @@ export interface Dispatcher {
   /** Defer CLI dispatch for a cell whose previous CLI process has unknown identity (`null` on macOS). */
   holdForUnknownOrphan(cellId: string): void;
   /** Runs in flight with what the stall check and the occupancy view need. */
-  running(): Array<{ cellId: string; stallOnly: boolean }>;
+  running(): Array<{ cwd: string | null; cellId: string; stallOnly: boolean }>;
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -199,6 +201,7 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
           if (reminder) context.appendEvidenceSync(cellId, {kind:"inbound", envelope:env, runId:`timer:${env.id}`, at:clock.now()});
         });
       } catch (err) {
+        inbox.retryPendingSync(cellId, env.id, String(err), core.retryBackoffMs);
         core.onError(err, `处理 ${cellId} 的定时事项 ${env.id}`);
       }
     }
@@ -221,6 +224,7 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
       if (core.lifecycle.cleaningUp(cellId)) continue; // The previous epoch notifies us when its runtime has stopped.
       // A cell with a Run in flight is re-notified when that Run ends; the claim is the real lock either way.
       if (inFlight(cellId) > 0) continue;
+      if (core.workspace.listJobsSync({cellId, state:["running"]}).some(job => job.cancelRequestedAt !== null)) continue;
       if (reapingOrphans.has(cellId)) continue;
       if (cell.spec.processor.kind === "llm") {
         // BUG-027: do not launch a replacement CLI process while an unverified previous process for this cell may still run.
@@ -258,6 +262,7 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
 
   function launch(batch: ClaimedBatch, cell: CellRecord): void {
     const handle: RunHandle = {
+      cwd: cell.spec.cwd || core.repoPath ? effectiveCwd(core, cell) : null,
       claimId: batch.claimId,
       cellId: batch.cellId,
       epoch: batch.epoch,
@@ -462,9 +467,8 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
     const cellId = handle.cellId;
     let closed: string[] = [];
     const afterwards: Array<() => void> = [];
-    withTx(core.db, () => {
-      const inputs = inbox.listMessagesSync({ claimId: handle.claimId, status: ["claimed", "done"] }).map(row => row.envelope);
-      inbox.completeSync(handle.claimId);
+    inbox.completeSync(handle.claimId, pauseSelf => {
+      const inputs = inbox.listMessagesSync({ claimId: handle.claimId, status: ["done"] }).map(row => row.envelope);
       const cur = cells.get(cellId);
       // Closed or cancelled while it ran: the late outcome changes nothing (guard 4).
       if (!cur || cur.status === "closed" || cur.epoch !== handle.epoch) return;
@@ -496,10 +500,10 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
         return;
       }
 
-      if (result !== "cancelled") core.stall.afterRun(cellId, inputs);
       const leaf = isLeafLifetime(cur.spec.lifetime) && cur.parentId !== null;
       const oneShot = leaf && cur.spec.lifetime === "one_shot";
       if (result === "refused") {
+        if (leaf && inbox.pendingWakeupCountSync(cellId) > 0) return;
         const said = lastWords(cellId, handle.claimId);
         const failed = `The model refused this task${said ? `: ${said}` : "."}`;
         if (oneShot) closed = deliverAndClose(cur, handle, { reason: "completed", failed });
@@ -516,20 +520,28 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
       const restingLeaf = leaf && !oneShot && result === "yielded_waiting";
       const currentCandidate = leaf && candidateOf(handle);
       const reported = oneShot && result === "yielded_waiting" && currentCandidate;
-      if (result !== "completed" && !self && !restingLeaf && !reported) return;
-      if (!leaf && !self) return;
+      if ((result !== "completed" && !self && !restingLeaf && !reported) || (!leaf && !self)) {
+        if (result !== "cancelled") core.stall.afterRun(cellId, inputs);
+        return;
+      }
       // Drain first: something that would wake the cell is waiting, so it is not done.
       if (inbox.pendingWakeupCountSync(cellId) > 0 || inbox.activeClaimCountSync(cellId, handle.claimId) > 0) return;
       if (leaf && !oneShot && currentCandidate) {
         for (const wait of core.waits.list([cellId])) core.waits.clear(cellId, wait.waitId);
       }
       if (oneShot && !self && !currentCandidate &&
-          core.readModel.activityOf([cellId]).get(cellId)?.state !== "dormant") return;
+          core.readModel.activityOf([cellId]).get(cellId)?.state !== "dormant") {
+        core.stall.afterRun(cellId, inputs);
+        return;
+      }
       if (!self && !oneShot) {
         // A wakeable leaf. Its turn is over only when nothing of it is still out — no wait it registered, no Job, no
         // card with the owner, no timer or watch it set for itself: exactly when it is dormant (this Run has already
         // left the run table and its claim is completed, so the read model sees the cell as it will be).
-        if (core.readModel.activityOf([cellId]).get(cellId)?.state !== "dormant") return;
+        if (core.readModel.activityOf([cellId]).get(cellId)?.state !== "dormant") {
+          core.stall.afterRun(cellId, inputs);
+          return;
+        }
         notifySettled(cur, handle, { outcome: "completed" });
         return;
       }
@@ -549,9 +561,17 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
         }
         return;
       }
+      if (self?.action === "complete") {
+        const pending = core.readModel.pendingSettlement(cellId, self.force);
+        if (pending.length) {
+          context.appendEvidenceSync(cellId, {kind: "system_note", runId: handle.claimId, at: clock.now(),
+            text: `Project remains open. Unfinished work: ${pending.join(", ")}`});
+          return;
+        }
+      }
       if (self?.statePatches) context.commitSync(cellId, { statePatches: self.statePatches });
       if (self?.action === "pause") {
-        if (cur.status === "active") inbox.controlSync(cellId, { action: "pause", ...(self.pauseReason ? {pauseReason:self.pauseReason} : {}), principalId: core.ownerPrincipal });
+        if (cur.status === "active") pauseSelf(self.pauseReason);
         return;
       }
       closed = deliverAndClose(cur, handle, { reason: self?.action === "cancel" ? "cancelled" : "completed", ...(self?.summary ? { summary: self.summary } : {}) });
@@ -728,6 +748,6 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
     renewAll,
     idle,
     holdForUnknownOrphan,
-    running: () => [...runs.values()].map((h) => ({ cellId: h.cellId, stallOnly: h.stallOnly })),
+    running: () => [...runs.values()].map((h) => ({ cellId: h.cellId, cwd: h.cwd, stallOnly: h.stallOnly })),
   };
 }

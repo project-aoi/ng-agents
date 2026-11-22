@@ -27,7 +27,7 @@ describe("kernel with CLI engines", () => {
     const h = await boot({ kernel: { cli: { claude: cliOpts(claude) } } });
     expect(h.kernel.agentBackend).toBeNull();
     h.script.add("desk", tool("set_state", { patches: { desk: "api" } }), { text: "ok" });
-    h.kernel.createRootCell({ id: "clicell", title: "CLI cell", processor: { kind: "llm", engine: "claude", toolsets: [TOOLSETS.context, TOOLSETS.comms] } });
+    h.kernel.createRootCell({ id: "clicell", title: "CLI cell", processor: { kind: "llm", engine: "claude", toolsets: [TOOLSETS.context, TOOLSETS.comms] } }, { principalId: h.kernel.ownerPrincipal });
 
     await h.memory.inject({ from: "alice", text: "hello desk" });
     message(h, "clicell", "hello cli");
@@ -74,7 +74,7 @@ describe("kernel with CLI engines", () => {
     const codexProcessor = { kind: "llm" as const, engine: "codex" as const, toolsets: [TOOLSETS.workspace, TOOLSETS.context, TOOLSETS.comms] };
 
     // worker on codex, docs/05 default: the owner's real directory, no OS sandbox
-    h.kernel.spawnCell("desk", { id: "build", preset: "worker", title: "build", cwd: repo, processor: codexProcessor }, "build it");
+    h.kernel.spawnCell("desk", { id: "build", preset: "worker", title: "build", cwd: repo, processor: codexProcessor }, "build it", { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     const argvs = () => codex.log().filter((e) => e.type === "argv");
     const configs = () => codex.log().filter((e) => e.type === "codex_config");
@@ -91,11 +91,11 @@ describe("kernel with CLI engines", () => {
     ).toEqual([[`build:${buildRun}:settled`, "built it"]]);
 
     // a CLI-run parent spawning a fork_prefix child: the kernel hands the child the parent's session to fork
-    h.kernel.createRootCell({ id: "lead", cwd:repo, processor: { kind: "llm", engine: "claude", toolsets: [TOOLSETS.context, TOOLSETS.comms, TOOLSETS.cells] } });
+    h.kernel.createRootCell({ id: "lead", cwd:repo, processor: { kind: "llm", engine: "claude", toolsets: [TOOLSETS.context, TOOLSETS.comms, TOOLSETS.cells] } }, { principalId: h.kernel.ownerPrincipal });
     message(h, "lead", "unique-parent-start");
     await h.kernel.idle();
     const parentRec = h.kernel.context.readStateSync<CliSessionRecord>("lead", CLI_SESSION_KEY)!;
-    const addr = h.kernel.spawnCell("lead", { contextMode: "fork_prefix", title: "sub", cwd:repo, processor: { kind: "llm", engine: "claude", toolsets: [TOOLSETS.context, TOOLSETS.comms] } }, "subtask");
+    const addr = h.kernel.spawnCell("lead", { contextMode: "fork_prefix", title: "sub", cwd:repo, processor: { kind: "llm", engine: "claude", toolsets: [TOOLSETS.context, TOOLSETS.comms] } }, "subtask", { principalId: h.kernel.ownerPrincipal });
     const childId = addr.slice("inbox:".length);
     await h.kernel.idle();
     const launches = claude.launches();
@@ -118,7 +118,7 @@ describe("kernel with CLI engines", () => {
 
     const h = await boot({ kernel: { loop: undefined, agentBackend: "auto", cli: { claude: { bin: missing }, codex: { bin: missing }, agy: cliOpts(agy) } } });
     expect(h.kernel.agentBackend).toBe("agy");
-    h.kernel.createRootCell({ id: "plain", processor: { kind: "llm", toolsets: [TOOLSETS.context] } });
+    h.kernel.createRootCell({ id: "plain", processor: { kind: "llm", toolsets: [TOOLSETS.context] } }, { principalId: h.kernel.ownerPrincipal });
     message(h, "plain", "hi");
     await h.kernel.idle();
     expect(h.kernel.context.readStateSync("plain", "via")).toBe("agy");

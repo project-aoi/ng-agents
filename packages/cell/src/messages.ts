@@ -166,6 +166,8 @@ export function directMessage(
     if (target.status === "closed") {
       // "Three seconds too late" must not exist for the owner: a worker that was closed under an open project comes back.
       if (!core.lifecycle.reopenLeafSync(cellId)) {
+        if (core.cells.ancestors(cellId).some(c => c.status === "paused"))
+          return { status: "refused", reason: "paused_parent", detail: "resume the parent before messaging this archived worker" };
         return { status: "refused", reason: "archived", detail: "this cell was closed with its project (or is not a worker that can be brought back); start the work again from its project or the desk" };
       }
       reopened = true;

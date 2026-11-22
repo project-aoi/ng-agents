@@ -1,4 +1,4 @@
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { isIP } from "node:net";
 
 // docs/01 §四 坑 1: a control plane reachable without authentication is a remote-execution hole. The desk binds to
@@ -19,7 +19,8 @@ export function isLoopbackHost(host: string): boolean {
 
 export interface SecurityPolicy {
   /** Required on every /api/* request when set (`Authorization: Bearer <token>`; `?token=` only on the SSE stream). */
-  token: string | null;
+  token: string;
+  generatedOwnerToken: boolean;
   /** Host header names accepted (lowercase, no port). null = any (the token is the guard). */
   allowedHosts: ReadonlySet<string> | null;
   /** Each external agent authenticates with its own token and acts as agent:<id>. */
@@ -48,8 +49,7 @@ export type AgentAuth = { ok: true; principalId: `agent:${string}`; agentId: str
 /**
  * Who is calling the agent API.
  * - A presented agent token → that agent.
- * - No agent token configured, loopback bind, and no owner token either (the default local setup, where the whole
- *   API is already open to local software): `agent:local` — still an agent, never the owner.
+ * - No agent token configured, loopback bind, and an automatically issued owner credential (default local setup): `agent:local` — still an agent, never the owner.
  * - Anything else is refused; in particular the owner's token does not open the agent API (two separate credentials).
  */
 export function agentAuthFor(policy: SecurityPolicy, presented: string | null): AgentAuth {
@@ -62,7 +62,7 @@ export function agentAuthFor(policy: SecurityPolicy, presented: string | null): 
     }
     return { ok: false, reason: "unknown agent token" };
   }
-  if (policy.agentTokens.size === 0 && policy.loopback && policy.token === null) return { ok: true, principalId: "agent:local", agentId: "local" };
+  if (policy.agentTokens.size === 0 && policy.loopback && policy.generatedOwnerToken) return { ok: true, principalId: "agent:local", agentId: "local" };
   return { ok: false, reason: "an agent token is required (Authorization: Bearer <NG_AGENT_TOKEN>)" };
 }
 
@@ -84,6 +84,7 @@ export function securityPolicyFor(
     agentTokens.set(id, at);
   }
   if (t && t.length < 16) throw new SecurityConfigError("NG_DESK_TOKEN is too short: use at least 16 random characters (e.g. `openssl rand -hex 24`).");
+  if (agentTokens.size && !t) throw new SecurityConfigError("配置助手令牌时必须同时设置独立的 NG_DESK_TOKEN");
   const loopback = isLoopbackHost(bindHost);
   if (!loopback && !t) {
     throw new SecurityConfigError(
@@ -92,7 +93,7 @@ export function securityPolicyFor(
   }
   const hosts = new Set(["localhost", "127.0.0.1", "::1", ...extraHosts.map((h) => h.trim().toLowerCase()).filter(Boolean)]);
   if (loopback && !["localhost", "127.0.0.1", "::1"].includes(bindHost.toLowerCase())) hosts.add(bindHost.toLowerCase());
-  return { token: t || null, allowedHosts: loopback ? hosts : extraHosts.length ? hosts : null, agentTokens, loopback };
+  return { token: t || randomBytes(32).toString("base64url"), generatedOwnerToken: !t, allowedHosts: loopback ? hosts : extraHosts.length ? hosts : null, agentTokens, loopback };
 }
 
 function digest(s: string): Buffer {

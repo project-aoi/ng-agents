@@ -4,7 +4,7 @@
 
 import { afterEach, describe, expect, it } from "vitest";
 import { gtdKeys } from "@ng/presets";
-import {  type ProjectRecord} from "@ng/protocol";
+import type { ProjectRecord } from "@ng/presets/records";
 import type { HumanItemDTO, ProjectMutationResponse, RadarDTO } from "../src/shared/api";
 import { bootRealDesk, cellMessages, cleanupAll, requestsOf, tool, type TestDesk } from "./helpers";
 
@@ -58,10 +58,12 @@ describe("app × real presets", () => {
     const d = await bootRealDesk();
     const cardId = await proposal(d, [{ title: "和市场部对齐风格", owner: "human", effort: "15m", nextStep: "约市场部聊 15 分钟" }]);
     // The project's first run: it waits for the owner.
-    d.script.add("project", tool("track_action",{title:"和市场部对齐风格",owner:"human",nextStep:"约市场部聊 15 分钟"}), tool("wait", { reason: "等主人和市场部对齐风格", waitingFor: "human" }));
+    d.script.add("project", tool("wait", { reason: "等主人和市场部对齐风格", waitingFor: "human" }));
     await approve(d, cardId);
     await d.kernel.idle();
-    const [item] = (await itemsOf(d));
+    const items = await itemsOf(d);
+    expect(items).toHaveLength(1);
+    const [item] = items;
     expect(item).toMatchObject({ title: "和市场部对齐风格", project: { title: "官网改版" } });
     const projectId = item!.project!.id;
     expect(d.kernel.listWaits([projectId]).map((w) => w.waitingFor)).toEqual(["human"]);

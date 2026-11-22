@@ -171,13 +171,17 @@ export function createWaits(core: Pick<KernelCore, "db" | "clock" | "inbox" | "b
         for (const env of envelopes) {
           const p = env.payload as Record<string, unknown> | null;
           const data = p?.data as Record<string, unknown> | undefined;
-          const refs = [p?.refId, p?.waitId, p?.replyToId, data?.refId, data?.waitId, data?.replyToId].filter((x) => typeof x === "string");
+          const refs = [p?.refId, p?.waitId, p?.replyToId, data?.refId, data?.waitId, data?.replyToId].filter((x) => typeof x === "string" && x.trim().length > 0);
           const candidates = open.filter(w => !done.has(w.waitId) && w.registeredRun !== runId && answers(w, env));
           const keys = p?.actionId ? [...refs, p.actionId] : refs;
           const explicit = candidates.filter(w => keys.includes(w.waitId) || (w.refId !== null && keys.includes(w.refId)));
           const direct = env.from === KERNEL_FROM.control && ["owner", "agent"].includes(parsePrincipal(env.principalId, core.ownerPrincipal).kind);
-          const unqualified = refs.length === 0 && (direct || candidates.length === 1);
-          const matches = env.type === PAYLOAD.waitTimeout ? candidates : explicit.length ? explicit : unqualified ? candidates : [];
+          const unnamed = candidates.filter(w => w.refId === null && w.waitId === w.waitingFor);
+          const chatReply = direct && !p?.actionId && ![p?.refId, p?.waitId, data?.refId, data?.waitId].some(Boolean);
+          const fallback = chatReply && !refs.length ? candidates
+            : chatReply ? unnamed.filter(w => w.waitingFor === "human")
+            : !refs.length && candidates.length === 1 ? unnamed : [];
+          const matches = env.type === PAYLOAD.waitTimeout ? candidates : explicit.length ? explicit : fallback;
           for (const w of matches) if (remove(cellId, w.waitId)) done.add(w.waitId);
         }
         return [...done];

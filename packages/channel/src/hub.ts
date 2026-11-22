@@ -3,6 +3,7 @@ import {
   type Bus, type Channel, type ChannelHub, type Clock, type Db, type Envelope, type LocalNotification,
 } from "@ng/protocol";
 
+
 export interface ChannelHubOptions {
   db: Db;
   bus: Bus;
@@ -21,7 +22,7 @@ export function createChannelHub({ db, bus, clock = systemClock, ownerPrincipal 
     const from = parseAddress(String(raw.from));
     if (!from || from.kind !== "channel" || from.channelId !== channelId) throw bad(`from "${String(raw.from)}" is not channel:${channelId}:<target>`);
     const p = raw.principalId;
-    if (typeof p !== "string" || !(p === ownerPrincipal || (p.startsWith(`${channelId}:`) && p.length > channelId.length + 1))) {
+    if (typeof p !== "string" || !(p === ownerPrincipal || (channels.get(channelId)?.workbenchIngress === true && /^agent:[a-z0-9][a-z0-9_-]{0,31}$/.test(p)) || (p.startsWith(`${channelId}:`) && p.length > channelId.length + 1))) {
       throw bad(`principal "${String(p)}" is neither the owner nor ${channelId}:<externalUserId>`);
     }
     if (raw.kind !== "event" && raw.kind !== "result") throw bad("kind must be event or result");

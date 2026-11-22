@@ -51,9 +51,13 @@ const PERMISSION_KINDS_READ = new Set(["read", "search", "think"]);
  * Decide one `session/request_permission` from the cell's capabilities (exported for tests). ACP tool kinds: read,
  * edit, delete, move, search, execute, think, fetch, switch_mode, other.
  */
-export function agyPermissionAllowed(toolCall: Record<string, unknown>, caps: CliCapabilities, serverName: string): boolean {
+function isBridgeTool(toolCall: Record<string, unknown>, serverName: string): boolean {
   const prefix = `mcp_${serverName}_`;
-  if ((str(toolCall["name"]) ?? "").startsWith(prefix) || (str(toolCall["title"]) ?? "").startsWith(`Run ${prefix}`)) return true;
+  return (str(toolCall["name"]) ?? "").startsWith(prefix) || (str(toolCall["title"]) ?? "").startsWith(`Run ${prefix}`);
+}
+
+export function agyPermissionAllowed(toolCall: Record<string, unknown>, caps: CliCapabilities, serverName: string): boolean {
+  if (isBridgeTool(toolCall, serverName)) return true;
   const kind = str(toolCall["kind"]) ?? "other";
   if (kind === "fetch") return caps.web;
   // A writing cell on the host may do anything the owner could; a read-only one reads/searches anywhere.
@@ -187,6 +191,11 @@ class AgyDriver implements CliDriver {
         this.#flushText(out);
         this.#promptId = null;
         const stopped = this.#cancelled || result["stopReason"] === "cancelled";
+        if (stopped && !this.#cancelled && !error) {
+          this.#queued.length = 0;
+          out.push({ type: "turn_end", ok: false, error: "agy stopped the prompt before completion" });
+          break;
+        }
         if (error || result["stopReason"] === "refusal") {
           this.#queued.length = 0;
           out.push(error
@@ -194,6 +203,7 @@ class AgyDriver implements CliDriver {
             : { type: "turn_end", ok: false, more: false, refused: true });
           break;
         }
+        if (io.acceptingPrompts?.() === false) this.#queued.length = 0;
         const next = this.#queued.shift();
         if (next !== undefined && !this.#prompt(io, next)) {
           this.#queued.length = 0;
@@ -252,7 +262,7 @@ class AgyDriver implements CliDriver {
         const id = str(update["toolCallId"]);
         if (!id || this.#finished.has(id)) break;
         const name = str(update["name"]) ?? str(update["title"]) ?? "tool";
-        if (name.startsWith(`mcp_${this.#req.mcp.serverName}_`)) break;
+        if (isBridgeTool(update, this.#req.mcp.serverName)) break;
         if (!this.#native.has(id)) {
           this.#native.set(id, name);
           out.push({ type: "tool_start", id, name, input: update["rawInput"] ?? update["args"] ?? {} });

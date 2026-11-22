@@ -53,7 +53,7 @@ describe("Phase 0 (@ng/cell) — BUG-020, BUG-027, BUG-028, BUG-034", () => {
   it("holds a cell during a reap even when an intervening probe would see no registration", async () => {
     vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
     const h = await boot({ start: false });
-    h.kernel.spawnCell("desk", {id:"w", preset:"worker"});
+    h.kernel.spawnCell("desk", {id:"w", preset:"worker"}, undefined, { principalId: h.kernel.ownerPrincipal });
     const dir = join(h.dataDir, "cli-procs");
     mkdirSync(dir, {recursive:true});
     const leader = spawn(process.execPath, ["-e", [
@@ -134,14 +134,15 @@ describe("Phase 0 (@ng/cell) — BUG-020, BUG-027, BUG-028, BUG-034", () => {
     await h.kernel.idle();
     const [resMsg] = h.kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.approvalResolved });
     const resPayload = resMsg!.envelope.payload as ApprovalResolvedPayload;
-    expect(resPayload.humanEdited).toBe(true);
+    expect(resPayload).toMatchObject({humanEdited: true, artifactVersion: 2});
+    expect(h.kernel.gate.getApprovalSync(card!.actionId)).toMatchObject({humanEdited: true, boundVersion: 2});
     expect(resPayload.humanDiff).toContain("- 旧的第二行");
     expect(resPayload.humanDiff).toContain("+ 主人改过的第二行");
   });
 
   it("BUG-034: inspect_cell preserves tail-200 + [res://...] on errors, formats job.result/approval.resolved cleanly, and keeps head 20% + tail 80% on truncation", async () => {
     const h = await boot();
-    h.kernel.spawnCell("desk", { id: "w", preset: "worker", title: "排查" });
+    h.kernel.spawnCell("desk", { id: "w", preset: "worker", title: "排查" }, undefined, { principalId: h.kernel.ownerPrincipal });
     const ctx = h.kernel.context;
 
     // 1) Long error tool_result with a [res://...] pointer at the end.
@@ -200,7 +201,7 @@ describe("Phase 0 (@ng/cell) — BUG-020, BUG-027, BUG-028, BUG-034", () => {
 
     // Seed a cell "w" first, then stop kernel.
     const a = await boot({ dataDir });
-    a.kernel.spawnCell("desk", { id: "w", preset: "worker" });
+    a.kernel.spawnCell("desk", { id: "w", preset: "worker" }, undefined, { principalId: a.kernel.ownerPrincipal });
     await a.kernel.close();
 
     // Plant an orphan CLI record for cell "w" pointing at a live PID whose identity cannot be read (null).

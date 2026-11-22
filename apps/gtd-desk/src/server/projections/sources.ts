@@ -1,4 +1,4 @@
-import type { SourceRecord } from "@ng/protocol";
+import type { SourceRecord } from "@ng/presets/records";
 import type { SensorSourceDTO, SourcesDTO } from "../../shared/api";
 import { readSources, type ProjectionInput } from "./common";
 import { button, enc, post } from "./format";
@@ -39,7 +39,7 @@ export function projectSources(input: ProjectionInput): SourcesDTO {
     const cell = kernel.getCell(s.cellId);
     if (!cell || cell.status === "closed") continue;
     const r = s.record;
-    const status = cell.status === "paused" ? "paused" : r.status === "paused" ? "ok" : r.status;
+    const status = r.status;
     const base = `/api/sources/${enc(s.cellId)}`;
     const other = r.mode === "observe" ? "active" : "observe";
     sensors.push({

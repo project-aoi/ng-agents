@@ -5,7 +5,7 @@
 // never goes out of date with the server it talks to.
 //
 //   NG_DESK_URL     base URL of the workbench            (default http://127.0.0.1:8790)
-//   NG_AGENT_TOKEN  the agent's bearer token             (not needed for a token-less loopback workbench)
+//   NG_AGENT_TOKEN  the agent's bearer token             (optional with the default loopback agent identity)
 //
 // Plain ESM without dependencies: any Node >= 18 runs it straight from the source tree, e.g.
 //   claude mcp add ng-desk -- node /path/to/ng-agents/apps/gtd-desk/bin/ng-mcp.mjs
@@ -40,7 +40,7 @@ async function http(method, path, body) {
 /** A failure the agent can act on, never a stack trace. */
 function unreachable(err) {
   const why = err && err.name === "AbortError" ? `no answer within ${Math.round(CALL_TIMEOUT_MS / 1000)} s` : err instanceof Error ? err.message : String(err);
-  return `The ng-agents workbench at ${base} could not be reached (${why}). It has to be running for these tools to work: start it with \`pnpm start\` in the ng-agents directory (or set NG_DESK_URL if it listens elsewhere). Tell the owner; do not retry in a loop.`;
+  return `The ng-agents workbench at ${base} could not be reached (${why}). Ask the owner to check the workbench service and its address. Do not retry in a loop.`;
 }
 
 let catalog = null;

@@ -2,8 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { NgError } from "@ng/protocol";
-import type { ModelsDTO, SetModelRequest } from "../shared/api";
-import type { ModelSwitch } from "./models";
+import type { SetModelRequest } from "../shared/api";
 import { Hono, type Context } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { streamSSE } from "hono/streaming";
@@ -23,8 +22,6 @@ export interface DeskAppDeps {
   security: SecurityPolicy;
   /** docs/05 §5.3: the external main agent's control plane (`/api/agent/*`, also what the MCP server proxies to). */
   agent?: AgentControlPlane;
-  /** The owner's model switch (CLI backends). */
-  models?: ModelSwitch;
   /** Built web client (index.html + assets); null/missing = API only. */
   webDir?: string | null;
   onError?: (err: unknown, where: string) => void;
@@ -68,17 +65,6 @@ async function body<T>(c: Context): Promise<T> {
 /**
  * The HTTP surface: `/api/*` (bearer token when configured, same-site writes only), `/api/events` (SSE),
  */
-const NO_MODELS: ModelsDTO = {
-  available: false,
-  engine: null,
-  models: [],
-  recommended: null,
-  fetchedAt: null,
-  error: null,
-  selection: { strong: { mode: "auto" }, fast: { mode: "auto" } },
-  effective: { strong: null, fast: null },
-};
-
 export function createDeskApp(deps: DeskAppDeps): Hono {
   const { desk, events, security } = deps;
   const ownerActor = { principalId: desk.ownerPrincipal };
@@ -136,38 +122,29 @@ export function createDeskApp(deps: DeskAppDeps): Hono {
   app.use("/api/*", limit);
 
   // ---------- top bar ----------
-  const withModel = <T extends { model?: string }>(status: T): T => {
-    const label = deps.models?.label();
-    return label ? { ...status, model: label } : status;
-  };
-  const deskStatus = () => withModel(desk.status());
-  app.get("/api/status", (c) => c.json(deskStatus()));
-  // The owner's model switch: the list is whatever the backend CLI reports.
-  app.get("/api/models", async (c) => c.json(await (deps.models ? deps.models.view({ refresh: c.req.query("refresh") === "1" }) : NO_MODELS)));
-  app.put("/api/models", async (c) => {
-    if (!deps.models) throw new DeskError(400, "unsupported", "当前不是由 CLI Agent 驱动，没有可切换的模型");
-    return c.json(await deps.models.set(await body<SetModelRequest>(c)));
-  });
+  app.get("/api/status", c => c.json(desk.status()));
+  app.get("/api/models", async c => c.json(await desk.models(c.req.query("refresh") === "1")));
+  app.put("/api/models", async c => c.json(await desk.setModel(await body<SetModelRequest>(c), ownerActor)));
   app.post("/api/capture", async (c) => c.json(await desk.ingest(await body(c),ownerActor)));
 
   app.get("/api/projects/closed", c => c.json({projects:desk.recentlyClosedProjects()}));
   app.get("/api/human-items", c => c.json({ items: desk.listHumanItems(), openArtifactIds: desk.openArtifactIds() }));
   app.post("/api/human-items/:id/decide", async (c) => {
     const result = await desk.decideHumanItem(c.req.param("id"), await body(c), ownerActor);
-    return c.json({ ...result, deskStatus: deskStatus() });
+    return c.json({ ...result, deskStatus: desk.status() });
   });
   app.post("/api/human-activity/:id/undo", async (c) => {
     const result = await desk.undoHumanDecision(c.req.param("id"), ownerActor);
-    return c.json({ ...result, deskStatus: deskStatus() });
+    return c.json({ ...result, deskStatus: desk.status() });
   });
   app.post("/api/projects/:id/reopen", async (c) => {
     const result = await desk.reopenProject(c.req.param("id"), ownerActor);
-    return c.json({ ...result, deskStatus: deskStatus() });
+    return c.json({ ...result, deskStatus: desk.status() });
   });
 
   app.put("/api/human-items/:id/plan", async (c) => {
     const result = await desk.savePlan(c.req.param("id"), await body(c), ownerActor);
-    return result.ok ? c.json({ ...result, deskStatus: withModel(result.deskStatus) }) : c.json(result, 409);
+    return result.ok ? c.json(result) : c.json(result, 409);
   });
 
   // ---------- drafts ----------
@@ -236,7 +213,7 @@ export function createDeskApp(deps: DeskAppDeps): Hono {
       const ping = setInterval(() => void write({ event: "ping", data: {} }), PING_MS);
       stream.onAbort(() => done());
       try {
-        await write({ event: "hello", data: { status: deskStatus() } });
+        await write({ event: "hello", data: { status: desk.status() } });
         await finished;
       } finally {
         clearInterval(ping);

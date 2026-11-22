@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { gtdKeys } from "@ng/presets";
 import { subjectKeys } from "@ng/protocol";
 import { DEFAULT_SETTINGS, inputOf, projectActivity, projectRadar, projectReview, projectSources, projectStatus, SENSOR_SUGGESTION_PREFIX, SKILL_SUGGESTION_PREFIX } from "../src/server/projections";
+import { topBallOwner } from "../src/server/projections/radar";
 import { cronText } from "../src/server/projections/sources";
 import { parseDecisions, waitingDTO } from "../src/server/projections/format";
 import { dueText, nextWeekly, weekStart } from "../src/server/projections/time";
@@ -44,9 +45,9 @@ describe("Radar projection", () => {
     // a card in the project's own subtree is the owner's anchor (docs/05 guard 2)
     makeReviewCard(kernel, { cellId: carded, subjectKey: subjectKeys.project(carded) });
     const timed = makeProject(kernel, "有闹钟");
-    kernel.spawnCell(timed, { id: "t1", preset: "checker", title: "超时提醒", schedules: [{ deliverAt: kernel.clock.now() + DAY }] });
+    kernel.spawnCell(timed, { id: "t1", preset: "checker", title: "超时提醒", schedules: [{ deliverAt: kernel.clock.now() + DAY }] }, undefined, { principalId: kernel.ownerPrincipal });
     const paused = makeProject(kernel, "暂停中");
-    kernel.control(paused, { action: "pause" });
+    kernel.control(paused, { action: "pause" }, { principalId: kernel.ownerPrincipal });
     // The projection only reads the kernel's stamp; the kernel re-checks right after each change (here: now).
     kernel.checkStalls();
     const rows = projectRadar(view(kernel)).projects;
@@ -80,14 +81,14 @@ describe("Radar projection — docs/05", () => {
     expect(projectRadar(view(kernel)).counts.stalled).toBe(1);
 
     // a stamp the app did not see the kernel clear (e.g. a pause) does not make a paused project red
-    kernel.control(p, { action: "pause" });
+    kernel.control(p, { action: "pause" }, { principalId: kernel.ownerPrincipal });
     row = projectRadar(view(kernel)).projects[0]!;
     expect(row).toMatchObject({ paused: true, stalled: false });
-    kernel.control(p, { action: "resume" });
+    kernel.control(p, { action: "resume" }, { principalId: kernel.ownerPrincipal });
     kernel.checkStalls();
 
     // a timer in the subtree is an anchor: the kernel clears the stamp
-    kernel.spawnCell(p, { id: "t1", preset: "checker", title: "明天再看", schedules: [{ deliverAt: clock.now() + DAY }] });
+    kernel.spawnCell(p, { id: "t1", preset: "checker", title: "明天再看", schedules: [{ deliverAt: clock.now() + DAY }] }, undefined, { principalId: kernel.ownerPrincipal });
     kernel.checkStalls();
     expect(kernel.db.prepare("SELECT 1 FROM cell_stalls WHERE cell_id=?").get(p)).toBeUndefined();
     expect(projectRadar(view(kernel)).projects[0]).toMatchObject({ stalled: false, waitingOn: 1, ball: { owner: "waiting" } });
@@ -96,10 +97,10 @@ describe("Radar projection — docs/05", () => {
   it("a project's workers and checkers are detail of its row, never rows of their own; summary and directory come from the record", async () => {
     const { kernel } = await bootDesk();
     const p = makeProject(kernel, "竞品调研", { summary: "A、B 两家已整理完", cwd: process.cwd() });
-    kernel.updateCell(p,{cwd:process.cwd()});
-    kernel.spawnCell(p, { id: "w1", preset: "inline", title: "扒 A 公司" });
-    kernel.spawnCell("w1", { id: "w1a", preset: "worker", title: "扒 A 的定价" });
-    kernel.spawnCell(p, { id: "wt", preset: "checker", title: "等 C 报价", watches: [{ threadOrFilter: { thread: "memory:quote-c" } }] });
+    kernel.updateCell(p,{cwd:process.cwd()}, { principalId: kernel.ownerPrincipal });
+    kernel.spawnCell(p, { id: "w1", preset: "inline", title: "扒 A 公司" }, undefined, { principalId: kernel.ownerPrincipal });
+    kernel.spawnCell("w1", { id: "w1a", preset: "worker", title: "扒 A 的定价" }, undefined, { principalId: kernel.ownerPrincipal });
+    kernel.spawnCell(p, { id: "wt", preset: "checker", title: "等 C 报价", watches: [{ threadOrFilter: { thread: "memory:quote-c" } }] }, undefined, { principalId: kernel.ownerPrincipal });
     const radar = projectRadar(view(kernel));
     expect(radar.projects.map((r) => r.id)).toEqual([p]);
     expect(radar.projects[0]).toMatchObject({ summary: "A、B 两家已整理完", cwd: process.cwd() });
@@ -133,8 +134,8 @@ describe("weekly review projection", () => {
     const p = makeProject(kernel, "比价");
     writeAction(kernel, p, { title: "等报价", owner: "waiting", waiting: { description: "等 C", join: "all", parties: [{ id: "c", label: "C", replied: false, dueAt: t - DAY }] } });
     writeProject(kernel, makeProject(kernel, "旧项目"), { title: "旧项目", lifecycle: "completed", completedAt: t - 2 * HOUR });
-    kernel.spawnCell("desk", { id: "s1", preset: "sensor", title: "指标巡检" });
-    writeSource(kernel, "s1", { title: "指标巡检", processor: "llm", runCount: 6, hitCount: 0 });
+    kernel.spawnCell("desk", { id: "s1", preset: "sensor", title: "指标巡检" }, undefined, { principalId: kernel.ownerPrincipal });
+    writeSource(kernel, "s1", { title: "指标巡检", runCount: 6, hitCount: 0 });
     kernel.context.commitSync("desk", {
       statePatches: {
         [`${SKILL_SUGGESTION_PREFIX}reply-style`]: { name: "reply-style", description: "回复客户的语气", body: "- 先结论", reason: "你本周 4 次把草稿改得更简短" },
@@ -185,8 +186,8 @@ describe("status projection", () => {
 describe("sources projection", () => {
   it("lists sensors with readable schedules", async () => {
     const { kernel } = await bootDesk();
-    kernel.spawnCell("desk", { id: "s2", preset: "sensor", title: "支付报错探头",processor:{kind:"code",entry:"gtd.sensor_script",args:{script:"checks/probe.sh"}},schedules:[{cron:"0 9 * * 1"}] });
-    writeSource(kernel, "s2", { title: "支付报错探头", schedule: { cron: "0 9 * * 1" }, mode: "observe", processor: "code", runCount: 3 });
+    kernel.spawnCell("desk", { id: "s2", preset: "sensor", title: "支付报错探头",processor:{kind:"code",entry:"gtd.sensor_script",args:{script:"checks/probe.sh"}},schedules:[{cron:"0 9 * * 1"}] }, undefined, { principalId: kernel.ownerPrincipal });
+    writeSource(kernel, "s2", { title: "支付报错探头", mode: "observe", runCount: 3 });
     const s = projectSources(view(kernel));
     expect(s.sensors).toMatchObject([{ id: "s2", scheduleText: "每周一 09:00", modeLabel: "只记观察笔记，不弹卡", processorLabel: "脚本检查（零 Token）", status: "ok" }]);
     expect(s.sensors[0]!.buttons.map((b) => b.id)).toEqual(["pause", "mode", "delete"]);
@@ -209,5 +210,14 @@ describe("pure helpers", () => {
     // A plan step "等行政确认…" with nobody counted (no watch) is plain text, not "已回 0/0".
     expect(waitingDTO({ description: "x", join: "any", parties: [] }, now)).toBeNull();
     expect(gtdKeys.project).toBe("gtd:project");
+  });
+});
+
+describe("project action display order", () => {
+  it("aggregates the ball owner by priority human > agent > waiting over open actions", () => {
+    expect(topBallOwner([{ owner: "waiting", status: "open" }, { owner: "agent", status: "open" }])).toBe("agent");
+    expect(topBallOwner([{ owner: "agent", status: "open" }, { owner: "human", status: "open" }])).toBe("human");
+    expect(topBallOwner([{ owner: "human", status: "done" }, { owner: "waiting", status: "open" }])).toBe("waiting");
+    expect(topBallOwner([{ owner: "human", status: "cancelled" }])).toBeNull();
   });
 });

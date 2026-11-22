@@ -12,7 +12,7 @@ import {
   NgError,
   parsePrincipal,
   PAYLOAD,
-  projectCellIdOf,
+  subjectKeys,
   stableStringify,
   run,
   withTx,
@@ -26,12 +26,13 @@ import {
   type HumanItemStatus,
   type ProposedAction,
 } from "@ng/protocol";
-import { ownerOnlyApproval } from "@ng/gate";
+import { ownerOnlyApproval, requiresApproval } from "@ng/gate";
 import { isProjectRoot, type KernelCore } from "./core";
 import { RESURFACE_MARKER } from "./constants";
 import { isKernelEscalation } from "./escalations";
 
 interface ItemRow {
+  principal_id: string;
   action_hash: string;
   action_id: string;
   cell_id: string | null;
@@ -49,6 +50,7 @@ interface ItemRow {
   related_project_ids: string;
   artifact_id: string | null;
   proposed_version: number | null;
+  bound_version: number | null;
   human_edited: number;
   category: HumanItem["category"];
   due_at: number | null;
@@ -266,7 +268,7 @@ export function createHumanItems(core: KernelCore) {
     const action: ProposedAction | null = JSON.parse(r.action);
     const card: Deliverable = JSON.parse(r.card);
     const info = card.data as Partial<HumanItemDraft> | undefined;
-    const controlled = action && (action.type !== "custom" || isKernelEscalation(action) || !!ownerOnlyApproval({ ...action, card }));
+    const controlled = action && !!r.action_hash && requiresApproval(action);
     const callback = r.cell_id !== null;
     let options: CardOption[];
     if (r.status === "resolved" || r.status === "cancelled") options = [];
@@ -276,11 +278,12 @@ export function createHumanItems(core: KernelCore) {
             controlled
               ? {
                   id: "system.execute",
-                  label: action?.type === "project.start" ? "确认立项" : action && isKernelEscalation(action) ? "继续处理" : "批准执行",
+                  label: action && isKernelEscalation(action) ? "继续处理" : "批准执行",
                   effect: "execute",
                 }
               : { id: "system.reply", label: "确认并回复", effect: "reply", input: { mode: "optional" } },
-            ...(action?.type === "project.start" ? [{ id: "system.someday", label: "先放进以后再说", effect: "execute" as const }] : []),
+            ...(controlled && action.type === "custom" && !isKernelEscalation(action)
+              ? [{id: "system.reply", label: "只回复", effect: "reply" as const, input: {mode: "optional" as const}}] : []),
             ...(r.artifact_id
               ? [{ id: "system.revise", label: "请修改", effect: "revise" as const, input: { mode: "required" as const } }]
               : []),
@@ -291,7 +294,7 @@ export function createHumanItems(core: KernelCore) {
     const art = r.artifact_id ? context.getArtifactSync(r.artifact_id) : null;
     const related = JSON.parse(r.related_project_ids) as string[];
     const holder = r.cell_id ? core.cells.get(r.cell_id) : undefined;
-    const projectId = holder && (isProjectRoot(core.registry, holder) ? holder.id : projectCellIdOf(holder.spec));
+    const projectId = holder && [holder, ...cells.ancestors(holder.id)].find(c => isProjectRoot(core.registry, c))?.id;
     if (projectId && !related.includes(projectId)) related.push(projectId);
     const humanEdited =
       !!r.human_edited ||
@@ -336,9 +339,14 @@ export function createHumanItems(core: KernelCore) {
       const cell = cellId === null ? null : core.cells.require(cellId);
       if (cell?.status === "closed") throw new NgError("conflict", "issuing cell is closed");
       const related = [...new Set(draft.relatedProjectIds ?? [])];
-      for (const pid of related) if (!isProjectRoot(core.registry, core.cells.get(pid))) throw new NgError("invalid_argument", "unknown related project");
+      const manages = (id: string) => !cell || id === cell.id || cells.ancestors(id).some(a => a.id === cell.id);
+      for (const pid of related) {
+        if (!isProjectRoot(core.registry, cells.get(pid))) throw new NgError("invalid_argument", "unknown related project");
+        if (cell && !manages(pid) && !cells.ancestors(cell.id).some(a => a.id === pid))
+          throw new NgError("bounds_violation", "关联项目超出发起任务的权限");
+      }
       for (const o of draft.options)
-        if (o.terminateMode === "cancel_task" && !related.includes(o.targetCellIds![0]!))
+        if (o.terminateMode === "cancel_task" && (!related.includes(o.targetCellIds![0]!) || !manages(o.targetCellIds![0]!)))
           throw new NgError("invalid_argument", "cancel target must be an explicitly related project");
       const now = clock.now();
       if (draft.dueAt !== undefined && !Number.isFinite(draft.dueAt)) throw new NgError("invalid_argument", "invalid due date");
@@ -354,8 +362,11 @@ export function createHumanItems(core: KernelCore) {
         data: { prep: draft.prep, rawInput: draft.rawInput, source: draft.source },
       });
       const action = { type: "custom", name: "human.reply", summary: draft.title, sideEffect: "none", subjectKey: draft.subjectKey };
+      const existingId = row(id);
+      if (existingId && existingId.action_id !== prior?.action_id) throw new NgError("conflict", "事项编号已被占用");
       if (prior) {
-        if (prior.action_hash !== "" || !prior.options || prior.epoch !== (cell?.epoch ?? null))
+        if (prior.action_hash !== "" || !prior.options || prior.epoch !== (cell?.epoch ?? null) ||
+            prior.category !== (draft.category ?? "decision") || prior.principal_id !== principalId)
           throw new NgError("conflict", "this subject has an open item");
         id = prior.action_id;
         run(
@@ -402,6 +413,17 @@ export function createHumanItems(core: KernelCore) {
     });
   }
 
+  function withdraw(id: string, reason: string) {
+    const r = row(id);
+    if (!r || r.disposition !== "pending") return;
+    if (r.action_hash) gate.withdrawSync(id, reason, {seenItemRevision: r.item_revision});
+    else {
+      run(db, "UPDATE human_items SET disposition='cancelled',status_reason=?,resolved_at=?,updated_at=?,item_revision=item_revision+1 WHERE action_id=?",
+        [reason, clock.now(), clock.now(), id]);
+      changed(row(id)!);
+    }
+  }
+
   function armResurface(id: string, until: number, actor: string) {
     const r = row(id)!;
     const root = core.cells.require(r.cell_id ? core.cells.require(r.cell_id).rootId : core.deskCellId);
@@ -442,7 +464,7 @@ export function createHumanItems(core: KernelCore) {
     ).map(project);
   }
 
-  async function decide(id: string, decision: HumanDecision, actor: string, onAccepted?: () => void): Promise<DecisionResult> {
+  async function decide(id: string, decision: HumanDecision, actor: string, onAccepted?: (item: HumanItem, option: CardOption) => void): Promise<DecisionResult> {
     const key = stableStringify({ actor, decision });
     const existing = inflight.get(id);
     if (existing?.key === key) {
@@ -451,7 +473,8 @@ export function createHumanItems(core: KernelCore) {
           (!current.artifact_id || context.getArtifactSync(current.artifact_id)?.version === decision.seenArtifactVersion)) return existing.promise;
     }
     if (existing) await existing.promise.catch(() => undefined);
-    const result = applyDecision(id, decision, actor, onAccepted);
+    const result = withTx(db, () => applyDecision(id, decision, actor, onAccepted));
+    if (result.status === "issuer_closed") throw new NgError("conflict", "事项所属任务已结束");
     const promise = Promise.resolve(result).finally(() => {
       if (inflight.get(id)?.promise === promise) inflight.delete(id);
     });
@@ -463,7 +486,7 @@ export function createHumanItems(core: KernelCore) {
     id: string,
     d: HumanDecision,
     actor: string,
-    onAccepted?: () => void,
+    onAccepted?: (item: HumanItem, option: CardOption) => void,
   ): DecisionResult {
     if (typeof actor !== "string" || !["owner", "agent"].includes(parsePrincipal(actor, core.ownerPrincipal).kind))
       throw new NgError("bounds_violation", "a control-plane actor is required");
@@ -493,25 +516,33 @@ export function createHumanItems(core: KernelCore) {
       let receiptId: string | null = null;
       let activityId: string | undefined;
       if (row(id)?.item_revision !== d.seenItemRevision) throw new NgError("conflict", "item changed");
-      if (o.id === "system.someday") throw new NgError("invalid_argument", "请通过工作台将方案放进以后再说");
-      if (o.effect !== "defer") onAccepted?.();
+      if (r.cell_id && r.disposition === "pending") {
+        const issuer = cells.get(r.cell_id);
+        if (!issuer || issuer.status === "closed" || issuer.epoch !== r.epoch) {
+          withdraw(id, "issuer_closed");
+          return { status: "issuer_closed" };
+        }
+      }
+      if (o.effect !== "defer") onAccepted?.(item, o);
       if (o.effect === "execute") {
         const rec = gate.getApprovalSync(id);
         if (rec?.status !== "pending" || gate.approveSync(id, actor, d.seenArtifactVersion, locks) !== "approved")
           throw new NgError("conflict", "事项已变动");
-        if (rec.action.type === "project.start") {
+        if (ownerOnlyApproval(rec.action)) {
           const approved = gate.getApprovalSync(id)!;
           const issuer = cells.require(approved.cellId);
-          const spawn = issuer.preset ? core.registry.presets.get(issuer.preset)?.approvedSpawn?.(approved, context, clock) : undefined;
-          if (spawn) core.lifecycle.spawnCell(issuer.id, spawn.spec, spawn.task, { principalId: cellPrincipal(issuer.id) });
+          const parent = issuer.preset && core.registry.presets.get(issuer.preset)?.approvedSpawn ? issuer : cells.require(core.deskCellId);
+          const spawn = parent.preset ? core.registry.presets.get(parent.preset)?.approvedSpawn?.(approved, context, clock) : undefined;
+          if (!spawn) throw new NgError("conflict", "当前任务无法执行这项已批准的操作，请交回主台");
+          core.lifecycle.spawnCell(parent.id, spawn.spec, spawn.task, { principalId: cellPrincipal(parent.id) });
           deliverResolved(approved, "approved", actor);
           return { status: "approved" };
         }
         const retry = isKernelEscalation(rec.action) && rec.action.args.reason === "retry_limit" ? rec.action.args : null;
-        gate.recordOutcomeSync(id, "executed", { note: d.note ?? "continued by the owner" });
+        gate.recordOutcomeSync(id, "executed", { note: d.note ?? o.label });
         if (retry?.stepLimit) continueSteps(retry.cellId, id);
         else if (retry) requeueDead(retry.cellId, retry.envelopeIds ?? []);
-        deliverResolved(rec, "executed", actor, { decision: "continue", silent: !!retry, note: d.note, until: d.until });
+        deliverResolved(gate.getApprovalSync(id)!, "executed", actor, { decision: "continue", silent: !!retry, note: d.note, until: d.until });
         return { status: "continued" };
       }
       if (o.effect === "revise") {
@@ -541,8 +572,8 @@ export function createHumanItems(core: KernelCore) {
         } else {
           run(db, "UPDATE human_items SET snoozed_until=?, updated_at=?, item_revision=item_revision+1 WHERE action_id=?",
             [until, clock.now(), id]);
+          armResurface(id, until, actor);
         }
-        armResurface(id, until, actor);
       } else {
         const target = o.targetCellIds?.[0];
         if (o.terminateMode === "cancel_task") {
@@ -555,7 +586,7 @@ export function createHumanItems(core: KernelCore) {
           )
             throw new NgError("conflict", "confirm the exact project to close");
         }
-        const alternative = o.effect === "reply" && r.action_hash !== "" && item.options.some((option) => option.effect === "execute");
+        const alternative = o.effect === "reply" && r.action_hash !== "" && !!item.action && requiresApproval(item.action);
         const disposition =
           o.effect === "terminate" ? "denied" : alternative ? "cancelled" : "executed";
         if (disposition === "denied" && r.action_hash && r.disposition === "pending") {
@@ -563,49 +594,50 @@ export function createHumanItems(core: KernelCore) {
         } else
           run(
             db,
-            "UPDATE human_items SET disposition=?, approver_id=?, resolved_at=?, updated_at=?, item_revision=item_revision+1 WHERE action_id=?",
-            [disposition, actor, clock.now(), clock.now(), id],
+            "UPDATE human_items SET disposition=?, status_reason=?, approver_id=?, resolved_at=?, updated_at=?, item_revision=item_revision+1 WHERE action_id=?",
+            [disposition, alternative ? "replied" : null, actor, clock.now(), clock.now(), id],
           );
         if (r.cell_id && item.action) {
-            const rec = gate.getApprovalSync(id);
-            const destination = rec && deliveryTarget(rec);
-            const issuer = core.cells.require(destination?.to ?? r.cell_id);
-            const lineage = [issuer, ...core.cells.ancestors(issuer.id)];
-            const closingRoot = o.terminateMode === "cancel_task" ? lineage.findIndex(c => c.id === target) : -1;
-            const recipient = lineage.slice(closingRoot + 1).find(c =>
-              c.status !== "closed" && (c.id !== issuer.id || c.epoch === (destination?.expectedEpoch ?? r.epoch))
-            );
-            if (!recipient) throw new NgError("conflict", "no live recipient");
-            const edit = rec ? humanEditInfo(rec, item.artifactVersion) : { humanEdited: false };
-            const envelope = createEnvelope(
-              {
-                id: `${id}:decision:${r.item_revision}`,
-                from: KERNEL_FROM.approval,
-                principalId: actor,
-                kind: "result",
-                type: PAYLOAD.approvalResolved,
-                delivery: "wakeup",
-                expectedEpoch: recipient.epoch,
-                payload: {
-                  actionId: id,
-                  status: disposition,
-                  action: item.action,
-                  approverId: actor,
-                  optionId: o.id,
-                  label: o.label,
-                  note: d.note,
-                  payload: o.payload,
-                  relatedProjectIds: item.relatedProjectIds,
-                  ...edit,
-                },
+          const rec = gate.getApprovalSync(id);
+          const destination = rec && deliveryTarget(rec);
+          const issuer = core.cells.require(destination?.to ?? r.cell_id);
+          const lineage = [issuer, ...core.cells.ancestors(issuer.id)];
+          const closingRoot = o.terminateMode === "cancel_task" ? lineage.findIndex(c => c.id === target) : -1;
+          const recipient = lineage.slice(closingRoot + 1).find(c =>
+            c.status !== "closed" && (c.id !== issuer.id || c.epoch === (destination?.expectedEpoch ?? r.epoch))
+          );
+          if (!recipient) throw new NgError("conflict", "no live recipient");
+          const edit = humanEditInfo({ artifactId:r.artifact_id, humanEdited:item.humanEdited, proposedVersion:r.proposed_version, boundVersion:r.bound_version }, item.artifactVersion);
+          if (r.artifact_id) run(db, "UPDATE human_items SET bound_version=?, human_edited=? WHERE action_id=?", [item.artifactVersion, Number(edit.humanEdited), id]);
+          const envelope = createEnvelope(
+            {
+              id: `${id}:decision:${r.item_revision}`,
+              from: KERNEL_FROM.approval,
+              principalId: actor,
+              kind: "result",
+              type: PAYLOAD.approvalResolved,
+              delivery: "wakeup",
+              expectedEpoch: recipient.epoch,
+              payload: {
+                actionId: id,
+                status: disposition,
+                action: item.action,
+                approverId: actor,
+                optionId: o.id,
+                label: o.label,
+                note: d.note,
+                payload: o.payload,
+                relatedProjectIds: item.relatedProjectIds,
+                ...edit,
               },
-              clock,
-            );
-            receiptCell = recipient.id;
-            receiptId = envelope.id;
-            core.inbox.enqueueSync(recipient.id, envelope);
-            if (!core.inbox.listMessagesSync({ cellId: recipient.id, envelopeId: envelope.id, status: ["pending"] }).length)
-              throw new NgError("conflict", "reply could not be queued");
+            },
+            clock,
+          );
+          receiptCell = recipient.id;
+          receiptId = envelope.id;
+          core.inbox.enqueueSync(recipient.id, envelope);
+          if (!core.inbox.listMessagesSync({ cellId: recipient.id, envelopeId: envelope.id, status: ["pending"] }).length)
+            throw new NgError("conflict", "reply could not be queued");
         }
         if (target && o.terminateMode === "cancel_task") {
           const closed = core.lifecycle.closeCellSync(target, "cancelled", { principalId: actor });
@@ -626,13 +658,15 @@ export function createHumanItems(core: KernelCore) {
         };
         run(
           db,
-          `INSERT INTO human_item_activity(id,item_id,before_state,after_revision,receipt_cell,receipt_id,target_project,at)
-          VALUES(?,?,?,?,?,?,?,?)`,
+          `INSERT INTO human_item_activity(id,item_id,before_state,after_revision,after_disposition,closed_epoch,receipt_cell,receipt_id,target_project,at)
+          VALUES(?,?,?,?,?,?,?,?,?,?)`,
           [
             activityId,
             id,
             JSON.stringify(before),
             updated.item_revision,
+            updated.status_reason === "replied" ? "executed" : updated.disposition,
+            o.terminateMode === "cancel_task" ? cells.require(o.targetCellIds![0]!).epoch : null,
             receiptCell,
             receiptId,
             o.terminateMode === "cancel_task" ? o.targetCellIds![0]! : null,
@@ -655,6 +689,7 @@ export function createHumanItems(core: KernelCore) {
       const event = get<{
         item_id: string;
         after_revision: number;
+        closed_epoch: number | null;
         receipt_cell: string | null;
         receipt_id: string | null;
         before_state: string;
@@ -674,10 +709,12 @@ export function createHumanItems(core: KernelCore) {
           : undefined;
       if (event.receipt_id && !receipt) throw new NgError("conflict", "无法确认后台是否已读");
       const claimed = !!receipt && receipt.firstClaimedAt !== null;
-      if (claimed && event.target_project) throw new NgError("conflict", "后台已读这次中止决定，请使用 reopen_project 重新打开项目");
-      let corrected = claimed;
+      if (claimed && event.target_project) throw new NgError("conflict", "后台已读这次中止决定，请在已结束的项目中选择重新打开");
+      const recipient = receipt && cells.get(receipt.cellId);
+      let corrected = claimed || !!recipient && (recipient.status === "closed" || (receipt?.envelope.expectedEpoch != null && recipient.epoch !== receipt.envelope.expectedEpoch)) || !event.target_project && !!current.cell_id && cells.require(current.cell_id).epoch !== current.epoch;
       if (event.target_project && epoch !== null && !claimed) {
         const target = cells.require(event.target_project);
+        if (target.epoch !== event.closed_epoch || epoch !== event.closed_epoch) throw new NgError("conflict", "项目已另行重开或关闭");
         if (target.status === "closed" && target.epoch === epoch) {
           try {
             core.lifecycle.reopenProjectSync(target.id, actor, epoch);
@@ -688,6 +725,7 @@ export function createHumanItems(core: KernelCore) {
         corrected = cells.require(target.id).status !== "active" || !!current.cell_id && cells.require(current.cell_id).status !== "active";
       }
       if (corrected) {
+        if (receipt?.status === "pending" && !claimed) core.inbox.cancelScheduledSync({cellId: receipt.cellId, envelopeId: receipt.envelope.id});
         const issuer = cells.require(receipt?.cellId ?? event.target_project ?? current.cell_id ?? core.deskCellId);
         const target = issuer.status !== "closed" ? issuer : core.cells.ancestors(issuer.id).find((c) => c.status !== "closed");
         if (!target) throw new NgError("conflict", "找不到可接收更正的后台分身");
@@ -729,11 +767,12 @@ export function createHumanItems(core: KernelCore) {
         run(
           db,
           `UPDATE human_items SET disposition=?,status_reason=?,snoozed_until=?,approver_id=?,resolved_at=?,updated_at=?,epoch=CASE WHEN ? THEN (SELECT epoch FROM cells WHERE id=human_items.cell_id) ELSE epoch END,item_revision=item_revision+1 WHERE action_id=?`,
-          [prior.disposition, prior.reason, prior.until, prior.actor, prior.resolvedAt, clock.now(), event.target_project ? 1 : 0, event.item_id],
+          [prior.disposition, prior.reason, prior.until > clock.now() ? prior.until : null, prior.actor, prior.resolvedAt, clock.now(), event.target_project ? 1 : 0, event.item_id],
         );
         if (prior.until > clock.now()) armResurface(event.item_id, prior.until, actor);
         changed(row(event.item_id)!);
       }
+      if (corrected) changed(current);
       run(db, "UPDATE human_item_activity SET undone_at=? WHERE id=?", [clock.now(), activityId]);
       return { status: corrected ? ("corrected" as const) : ("undone" as const), message: corrected ? "已通知后台更正" : "已撤销" };
     });
@@ -779,6 +818,20 @@ export function createHumanItems(core: KernelCore) {
     create,
     list,
     undo,
+    withdrawForClosedCells(closed: readonly {id: string; epoch: number}[]) {
+      for (const {id,epoch} of closed) {
+        for (const r of all<{action_id: string}>(db, "SELECT action_id FROM human_items WHERE cell_id=? AND epoch<? AND disposition='pending'", [id,epoch]))
+          withdraw(r.action_id, "issuer_closed");
+        if (!isProjectRoot(core.registry, cells.get(id))) continue;
+        const held = all<ItemRow>(db, `SELECT * FROM human_items WHERE cell_id=? AND category='decision' AND disposition='pending'
+          AND (subject_key=? OR EXISTS(SELECT 1 FROM json_each(related_project_ids) WHERE value=?))`,
+          [core.deskCellId, subjectKeys.project(id), id]);
+        for (const r of held) {
+          const related = JSON.parse(r.related_project_ids) as string[];
+          if (related.every(pid => cells.get(pid)?.status === "closed")) withdraw(r.action_id, "project_closed");
+        }
+      }
+    },
     armResurface,
     resurface,
     get: (id: string) => {

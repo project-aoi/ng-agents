@@ -48,7 +48,7 @@ describe("dispatcher", () => {
     await kernel.idle();
     expect(kernel.inbox.listMessagesSync({ envelopeId: "stale" })[0]?.status).toBe("done");
     expect(kernel.inbox.listMessagesSync({ envelopeId: "quiet" })[0]).toMatchObject({ status: "pending", firstClaimedAt: null });
-    kernel.sendToCell("desk", { text: "read updates" });
+    kernel.sendToCell("desk", { text: "read updates" }, { principalId: kernel.ownerPrincipal });
     await kernel.idle();
     expect(kernel.inbox.listMessagesSync({ envelopeId: "quiet" })[0]).toMatchObject({ status: "done", firstClaimedAt: clock.now() });
   });
@@ -115,7 +115,7 @@ describe("dispatcher", () => {
     const ids = ["w1", "w2", "w3", "w4", "w5"];
     for (const id of ids) {
       h.script.add(id, { text: "ok", delayMs: 20 });
-      h.kernel.spawnCell("desk", { id, preset: "worker", meta: { role: id } }, "go");
+      h.kernel.spawnCell("desk", { id, preset: "worker", meta: { role: id } }, "go", { principalId: h.kernel.ownerPrincipal });
     }
     await h.kernel.idle();
     expect(maxOverlap(h)).toBe(2); // the cap counts every cell's Runs, the desk's included
@@ -132,7 +132,7 @@ describe("dispatcher", () => {
   it("cancel takes effect at once, independent of queue length: the Run is aborted, 300 queued messages are dropped", async () => {
     const h = await boot();
     h.script.add("worker", { text: "never", delayMs: 60_000 });
-    h.kernel.spawnCell("desk", { id: "w", preset: "worker" }, "start");
+    h.kernel.spawnCell("desk", { id: "w", preset: "worker" }, "start", { principalId: h.kernel.ownerPrincipal });
     await waitFor(() => h.kernel.activeRuns().some((r) => r.cellId === "w"), 5_000, "run");
     for (let i = 0; i < 300; i++) {
       h.kernel.inbox.enqueueSync("w", {
@@ -146,7 +146,7 @@ describe("dispatcher", () => {
       });
     }
     const t0 = Date.now();
-    expect(h.kernel.control("w", { action: "cancel" })).toMatchObject({ applied: true });
+    expect(h.kernel.control("w", { action: "cancel" }, { principalId: h.kernel.ownerPrincipal })).toMatchObject({ applied: true });
     await h.kernel.idle();
     expect(Date.now() - t0).toBeLessThan(1_000);
     expect(h.of("run.finished").filter((e) => e.cellId === "w").map((e) => e.outcome)).toEqual(["cancelled"]);
@@ -157,10 +157,10 @@ describe("dispatcher", () => {
   it("pause aborts the Run and gives the batch back without using an attempt; nothing runs until resume", async () => {
     const h = await boot({ kernel: { maxAttempts: 1 } });
     h.script.add("worker", { text: "slow", delayMs: 60_000 }, { text: "resumed and done" });
-    h.kernel.spawnCell("desk", { id: "w", preset: "worker" }, "start");
+    h.kernel.spawnCell("desk", { id: "w", preset: "worker" }, "start", { principalId: h.kernel.ownerPrincipal });
     await waitFor(() => h.kernel.activeRuns().some((r) => r.cellId === "w"), 5_000, "run");
 
-    expect(h.kernel.control("w", { action: "pause" })).toMatchObject({ applied: true });
+    expect(h.kernel.control("w", { action: "pause" }, { principalId: h.kernel.ownerPrincipal })).toMatchObject({ applied: true });
     await h.kernel.idle();
     expect(h.of("run.finished").map((e) => e.outcome)).toEqual(["cancelled"]);
     const task = h.kernel.inbox.listMessagesSync({ cellId: "w", type: PAYLOAD.cellTask })[0]!;
@@ -171,7 +171,7 @@ describe("dispatcher", () => {
     await h.kernel.idle();
     expect(h.of("run.started")).toHaveLength(1);
 
-    h.kernel.control("w", { action: "resume" });
+    h.kernel.control("w", { action: "resume" }, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     expect(h.of("run.finished").filter((e) => e.cellId === "w").map((e) => e.outcome)).toEqual(["cancelled", "completed"]);
     expect(h.kernel.inbox.listMessagesSync({ cellId: "w" }).map((m) => m.status)).toEqual(["done", "done"]);
@@ -199,9 +199,9 @@ describe("dispatcher", () => {
       },
       { text: "switched" },
     );
-    await h.ui.capture({ text: "按方案 A 写周报" });
+    await h.ui.capture({ text: "按方案 A 写周报" }, "owner");
     await waitFor(() => h.kernel.activeRuns().length === 1, 5_000, "run");
-    expect(h.kernel.control("desk", { action: "steer", steerMessage: "改成方案 B" })).toMatchObject({ applied: true });
+    expect(h.kernel.control("desk", { action: "steer", steerMessage: "改成方案 B" }, { principalId: h.kernel.ownerPrincipal })).toMatchObject({ applied: true });
     g.open();
     await h.kernel.idle();
     expect(h.kernel.context.readStateSync("desk", "plan")).toBe("B");
@@ -214,11 +214,11 @@ describe("dispatcher", () => {
     const h = await boot();
     h.script.add("hub", tool("set_reminder", { label: "follow up", inSeconds: 3600 }), { text: "set" });
     // a cell that lives on its timer (a one-shot one is closed, its timers with it, as soon as its Run completes)
-    h.kernel.spawnCell("desk", { id: "w", preset: "hub", lifetime: "persistent" }, "go");
+    h.kernel.spawnCell("desk", { id: "w", preset: "hub", lifetime: "persistent" }, "go", { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     const timer = h.kernel.inbox.listMessagesSync({ cellId: "w", type: PAYLOAD.timerFired })[0]!;
     expect(timer).toMatchObject({ status: "pending", expectedEpoch: 0 });
-    h.kernel.control("w", { action: "cancel" });
+    h.kernel.control("w", { action: "cancel" }, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     h.clock.advance(2 * HOUR);
     await h.kernel.idle();
@@ -261,14 +261,14 @@ describe("escalations", () => {
 
   it("continues a step-limited task independently of its dead letters", async () => {
     const h = await boot({kernel:{maxAttempts:1}});
-    h.kernel.spawnCell("desk", {id:"w", preset:"worker"});
+    h.kernel.spawnCell("desk", {id:"w", preset:"worker"}, undefined, { principalId: h.kernel.ownerPrincipal });
     const stepRequest = h.kernel.gate.authorizeSync({
       type:"custom", name:"kernel.escalation", subjectKey:"kernel:w:step_limit", sideEffect:"external", summary:"超步",
       args:{kernel:true, cellId:"w", reason:"retry_limit", stepLimit:true},
     }, {cellId:"desk", epoch:0, principalId:"kernel:escalation"});
     if (stepRequest.type !== "defer") throw Error(stepRequest.type);
     h.script.add("worker", {error: Error("dead letter")});
-    h.kernel.sendToCell("w", {text:"重新核查"});
+    h.kernel.sendToCell("w", {text:"重新核查"}, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     const step = h.kernel.humanItems.get(stepRequest.actionId)!;
     expect(step.subjectKey).toBe("kernel:w:step_limit");
@@ -283,7 +283,7 @@ describe("escalations", () => {
   it("a second dead letter of the same item does not create a second card", async () => {
     const h = await boot({ kernel: { maxAttempts: 1 } });
     h.script.add("worker", { error: new Error("boom") }, { error: new Error("boom again") });
-    h.kernel.spawnCell("desk", { id: "w", preset: "worker" }, "go");
+    h.kernel.spawnCell("desk", { id: "w", preset: "worker" }, "go", { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     h.kernel.inbox.enqueueSync("w", { id: "m2", from: "inbox:desk", principalId: "cell:desk", kind: "event", type: PAYLOAD.userMessage, payload: { text: "again" }, createdAt: h.clock.now() });
     await h.kernel.idle();
@@ -316,14 +316,14 @@ describe("leaf results (docs/05 guard 1: the kernel is the single sender)", () =
         registry.codeProcessors.register(emit);
       },
     });
-    h.kernel.spawnCell("desk", { id: "e", preset: "checker", processor: { kind: "code", entry: emit.name } }, "go");
+    h.kernel.spawnCell("desk", { id: "e", preset: "checker", processor: { kind: "code", entry: emit.name } }, "go", { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     expect(h.kernel.getCell("e")!.status).toBe("closed");
     const sent = () => h.kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.cellResult }).map((m) => [m.envelope.id, (m.envelope.payload as CellResultPayload).summary]);
     expect(sent()).toEqual([[finalResultEnvelopeId("e", 0), "emitted directly"]]);
 
     // the same from a wakeable worker: one notice for its turn, which carries the emitted summary
-    h.kernel.spawnCell("desk", { id: "f", preset: "worker", processor: { kind: "code", entry: emit.name } }, "go");
+    h.kernel.spawnCell("desk", { id: "f", preset: "worker", processor: { kind: "code", entry: emit.name } }, "go", { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     expect(h.kernel.getCell("f")!.status).toBe("active");
     const run = h.of("run.started").find((e) => e.cellId === "f")!.runId;

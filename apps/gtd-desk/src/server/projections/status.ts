@@ -59,7 +59,7 @@ export function projectStatus(input: ProjectionInput): StatusDTO {
   const counts = get<{pending: number; snoozed: number}>(kernel.db, `
     SELECT COUNT(*) FILTER (WHERE snoozed_until IS NULL OR snoozed_until <= ?) AS pending,
            COUNT(*) FILTER (WHERE snoozed_until > ?) AS snoozed
-    FROM human_items WHERE status IN ('pending','snoozed')`, [now, now])!;
+    FROM human_items WHERE status IN ('pending','snoozed') AND (cell_id IS NOT NULL OR due_at IS NULL OR due_at <= ?)`, [now, now, now])!;
   const since = localMidnight(now);
   const today = { archivedNotifications: 0, notesSaved: 0, remindersSet: 0, cardsWithdrawn: 0, since };
   for (const a of readActivities(kernel)) {
@@ -70,8 +70,8 @@ export function projectStatus(input: ProjectionInput): StatusDTO {
 
   }
   today.cardsWithdrawn = get<{n: number}>(kernel.db, `SELECT COUNT(*) AS n FROM human_item_activity a
-    JOIN human_items i ON i.action_id=a.item_id WHERE a.at >= ? AND a.undone_at IS NULL
-    AND i.disposition IN ('denied','cancelled')`, [since])!.n;
+    WHERE a.at >= ? AND a.undone_at IS NULL
+    AND a.after_disposition IN ('denied','cancelled')`, [since])!.n;
   const radar = radarProjects(input);
   const nextReviewAt = nextWeekly(now, settings.weeklyReview.weekday, settings.weeklyReview.hour);
 

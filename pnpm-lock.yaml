@@ -102,6 +102,9 @@ importers:
       '@ng/workspace':
         specifier: workspace:*
         version: link:../workspace
+      esbuild:
+        specifier: 0.28.2
+        version: 0.28.2
 
   packages/channel:
     dependencies:

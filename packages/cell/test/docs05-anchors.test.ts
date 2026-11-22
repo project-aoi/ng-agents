@@ -15,8 +15,8 @@ afterEach(cleanupAll);
 const GRACE = 2_000;
 
 function project(h: Harness, id = "proj", parked = false): void {
-  h.kernel.spawnCell("desk", { id, preset: "project", title: "Harness 对比", meta: { role: id, projectCellId: id } });
-  if (parked) h.kernel.control(id, {action: "pause", pauseReason: "parked"});
+  h.kernel.spawnCell("desk", { id, preset: "project", title: "Harness 对比", meta: { role: id, projectCellId: id } }, undefined, { principalId: h.kernel.ownerPrincipal });
+  if (parked) h.kernel.control(id, {action: "pause", pauseReason: "parked"}, { principalId: h.kernel.ownerPrincipal });
 }
 
 function addWait(h: Harness, from: string, to: string, id = to, registration = id): void {
@@ -52,7 +52,7 @@ describe("stall check", () => {
     expect(h.kernel.anchorsOf("proj")).toMatchObject({ human: true, stalled: false });
     h.clock.advance(6 * HOUR);
     h.kernel.checkStalls();
-    await h.ui.capture({ text: "无关的一条随手记" });
+    await h.ui.capture({ text: "无关的一条随手记" }, "owner");
     await h.kernel.idle();
     expect(checks(h)).toHaveLength(1);
     expect(h.script.callsOf("proj")).toHaveLength(1);
@@ -72,7 +72,8 @@ describe("stall check", () => {
     await h.kernel.humanItems.decide(task.id, {optionId: "done", seenItemRevision: task.itemRevision}, "owner");
     await h.kernel.idle();
     expect(stall(h)).toMatchObject({ since: again, notified_at: again });
-    expect(checks(h).map((m) => m.envelope.id)).toEqual([`proj:stalled:${T0}`, `proj:stalled:${again}`]);
+    expect(checks(h).map(m => m.envelope.payload)).toMatchObject([{stalledSince:T0}, {stalledSince:again}]);
+    expect(new Set(checks(h).map(m => m.envelope.id)).size).toBe(2);
   });
 
   it("a stall that is over before the grace period ends never reaches the model", async () => {
@@ -82,7 +83,7 @@ describe("stall check", () => {
     expect(checks(h)).toHaveLength(1);
 
     // Within the grace period the project gets a checker with a timer: an external anchor.
-    h.kernel.spawnCell("proj", { id: "mr-watch", preset: "checker", title: "盯 MR !12", schedules: [{ deliverAt: T0 + HOUR }] });
+    h.kernel.spawnCell("proj", { id: "mr-watch", preset: "checker", title: "盯 MR !12", schedules: [{ deliverAt: T0 + HOUR }] }, undefined, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     expect(h.kernel.anchorsOf("proj")).toMatchObject({ external: true, stalled: false });
     // The notice is withdrawn together with the stall it was about.
@@ -100,15 +101,15 @@ describe("stall check", () => {
     project(h, "p-wait");
     project(h, "p-someday", true);
     project(h, "p-paused");
-    h.kernel.control("p-paused", { action: "pause" });
+    h.kernel.control("p-paused", { action: "pause" }, { principalId: h.kernel.ownerPrincipal });
 
     // @Agent: a worker with work queued; @Human: a pending card; @Waiting(internal): an open wait on a live cell.
-    h.kernel.spawnCell("p-agent", { id: "w", preset: "worker", meta: { role: "w" } }, "分析 trae 代码");
+    h.kernel.spawnCell("p-agent", { id: "w", preset: "worker", meta: { role: "w" } }, "分析 trae 代码", { principalId: h.kernel.ownerPrincipal });
     h.script.add("w", tool("wait", { reason: "等编译" }));
     h.script.add("p-human", tool("request_approval", { kind: "escalation", title: "需要你确认", summary: "blocked", escalation: { reason: "blocked", explanation: "仓库里有你没提交的改动" } }));
-    h.kernel.sendToCell("p-human", { text: "go" });
+    h.kernel.sendToCell("p-human", { text: "go" }, { principalId: h.kernel.ownerPrincipal });
     h.script.add("p-wait", tool("wait", { reason: "等 desk 裁决", waitingFor: "inbox:desk" }));
-    h.kernel.sendToCell("p-wait", { text: "go" });
+    h.kernel.sendToCell("p-wait", { text: "go" }, { principalId: h.kernel.ownerPrincipal });
     expect(h.kernel.anchorsOf("p-agent")).toMatchObject({ agent: true, stalled: false });
     await h.kernel.idle();
 
@@ -133,7 +134,7 @@ describe("waits (the internal anchor)", () => {
     const h = await boot();
     project(h);
     h.script.add("proj", tool("wait", { reason: "等 desk 裁决工作区冲突", waitingFor: "inbox:desk", timeoutMinutes: 30 }));
-    h.kernel.sendToCell("proj", { text: "start" });
+    h.kernel.sendToCell("proj", { text: "start" }, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     expect(h.kernel.listWaits(["proj"])).toMatchObject([{ waitingFor: "inbox:desk", timeoutAt: T0 + 30 * 60_000 }]);
 
@@ -152,7 +153,7 @@ describe("waits (the internal anchor)", () => {
     // The desk answers: the wait closes and its timeout is cancelled.
     h.script.add("desk", tool("send_message", { to: "inbox:proj", text: "按主人拍板执行：stash 后继续", summary: "裁决" }));
     h.script.add("proj", tool("wait", { reason: "继续推进", waitingFor: "inbox:desk", timeoutMinutes: 10 }));
-    await h.ui.capture({ text: "告诉 proj 可以继续了" });
+    await h.ui.capture({ text: "告诉 proj 可以继续了" }, "owner");
     await h.kernel.idle();
     const timers = () => h.kernel.inbox.listMessagesSync({ cellId: "proj", type: PAYLOAD.waitTimeout }).map((m) => m.status);
     expect(timers()).toEqual(["cancelled", "pending"]);
@@ -172,14 +173,14 @@ describe("waits (the internal anchor)", () => {
   it("a wait on a cell that has closed is no anchor, and closing a cell drops its own waits", async () => {
     const h = await boot();
     project(h);
-    h.kernel.spawnCell("proj", { id: "w1", preset: "worker", meta: { role: "w1" } }, "task");
+    h.kernel.spawnCell("proj", { id: "w1", preset: "worker", meta: { role: "w1" } }, "task", { principalId: h.kernel.ownerPrincipal });
     h.script.add("w1", tool("wait", { reason: "等 proj 的补充说明", waitingFor: "inbox:proj" }));
     h.script.add("proj", tool("wait", { reason: "等 w1 交卷", waitingFor: "inbox:w1" }));
-    h.kernel.sendToCell("proj", { text: "go" });
+    h.kernel.sendToCell("proj", { text: "go" }, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     expect(h.kernel.anchorsOf("proj")).toMatchObject({ internal: false, stalled: true });
 
-    await h.kernel.closeCell("w1", "cancelled");
+    await h.kernel.closeCell("w1", "cancelled", { principalId: h.kernel.ownerPrincipal });
     expect(h.kernel.listWaits(["w1"])).toEqual([]);
     // The closure notice informs the parent without answering its outstanding question.
     h.script.add("proj", { text: "w1 被关了" });
@@ -207,7 +208,7 @@ describe("hub: operator watches, coalescing, absorption", () => {
         { threadOrFilter: { "payload.mentions": { $contains: "ng-bot" }, "payload.eventKind": { $in: ["mention", "review_requested"] } }, coalesceMs: 60_000 },
         { threadOrFilter: { from: "channel:memory:chat-review", "payload.text": { $anyKeyword: ["帮忙排查", "线上报错"] } }, coalesceMs: 60_000 },
       ],
-    });
+    }, undefined, { principalId: h.kernel.ownerPrincipal });
 
     const r1 = await h.kernel.ingest(memory("@ng-bot 看下 MR !41", { mentions: ["NG-Bot"], eventKind: "mention" }), "memory");
     expect(r1).toMatchObject({ routedBy: "watch", cellIds: ["review-hub"], coalesced: ["review-hub"] });
@@ -259,7 +260,7 @@ describe("hub: operator watches, coalescing, absorption", () => {
 
   it("a malformed operator is refused when the watch is created", async () => {
     const h = await boot();
-    const bad = (filter: Record<string, unknown>) => () => h.kernel.spawnCell("desk", { preset: "hub", watches: [{ threadOrFilter: filter }] });
+    const bad = (filter: Record<string, unknown>) => () => h.kernel.spawnCell("desk", { preset: "hub", watches: [{ threadOrFilter: filter }] }, undefined, { principalId: h.kernel.ownerPrincipal });
     expect(bad({ "payload.text": { $regex: "x" } })).toThrow(/unknown operator/);
     expect(bad({ "payload.text": { $anyKeyword: [] } })).toThrow(/non-empty array/);
     expect(bad({ "payload.text": { $contains: 3 } })).toThrow(/non-empty string/);
@@ -296,13 +297,13 @@ describe("preferences reach cells that are already alive", () => {
   it("a preference saved after a cell's first Run is in that cell's system prompt at its next Run", async () => {
     const h = await boot();
     h.script.add("desk", { text: "ok" });
-    await h.ui.capture({ text: "第一条" });
+    await h.ui.capture({ text: "第一条" }, "owner");
     await h.kernel.idle();
     expect(h.script.callsOf("desk")[0]!.system).not.toContain("ship-mr");
 
     h.kernel.context.upsertSkillOrNoteSync("desk", { kind: "preference", name: "code-change-followup", description: "改完代码用 /ship-mr 提 MR", body: "改完代码后直接用 /ship-mr 提 MR，不用再问。", scope: "global", mode: "upsert" });
     h.script.add("desk", { text: "ok" });
-    await h.ui.capture({ text: "第二条" });
+    await h.ui.capture({ text: "第二条" }, "owner");
     await h.kernel.idle();
     expect(h.script.callsOf("desk")[1]!.system).toContain("/ship-mr");
   });
@@ -310,9 +311,9 @@ describe("preferences reach cells that are already alive", () => {
 
 it("rechecks an orphaned worker wait outside projects", async () => {
   const h = await boot();
-  h.kernel.spawnCell("desk", {id:"detached",preset:"worker",meta:{role:"detached"}});
+  h.kernel.spawnCell("desk", {id:"detached",preset:"worker",meta:{role:"detached"}}, undefined, { principalId: h.kernel.ownerPrincipal });
   h.script.add("detached",tool("wait",{waitingFor:"inbox:desk",waitId:"missing-reply",reason:"waiting for an answer"}));
-  h.kernel.sendToCell("detached",{text:"wait for instructions"});
+  h.kernel.sendToCell("detached",{text:"wait for instructions"}, { principalId: h.kernel.ownerPrincipal });
   await h.kernel.idle();
   expect(checks(h,"detached").filter(m=>m.status==="pending")).toHaveLength(1);
 });
@@ -320,13 +321,13 @@ it("rechecks an orphaned worker wait outside projects", async () => {
 it("requires a real source beyond an internal wait chain and rejects cycles of three cells", async () => {
   const h = await boot({ start: false });
   project(h);
-  for (const id of ["a","b","c"]) h.kernel.spawnCell("proj", { id, preset: "worker" });
+  for (const id of ["a","b","c"]) h.kernel.spawnCell("proj", { id, preset: "worker" }, undefined, { principalId: h.kernel.ownerPrincipal });
   addWait(h, "a", "proj");
   expect(h.kernel.anchorsOf("proj").internal).toBe(false);
   addWait(h, "a", "b");
   addWait(h, "b", "c");
   expect(h.kernel.anchorsOf("proj").internal).toBe(false);
-  h.kernel.updateCell("c", { watches: [{ threadOrFilter: { thread: "memory:result" } }] });
+  h.kernel.updateCell("c", { watches: [{ threadOrFilter: { thread: "memory:result" } }] }, { principalId: h.kernel.ownerPrincipal });
   expect(h.kernel.anchorsOf("proj").internal).toBe(true);
   addWait(h, "c", "a");
   expect(h.kernel.anchorsOf("proj").internal).toBe(false);
@@ -347,7 +348,7 @@ it("arbitrates each affected project separately and re-arms a resolved incident 
   };
   decision("arb:a", ["a"]);
   h.kernel.spawnCell("desk", { id: "fixer", preset: "worker", meta: {relatedProjectIds:["c"]},
-    watches: [{ threadOrFilter: {thread:"memory:fixer"} }] });
+    watches: [{ threadOrFilter: {thread:"memory:fixer"} }] }, undefined, { principalId: h.kernel.ownerPrincipal });
   h.kernel.humanItems.create({category:"action", title:"普通待办", subjectKey:"action:b", relatedProjectIds:["b"],
     options:[{id:"done",label:"完成",effect:"reply"}]}, "b");
   const cause = "arb:shared";
@@ -391,13 +392,13 @@ it("settles multiple waits on an owner's direct answer even when the new run def
 it("shows a coordinator a human edit on a descendant's shared artifact", async () => {
   const h = await boot();
   project(h);
-  h.kernel.spawnCell("proj", {id:"worker",preset:"worker"});
-  h.kernel.sendToCell("worker",{text:"continue"});
+  h.kernel.spawnCell("proj", {id:"worker",preset:"worker"}, undefined, { principalId: h.kernel.ownerPrincipal });
+  h.kernel.sendToCell("worker",{text:"continue"}, { principalId: h.kernel.ownerPrincipal });
   await h.kernel.idle();
   const draft = (body: string) => ({format:"text" as const, body});
   h.kernel.context.commitSync("worker",{artifact:{artifactId:"art_report",content:draft("draft"),updatedBy:"agent"}});
   h.kernel.context.commitSync("worker",{artifact:{artifactId:"art_report",expectedVersion:1,content:draft("reviewed"),updatedBy:"human"}});
-  h.kernel.sendToCell("proj",{text:"查看共享文档"});
+  h.kernel.sendToCell("proj",{text:"查看共享文档"}, { principalId: h.kernel.ownerPrincipal });
   await h.kernel.idle();
   const prompt = requestText(h.script.callsOf("proj").at(-1)!);
   expect(prompt).toContain("[human-edited artifacts]");
@@ -406,7 +407,7 @@ it("shows a coordinator a human edit on a descendant's shared artifact", async (
 
 it("grounds a detached leaf on its own decision at the desk", async () => {
   const h = await boot({start:false});
-  h.kernel.spawnCell("desk", {id:"leaf",preset:"worker"});
+  h.kernel.spawnCell("desk", {id:"leaf",preset:"worker"}, undefined, { principalId: h.kernel.ownerPrincipal });
   addWait(h, "leaf", "desk", "scope");
   const decision = {title:"选择范围", options:[{id:"reply",label:"回复",effect:"reply" as const}]};
   h.kernel.humanItems.create({...decision, category:"action", subjectKey:"scope"}, "desk");
@@ -414,6 +415,46 @@ it("grounds a detached leaf on its own decision at the desk", async () => {
   expect(h.kernel.anchorsOf("leaf")).toMatchObject({internal:false,stalled:true});
   h.kernel.humanItems.create({...decision, subjectKey:"cell:leaf"}, "desk");
   expect(h.kernel.anchorsOf("leaf")).toMatchObject({internal:true,stalled:false});
+});
+
+it("defers a project self-check while desk arbitration owns a subset of its waits", async () => {
+  const h = await boot({start:false});
+  project(h);
+  addWait(h, "proj", "desk", "budget");
+  addWait(h, "proj", "other", "review");
+  const waiter = {cellId:"proj", waitId:"budget", registrationId:"budget"};
+  const wake = createEnvelope({from:"kernel:stall", principalId:"owner", kind:"event", type:PAYLOAD.arbitrationUnanswered,
+    payload:{causeKey:"budget", waiters:[waiter]}}, h.clock);
+  h.kernel.inbox.enqueueSync("desk", wake, {deliverAt: T0 + GRACE * 2});
+  run(h.kernel.db, `INSERT INTO stall_incidents(incident_id,cause_key,wait_ids,wake_envelope_id,updated_at)
+    VALUES(?,?,?,?,?)`, ["pending-budget", "budget", JSON.stringify([waiter]), wake.id, T0]);
+  await h.kernel.start();
+  await h.kernel.idle();
+  h.clock.advance(GRACE);
+  await h.kernel.idle();
+  expect(checks(h).map(m => m.status)).toEqual(["done"]);
+  expect(h.kernel.humanItems.list()).toHaveLength(0);
+  h.clock.advance(GRACE);
+  await h.kernel.idle();
+  expect(h.kernel.humanItems.list()).toMatchObject([{relatedProjectIds:["proj"]}]);
+  expect(get(h.kernel.db, "SELECT 1 FROM stall_incidents WHERE incident_id='pending-budget'")).toBeUndefined();
+});
+
+it("connects a desk arbitration escalation only to the detached leaf registration that triggered it", async () => {
+  const h = await boot();
+  for (const id of ["leaf", "other"]) {
+    h.kernel.spawnCell("desk", {id, preset:"worker"}, undefined, { principalId: h.kernel.ownerPrincipal });
+    addWait(h, id, "desk", "scope", id+"-first");
+  }
+  const wake = createEnvelope({from:"kernel:stall", principalId:"owner", kind:"event", type:PAYLOAD.arbitrationUnanswered,
+    payload:{causeKey:"scope", waiters:[{cellId:"leaf", waitId:"scope", registrationId:"leaf-first"}]}}, h.clock);
+  h.kernel.inbox.enqueueSync("desk", wake);
+  await h.kernel.idle();
+  expect(h.kernel.humanItems.list().filter(i => i.subjectKey.startsWith("kernel:stalled:scope:"))).toHaveLength(1);
+  expect(h.kernel.anchorsOf("leaf")).toMatchObject({human:true, internal:true, stalled:false});
+  expect(h.kernel.anchorsOf("other")).toMatchObject({human:false, internal:false, stalled:true});
+  run(h.kernel.db, "UPDATE cell_waits SET registration_id='next' WHERE cell_id='leaf'");
+  expect(h.kernel.anchorsOf("leaf")).toMatchObject({human:false, internal:false, stalled:true});
 });
 
 it("keeps concurrent escalations with the same cause separate by wait registration", async () => {
@@ -430,4 +471,40 @@ it("keeps concurrent escalations with the same cause separate by wait registrati
   }
   const open = h.kernel.humanItems.list().filter(i => i.subjectKey.startsWith("kernel:stalled:shared-review:"));
   expect(open.map(i => i.relatedProjectIds[0]).sort()).toEqual(["alpha","beta"]);
+});
+
+it("settles a self-park before escalating a stalled check and separates same-clock stall episodes", async () => {
+  const h = await boot();
+  project(h);
+  await h.kernel.idle();
+  h.kernel.control("proj",{action:"pause"}, { principalId: h.kernel.ownerPrincipal });
+  await h.kernel.idle();
+  h.kernel.control("proj",{action:"resume"}, { principalId: h.kernel.ownerPrincipal });
+  await h.kernel.idle();
+  const episodes = checks(h);
+  expect(episodes.map(m => m.status)).toEqual(["cancelled","pending"]);
+  expect(episodes[0]!.envelope.id).not.toBe(episodes[1]!.envelope.id);
+  h.script.add("proj", tool("pause_self", {reason:"稍后继续"}));
+  h.clock.advance(GRACE);
+  await h.kernel.idle();
+  expect(h.kernel.getCell("proj")).toMatchObject({status:"paused",pauseReason:"parked"});
+  expect(h.kernel.humanItems.list(true)).toHaveLength(0);
+});
+
+it("matches a chat reply to an unnamed human wait and keeps a named backend wait until referenced", async () => {
+  const h = await boot();
+  project(h);
+  h.script.add("proj", tool("wait", {waitingFor:"human",reason:"需要意见"}));
+  h.kernel.sendToCell("proj",{text:"核对草稿"}, { principalId: h.kernel.ownerPrincipal });
+  await h.kernel.idle();
+  expect(h.kernel.listWaits(["proj"])).toMatchObject([{waitingFor:"human"}]);
+  h.kernel.directMessage("proj",{text:"核对完了",replyToId:"timeline-entry"}, { principalId: h.kernel.ownerPrincipal });
+  await h.kernel.idle();
+  expect(h.kernel.listWaits(["proj"])).toEqual([]);
+  addWait(h,"proj","desk","budget");
+  run(h.kernel.db,"UPDATE cell_waits SET ref_id=? WHERE cell_id=?",["estimate","proj"]);
+  h.kernel.inbox.enqueueSync("proj",createEnvelope({from:"inbox:desk",principalId:"cell:desk",kind:"event",type:PAYLOAD.cellMessage,
+    payload:{fromCellId:"desk",text:"日常消息"}},h.clock));
+  await h.kernel.idle();
+  expect(h.kernel.listWaits(["proj"])).toMatchObject([{refId:"estimate"}]);
 });

@@ -29,10 +29,10 @@ const copies = (h: Harness, parent: string) =>
 
 /** A project under the desk and a worker under the project, each with its own script queue. */
 function project(h: Harness, id = "proj"): void {
-  h.kernel.spawnCell("desk", { id, preset: "project", title: id, meta: { role: id } });
+  h.kernel.spawnCell("desk", { id, preset: "project", title: id, meta: { role: id } }, undefined, { principalId: h.kernel.ownerPrincipal });
 }
 function worker(h: Harness, id: string, parent = "proj", task: string | undefined = "do it", extra: Record<string, unknown> = {}): void {
-  h.kernel.spawnCell(parent, { id, preset: "worker", title: id, meta: { role: id }, ...extra }, task);
+  h.kernel.spawnCell(parent, { id, preset: "worker", title: id, meta: { role: id }, ...extra }, task, { principalId: h.kernel.ownerPrincipal });
 }
 const activity = (h: Harness, id: string) => h.kernel.activityOf([id]).get(id)!.state;
 
@@ -119,7 +119,7 @@ describe("a wakeable worker's turn settles: the parent is told, the worker stays
     // The answer closes the wait; now the turn that follows settles — as failed, because it says so.
     h.script.add("w1", tool("report_to_parent", { kind: "result", status: "failed", text: "没法继续：分支被人占着" }));
     // (The owner answering directly counts as the answer, whoever the worker was waiting for.)
-    expect(h.kernel.directMessage("w1", { text: "那就先停" })).toMatchObject({ status: "delivered" });
+    expect(h.kernel.directMessage("w1", { text: "那就先停" }, { principalId: h.kernel.ownerPrincipal })).toMatchObject({ status: "delivered" });
     await h.kernel.idle();
     expect(h.kernel.listWaits(["w1"])).toEqual([]);
     expect(results(h, "proj")).toHaveLength(1);
@@ -158,7 +158,7 @@ describe("a wakeable worker's turn settles: the parent is told, the worker stays
   it("a one_shot leaf (a checker) still reports once and is closed, with its timers", async () => {
     const h = await boot();
     project(h);
-    h.kernel.spawnCell("proj", { id: "wt", preset: "checker", title: "wt", meta: { role: "wt" }, schedules: [{ cron: "0 9 * * *" }] }, "is the MR merged?");
+    h.kernel.spawnCell("proj", { id: "wt", preset: "checker", title: "wt", meta: { role: "wt" }, schedules: [{ cron: "0 9 * * *" }] }, "is the MR merged?", { principalId: h.kernel.ownerPrincipal });
     h.script.add("wt", tool("report_to_parent", { kind: "result", text: "merged at 10:02" }));
     await h.kernel.idle();
     expect(h.kernel.getCell("wt")).toMatchObject({ status: "closed", closeReason: "completed" });
@@ -170,7 +170,7 @@ describe("a wakeable worker's turn settles: the parent is told, the worker stays
 describe("dormant workers cost nothing and block nothing", () => {
   it("take no slot of maxConcurrentChildren; a worker at work, or one that waits, does", async () => {
     const h = await boot();
-    h.kernel.spawnCell("desk", { id: "proj", preset: "project", title: "proj", meta: { role: "proj" }, bounds: { maxConcurrentChildren: 2 } });
+    h.kernel.spawnCell("desk", { id: "proj", preset: "project", title: "proj", meta: { role: "proj" }, bounds: { maxConcurrentChildren: 2 } }, undefined, { principalId: h.kernel.ownerPrincipal });
     worker(h, "a");
     worker(h, "b");
     h.script.add("a", { text: "a done" });
@@ -178,12 +178,12 @@ describe("dormant workers cost nothing and block nothing", () => {
     await h.kernel.idle();
     expect([activity(h, "a"), activity(h, "b")]).toEqual(["dormant", "dormant"]);
     // Two finished workers are still there, and two more can start.
-    h.kernel.spawnCell("proj", { id: "c", preset: "worker", meta: { role: "c" } }, undefined, {});
+    h.kernel.spawnCell("proj", { id: "c", preset: "worker", meta: { role: "c" } }, undefined, { principalId: h.kernel.ownerPrincipal });
     h.kernel.inbox.enqueueSync("c", { id: "c-later", from: "timer:test", principalId: "cell:c", kind: "event", type: PAYLOAD.timerFired, payload: { label: "later" }, createdAt: h.clock.now() }, { deliverAt: h.clock.now() + 3_600_000 });
-    h.kernel.spawnCell("proj", { id: "d", preset: "worker", meta: { role: "d" } }, undefined, {});
+    h.kernel.spawnCell("proj", { id: "d", preset: "worker", meta: { role: "d" } }, undefined, { principalId: h.kernel.ownerPrincipal });
     h.kernel.inbox.enqueueSync("d", { id: "d-later", from: "timer:test", principalId: "cell:d", kind: "event", type: PAYLOAD.timerFired, payload: { label: "later" }, createdAt: h.clock.now() }, { deliverAt: h.clock.now() + 3_600_000 });
     expect([activity(h, "c"), activity(h, "d")]).toEqual(["waiting", "waiting"]);
-    expect(() => h.kernel.spawnCell("proj", { id: "e", preset: "worker" }, "go")).toThrow(/already has 2 children at work \(maxConcurrentChildren 2\)/);
+    expect(() => h.kernel.spawnCell("proj", { id: "e", preset: "worker" }, "go", { principalId: h.kernel.ownerPrincipal })).toThrow(/already has 2 children at work \(maxConcurrentChildren 2\)/);
   });
 
   it("do not keep their project from finishing, and are archived with it — a worker still at work does keep it open", async () => {
@@ -192,7 +192,7 @@ describe("dormant workers cost nothing and block nothing", () => {
     worker(h, "w1");
     h.script.add("w1", { text: "done" });
     await h.kernel.idle();
-    h.kernel.spawnCell("proj", { id: "w2", preset: "worker", title: "w2", meta: { role: "w2" } });
+    h.kernel.spawnCell("proj", { id: "w2", preset: "worker", title: "w2", meta: { role: "w2" } }, undefined, { principalId: h.kernel.ownerPrincipal });
     h.kernel.inbox.enqueueSync("w2", { id: "w2-later", from: "timer:test", principalId: "cell:w2", kind: "event", type: PAYLOAD.timerFired, payload: { label: "later" }, createdAt: h.clock.now() }, { deliverAt: h.clock.now() + 3_600_000 });
 
     h.script.add("proj", tool("complete_self", { summary: "all done" }), (req) => {
@@ -248,10 +248,10 @@ describe("the owner talks to a worker directly", () => {
       projSaw = requestText(req);
       return {};
     });
-    const r = h.kernel.directMessage("w1", { text: "把最大重试次数从 5 改成 3", clientId: "c-1" });
+    const r = h.kernel.directMessage("w1", { text: "把最大重试次数从 5 改成 3", clientId: "c-1" }, { principalId: h.kernel.ownerPrincipal });
     expect(r).toEqual({ status: "delivered", envelopeId: "c-1", duplicate: false, reopened: false, targetStatus: "active", ccTo: "proj" });
     // A retried send is the same message: not delivered twice, not copied twice.
-    expect(h.kernel.directMessage("w1", { text: "把最大重试次数从 5 改成 3", clientId: "c-1" })).toMatchObject({ status: "delivered", duplicate: true });
+    expect(h.kernel.directMessage("w1", { text: "把最大重试次数从 5 改成 3", clientId: "c-1" }, { principalId: h.kernel.ownerPrincipal })).toMatchObject({ status: "delivered", duplicate: true });
     await h.kernel.idle();
 
     expect(woken).toBe(1);
@@ -280,10 +280,10 @@ describe("the owner talks to a worker directly", () => {
     expect(h.of("run.started").filter((e) => e.cellId === "proj").length).toBeGreaterThan(before);
     // The plain control-plane calls give the project the same copy.
     h.script.add("w1", { text: "ok" });
-    h.kernel.sendToCell("w1", { text: "再跑一遍" });
+    h.kernel.sendToCell("w1", { text: "再跑一遍" }, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     h.script.add("w1", { text: "ok" });
-    h.kernel.control("w1", { action: "steer", steerMessage: "用 pnpm" });
+    h.kernel.control("w1", { action: "steer", steerMessage: "用 pnpm" }, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     expect(copies(h, "proj").map((c) => [c.mode, c.text])).toEqual([["steer", "方向错了，停掉迁移"], ["enqueue", "再跑一遍"], ["steer", "用 pnpm"]]);
     // A cell writing to a cell is not the owner speaking: no copy.
@@ -305,25 +305,25 @@ describe("the owner talks to a worker directly", () => {
     worker(h, "w1");
     h.script.add("w1", { text: "v1 done" });
     await h.kernel.idle();
-    await h.kernel.closeCell("w1", "completed");
-    expect(h.kernel.sendToCell("w1", { text: "x" })).toMatchObject({ status: "closed" });
+    await h.kernel.closeCell("w1", "completed", { principalId: h.kernel.ownerPrincipal });
+    expect(h.kernel.sendToCell("w1", { text: "x" }, { principalId: h.kernel.ownerPrincipal })).toMatchObject({ status: "closed" });
 
     h.script.add("w1", (req) => {
       expect(requestText(req)).toContain("v1 done");
       return { text: "v2 done" };
     });
-    expect(h.kernel.directMessage("w1", { text: "再改一处" })).toMatchObject({ status: "delivered", reopened: true, ccTo: "proj" });
+    expect(h.kernel.directMessage("w1", { text: "再改一处" }, { principalId: h.kernel.ownerPrincipal })).toMatchObject({ status: "delivered", reopened: true, ccTo: "proj" });
     await h.kernel.idle();
     expect(h.kernel.getCell("w1")!.status).toBe("active");
     expect(results(h, "proj").at(-1)).toMatchObject({ summary: "v2 done", childState: "dormant" });
 
-    h.kernel.spawnCell("proj", { id: "probe", preset: "hub", processor: { kind: "code", entry: "test.noop" }, lifetime: "persistent" });
-    expect(h.kernel.directMessage("probe", { text: "hello" })).toMatchObject({ status: "refused", reason: "code" });
-    expect(h.kernel.directMessage("nope", { text: "hello" })).toEqual({ status: "not_found" });
+    h.kernel.spawnCell("proj", { id: "probe", preset: "hub", processor: { kind: "code", entry: "test.noop" }, lifetime: "persistent" }, undefined, { principalId: h.kernel.ownerPrincipal });
+    expect(h.kernel.directMessage("probe", { text: "hello" }, { principalId: h.kernel.ownerPrincipal })).toMatchObject({ status: "refused", reason: "code" });
+    expect(h.kernel.directMessage("nope", { text: "hello" }, { principalId: h.kernel.ownerPrincipal })).toEqual({ status: "not_found" });
     expect(h.kernel.directMessage("w1", { text: "hello" }, { principalId: "cell:desk" })).toMatchObject({ status: "refused", reason: "not_allowed" });
 
-    await h.kernel.closeCell("proj", "completed");
-    expect(h.kernel.directMessage("w1", { text: "还在吗" })).toMatchObject({ status: "refused", reason: "archived" });
+    await h.kernel.closeCell("proj", "completed", { principalId: h.kernel.ownerPrincipal });
+    expect(h.kernel.directMessage("w1", { text: "还在吗" }, { principalId: h.kernel.ownerPrincipal })).toMatchObject({ status: "refused", reason: "archived" });
     expect(h.kernel.getCell("w1")!.status).toBe("closed");
   });
 
@@ -334,7 +334,7 @@ describe("the owner talks to a worker directly", () => {
       saw = requestText(req);
       return { text: "好的，已立项" };
     });
-    expect(h.kernel.directMessage("desk", { text: "在 ~/dev/pay-core", clientId: "m-7", replyToId: "q-3", replyToText: "代码在哪个本地目录下呀？", conversationId: "web-1" })).toMatchObject({ status: "delivered", ccTo: null });
+    expect(h.kernel.directMessage("desk", { text: "在 ~/dev/pay-core", clientId: "m-7", replyToId: "q-3", replyToText: "代码在哪个本地目录下呀？", conversationId: "web-1" }, { principalId: h.kernel.ownerPrincipal })).toMatchObject({ status: "delivered", ccTo: null });
     await h.kernel.idle();
     expect(saw).toContain("user.message");
     expect(saw).toContain("id m-7");
@@ -380,7 +380,7 @@ describe("the parent pulls: inspect_cell", () => {
       second = lastToolResult(req);
       return {};
     });
-    h.kernel.directMessage("w1", { text: "最大重试改成 3" });
+    h.kernel.directMessage("w1", { text: "最大重试改成 3" }, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     expect(second).toContain("the owner, directly (owner): 最大重试改成 3");
     expect(second).toContain("the owner spoke to it directly 1 time(s)");
@@ -459,7 +459,7 @@ describe("what a coordinator sees at every wake-up", () => {
 
 it.each(["one_shot", "wakeable"] as const)("enforces the leaf boundary for the %s lifetime even on a custom spec", async lifetime => {
   const h = await boot();
-  h.kernel.spawnCell("desk", { id: "leaf", preset: "inline", lifetime, bounds: { maxDepth: 3 } });
+  h.kernel.spawnCell("desk", { id: "leaf", preset: "inline", lifetime, bounds: { maxDepth: 3 } }, undefined, { principalId: h.kernel.ownerPrincipal });
   expect(h.kernel.getCell("leaf")?.bounds.maxDepth).toBe(0);
-  expect(() => h.kernel.spawnCell("leaf", { preset: "worker" })).toThrow(/maxDepth 0/);
+  expect(() => h.kernel.spawnCell("leaf", { preset: "worker" }, undefined, { principalId: h.kernel.ownerPrincipal })).toThrow(/maxDepth 0/);
 });

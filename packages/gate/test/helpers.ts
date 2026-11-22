@@ -20,7 +20,6 @@ import { createGate, type GateOptions, type GateService } from "../src";
 export const DESK_BOUNDS: BoundsInit = {
   tools: ["read", "write", "edit", "bash"],
   canSendTo: ["inbox:*", "channel:ui:*"],
-  isolation: "none",
   maxConcurrentChildren: 3,
   maxDepth: 3,
 };
@@ -58,7 +57,7 @@ export function withWorker(f: Fixture, id = "w1", requested: Partial<PolicyBound
   const parent = f.cells.require("desk");
   const bounds = f.gate.attenuate(parent.bounds, "desk", {
     tools: new Set(["read", "write", "edit", "bash"]),
-    isolation: "none",
+
     ...requested,
   });
   f.cells.insert({ id, parentId: "desk", bounds });

@@ -1,5 +1,5 @@
 export { gtdKeys } from "./shared/keys";
-import {gtdLifecycle} from "./shared/lifecycle";
+import { gtdLifecycle } from "./shared/lifecycle";
 export {gtdLifecycle} from "./shared/lifecycle";
 // @ng/presets — the workbench's cell templates (docs/05): the desk (triage + arbitration), persistent projects that keep
 // the records and dispatch workers (they rest between turns and can be woken again), light checkers, sources and hubs,
@@ -62,6 +62,7 @@ export function registerPresets(registry: Registry, opts: RegisterPresetsOptions
 
 // ---------- for the app, the control plane, custom sensors ----------
 
+export { sensorPreset };
 export { PROMPTS, TOOLSETS, PROCESSORS, ROLES, KEYS, RESTORE_REASON } from "./shared/config";
 export { BUILTIN_SKILLS, type BuiltinSkill } from "./shared/skills";
 export { seedBuiltinSkills } from "./shared/seed";
@@ -72,3 +73,5 @@ export { startApprovedProjectSync, projectIdForApproval, type ProposalItem } fro
 export type { ProbeArgs, ProbeState, ProbeUntil } from "./shared/probe";
 
 export { writeActionRecordSync, readHumanActionRecords } from "./shared/human-actions";
+
+export type * from "./shared/product-records";

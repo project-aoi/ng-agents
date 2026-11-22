@@ -1,8 +1,9 @@
 import { gtdKeys } from "../shared/keys";
+import type { ProjectRecord } from "../shared/product-records";
 import {
   CELL_STATUS_KEY,
   isEnvelopeOfType,
-  newId, sha256Hex,
+  newId,
   PAYLOAD,
   type ActionRecord,
   type CellResultPayload,
@@ -10,13 +11,12 @@ import {
   type Clock,
   type Envelope,
   type PrepareRunInput,
-  type ProjectRecord,
   type RunPorts,
   type WaitingSet,
 } from "@ng/protocol";
 import { ROLES } from "../shared/config";
 import { newAction, newProject, patchAction, statusLine } from "../shared/records";
-import type { PlannedAction, ProjectTaskInput } from "./launch";
+import { seededActionId, type PlannedAction, type ProjectTaskInput } from "./launch";
 
 // A project's books: the records that follow mechanically from what woke it, kept before the model runs (and whatever
 // engine runs it) so they never depend on a model calling a tool. They never consume the batch — the project always
@@ -43,7 +43,7 @@ function seedActions(self: string, planned: readonly PlannedAction[], clock: Clo
     .map((p, index) =>
       newAction(
         {
-          id: `act_${sha256Hex(self).slice(0, 24)}_${String(index).padStart(8, "0")}`,
+          id: seededActionId(self, index),
           title: p.title,
           owner: p.owner === "human" || p.owner === "waiting" ? p.owner : "agent",
           projectCellId: self,
@@ -117,7 +117,7 @@ export async function prepareProjectRun({ snapshot, ports, clock }: PrepareRunIn
     for (const a of seeded.actions) if (!actions.has(a.id)) set(a);
   }
 
-  const carrying = (cellId: string) => [...actions.values()].find((a) => a.status === "open" && a.cellId === cellId);
+  const carrying = (cellId: string) => [...actions.values()].find((a) => a.status === "open" && a.owner !== "human" && a.cellId === cellId);
   for (const env of batch) {
     if (isEnvelopeOfType(env, "cell.result")) {
       const p = env.payload as CellResultPayload;

@@ -145,7 +145,7 @@ export type HydrateMode = ContextMode;
 
 /**
  * Commit semantics (all-or-nothing, one SQLite transaction, nests inside a caller's `withTx`):
- * - `statePatches`: key → JSON value; `null`/`undefined` deletes the key. Keys are free-form; GTD keys live in gtd.ts.
+ * - `statePatches`: key → JSON value; `null`/`undefined` deletes the key. Presets declare their reserved keys.
  * - `artifact`: creates (version 1) when the id does not exist (`expectedVersion` must be absent or 0). Updating an
  *   existing artifact — by any cell, not only the one that created it (docs/05 guard 3: shared reports) — requires
  *   `expectedVersion` equal to the current version; absent or different, the whole commit is rejected with
@@ -417,6 +417,7 @@ export interface CompactionResult {
 /** One line per child in the volatile tail ("in-flight children roster"). */
 export interface ChildSummary {
   cellId: string;
+  processorKind?: "llm" | "code";
   title: string | null;
   preset: PresetName | null;
   status: CellStatus;

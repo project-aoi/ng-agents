@@ -34,7 +34,7 @@ describe("the default checker: a one-shot checker that watches on its own", () =
         return tool("report_to_parent", { kind: "result", text: "MR !5 已合入" });
       },
     );
-    const { projectId } = startProjectSync(h.kernel, { title: "p", outcome: "o", brief: "b" });
+    const { projectId } = startProjectSync(h.kernel, { title: "p", outcome: "o", brief: "b" }, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     const [checker] = childrenOf(h, projectId);
     expect(h.kernel.getCell(checker!)).toMatchObject({ status: "active", spec: { watches: [{ threadOrFilter: { thread: "memory:mr-5" } }] } });
@@ -58,7 +58,7 @@ describe("a source filtered by a small model", () => {
       const text = lastUserText(req);
       return text.includes("被扣了两次") ? tool("report_hit", { title: "用户反馈重复扣款", summary: "群里有人说同一笔订单被扣了两次", rawInput: "我昨天的订单被扣了两次款" }) : tool("no_hit");
     });
-    await h.ui.capture({ text: "帮我盯着支付群，有人反馈付款问题就告诉我" });
+    await h.ui.capture({ text: "帮我盯着支付群，有人反馈付款问题就告诉我" }, "owner");
     await h.kernel.idle();
     const sensor = h.kernel.listCells({ parentId: "desk", preset: "sensor" })[0]!;
     expect(sensor.spec).toMatchObject({ lifetime: "persistent", processor: { kind: "llm", modelTier: "fast" } });

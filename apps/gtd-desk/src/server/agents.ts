@@ -1,6 +1,6 @@
 import { isProjectRoot, type Kernel } from "@ng/cell";
 import { gtdKeys } from "@ng/presets";
-import { createEnvelope,  inboxAddr, newId, PAYLOAD, type TimerFiredPayload} from "@ng/protocol";
+import { createEnvelope, inboxAddr, newId, PAYLOAD, type TimerFiredPayload } from "@ng/protocol";
 import type {
   CellControlRequest,
   CellControlResponse,
@@ -28,7 +28,7 @@ import {
   type TimelineQuery,
 } from "./projections/agents";
 
-// 分身实况 (Agents): the endpoints behind the fourth view — the topology, one cell's timeline, a page of a spilled
+// 分身实况 (Agents): the endpoints behind the agent view — the topology, one cell's timeline, a page of a spilled
 // output, a message typed to a cell, and its pause / resume / stop buttons. A message is the kernel's directMessage
 // (one transaction: a closed worker under an open project is brought back, the message is queued or steered, the
 // project is given a copy); this file validates, words the outcome for a person and answers with the fresh view.
@@ -40,6 +40,7 @@ export interface AgentsErrors {
 }
 
 export interface AgentsDeps {
+  requireActor(actor: {principalId: string}): {principalId: string};
   kernel: Kernel;
   commands:{
     message(id:string, req:Parameters<Kernel["directMessage"]>[1], as:{principalId:string}):ReturnType<Kernel["directMessage"]>;
@@ -75,15 +76,8 @@ export interface Delivery {
   ccTitle: string | null;
 }
 
-export function createAgentsApi({ commands,kernel, settings, status, projectOp, errors }: AgentsDeps) {
+export function createAgentsApi({ requireActor, commands, kernel, settings, status, projectOp, errors }: AgentsDeps) {
   const input = () => inputOf(kernel, settings);
-  const requireActor = (as: { principalId: string }): { principalId: string } => {
-    if (!as || typeof as.principalId !== "string" || !as.principalId.trim()) {
-      throw errors.bad("缺少操作者身份（principalId）");
-    }
-    return { principalId: as.principalId.trim() };
-  };
-
   function topology(q: { includeArchived?: boolean; projectId?: string | null } = {}): TopologyDTO {
     if (q.projectId && !kernel.getCell(q.projectId)) throw errors.missing("找不到这个项目");
     return projectTopology(input(), q);
@@ -144,7 +138,8 @@ export function createAgentsApi({ commands,kernel, settings, status, projectOp, 
         return { ...no, outcome: "not_found", ok: false, message: "找不到这个分身", before: null };
       case "refused":
         if (r.reason === "code") return { ...no, outcome: "refused_script", ok: false, message: "这是零算力确定性脚本探针，不接受自然语言对话（可以立即触发一次检查或暂停它）" };
-        if (r.reason === "archived") return { ...no, outcome: "refused_archived", ok: false, message: "它已随所属项目归档，不能再发消息；有新的需要，去总助理另起新事项" };
+        if (r.reason === "paused_parent") return { ...no, outcome: "refused_paused_parent", ok: false, message: "请先恢复所属任务，再向这个分身发消息" };
+        if (r.reason === "archived") return { ...no, outcome: "refused_archived", ok: false, message: "它已随所属项目归档。请在已结束的项目中重新打开，再继续对话" };
         return { ...no, outcome: "refused_archived", ok: false, message: "没有送达：它现在不接受消息" };
       case "delivered": {
         if (r.duplicate) return { ...no, id: r.envelopeId, outcome: "duplicate", ok: true, message: "这条消息已经发过了，不会重复发送" };

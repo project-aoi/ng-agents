@@ -1,5 +1,5 @@
 import {
-  stableStringify, describeBounds,
+  all, PAYLOAD, stableStringify, describeBounds,
   get,
   mergeAdjacentMessages,
   NgError,
@@ -141,6 +141,14 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
     }));
   }
 
+  function resourceExcerpt(cellId: string, text: string, budget: number, source: string): string {
+    if (text.length <= budget) return text;
+    const existing = get<{ uri: string }>(db,
+      "SELECT uri FROM resources WHERE cell_id=? AND source=? AND content=? LIMIT 1", [cellId, source, text]);
+    const uri = existing?.uri ?? evidence.writeResource(cellId, text, { source });
+    return [safeHead(text, Math.max(0, budget - uri.length - 2)), uri].filter(Boolean).join(" ");
+  }
+
   function originalTask(cellId: string): string | null {
     const row = get<{payload: string | null}>(db, `SELECT content -> '$.envelope.payload' AS payload FROM evidence
       WHERE cell_id=? AND kind='inbound' AND json_extract(content,'$.envelope.type')='cell.task' ORDER BY seq LIMIT 1`,[cellId]);
@@ -150,7 +158,8 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
     const refs = referencesIn(task);
     const instruction = typeof task.instruction === "string" ? oneLine(task.instruction, 800) : "";
     const input = task.input === undefined ? "" : "input=" + stableStringify(task.input);
-    return [`[original task] parent=${task.parentCellId ?? ""}`, instruction, input, ...refs].filter(Boolean).join(" ");
+    const full = [`[original task] parent=${task.parentCellId ?? ""}`, instruction, input, ...refs].filter(Boolean).join(" ");
+    return resourceExcerpt(cellId, full, Math.max(128, Math.floor(limits.summaryMaxChars / 4)), "original-task");
   }
 
   function buildSystem(cell: CellRecord): { text: string; skills: SkillIndexEntry[] } {
@@ -175,7 +184,8 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
     const kind = cell.preset ? `, a ${cell.preset} cell` : "";
     const parts = [
       `[fork] Everything above is the context of cell "${parent.id}" up to the moment it created this cell. ` +
-        `You are now ${who.join(" ")}${kind} with your own task, bounds and history; continue from here on your own.`,
+        `You are now ${who.join(" ")}${kind} — you are NO LONGER cell "${parent.id}": ignore the parent role instructions and parent bounds in the system prompt above, ` +
+        `and follow "## Your instructions", "## Your bounds", and the tools actually exposed to this cell.`,
     ];
     const prompt = deps.resolvePrompt(cell).trimEnd();
     if (prompt) parts.push(`## Your instructions\n${prompt}`);
@@ -244,13 +254,14 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
     row: PrefixRow,
     upto: number | undefined,
     openAtEnd: "error" | "fork",
+    incoming?: Set<string>,
   ): { messages: ModelMessage[]; uptoSeq: number } {
     // A child may hydrate for the first time after its parent compacted past the fork point.
     const futureSummary = upto !== undefined && row.summary_upto_seq > upto;
     const messages = futureSummary ? [] : headMessages(row, true);
     const afterSeq = futureSummary ? 0 : row.summary_upto_seq;
     const records = evidence.list(cell.id, { afterSeq, ...(upto !== undefined ? { uptoSeq: upto } : {}) });
-    messages.push(...renderRecords(records.map((r) => r.record), { openAtEnd }));
+    messages.push(...renderRecords(records.map(r => r.record).filter(r => !(r.kind === "system_note" && r.envelopeId && incoming?.has(r.envelopeId))), { openAtEnd }));
     if (messages[0]?.role === "assistant") messages.unshift(textMessage("user", HISTORY_START_TEXT));
     let uptoSeq = Math.max(afterSeq, records[records.length - 1]?.seq ?? 0);
     if (row.inherited !== null && cell.spec.fork) uptoSeq = Math.max(uptoSeq, cell.spec.fork.uptoSeq);
@@ -310,7 +321,7 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
       baseCompactions: row.compactions,
       uptoSeq: cut > 0 ? records[cut - 1]!.seq : Math.max(row.summary_upto_seq, inheritedUpto),
       keptChars: suffix[cut]!,
-      ...(latest ? {latestExcerpt:JSON.stringify(latest.record).slice(-Math.min(1500,limits.keepRecentChars))} : {}),
+      ...(latest ? {latestExcerpt:safeTail(JSON.stringify(latest.record), Math.min(1500,limits.keepRecentChars))} : {}),
       charsBefore: total,
       input: { cellId, previousSummary: row.summary, messages: folded, maxChars: limits.summaryMaxChars },
     };
@@ -325,7 +336,8 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
       const cell = cells.require(plan.cellId);
       const task = originalTask(cell.id);
       const body = summary.split("\n").filter(line => !line.startsWith("[original task]") && !line.startsWith("[references] ")).join("\n");
-      const refs = referenceLine(referencesIn(plan.input.previousSummary, plan.input.messages, summary, task));
+      const refs = resourceExcerpt(cell.id, referenceLine(referencesIn(plan.input.previousSummary, plan.input.messages, summary, task)),
+        Math.max(64, Math.floor(limits.summaryMaxChars / 3)), "compaction-references");
       const available = Math.max(0, limits.summaryMaxChars - refs.length - (refs ? 1 : 0));
       const prefix = task ? safeHead(task, Math.floor(available / 2)) : "";
       const remaining = Math.max(0, available - prefix.length - (prefix ? 1 : 0));
@@ -397,7 +409,11 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
     }
     const cell = cells.require(cellId);
     const row = ensurePrefix(cell, mode);
-    const history = renderHistory(cell, row, undefined, "error");
+    const incoming = new Set(batch.envelopes.map(e => e.id));
+    for (const message of all<{envelope_id:string}>(db, `SELECT envelope_id FROM inbox_messages
+      WHERE cell_id=? AND type=? AND status IN ('pending','claimed') AND (expected_epoch IS NULL OR expected_epoch=?)`,
+      [cellId, PAYLOAD.controlSteer, cell.epoch])) incoming.add(message.envelope_id);
+    const history = renderHistory(cell, row, undefined, "error", incoming);
     const roster = deps.roster(cellId);
     const notes = (deps.tailNotes(cellId) ?? []).filter((n) => typeof n === "string" && n.trim() !== "");
     const task = originalTask(cell.id);

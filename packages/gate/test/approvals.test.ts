@@ -115,7 +115,7 @@ describe("approve — an external main agent (agent:*) orchestrates but is never
     const f = setup();
     const project = expectType(
       f.gate.authorizeSync(
-        { type: "project.start", summary: "立项", subjectKey: "msg:p", sideEffect: "external", proposal: { title: "竞品调研", outcome: "", actions: [] } },
+        { type: "project.start", summary: "立项", subjectKey: "msg:p", sideEffect: "external", proposal: { title: "竞品调研", outcome: "交付调研报告", actions: [] } },
         meta("desk"),
       ),
       "defer",

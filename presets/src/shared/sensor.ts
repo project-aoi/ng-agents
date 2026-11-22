@@ -1,8 +1,12 @@
-import type {CellSpec,ProcessorSpec} from "@ng/protocol";
-import {SENSOR_LLM_PROCESSOR} from "./processors";
+import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { CellSpec, ProcessorSpec } from "@ng/protocol";
+import { SENSOR_LLM_PROCESSOR } from "./processors";
 import { z } from "zod";
-import { scriptCommand } from "./script-command";
+import { scriptCommand, shellQuote } from "./script-command";
 import { gtdKeys } from "./keys";
+import type { SourceRecord, SourceState } from "./product-records";
 import {
   defineTool,
   PAYLOAD,
@@ -12,7 +16,6 @@ import {
   type Envelope,
   type RunPorts,
   type SourceHitPayload,
-  type SourceRecord,
   type Toolset,
 } from "@ng/protocol";
 import { PROCESSORS, TOOLSETS } from "./config";
@@ -35,16 +38,19 @@ export type SourceInit = Pick<SourceRecord, "title" | "kind" | "mode" | "process
 
 export const OBSERVATION_NOTE = "观察笔记";
 
-function sourceInit(ports: RunPorts): SourceInit {
-  const init = (ports.self.spec.meta?.["gtd"] as { source?: SourceInit } | undefined)?.source;
-  return init ?? { title: ports.self.spec.title ?? "信源", kind: "cron", mode: "active", processor: ports.self.spec.processor.kind };
+export function sourceInit(spec: CellSpec): SourceInit {
+  const init = (spec.meta?.["gtd"] as { source?: SourceInit } | undefined)?.source;
+  const rule = spec.schedules?.find(s => s.cron);
+  return { title: spec.title ?? init?.title ?? "信源", kind: rule?.cron || !spec.watches?.length ? "cron" : "watch",
+    mode: init?.mode ?? "active", processor: spec.processor.kind, ...(init?.description && {description: init.description}),
+    ...(rule?.cron && {schedule:{cron:rule.cron, ...(rule.tz && {tz:rule.tz})}}) };
 }
 
 /** Read (or create from the spec) the cell's SourceRecord. */
-export async function ensureSource(ports: RunPorts, now: number): Promise<SourceRecord> {
-  const cur = await ports.context.readState<SourceRecord>(ports.self.cellId, gtdKeys.source);
+export async function ensureSource(ports: RunPorts, now: number): Promise<SourceState> {
+  const cur = await ports.context.readState<SourceState>(ports.self.cellId, gtdKeys.source);
   if (cur) return cur;
-  const rec = newSource(sourceInit(ports), now);
+  const rec = newSource(sourceInit(ports.self.spec), now);
   await ports.context.commit(ports.self.cellId, { statePatches: { [gtdKeys.source]: rec } });
   return rec;
 }
@@ -53,11 +59,11 @@ export async function ensureSource(ports: RunPorts, now: number): Promise<Source
  * One finished check: SourceRecord counters, then the hit (if any) goes to the desk — or, in observe mode, into the
  * observation notes only. `runKey` makes a retried Run post the same hit only once.
  */
-export async function recordCheck(ports: RunPorts, now: number, result: { hit: SensorHit | null; error?: string }, runKey: string): Promise<SourceRecord> {
+export async function recordCheck(ports: RunPorts, now: number, result: { hit: SensorHit | null; error?: string }, runKey: string): Promise<SourceState> {
   const src = await ensureSource(ports, now);
   if (src.lastCheckKey === runKey) return src;
   let appendReference: CommitTx["appendReference"];
-  const next: SourceRecord = { ...src, lastCheckKey: runKey, runCount: src.runCount + 1, lastRunAt: now, updatedAt: now, status: result.error ? "error" : "ok" };
+  const next: SourceState = { ...src, lastCheckKey: runKey, runCount: src.runCount + 1, lastRunAt: now, updatedAt: now };
   if (result.error) next.lastError = clip(result.error, 300);
   else delete next.lastError;
   const hit = result.hit;
@@ -89,7 +95,7 @@ function dueEnvelopes(envs: readonly Envelope[]): Envelope[] {
 }
 
 export interface SensorCheckInput extends CodeProcessorInput {
-  source: SourceRecord;
+  source: SourceState;
   /** What woke the sensor (timer firings, watched messages). */
   due: Envelope[];
 }
@@ -107,16 +113,22 @@ export function defineSensorCheck(name: string, check: (input: SensorCheckInput)
       const now = input.clock.now();
       const source = await ensureSource(input.ports, now);
       const due = dueEnvelopes(input.snapshot.batch.envelopes);
-      if (due.length === 0 || source.lastCheckKey === due[0]!.id) return "completed";
+      const trigger = due[0];
+      if (!trigger) return "completed";
+      if (due.length > 1) {
+        if (!input.ports.requeueEnvelopes) throw new Error("Cannot release unprocessed source inputs");
+        input.ports.requeueEnvelopes(due.slice(1).map(e => e.id), "process each source input individually");
+      }
+      if (source.lastCheckKey === trigger.id) return "completed";
       let hit: SensorHit | null = null;
       let error: string | undefined;
       try {
-        hit = await check({ ...input, source, due });
+        hit = await check({ ...input, source, due: [trigger] });
       } catch (err) {
         if (input.signal.aborted) throw err;
         error = err instanceof Error ? err.message : String(err);
       }
-      await recordCheck(input.ports, now, error ? { hit: null, error } : { hit }, due[0]!.id);
+      await recordCheck(input.ports, now, error ? { hit: null, error } : { hit }, trigger.id);
       return "completed";
     },
   };
@@ -129,9 +141,21 @@ export function createScriptSensor(): CodeProcessor {
     async ({ ports, args, signal, snapshot, due }) => {
       const script = args["script"];
       if (typeof script !== "string" || !script.trim()) throw new Error("sensor: args.script is missing");
-      const command = scriptCommand(script, { NG_CELL_ID: ports.self.cellId, NG_RUN_ID: snapshot.runId, NG_ARGS: JSON.stringify(args), NG_TRIGGER_JSON: JSON.stringify(due[0]) });
+      const json = JSON.stringify(due[0]);
+      const large = Buffer.byteLength(shellQuote(json)) > 64 * 1024;
+      const dir = large ? await mkdtemp(join(tmpdir(), "ng-sensor-")) : undefined;
       const timeoutMs = typeof args["timeoutMs"] === "number" ? args["timeoutMs"] : 120_000;
-      const res = await ports.workspace.exec("bash", { command, timeoutMs }, signal);
+      let res;
+      try {
+        const env: Record<string,string> = { NG_CELL_ID: ports.self.cellId, NG_RUN_ID: snapshot.runId, NG_ARGS: JSON.stringify(args) };
+        if (dir) {
+          env.NG_TRIGGER_FILE = join(dir, "trigger.json");
+          await writeFile(env.NG_TRIGGER_FILE, json, { mode: 0o600 });
+        } else env.NG_TRIGGER_JSON = json;
+        res = await ports.workspace.exec("bash", { command: scriptCommand(script, env), timeoutMs }, signal);
+      } finally {
+        if (dir) await rm(dir, { recursive: true, force: true });
+      }
       const out = res.output.trim();
       if ((res.exitCode ?? 0) !== 0) throw new Error(`exit ${res.exitCode}: ${clip(out.slice(-300), 300)}`);
       return out ? { summary: clip(out, 1_000), rawInput: out.slice(0, 20_000) } : null;
@@ -193,6 +217,6 @@ export function sensorProcessor(entry: string): Extract<ProcessorSpec, { kind: "
   return { kind: "code", entry: PROCESSORS.sensorScript, args: { script } };
 }
 export function createSensorSpec(id:string,source:SourceInit,processor:ProcessorSpec = SENSOR_LLM_PROCESSOR,thread?:string): CellSpec {
-  return {id,preset:"sensor",title:source.title,processor,meta:{role:"sensor",gtd:{source}},
+  return {id,preset:"sensor",title:source.title,processor,meta:{role:"sensor",gtd:{source:{mode:source.mode, description:source.description}}},
     ...(source.schedule ? {schedules:[source.schedule]} : {}),...(thread ? {watches:[{threadOrFilter:{thread}}]} : {})};
 }

@@ -8,12 +8,12 @@ import type { SendToCellResult } from "@ng/protocol";
  * null when the project cell is closed or unknown (nothing to tell). In the caller's transaction.
  */
 export function notifyProjectOfOwnerChangeSync(
-  kernel: Pick<Kernel, "getCell" | "sendToCell" | "ownerPrincipal">,
+  kernel: Pick<Kernel, "getCell" | "sendToCell">,
   projectCellId: string,
   text: string,
-  opts: { id?: string; principalId?: string } = {},
+  opts: { id?: string; principalId: string },
 ): SendToCellResult | null {
   const cell = kernel.getCell(projectCellId);
   if (!cell || cell.status === "closed") return null;
-  return kernel.sendToCell(projectCellId, { text, summary: "主人更新了事项", ...(opts.id ? { id: opts.id } : {}) }, { principalId: opts.principalId ?? kernel.ownerPrincipal });
+  return kernel.sendToCell(projectCellId, { text, summary: "主人更新了事项", ...(opts.id ? { id: opts.id } : {}) }, { principalId: opts.principalId });
 }

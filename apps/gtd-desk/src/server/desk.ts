@@ -1,5 +1,7 @@
+import { createModelSwitch } from "./models";
+import type { SetModelRequest } from "../shared/api";
 import { ownerOnlyApproval } from "@ng/gate";
-import type { HumanDecision } from "@ng/protocol";
+import type { HumanDecision, HumanItem, CardOption } from "@ng/protocol";
 import { isProjectRoot, type Kernel } from "@ng/cell";
 import type { UiChannel } from "@ng/channel";
 import {
@@ -13,12 +15,13 @@ import {
   writeActionRecordSync,
   type ProjectInit,
 } from "@ng/presets";
+import type { ProjectRecord, SourceState } from "@ng/presets/records";
 import {
   all,
   asDecisionCard,
+  acceptsApprovalDraft,
   isProjectProposal,
   get,
-  cellPrincipal,
   createEnvelope,
   inboxAddr,
   isEnvelopeOfType,
@@ -27,6 +30,7 @@ import {
   NgError,
   PAYLOAD,
   projectCellIdOf,
+  parsePrincipal,
   subjectKeys,
   withTx,
   type ActionRecord,
@@ -37,8 +41,6 @@ import {
   type Envelope,
   type HandbackPayload,
   type ProjectProposal,
-  type ProjectRecord,
-  type SourceRecord,
 } from "@ng/protocol";
 import type {
   ActivityKind,
@@ -138,6 +140,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
   const { context, gate, clock } = kernel;
   const owner = kernel.ownerPrincipal;
   const desk = kernel.deskCellId;
+  const models = createModelSwitch(kernel);
   const input = () => inputOf(kernel, settings);
   const now = () => clock.now();
   const isEffort = (s: unknown): s is Effort => s === "15m" || s === "45m" || s === "low_energy";
@@ -148,7 +151,8 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
   // request that follows a change synchronously could otherwise see the previous stamp.
   const status = (): StatusDTO => {
     restamp();
-    return projectStatus(input());
+    const model = models.label();
+    return { ...projectStatus(input()), ...(model ? {model} : {}) };
   };
   const radar = (): RadarDTO => {
     restamp();
@@ -159,7 +163,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
   const activity = (kind?: ActivityKind): ActivityListDTO => projectActivity(input(), kind);
   function artifact(artifactId: string): ArtifactDTO {
     const a = artifactDTO(kernel, artifactId, now());
-    if (!a) throw missing(`没有这份草稿 ${artifactId}`);
+    if (!a) throw missing("这份草稿已移除");
     return a;
   }
 
@@ -188,15 +192,18 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
 
   function principalOf(as: DeskActor): string {
     if (!as || typeof as.principalId !== "string" || !as.principalId.trim()) {
-      throw bad("缺少操作者身份（principalId）");
+      throw bad("缺少操作者身份");
     }
-    return as.principalId.trim();
+    const id = as.principalId.trim();
+    const actor = parsePrincipal(id, owner);
+    if (actor.kind !== "owner" && actor.kind !== "agent") throw new NgError("bounds_violation", "此身份不能操作工作台");
+    return id;
   }
   const actorOf = (as: DeskActor) => ({ principalId: principalOf(as) });
   const byAgent = (as: DeskActor) => principalOf(as) !== owner;
   function seenRevisionOf(v: number | null | undefined): number {
-    if (v == null) throw bad("请提供页面上看到的 seenItemRevision");
-    if (!Number.isInteger(v) || v < 1) throw bad("seenItemRevision 必须是正整数");
+    if (v == null) throw bad("请核对页面上显示的事项版本");
+    if (!Number.isInteger(v) || v < 1) throw bad("事项版本必须是正整数");
     return v;
   }
 
@@ -238,13 +245,16 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
       : undefined;
     if (!text.trim() && !attachments?.length) throw bad("随手记不能为空");
     if (req.clientId !== undefined && (typeof req.clientId !== "string" || !/^[\w.:-]{1,80}$/.test(req.clientId))) throw bad("clientId 格式不对");
-    const env = ui.captureEnvelope({
+    if (req.threads !== undefined && (!Array.isArray(req.threads) || req.threads.length > 16 ||
+        req.threads.some(t => typeof t !== "string" || !t.startsWith("ui:") || !t.slice(3).trim() || t.length > 160)))
+      throw bad("请提供有效的工作台专题");
+    const env = await ui.capture({
+      ...(req.threads && { threads: [...new Set(req.threads)] }),
       text,
       ...(attachments?.length ? { attachments } : {}),
       ...(req.voice ? { voice: true } : {}),
       ...(req.clientId ? { clientId: req.clientId } : {}),
     },principalOf(as));
-    await kernel.ingest(env,ui.id);
     return { ok: true, id: env.id, acceptedAt: env.createdAt, message: "已收进信箱", status: status() };
   }
 
@@ -294,6 +304,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
       outcome: proposal.outcome,
       brief: parkedBrief(proposal),
       proposal,
+      plan: proposal.actions,
       source,
       ...(card?.rawInput.text ? { rawInput: card.rawInput.text } : {}),
       ...(proposal.cwd ? { cwd: proposal.cwd! } : {}),
@@ -333,93 +344,98 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     return [
       "主人在立项卡上点了“先放进以后再说”：这个项目先停着，什么都不做。你读到这条消息时，主人已经把它重新启动了——按下面的方案开始推进（方案也在你的项目记录里，proposal 字段）。",
       proposal.background ?? "",
-      proposal.actions.length ? ["方案里的步骤（还没有记进行动记录，需要时用 track_action / dispatch 记下）：", ...proposal.actions.map((a) => `- [${owners[a.owner]}] ${a.title}${a.nextStep ? `：${a.nextStep}` : ""}`)].join("\n") : "",
+      proposal.actions.length ? ["方案里的步骤（启动时自动记入行动记录）：", ...proposal.actions.map((a) => `- [${owners[a.owner]}] ${a.title}${a.nextStep ? `：${a.nextStep}` : ""}`)].join("\n") : "",
     ]
       .filter(Boolean)
       .join("\n\n");
   }
 
   async function savePlan(cardId: string, req: PlanSaveRequest, as: DeskActor): Promise<PlanSaveResponse> {
-    principalOf(as);
-    const { rec, card } = pendingCard(cardId);
-    if (card?.cardType !== "project_proposal") throw wrongState("这不是立项卡");
-    const draftId = rec.artifactId ?? card.draft?.artifactId;
-    const art = draftId ? context.getArtifactSync(draftId) : null;
-    if (!art) throw wrongState("这张卡的方案不能在这里修改");
-    if (!Number.isInteger(req?.expectedVersion)) throw bad("expectedVersion 必须是整数");
-    const p = req.proposal;
-    if (!p || typeof p.outcome !== "string" || !Array.isArray(p.actions)) throw bad("方案需要 outcome 和 actions");
-    const owners = new Set<BallOwner>(["human", "agent", "waiting"]);
-    const actions = p.actions.map((a) => {
-      if (!a || typeof a.title !== "string" || !a.title.trim() || !owners.has(a.owner)) throw bad("每个动作都需要标题和负责方（human / agent / waiting）");
-      if (a.effort !== undefined && !isEffort(a.effort)) throw bad(`未知的精力标签 ${String(a.effort)}`);
-      return { title: a.title.trim(), owner: a.owner, ...(a.effort ? { effort: a.effort } : {}), ...(a.nextStep ? { nextStep: a.nextStep } : {}) };
+    if (byAgent(as)) throw new NgError("bounds_violation", "这项修改需要主人操作");
+    return withTx(kernel.db, () => {
+      const { rec, card } = pendingCard(cardId);
+      if (card?.cardType !== "project_proposal") throw wrongState("这不是立项卡");
+      const draftId = rec.artifactId ?? card.draft?.artifactId;
+      const art = draftId ? context.getArtifactSync(draftId) : null;
+      if (!art) throw wrongState("这张卡的方案不能在这里修改");
+      if (!Number.isInteger(req?.expectedVersion) || req.expectedVersion < 1) throw bad("方案版本必须是正整数");
+      const p = req.proposal;
+      if (!p || typeof p.outcome !== "string" || !p.outcome.trim() || !Array.isArray(p.actions)) throw bad("请填写项目目标和行动清单");
+      const owners = new Set<BallOwner>(["human", "agent", "waiting"]);
+      const actions = p.actions.map((a) => {
+        if (!a || typeof a.title !== "string" || !a.title.trim() || !owners.has(a.owner)) throw bad("每项行动都需要标题和负责方");
+        if (a.effort !== undefined && !isEffort(a.effort)) throw bad(`未知的精力标签 ${String(a.effort)}`);
+        return { title: a.title.trim(), owner: a.owner, ...(a.effort ? { effort: a.effort } : {}), ...(a.nextStep ? { nextStep: a.nextStep } : {}) };
+      });
+      const proposal: ProjectProposal = {
+        ...proposalOf(rec, card),
+        title: typeof p.title === "string" && p.title.trim() ? p.title.trim() : proposalOf(rec, card).title,
+        outcome: p.outcome.trim(),
+        ...(p.background !== undefined ? { background: p.background } : {}),
+        actions,
+      };
+      if (!isProjectProposal(proposal)) throw bad("请核对方案背景、行动说明及项目目录");
+      const r = context.commitSync(art.cellId, {
+        artifact: {
+          artifactId: art.artifactId,
+          content: { format: "json", title: proposal.title, body: JSON.stringify(proposal, null, 2), data: proposal },
+          updatedBy: "human",
+          expectedVersion: req.expectedVersion,
+        },
+      });
+      if (!r.ok) {
+        return { ok: false, outcome: "conflict", message: "方案在你编辑时被更新了，请看一下最新版本再保存", current: artifact(art.artifactId) };
+      }
+      return { ok: true, outcome: "saved", message: `已保存方案 v${r.artifactVersion}`, artifact: artifact(art.artifactId), deskStatus: status() };
     });
-    const proposal: ProjectProposal = {
-      ...proposalOf(rec, card),
-      title: typeof p.title === "string" && p.title.trim() ? p.title.trim() : proposalOf(rec, card).title,
-      outcome: p.outcome,
-      ...(p.background !== undefined ? { background: p.background } : {}),
-      actions,
-    };
-    const r = context.commitSync(art.cellId, {
-      artifact: {
-        artifactId: art.artifactId,
-        content: { format: "json", title: proposal.title, body: JSON.stringify(proposal, null, 2), data: proposal },
-        updatedBy: "human",
-        expectedVersion: req.expectedVersion,
-      },
-    });
-    if (!r.ok) {
-      return { ok: false, outcome: "conflict", message: "方案在你编辑时被更新了，请看一下最新版本再保存", current: artifact(art.artifactId) };
-    }
-    return { ok: true, outcome: "saved", message: `已保存方案 v${r.artifactVersion}`, deskStatus: status() };
   }
 
   // ==================== drafts ====================
 
   function saveArtifact(artifactId: string, req: ArtifactSaveRequest, as: DeskActor): ArtifactSaveResponse {
-    principalOf(as);
-    const art = context.getArtifactSync(artifactId);
-    if (!art) throw missing(`没有这份草稿 ${artifactId}`);
-    if (!Number.isInteger(req?.expectedVersion) || req.expectedVersion < 1) throw bad("expectedVersion 必须是正整数");
-    if (typeof req.body !== "string") throw bad("body 必须是文本");
-    const format = req.format ?? (art.content.format === "card" ? "card" : art.content.format);
-    if (!["text", "markdown", "json", "card"].includes(format)) throw bad(`未知格式 ${String(format)}`);
-    let data: unknown = req.data !== undefined ? req.data : art.content.data;
-    if (format === "json" && req.data === undefined) {
-      try {
-        data = JSON.parse(req.body);
-      } catch {
-        throw bad("JSON 草稿的内容不是合法的 JSON");
+    if (byAgent(as)) throw new NgError("bounds_violation", "这项修改需要主人操作");
+    return withTx(kernel.db, () => {
+      const art = context.getArtifactSync(artifactId);
+      if (!art) throw missing("这份草稿已移除");
+      if (!Number.isInteger(req?.expectedVersion) || req.expectedVersion < 1) throw bad("请刷新草稿，核对要保存的版本");
+      if (typeof req.body !== "string") throw bad("草稿正文必须是文本");
+      const format = req.format ?? (art.content.format === "card" ? "card" : art.content.format);
+      if (!["text", "markdown", "json", "card"].includes(format)) throw bad(`未知格式 ${String(format)}`);
+      let data: unknown = req.data !== undefined ? req.data : art.content.data;
+      if (format === "json" && req.data === undefined) {
+        try {
+          data = JSON.parse(req.body);
+        } catch {
+          throw bad("JSON 草稿的内容不是合法的 JSON");
+        }
       }
-    }
-    const boundPlan = get(kernel.db,"SELECT 1 FROM human_items WHERE artifact_id=? AND action_type='project.start' AND status IN ('pending','snoozed') LIMIT 1",[artifactId]);
-    if (boundPlan && (format !== "json" || !isProjectProposal(data))) throw bad("立项方案需要有效的标题、目标、动作、目录和阶段");
-    const title = req.title ?? art.content.title;
-    const r = context.commitSync(art.cellId, {
-      artifact: {
-        artifactId,
-        content: {
-          format,
-          body: req.body,
-          ...(title !== undefined ? { title } : {}),
-          ...(data !== undefined && format !== "text" && format !== "markdown" ? { data } : {}),
-          ...(art.content.attachments ? { attachments: art.content.attachments } : {}),
+      const boundPlan = get(kernel.db,"SELECT 1 FROM human_items WHERE artifact_id=? AND action_type='project.start' AND status IN ('pending','snoozed') LIMIT 1",[artifactId]);
+      if (boundPlan && !acceptsApprovalDraft("project.start", format, data)) throw bad("立项方案需要有效的标题、目标、动作、目录和阶段");
+      const title = req.title ?? art.content.title;
+      const r = context.commitSync(art.cellId, {
+        artifact: {
+          artifactId,
+          content: {
+            format,
+            body: req.body,
+            ...(title !== undefined ? { title } : {}),
+            ...(data !== undefined && format !== "text" && format !== "markdown" ? { data } : {}),
+            ...(art.content.attachments ? { attachments: art.content.attachments } : {}),
+          },
+          updatedBy: "human",
+          expectedVersion: req.expectedVersion,
         },
-        updatedBy: "human",
-        expectedVersion: req.expectedVersion,
-      },
+      });
+      if (!r.ok) {
+        return {
+          ok: false,
+          outcome: "conflict",
+          message: `草稿在你编辑时已更新到 v${r.currentArtifact.version}，你的修改还没保存：请对照右栏的新内容合并后再保存`,
+          artifact: artifact(artifactId),
+        };
+      }
+      return { ok: true, outcome: "saved", message: `已保存 v${r.artifactVersion}`, artifact: artifact(artifactId) };
     });
-    if (!r.ok) {
-      return {
-        ok: false,
-        outcome: "conflict",
-        message: `草稿在你编辑时已更新到 v${r.currentArtifact.version}，你的修改还没保存：请对照右栏的新内容合并后再保存`,
-        artifact: artifact(artifactId),
-      };
-    }
-    return { ok: true, outcome: "saved", message: `已保存 v${r.artifactVersion}`, artifact: artifact(artifactId) };
   }
 
   function dismissParked(artifactId: string, parkedId: string, as: DeskActor): ArtifactDTO {
@@ -446,13 +462,6 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     return { ok, outcome, message, view: radar(), status: status(), ...extra };
   }
 
-  /** Cards about the project held outside its own cells (e.g. by the desk) go with it. */
-  async function withdrawProjectCards(projectId: string, reason: string, as: DeskActor): Promise<void> {
-    principalOf(as);
-    const rec = gate.findPendingBySubjectSync(subjectKeys.project(projectId), desk);
-    if (rec) gate.withdrawSync(rec.actionId, reason, { seenItemRevision: rec.itemRevision });
-  }
-
   /**
    * Radar's project buttons, and the control plane's set_project_state (same code, the caller's principal):
    * - pause / resume: kernel.control on the project cell (its whole subtree follows).
@@ -473,14 +482,14 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
         if (!open) return projectResult("not_applied", false, "这个项目没有在运行的任务");
         if (cell.status === "paused") return projectResult("paused", true, `「${record.title}」已经暂停了`);
         const r = control("pause");
-        return r.applied ? projectResult("paused", true, `已暂停「${record.title}」`) : projectResult("not_applied", false, r.reason ?? "暂停没有生效");
+        return r.applied ? projectResult("paused", true, `已暂停「${record.title}」`) : projectResult("not_applied", false, "暂停没有生效");
       }
       case "resume": {
         if (!open) return projectResult("not_applied", false, "这个项目没有可以继续的任务");
         if (cell?.pauseReason === "parked") return projectResult("not_applied", false, `「${record.title}」在以后再说里：用“重新启动”让它继续`);
         if (cell.status === "active") return projectResult("resumed", true, `「${record.title}」正在推进`);
         const r = control("resume");
-        return r.applied ? projectResult("resumed", true, `「${record.title}」继续推进`) : projectResult("not_applied", false, r.reason ?? "继续没有生效");
+        return r.applied ? projectResult("resumed", true, `「${record.title}」继续推进`) : projectResult("not_applied", false, "继续没有生效");
       }
       case "cancel":
       case "complete": {
@@ -494,7 +503,6 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
           projectActions(projectId).filter((a) => a.record.status === "open"),
           op === "cancel" ? "cancelled" : "done",
         );
-        await withdrawProjectCards(projectId, `the project was ${how}`, as);
         return op === "cancel"
           ? projectResult("cancelled", true, `已取消「${record.title}」，后台任务已全部停止（文件和分支都留在原处）`)
           : projectResult("completed", true, `「${record.title}」已完结`);
@@ -504,7 +512,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
         if (!open || record.lifecycle !== "active") return projectResult("not_applied", false, "只有进行中的项目可以移进以后再说");
         {
           const r = kernel.control(projectId,{action:"pause",pauseReason:"parked"},actorOf(as));
-          if (!r.applied) return projectResult("not_applied", false, r.reason ?? "暂停没有生效");
+          if (!r.applied) return projectResult("not_applied", false, "暂停没有生效");
         }
         return projectResult("someday", true, `「${record.title}」已移进以后再说，后台任务已暂停，记录和报告都留着`);
       }
@@ -514,7 +522,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
         withTx(kernel.db, () => {
           if (cell.status === "paused") {
             const r = control("resume");
-            if (!r.applied) throw wrongState(r.reason ?? "继续没有生效");
+            if (!r.applied) throw wrongState("继续没有生效");
           }
           tellProject(projectId, activateText(record, as), as);
         });
@@ -614,12 +622,11 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
 
   function sensorToCode(sensorId: string, req: SensorToCodeRequest, as: DeskActor): ReviewMutationResponse {
     principalOf(as);
-    const src = context.readStateSync<SourceRecord>(sensorId, gtdKeys.source);
+    const src = context.readStateSync<SourceState>(sensorId, gtdKeys.source);
     const cell = kernel.getCell(sensorId);
     if (!src || !cell || cell.status === "closed") throw missing("找不到这个信源");
     const entry = checkEntry(req?.entry);
     kernel.updateCell(sensorId, { processor: sensorProcessor(entry) },actorOf(as));
-    commitState(sensorId, { [gtdKeys.source]: { ...src, processor: "code", updatedAt: now() } });
     commitState(desk, { [`${SENSOR_SUGGESTION_PREFIX}${sensorId}`]: null });
     return reviewResult("switched_to_code", true, `「${src.title}」已改为零 Token 的脚本检查`);
   }
@@ -647,7 +654,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
         {
           id: `${original.id}#restore#${activityId}`,
           from: KERNEL_FROM.router,
-          principalId: owner,
+          principalId: principalOf(as),
           kind: "event",
           type: PAYLOAD.handback,
           payload: { original, fromCellId: desk, reason: RESTORE_REASON },
@@ -673,10 +680,10 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
       return { cron: schedule.cron.trim(), ...(typeof schedule.tz === "string" && schedule.tz ? { tz: schedule.tz } : {}) };
     }
     const m = schedule.everyMinutes;
-    if (!Number.isInteger(m) || m < 1) throw bad("everyMinutes 必须是正整数");
+    if (!Number.isInteger(m) || m < 1) throw bad("检查间隔必须是正整数分钟");
     if (m < 60) return { cron: `*/${m} * * * *` };
     if (m % 60 === 0 && m <= 24 * 60) return { cron: m === 24 * 60 ? "0 0 * * *" : `0 */${m / 60} * * *` };
-    throw bad("everyMinutes 需小于 60，或是 60 的整数倍（最多 1440）");
+    throw bad("检查间隔需小于一小时，或为整小时，最长一天");
   }
 
   function createSource(req: CreateSourceRequest, as: DeskActor): SourcesMutationResponse {
@@ -701,35 +708,16 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     }
     const mode = req.mode === "observe" ? "observe" : "active";
     const id = newId("src", clock);
-    const t = now();
-    const record: SourceRecord = {
-      title,
-      ...(typeof req.description === "string" && req.description ? { description: req.description } : {}),
-      kind: "cron",
-      schedule,
-      mode,
-      status: "ok",
-      processor: processor ? "code" : "llm",
-      runCount: 0,
-      hitCount: 0,
-      createdAt: t,
-      updatedAt: t,
-    };
-    const { runCount: _r, hitCount: _h, status: _s, createdAt: _c, updatedAt: _u, ...init } = record;
-    withTx(kernel.db, () => {
-      // Same shape as the desk's own add_source: the first task runs the check once; meta.gtd.source seeds the record.
-      kernel.spawnCell(
-        desk,
-        createSensorSpec(id,init,processor ?? kernel.registry.presets.get("sensor")?.defaults?.processor),
-        { instruction, title },actorOf(as),
-      );
-      commitState(id, { [gtdKeys.source]: record });
-    });
+    const spec = createSensorSpec(id, {
+      title, kind: "cron", schedule, mode, processor: processor ? "code" : "llm",
+      ...(typeof req.description === "string" && req.description && { description: req.description }),
+    }, processor ?? kernel.registry.presets.get("sensor")?.defaults?.processor);
+    kernel.spawnCell(desk, spec, { instruction, title }, actorOf(as));
     return sourcesResult("created", true, `已添加信源「${title}」`, id);
   }
 
-  function sourceRecord(sensorId: string): SourceRecord {
-    const src = context.readStateSync<SourceRecord>(sensorId, gtdKeys.source);
+  function sourceRecord(sensorId: string): SourceState {
+    const src = context.readStateSync<SourceState>(sensorId, gtdKeys.source);
     const cell = kernel.getCell(sensorId);
     if (!src || !cell || cell.status === "closed") throw missing("找不到这个信源");
     return src;
@@ -739,8 +727,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     principalOf(as);
     const src = sourceRecord(sensorId);
     const r = kernel.control(sensorId, { action: pause ? "pause" : "resume" },actorOf(as));
-    if (!r.applied) throw wrongState(r.reason ?? "操作没有生效");
-    commitState(sensorId, { [gtdKeys.source]: { ...src, status: pause ? "paused" : "ok", updatedAt: now() } });
+    if (!r.applied) throw wrongState("操作没有生效，请检查所属项目是否暂停或结束");
     return sourcesResult(pause ? "paused" : "resumed", true, pause ? `已暂停「${src.title}」` : `「${src.title}」恢复运行`, sensorId);
   }
 
@@ -760,13 +747,12 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
   async function deleteSource(sensorId: string, as: DeskActor): Promise<SourcesMutationResponse> {
     principalOf(as);
     const src = sourceRecord(sensorId);
-    const parentId = kernel.getCell(sensorId)?.parentId;
-    // Closed as its parent: a deleted source is not news the desk needs to be woken for.
-    await kernel.closeCell(sensorId, "cancelled", parentId ? { principalId: cellPrincipal(parentId) } : {});
+    await kernel.closeCell(sensorId, "cancelled", { ...actorOf(as), parentDelivery: "silent_inject" });
     return sourcesResult("deleted", true, `已删除信源「${src.title}」`, sensorId);
   }
 
   const agents = createAgentsApi({
+    requireActor: actorOf,
     commands:{
       message:(id,req,as)=>kernel.directMessage(id,req,actorOf(as)),
       control:(id,cmd,as)=>kernel.control(id,cmd,actorOf(as)),
@@ -781,6 +767,13 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     projectOp: (projectId, op, as) => projectOp(projectId, op, as),
     errors: { bad, missing },
   });
+
+  function deskOptions(item: HumanItem): CardOption[] {
+    if (item.action?.type !== "project.start") return item.options;
+    return item.options.flatMap(option => option.id === "system.execute"
+      ? [{...option, label: "确认立项"}, {id: "system.someday", label: "先放进以后再说", effect: "execute" as const}]
+      : [option]);
+  }
 
   function decisionCells(cellId: string | null) {
     const issuer = cellId ? kernel.getCell(cellId) : undefined;
@@ -800,6 +793,11 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
 
   return {
     ownerPrincipal: owner,
+    models: (refresh: boolean) => models.view({ refresh }),
+    setModel(req: SetModelRequest, actor: DeskActor) {
+      principalOf(actor);
+      return models.set(req);
+    },
     status,
     topology: agents.topology,
     timeline: agents.timeline,
@@ -833,21 +831,22 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
       const projects=item.relatedProjectIds.map(id=>kernel.getCell(id)).filter(p=>p!==undefined)
         .map(p=>({id:p.id,title:p.title?.trim() || "未命名项目"}));
       const plan=item.action?.type==="project.start" ? (item.artifactId ? context.getArtifactSync(item.artifactId)?.content.data : item.action.proposal) : undefined;
-      return {...item, resumeTarget:paused ? {id:paused.id, title:paused.title?.trim() || "未命名任务"} : null, proposal:isProjectProposal(plan) ? plan : null, projects, closeTargets, artifact:item.artifactId ? artifactDTO(kernel,item.artifactId,now()) : null,
+      return {...item, options:deskOptions(item), resumeTarget:paused ? {id:paused.id, title:paused.title?.trim() || "未命名任务"} : null, proposal:isProjectProposal(plan) ? plan : null, projects, closeTargets, artifact:item.artifactId ? artifactDTO(kernel,item.artifactId,now()) : null,
         project:project ? {id:project.id,title:project.title?.trim() || "未命名项目",paused:project.status==="paused",parked:project.pauseReason==="parked"} : null,
         ownerOnly:rec ? ownerOnlyApproval(rec.action)!==null : false,
       };
     }),
     async decideHumanItem(id: string, decision: HumanDecision, as: DeskActor) {
       const principal = principalOf(as);
-      const item = kernel.humanItems.get(id);
-      if (!item) throw missing("找不到这件事项");
-      const option = item.options.find(o => o.id === decision.optionId);
       if (decision.optionId === "system.someday") {
-        if (!option) throw wrongState("选项已变更");
-        return parkProposal(id, decision, as);
+        return withTx(kernel.db, () => {
+          const item = kernel.humanItems.get(id);
+          if (!item) throw missing("找不到这件事项");
+          if (!deskOptions(item).some(o => o.id === decision.optionId)) throw wrongState("选项已变更");
+          return parkProposal(id, decision, as);
+        });
       }
-      const accept = () => {
+      const accept = (item: HumanItem, option: CardOption) => {
         if (option?.terminateMode==="cancel_task") {
           const expected=closureMembers(option.targetCellIds![0]!).map(c=>c.id);
           if (!expected.length || JSON.stringify(expected)!==JSON.stringify(decision.confirmedClosure)) throw wrongState("待关闭的任务清单已变动");
@@ -855,11 +854,16 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
         if (option?.effect === "defer" || option?.effect === "terminate") return;
         const {paused} = decisionCells(item.cellId);
         if (!paused) return;
-        if (decision.resumeProjectId !== paused.id) throw wrongState(`请先确认恢复「${paused.title ?? paused.id}」`);
+        if (decision.resumeProjectId !== paused.id) throw wrongState(`请先确认恢复「${paused.title?.trim() || "未命名任务"}」`);
         const r = kernel.control(paused.id, {action:"resume"}, actorOf(as));
         if (!r.applied) throw wrongState("任务未能恢复");
       };
-      return kernel.humanItems.decide(id, decision, principal, accept);
+      try {
+        return await kernel.humanItems.decide(id, decision, principal, accept);
+      } catch (err) {
+        if (err instanceof NgError && err.code === "not_found" && !kernel.humanItems.get(id)) throw missing("找不到这件事项");
+        throw err;
+      }
     },
     undoHumanDecision: (activityId: string, as: DeskActor) => kernel.humanItems.undo(activityId,principalOf(as)),
     reopenProject: async (projectId: string, as: DeskActor) => ({restored:await kernel.reopenProject(projectId,principalOf(as))}),

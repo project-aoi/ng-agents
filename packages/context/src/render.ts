@@ -25,6 +25,7 @@ const PRIMARY_FIELD: Readonly<Record<string, string>> = {
   "cell.task": "instruction",
   "cell.message": "text",
   "cell.direct_chat": "text",
+  "job.warning": "message",
   "kernel.stalled_check": "detail",
   "kernel.wait_timeout": "reason",
 };
@@ -35,8 +36,14 @@ const PRIMARY_FIELD: Readonly<Record<string, string>> = {
 const LEAD: Readonly<Record<string, string>> = {
   "cell.direct_chat":
     "The owner said this directly to one of your cells (named below), not to you. It is already with that cell — do not forward it. Take it into your own picture of the work: the plan, your notes, what you tell the next cell.",
+  "approval.revise":
+    "The owner asked for a revision to the pending card below (the card stays open until updated). If an artifactId is given, read_artifact first to see the latest version (including any edits the owner already made), then update it with save_artifact or patch_artifact using that expectedVersion; if you resubmit a card or proposal, pass the same subjectKey so you update this card instead of creating a duplicate.",
+  "job.warning":
+    "One of your running background jobs triggered a warning (for example, it has been quiet for a long time and may be waiting for interactive input). Inspect it with job_observe, send stdin with job_input if it is waiting on a prompt, or stop it with job_cancel; then end your turn without reporting the whole task finished unless the job is actually done.",
   "kernel.stalled_check":
-    "Nothing is moving this project forward any more. Look at where it stands and do exactly one of these now: start the next step; record what it waits for (a card or an action for the owner, a subscription or timer for an outside event, a wait on a cell that will answer); park it (pause_self); or finish it (complete_self). You get this notice once per stall — if you end this run without doing one of them, the project just stays stalled.",
+    'Nothing is moving this project forward any more. Look at where it stands and do exactly one of these now: start the next step; record what it waits for (a card or an action for the owner, a subscription or timer for an outside event, a wait on a cell that will answer); park it (finish_project with outcome "someday", or pause_self for a non-project cell); or finish it (finish_project, or complete_self for a non-project cell). You get this notice once per stall — if you end this run without doing one of them, the project just stays stalled.',
+  "kernel.arbitration_unanswered":
+    "An arbitration decision was already handled, but the waiting cell(s) listed below still have no answer from you. Reply to each one now with send_message (passing its waitId as refId) or raise a decision card covering them; if any remain unanswered when this run ends, the system will escalate directly to the owner.",
   "kernel.continue":
     "Your previous run stopped at its step limit before the work was finished. Continue from where you stopped — do not start over, and do not repeat what is already done.",
   "kernel.wait_timeout":

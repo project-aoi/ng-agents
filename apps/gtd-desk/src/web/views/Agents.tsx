@@ -92,10 +92,13 @@ function NodePane({ cellId, onSelect, onChanged }: { cellId: string; onSelect(id
     }
   }, [density]);
 
+  const autoReplyId = useRef<string | null>(null);
   // The node's open question becomes the reply target, unless the owner set it aside; once it is answered it goes.
   useEffect(() => {
+    const previous = autoReplyId.current;
+    autoReplyId.current = question?.id ?? null;
     if (question && question.id !== dismissed.current) setReply(question);
-    if (!question) setReply((r) => (r && r.id === dismissed.current ? null : r));
+    else if (previous) setReply(r => r?.id === previous ? null : r);
   }, [question?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const dismissReply = () => {

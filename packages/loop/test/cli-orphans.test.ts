@@ -135,17 +135,49 @@ describe("orphaned CLI processes (cross-platform 3-state)", () => {
     expect(cliProcessStatus(process.pid,"run_x",identity)).toBe(true);
     expect(cliProcessStatus(process.pid,"run_x",identity+"-different")).toBe(false);
     writeFileSync(file,JSON.stringify({...record,unknownSince:Date.now()-31_000}));
-    expect(probeOrphanCliCell(dir,"w3")).toBe("clear");
-    expect(existsSync(file)).toBe(false);
+    expect(probeOrphanCliCell(dir,"w3")).toBe("unknown");
+    expect(existsSync(file)).toBe(true);
     expect(()=>process.kill(process.pid,0)).not.toThrow();
   });
 
-  it("a missing or unreadable record directory is simply empty", async () => {
+  it("preserves the registration when identity becomes unreadable during termination", async () => {
+    const dir = tmp();
+    const child = spawn(process.execPath, ["-e", `
+      const fs = require("node:fs");
+      process.on("SIGTERM", () => fs.writeFileSync("term", ""));
+      fs.writeFileSync("ready", "");
+      setInterval(() => {}, 1000);
+    `], {cwd:dir, stdio:"ignore", detached:true});
+    const pid = child.pid!;
+    pids.push(pid);
+    await expect.poll(() => existsSync(join(dir,"ready"))).toBe(true);
+    const file = join(dir, `${pid}.json`);
+    writeFileSync(file,JSON.stringify({pid,marker:"test",cellId:"cell",runId:"run",cwd:dir}));
+    processInspection.useProc = false;
+    processInspection.readEnvironment = id => id === pid && !existsSync(join(dir,"term")) ? "NG_CLI_PROC=test" : null;
+    processInspection.readIdentity = () => null;
+    try {
+      expect((await reapOrphanedCliProcesses(dir,{graceMs:100}))[0]?.status).toBe("unknown");
+      expect(existsSync(join(dir,"term"))).toBe(true);
+      expect(existsSync(file)).toBe(true);
+      expect(probeOrphanCliCell(dir,"cell")).toBe("unknown");
+    } finally {
+      child.kill("SIGKILL");
+      await once(child,"exit");
+    }
+  });
+
+  it("distinguishes an absent registry from damaged ownership evidence", async () => {
     expect(await reapOrphanedCliProcesses(join(tmp(), "nope"))).toEqual([]);
     const dir = tmp();
     writeFileSync(join(dir, "123.json"), "{not json");
-    expect(await reapOrphanedCliProcesses(dir)).toEqual([]);
-    expect(readdirSync(dir)).toEqual([]);
+    await expect(reapOrphanedCliProcesses(dir)).rejects.toThrow();
+    expect(probeOrphanCliCell(dir, "worker")).toBe("unknown");
+    expect(readdirSync(dir)).toEqual(["123.json"]);
+    writeFileSync(join(dir, "123.json"), JSON.stringify({pid:123}));
+    await expect(reapOrphanedCliProcesses(dir)).rejects.toThrow(/Incomplete CLI/);
+    expect(probeOrphanCliCell(dir, "worker")).toBe("unknown");
+    expect(readdirSync(dir)).toEqual(["123.json"]);
   });
 
   it("uses the same process identity after the system time zone changes", () => {

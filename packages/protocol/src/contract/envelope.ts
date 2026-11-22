@@ -27,7 +27,6 @@ export interface Envelope<T = unknown> {
 export interface PolicyBounds {         // one permission set; deriving a child Cell must strictly satisfy child ⊆ parent
   tools: ReadonlySet<ToolKind>;         // upper bound of authorized workspace tool kinds
   canSendTo: readonly Address[];        // permitted destinations for workbench notifications
-  isolation: "none";
   maxConcurrentChildren: number;        // cap on simultaneously active children / child sandboxes (prevents unbounded fan-out)
   maxDepth: number;                     // remaining levels of spawnCell allowed (minus 1 per level; 0 forbids further spawning)
 }
@@ -36,8 +35,7 @@ export interface PolicyBounds {         // one permission set; deriving a child 
 
 export const TOOL_KINDS = ["read", "write", "edit", "bash"] as const satisfies readonly ToolKind[];
 
-export type IsolationLevel = PolicyBounds["isolation"];
-export const ISOLATION_LEVELS = ["none"] as const satisfies readonly IsolationLevel[];
+
 
 /** Thread ids in `Envelope.threads` are namespaced by channel: `${channelId}:${externalThreadId}` (e.g. `ui:desk`). */
 export function threadId(channelId: string, externalThreadId: string): string {

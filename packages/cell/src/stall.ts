@@ -40,13 +40,13 @@ export function createStallMonitor(core: KernelCore): StallMonitor {
     });
   }
   function record(cellId: string) {
-    return get<{since: number; notified_at: number | null}>(db, "SELECT since,notified_at FROM cell_stalls WHERE cell_id=?", [cellId]);
+    return get<{since: number; notified_at: number | null; wake_envelope_id: string}>(db, "SELECT since,notified_at,wake_envelope_id FROM cell_stalls WHERE cell_id=?", [cellId]);
   }
   function clearStall(cellId: string, since: number) {
     withTx(db, () => {
-      const envelopeId = `${cellId}:stalled:${since}`;
+      const cancelGroup = `${cellId}:stalled:${since}`;
       for (const target of new Set([cellId, core.deskCellId])) {
-        if (cells.get(target)) inbox.cancelScheduledSync({cellId: target, envelopeId});
+        if (cells.get(target)) inbox.cancelScheduledSync({cellId: target, cancelGroup});
       }
       run(db, "DELETE FROM cell_stalls WHERE cell_id=?", [cellId]);
     });
@@ -55,6 +55,11 @@ export function createStallMonitor(core: KernelCore): StallMonitor {
     const stalled: string[] = [];
     const monitoredCells = monitored();
     const active = new Set(monitoredCells.map(c => c.id));
+    // A local check deferred to a live desk wake must be eligible again if that wake
+    // settles without creating a card or is cancelled. A genuinely new stall gets a new id.
+    run(db, `DELETE FROM cell_stalls WHERE deferred_to IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM inbox_messages m WHERE m.cell_id=? AND m.envelope_id=cell_stalls.deferred_to
+        AND m.status IN ('pending','claimed'))`, [core.deskCellId]);
     for (const saved of all<{cell_id: string; since: number}>(db, "SELECT cell_id,since FROM cell_stalls")) {
       if (!active.has(saved.cell_id)) clearStall(saved.cell_id, saved.since);
     }
@@ -72,13 +77,13 @@ export function createStallMonitor(core: KernelCore): StallMonitor {
         if (saved?.notified_at!=null) return;
         const since=saved?.since ?? now;
         const target=cell;
+        const wakeId = newId("stall", clock);
         const payload: StalledCheckPayload = { projectCellId: cellId, stalledSince: since, detail: report.detail };
         inbox.enqueueSync(
           target.id,
           createEnvelope<StalledCheckPayload>(
             {
-              // One per stall: the id carries when the stall began.
-              id: `${cellId}:stalled:${since}`,
+              id: wakeId,
               from: KERNEL_FROM.stall,
               principalId: core.ownerPrincipal,
               kind: "event",
@@ -88,9 +93,9 @@ export function createStallMonitor(core: KernelCore): StallMonitor {
             },
             clock,
           ),
-          { deliverAt: now + core.stallGraceMs },
+          { deliverAt: now + core.stallGraceMs, cancelGroup: `${cellId}:stalled:${since}` },
         );
-        run(db,"INSERT OR REPLACE INTO cell_stalls(cell_id,since,notified_at) VALUES(?,?,?)",[cellId,since,now]);
+        run(db,"INSERT OR REPLACE INTO cell_stalls(cell_id,since,notified_at,wake_envelope_id) VALUES(?,?,?,?)",[cellId,since,now,wakeId]);
       });
     }
     return stalled;
@@ -111,7 +116,7 @@ export function createStallMonitor(core: KernelCore): StallMonitor {
         }
       }
       const previous = JSON.parse(row.wait_ids) as WaitRef[];
-      if ((!previous.length && !waits.length) || previous.some(w => waits.some(other => sameWait(w, other)))) return row;
+      if ((!previous.length && !waits.length) || (previous.length === waits.length && previous.every(w => waits.some(other => sameWait(w, other))))) return row;
     }
   }
 
@@ -121,7 +126,10 @@ export function createStallMonitor(core: KernelCore): StallMonitor {
       if (existing?.escalation_id) return;
       const id = existing?.incident_id ?? newId("incident", clock);
       const card = core.humanItems.create({
-        title: "后台仍在等待下一步", description: waits.length ? waits.map(w => `${w.cellId} 等待 ${w.waitId}`).join("\n") : "后台已自查一次，仍没有可以推进的下一步。",
+        title: "后台仍在等待下一步",
+        description: waits.length
+          ? [...new Set(waits.map(w => cells.get(w.cellId)?.title?.trim() || "后台任务"))].map(title => `${title}仍在等答复，请确认接下来怎么做。`).join("\n")
+          : "后台已自查一次，仍没有可以推进的下一步。",
         relatedProjectIds: projects, subjectKey: `kernel:stalled:${key}:${id}`, options: [{id:"reply", label:"回复后台", effect:"reply", input:{mode:"optional"}}],
       }, issuer, undefined, "kernel:stall");
       run(db, `INSERT INTO stall_incidents(incident_id, cause_key, wait_ids, escalation_id, updated_at) VALUES(?,?,?,?,?)
@@ -132,16 +140,31 @@ export function createStallMonitor(core: KernelCore): StallMonitor {
 
   function afterRun(cellId: string, consumed: readonly Envelope[]) {
     for (const env of consumed) {
+      // Once dequeued, the wake no longer owns the wait. Re-evaluate the remaining
+      // registrations below and create an escalation only for those still uncovered.
+      if (env.type === PAYLOAD.arbitrationUnanswered)
+        run(db, "DELETE FROM stall_incidents WHERE wake_envelope_id=? AND escalation_id IS NULL", [env.id]);
       if (env.type === PAYLOAD.stalledCheck) {
         const p = env.payload as StalledCheckPayload;
-        if (!core.readModel.anchorsOf(p.projectCellId).stalled) continue;
-        const waits = core.waits.list([p.projectCellId,...cells.descendants(p.projectCellId).map(c=>c.id)]);
-        const matched = all<{cause_key:string;wait_ids:string}>(db,"SELECT cause_key,wait_ids FROM stall_incidents WHERE wait_ids <> '[]'")
-          .find(r => (JSON.parse(r.wait_ids) as WaitRef[]).some(w => waits.some(x => sameWait(x,w))));
-        if (matched?.cause_key && incident(matched.cause_key,waits)?.wake_envelope_id) continue;
+        if (record(p.projectCellId)?.wake_envelope_id !== env.id || !core.readModel.anchorsOf(p.projectCellId).stalled) continue;
+        const active = [p.projectCellId, ...cells.descendants(p.projectCellId).map(c => c.id)].filter(id => cells.isActiveInTree(id));
+        const waits = core.waits.list(active);
+        const activeIncidents = all<Incident>(db, `SELECT i.* FROM stall_incidents i
+          WHERE EXISTS (SELECT 1 FROM human_items h WHERE h.action_id=i.escalation_id AND h.disposition='pending')
+             OR EXISTS (SELECT 1 FROM inbox_messages m WHERE m.cell_id=? AND m.envelope_id=i.wake_envelope_id AND m.status IN ('pending','claimed'))`,
+          [core.deskCellId]);
+        const pending = activeIncidents.find(i => i.wake_envelope_id && !i.escalation_id &&
+          (JSON.parse(i.wait_ids) as WaitRef[]).some(previous => waits.some(w => sameWait(w, previous))));
+        if (pending) {
+          run(db, "UPDATE cell_stalls SET deferred_to=? WHERE cell_id=? AND wake_envelope_id=?", [pending.wake_envelope_id, p.projectCellId, env.id]);
+          continue;
+        }
+        const covered = activeIncidents.flatMap(i => JSON.parse(i.wait_ids) as WaitRef[]);
+        const uncovered = waits.filter(w => !covered.some(other => sameWait(w, other)));
+        if (waits.length && !uncovered.length) continue;
         const holder=cells.require(p.projectCellId);
         const project=[holder,...cells.ancestors(holder.id)].find(c=>isProjectRoot(core.registry, c));
-        escalate(matched?.cause_key ?? env.id, project ? [project.id] : [], waits, holder.id);
+        escalate(env.id, project ? [project.id] : [], uncovered, holder.id);
         continue;
       }
       if (cellId !== core.deskCellId || (env.type !== PAYLOAD.approvalResolved && env.type !== PAYLOAD.arbitrationUnanswered)) continue;
@@ -161,7 +184,7 @@ export function createStallMonitor(core: KernelCore): StallMonitor {
           const payload = m.envelope.payload as {replyToId?: string; data?: {refId?: string; waitId?: string}};
           const refs = [payload.replyToId, payload.data?.refId, payload.data?.waitId];
           if (refs.includes(w.waitId) || (w.refId !== null && refs.includes(w.refId))) return true;
-          return !refs.some(Boolean) && outstanding.filter(x => x.cellId === w.cellId).length === 1;
+          return !refs.some(Boolean) && w.refId === null && w.waitId === w.waitingFor && outstanding.filter(x => x.cellId === w.cellId).length === 1;
         });
       });
       if (!remaining.length) continue;
@@ -172,7 +195,10 @@ export function createStallMonitor(core: KernelCore): StallMonitor {
       const prior = incident(key, uncovered);
       if (prior?.escalation_id) continue;
       if (env.type === PAYLOAD.arbitrationUnanswered) { escalate(key, affected, uncovered, cellId); continue; }
-      if (prior?.wake_envelope_id) continue;
+      if (prior?.wake_envelope_id) {
+        if (inbox.listMessagesSync({cellId, envelopeId:prior.wake_envelope_id, status:["pending","claimed"]}).length) continue;
+        run(db, "DELETE FROM stall_incidents WHERE incident_id=?", [prior.incident_id]);
+      }
       const wake = createEnvelope({from:KERNEL_FROM.stall, principalId:core.ownerPrincipal, kind:"event", type:PAYLOAD.arbitrationUnanswered,
         expectedEpoch:cells.require(cellId).epoch, payload:{causeKey:key,waiters:uncovered.map(({cellId,waitId,registrationId}) => ({cellId,waitId,registrationId}))}},clock);
       withTx(db, () => {
@@ -205,7 +231,7 @@ export function createStallMonitor(core: KernelCore): StallMonitor {
     stillStalled(checks) {
       return checks.some((e) => {
         const p = e.payload as StalledCheckPayload;
-        if (record(p.projectCellId)?.since !== p.stalledSince) return false;
+        if (record(p.projectCellId)?.wake_envelope_id !== e.id) return false;
         return core.readModel.anchorsOf(p.projectCellId).stalled;
       });
     },

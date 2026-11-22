@@ -2,6 +2,7 @@ import type { Kernel } from "@ng/cell";
 import {
   isNgError,
   newId,
+  sha256Hex,
   type BallOwner,
   type CellSpec,
   type Clock,
@@ -95,8 +96,13 @@ function proposalOf(init: ProjectInit): ProjectProposal | undefined {
 
 const OWNER_TEXT: Readonly<Record<BallOwner, string>> = { agent: "交给 worker", human: "主人来做", waiting: "等外部" };
 
+/** Deterministic action id assigned to the i-th valid planned action seeded on a project's first Run. */
+export function seededActionId(projectId: string, index: number): string {
+  return `act_${sha256Hex(projectId).slice(0, 24)}_${String(index).padStart(8, "0")}`;
+}
+
 /** The project's first message, in Chinese: everything it needs, nothing implicit. */
-export function renderBrief(init: ProjectInit): string {
+export function renderBrief(init: ProjectInit, projectId?: string): string {
   const out: string[] = [];
   const section = (title: string, ...lines: string[]) => out.push(`## ${title}`, ...lines, "");
   section("主人的要求", ...(init.rawInput && init.rawInput.trim() && init.rawInput.trim() !== init.brief.trim() ? [`原话：${init.rawInput.trim()}`] : []), init.brief.trim());
@@ -124,10 +130,11 @@ export function renderBrief(init: ProjectInit): string {
       "一次只推进一个阶段：当前阶段完成后，用 request_approval 请主人确认，得到同意再开始下一阶段。",
     );
   }
-  if (init.plan?.length) {
+  const planned = (init.plan ?? []).filter((a) => a && typeof a.title === "string" && a.title.trim());
+  if (planned.length) {
     section(
-      "初步计划（已记在你的行动记录里）",
-      ...init.plan.map((a) => `- [${OWNER_TEXT[a.owner]}] ${a.title}${a.phase ? `（阶段 ${a.phase}）` : ""}${a.nextStep ? `：${a.nextStep}` : ""}`),
+      "初步计划（已记在你的行动记录里；派工或更新时请直接传对应的 actionId）",
+      ...planned.map((a, i) => `- [${OWNER_TEXT[a.owner]}]${projectId ? ` (${seededActionId(projectId, i)})` : ""} ${a.title}${a.phase ? `（阶段 ${a.phase}）` : ""}${a.nextStep ? `：${a.nextStep}` : ""}`),
     );
   }
   return out.join("\n").trimEnd();
@@ -159,23 +166,22 @@ export function projectLaunch(init: ProjectInit, clock: Clock): ProjectLaunch {
     ...(init.phases?.length ? { phases: init.phases } : {}),
     ...(init.repos?.length ? { repos: init.repos } : {}),
   };
-  return { projectId, spec, task: { title: init.title, instruction: renderBrief(init), input } };
+  return { projectId, spec, task: { title: init.title, instruction: renderBrief(init, projectId), input } };
 }
 
 /**
  * For the app's control plane (and an approved proposal): start a project exactly as the desk's start_project does,
- * in the caller's transaction. Spawned under `opts.parentId` (default the desk) as `opts.principalId` (default the
- * owner; an `agent:<id>` principal is allowed by the kernel). Idempotent on `init.id`: an existing cell gives
+ * in the caller's transaction. Spawned under `opts.parentId` (default the desk) as the explicitly supplied principal. Idempotent on `init.id`: an existing cell gives
  * `started: false`. A kernel refusal (e.g. `cwd` is not an existing directory) propagates as the NgError it is.
  */
 export function startProjectSync(
   kernel: Pick<Kernel, "spawnCell" | "clock" | "deskCellId">,
   init: ProjectInit,
-  opts: { principalId?: string; parentId?: string } = {},
+  opts: { principalId: string; parentId?: string },
 ): { projectId: string; started: boolean } {
   const launch = projectLaunch(init, kernel.clock);
   try {
-    kernel.spawnCell(opts.parentId ?? kernel.deskCellId, launch.spec, launch.task, opts.principalId ? { principalId: opts.principalId } : {});
+    kernel.spawnCell(opts.parentId ?? kernel.deskCellId, launch.spec, launch.task, { principalId: opts.principalId });
     return { projectId: launch.projectId, started: true };
   } catch (err) {
     if (isNgError(err, "duplicate")) return { projectId: launch.projectId, started: false };

@@ -83,7 +83,7 @@ export function useCellTimeline(cellId: string): CellTimeline {
   /** Highest seq announced by `cell_tail`, and the highest one a finished fetch has covered. */
   const wanted = useRef(0);
   const covered = useRef(0);
-  const tailBusy = useRef(false);
+  const tailBusy = useRef<number | null>(null);
   const tailAgain = useRef(false);
   const earlierBusy = useRef(false);
 
@@ -101,6 +101,7 @@ export function useCellTimeline(cellId: string): CellTimeline {
         syncServerClock(tl.generatedAt);
         loaded.current = true;
         lastSeq.current = Math.max(tl.lastSeq, lastOf(tl.items));
+        if (wanted.current > lastSeq.current) void fetchTail();
         firstSeq.current = tl.items.length ? tl.firstSeq || tl.items[0]!.seq : 0;
         setS({ ...EMPTY, head: tl, items: tl.items, firstSeq: firstSeq.current, hasEarlier: tl.hasEarlier, jobs: tl.jobs, loading: false });
       },
@@ -131,16 +132,16 @@ export function useCellTimeline(cellId: string): CellTimeline {
   }, []);
 
   const fetchTail = useCallback(async () => {
-    if (!loaded.current) return; // the first page is still on its way and will include it
-    if (tailBusy.current) {
+    if (!loaded.current) return; // The initial fetch checks wanted before finishing.
+    const my = gen.current;
+    if (tailBusy.current === my) {
       tailAgain.current = true;
       return;
     }
-    tailBusy.current = true;
+    tailBusy.current = my;
     try {
       do {
         tailAgain.current = false;
-        const my = gen.current;
         const want = wanted.current;
         let tl: CellTimelineDTO;
         try {
@@ -156,7 +157,7 @@ export function useCellTimeline(cellId: string): CellTimeline {
         if (tl.items.length > 0 && lastSeq.current < wanted.current) tailAgain.current = true;
       } while (tailAgain.current);
     } finally {
-      tailBusy.current = false;
+      if (tailBusy.current === my) tailBusy.current = null;
     }
   }, [cellId, applyTail]);
 

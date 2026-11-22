@@ -4,6 +4,8 @@ import type { Envelope } from "./envelope";
 export type IngressEmit = (raw: Omit<Envelope, "to">) => Promise<void>;
 
 export interface Channel {
+  /** The registered workbench ingress may forward an authenticated control-plane identity. */
+  readonly workbenchIngress?: true;
   readonly id: string;
   onIngress(emit: IngressEmit): void;
 }

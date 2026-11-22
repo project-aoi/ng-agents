@@ -1,3 +1,4 @@
+import type { ClosedProjectsResponse, HumanItemsResponse, HumanDecisionRequest, HumanDecisionResponse, UndoResponse, PlanSaveRequest, PlanSaveResponse } from "../shared/api";
 import type {
   ActivityKind,
   ActivityListDTO,
@@ -34,7 +35,7 @@ let token: string | null = null;
  * this tab's sessionStorage. The token never goes into localStorage.
  */
 export function initToken(): void {
-  const m = /(?:^#|[#&])token=([^&]+)/.exec(window.location.hash);
+  const m = /(?:^#|[?&])token=([^&]+)/.exec(window.location.hash);
   if (m?.[1]) {
     token = decodeURIComponent(m[1]);
     try {
@@ -42,7 +43,8 @@ export function initToken(): void {
     } catch {
       // storage can be unavailable (private mode); the in-memory copy still works for this page
     }
-    const rest = window.location.hash.replace(/(?:^#|[#&])token=[^&]+&?/, "#").replace(/^#$/, "");
+    const rest = window.location.hash.replace(/(^#|[?&])token=[^&]*(&?)/, (_, prefix: string, next: string) =>
+      next ? prefix : prefix === "#" ? "#" : "").replace(/^#$/, "");
     history.replaceState(null, "", window.location.pathname + window.location.search + rest);
     return;
   }
@@ -146,6 +148,12 @@ export const api = {
 
 
 
+  humanItems: () => request<HumanItemsResponse>("GET", "/api/human-items"),
+  decide: (id: string, d: HumanDecisionRequest) => request<HumanDecisionResponse>("POST", `/api/human-items/${enc(id)}/decide`, d),
+  undo: (id: string) => request<UndoResponse>("POST", `/api/human-activity/${enc(id)}/undo`),
+  closedProjects: () => request<ClosedProjectsResponse>("GET", "/api/projects/closed"),
+  reopen: (id: string) => request<{deskStatus: StatusDTO}>("POST", `/api/projects/${enc(id)}/reopen`),
+  savePlan: (id: string, plan: PlanSaveRequest) => request<PlanSaveResponse>("PUT", `/api/human-items/${enc(id)}/plan`, plan),
   artifact: (artifactId: string) => request<ArtifactDTO>("GET", `/api/artifacts/${enc(artifactId)}`),
   saveArtifact: (save: ArtifactDTO["save"], req: ArtifactSaveRequest) => request<ArtifactSaveResponse>(save.method, save.path, req),
 

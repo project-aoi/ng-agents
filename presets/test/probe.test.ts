@@ -21,7 +21,7 @@ async function probeIn(h: Harness, dir: string, dispatchArgs: Record<string, unk
       return {};
     },
   );
-  const { projectId } = startProjectSync(h.kernel, { title: "发布", outcome: "发布完成", brief: "等发布", cwd: dir });
+  const { projectId } = startProjectSync(h.kernel, { title: "发布", outcome: "发布完成", brief: "等发布", cwd: dir }, { principalId: h.kernel.ownerPrincipal });
   await h.kernel.idle();
   return { project: projectId, checker: childrenOf(h, projectId)[0]!, output };
 }
@@ -128,8 +128,20 @@ describe("a checker with a check command", () => {
 
     writeFileSync(join(dir, "mode"), "ok\n");
     h.script.add("project", {});
+    const runsBefore = h.of("run.started").filter(r => r.cellId === checker).length;
+    let injected = false;
+    const unsubscribe = h.kernel.bus.on("state.changed", e => {
+      if (!injected && e.cellId === checker && h.state<ProbeState>(checker, KEYS.probe)?.result) {
+        injected = true;
+        h.kernel.sendToCell(checker, { text: "再检查一次" }, { principalId: h.kernel.ownerPrincipal });
+      }
+    });
     h.clock.advance(MIN);
     await h.kernel.idle();
+    unsubscribe();
+    expect(injected).toBe(true);
+    expect(h.of("run.started").filter(r => r.cellId === checker)).toHaveLength(runsBefore + 2);
+    expect(results(h, project)).toHaveLength(1);
     const [result] = results(h, project);
     expect(result).toMatchObject({ status: "failed", data: { check: { outcome: "deadline", checks: 3, exitCode: 1, deadlineAt: T0 + 3 * MIN } } });
     expect(result!.summary).toMatch(/^到期仍未满足，已停止监听：`.+` 检查了 3 次，截止时间 .+ 已过；最后一次 exit 1。$/);
@@ -190,7 +202,7 @@ describe("dispatch keeps one timer source per checker", () => {
       checkerTask = requestText(req);
       return tool("wait", { reason: "还没合入", waitingFor: "external" });
     });
-    const { projectId } = startProjectSync(h.kernel, { title: "p", outcome: "o", brief: "b", cwd: dir });
+    const { projectId } = startProjectSync(h.kernel, { title: "p", outcome: "o", brief: "b", cwd: dir }, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     expect(h.script.pending("project")).toBe(0);
     expect(childrenOf(h, projectId)).toEqual([checker]);

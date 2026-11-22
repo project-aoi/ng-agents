@@ -13,6 +13,7 @@ type FakeCliAction =
   /** codex only: a raw item emitted as `item.completed` (e.g. a code-mode `custom_tool_call`). */
   | { item: Record<string, unknown> }
   | { awaitQueuedInput: true }
+  | { waitFile: string }
   | { sleep: number }
   | { fail: string }
   | { exit: number };
@@ -23,6 +24,8 @@ export interface FakeCliTurn {
   acknowledgeInterrupt?: boolean;
   /** AGY reports a refusal after the scripted actions. */
   refused?: boolean;
+  /** AGY can acknowledge cancellation while a previous tool call is still in flight. */
+  acknowledgeCancelDuringTool?: boolean;
   omitQueuedTurnCount?: boolean;
   /** Claude exits after its result even if it has buffered another user turn. */
   exitAfterTurn?: boolean;

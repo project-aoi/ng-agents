@@ -7,19 +7,17 @@ import { MemoryChannel, UiChannel } from "@ng/channel";
 import { createKernel, type Kernel, type KernelOptions } from "@ng/cell";
 import { createScriptedLoop, ScriptedModelClient, type ModelRequest, type ScriptResponder, type ScriptTurn } from "@ng/loop/testing";
 import { gtdKeys } from "../src/shared/keys";
+import { sourceRecordFor, type ActivityRecord, type ProjectRecord, type SourceState, type SourceRecord } from "../src/shared/product-records";
 import {
   asDecisionCard,
   createRegistry,
   ManualClock,
   type ActionRecord,
-  type ActivityRecord,
   type ApprovalRecord,
   type BusTopic,
   type BusTopics,
   type DecisionCard,
-  type ProjectRecord,
   type Registry,
-  type SourceRecord,
 } from "@ng/protocol";
 import { registerPresets, type RegisterPresetsOptions } from "../src";
 
@@ -165,7 +163,7 @@ export async function boot(opts: BootOptions = {}): Promise<Harness> {
   cleanups.push(() => kernel.close());
   const events: Harness["events"] = [];
   kernel.bus.on("*", (topic, data) => events.push({ topic, data }));
-  kernel.ensureRootCell({ id: "desk", preset: "inline" });
+  kernel.ensureRootCell({ id: "desk", preset: "inline" }, { principalId: kernel.ownerPrincipal });
   await kernel.start();
   const h: Harness = {
     kernel,
@@ -188,7 +186,11 @@ export async function boot(opts: BootOptions = {}): Promise<Harness> {
     actions: (cellId) => kernel.context.queryStateSync({ keyPrefix: gtdKeys.actionPrefix, ...(cellId ? { cellIds: [cellId] } : {}) }).map((e) => e.value as ActionRecord).concat(readHumanActionRecords(kernel.db, kernel.deskCellId, cellId).map(e=>e.record)),
     activities: () => kernel.context.queryStateSync({ keyPrefix: gtdKeys.activityPrefix, cellIds: ["desk"] }).map((e) => e.value as ActivityRecord),
     project: rootId => kernel.context.readStateSync<ProjectRecord>(rootId, gtdKeys.project),
-    source: (cellId) => kernel.context.readStateSync<SourceRecord>(cellId, gtdKeys.source),
+    source: (cellId) => {
+      const state = kernel.context.readStateSync<SourceState>(cellId, gtdKeys.source);
+      const cell = kernel.getCell(cellId);
+      return state && cell ? sourceRecordFor(cell, state) : null;
+    },
     state: (cellId, key) => kernel.context.readStateSync(cellId, key),
     deskRuns: () => events.filter((e) => e.topic === "run.started" && (e.data as { cellId: string }).cellId === "desk").length,
   };

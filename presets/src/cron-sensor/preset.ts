@@ -1,4 +1,7 @@
 import type { PresetDef } from "@ng/protocol";
+import { sourceInit } from "../shared/sensor";
+import { newSource } from "../shared/records";
+import { gtdKeys } from "../shared/keys";
 import { ROLES } from "../shared/config";
 import { SENSOR_LLM_PROCESSOR } from "../shared/processors";
 
@@ -9,5 +12,8 @@ export function sensorPreset(): PresetDef {
     // It may need commands for its check, in a directory of its own; it only looks (its prompt's red line).
     defaults: { processor: SENSOR_LLM_PROCESSOR, lifetime: "persistent", meta: { role: ROLES.sensor } },
     inheritCwd: false,
+    onCellCreated(cell, store, clock) {
+      store.commitSync(cell.id, { statePatches: { [gtdKeys.source]: newSource(sourceInit(cell.spec), clock.now()) } });
+    },
   };
 }

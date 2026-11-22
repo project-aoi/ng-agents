@@ -1,5 +1,5 @@
 import type { CellNode } from "@ng/cell";
-import { all, compareBallOwner, topBallOwner, type ActionRecord, type BallOwner, type CellRecord } from "@ng/protocol";
+import { all, type ActionRecord, type BallOwner, type CellRecord } from "@ng/protocol";
 import {
   BALL_LABEL,
   type ArtifactRefDTO,
@@ -15,6 +15,23 @@ import { projectOfAction, readActions, readProjects, type DeskKernel, type Locat
 import { button, enc, ownerLabel, post, progressDTO, waitingDeadline, waitingDTO } from "./format";
 import { projectReview } from "./review";
 import { weekStart, whenText } from "./time";
+
+/** Display priority when aggregating a project's open actions: 🔵 > 🟢 > 🟡. */
+const BALL_OWNER_PRIORITY: readonly BallOwner[] = ["human", "agent", "waiting"];
+
+function compareBallOwner(a: BallOwner, b: BallOwner): number {
+  return BALL_OWNER_PRIORITY.indexOf(a) - BALL_OWNER_PRIORITY.indexOf(b);
+}
+
+/** The ball owner a project row shows: the highest-priority owner among its open actions (null if none open). */
+export function topBallOwner(actions: Iterable<Pick<ActionRecord, "owner" | "status">>): BallOwner | null {
+  let best: BallOwner | null = null;
+  for (const a of actions) {
+    if (a.status !== "open") continue;
+    if (best === null || compareBallOwner(a.owner, best) < 0) best = a.owner;
+  }
+  return best;
+}
 
 export const STALLED_TEXT = "没有在推进的任务、没有在等的回复，也没有下一步 — 补上下一步，或移进以后再说";
 
@@ -83,7 +100,7 @@ function workersOf(node: CellNode | undefined, activity: KernelActivity, project
   const walk = (n: CellNode) => {
     for (const c of n.children) {
       if (c.status === "closed" || projectCells.has(c.cellId)) continue;
-      out.push({ cellId: c.cellId, title: c.title ?? c.cellId, preset: c.preset, state: nodeState(c, activity), statusLine: c.statusLine });
+      out.push({ cellId: c.cellId, title: c.title?.trim() || "未命名项目", preset: c.preset, state: nodeState(c, activity), statusLine: c.statusLine });
       walk(c);
     }
   };

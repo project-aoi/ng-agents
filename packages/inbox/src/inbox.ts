@@ -1,7 +1,10 @@
+import { checkEnvelope, normalizeRule, type Rule } from "./ingress";
+import { inboxQueries } from "./queries";
 import {
   afterCommit,
   all,
   cellsRepo,
+  cellPrincipal,
   createEnvelope,
   DESK_CELL_ID,
   fromJson,
@@ -33,21 +36,16 @@ import {
   type EnqueueResult,
   type Envelope,
   type HandbackPayload,
-  type InboxMessageFilter,
-  type InboxMessageRecord,
   type InboxMessageStatus,
-  type InboxScheduleRecord,
   type ScheduleRule,
   type SqlParam,
   type TickReport,
 } from "@ng/protocol";
 import { nextCronAt } from "./cron";
-import { toClaim, toMessage, toSchedule, type ClaimRow, type MessageRow, type ScheduleRow } from "./rows";
+import { type ClaimRow, type MessageRow, type ScheduleRow } from "./rows";
 import type {
   ControlEvent,
   ControlListener,
-  InboxClaimRecord,
-  InboxClaimStatus,
   InboxOptions,
   InboxReleaseOptions,
   InboxService,
@@ -55,12 +53,6 @@ import type {
 } from "./types";
 
 type EnqueuedReason = BusTopics["inbox.enqueued"]["reason"];
-
-type Rule =
-  | { kind: "now"; cancelGroup: string | null }
-  | { kind: "at"; deliverAt: number; cancelGroup: string | null }
-  | { kind: "coalesce"; key: string; windowMs: number }
-  | { kind: "cron"; cron: string; tz: string | null; cancelGroup: string | null };
 
 interface InsertOpts {
   deliverAt: number;
@@ -106,6 +98,7 @@ const SQL_MAYBE_CLAIMABLE = `SELECT 1 AS x WHERE
 export function createInbox(opts: InboxOptions): InboxService {
   const { db, bus, clock } = opts;
   const cells = cellsRepo(db, clock);
+  const { listMessagesSync, listSchedulesSync, pendingCountsSync, getClaimSync, listClaimsSync } = inboxQueries(db, cells);
   const maxAttempts = Math.max(1, Math.floor(opts.maxAttempts ?? 5));
   const defaultLeaseMs = opts.defaultLeaseMs ?? 10 * 60_000;
   const maxTimerDelayMs = Math.max(1, opts.maxTimerDelayMs ?? 60_000);
@@ -155,6 +148,7 @@ export function createInbox(opts: InboxOptions): InboxService {
   }
 
   function scheduleChanged(): void {
+    if (clock.now() < watermark) watermark = clock.now() - 1;
     if (started && !manualClock) afterCommit(db, rearmTimer);
   }
 
@@ -422,7 +416,7 @@ export function createInbox(opts: InboxOptions): InboxService {
     });
   }
 
-  function completeSync(claimId: string): void {
+  function completeSync(claimId: string, settle?: (pauseSelf: (reason?: "manual" | "parked") => ControlResult) => void): void {
     withTx(db, () => {
       const c = requireClaim(claimId);
       if (c.status === "completed") return;
@@ -437,6 +431,16 @@ export function createInbox(opts: InboxOptions): InboxService {
       run(db, "UPDATE inbox_messages SET status = 'done', updated_at = ? WHERE claim_id = ? AND status = 'claimed'", [now, claimId]);
       run(db, "UPDATE inbox_claims SET status = 'completed', finished_at = ? WHERE claim_id = ?", [now, claimId]);
       if (isClaimable(c.cell_id, now)) announce(c.cell_id, "released");
+      if (settle) {
+        let canPause = true;
+        try {
+          settle(pauseReason => {
+            if (!canPause) throw new NgError("conflict", "self-pause is only available during claim settlement");
+            canPause = false;
+            return controlSync(c.cell_id, {action:"pause", principalId:cellPrincipal(c.cell_id), ...(pauseReason && {pauseReason})}, c.epoch);
+          });
+        } finally { canPause = false; }
+      }
     });
   }
 
@@ -506,7 +510,7 @@ export function createInbox(opts: InboxOptions): InboxService {
       // Steers move to `claimed` (attached to this claim) — never `done` before delivery is confirmed — so a crash
       // or an unconfirmed CLI write can return them to `pending`.
       if (!claim || claim.cell_id !== cellId || claim.status !== "active") return [];
-      if (cell.status !== "active" || claim.epoch !== cell.epoch) return [];
+      if (!cells.isActiveInTree(cellId) || claim.epoch !== cell.epoch) return [];
       const now = clock.now();
       const rows = all<{ seq: number; envelope: string }>(
         db,
@@ -593,7 +597,7 @@ export function createInbox(opts: InboxOptions): InboxService {
       // Only the cell's live serial Run may absorb: a claim that was released/expired no longer owns anything, and a
       // Run from before a cancel (epoch moved) is being aborted — what arrives now belongs to whatever runs next.
       if (!c || c.cell_id !== cellId || c.status !== "active") return [];
-      if (cell.status !== "active" || c.epoch !== cell.epoch) return [];
+      if (!cells.isActiveInTree(cellId) || c.epoch !== cell.epoch) return [];
       const now = clock.now();
       dropStale(cell, now);
       // Same rule as a claim: silent_inject rows ride along with a wakeup, they never start anything by themselves.
@@ -738,7 +742,7 @@ export function createInbox(opts: InboxOptions): InboxService {
     }
   }
 
-  function controlSync(cellId: string, cmd: ControlCommand): ControlResult {
+  function controlSync(cellId: string, cmd: ControlCommand, settledEpoch?: number): ControlResult {
     if (!cmd || !CONTROL_ACTIONS.has(cmd.action)) throw new NgError("invalid_argument", `unknown control action "${String(cmd?.action)}"`);
     if (typeof cmd.principalId !== "string" || cmd.principalId.length === 0) throw new NgError("invalid_argument", "control: principalId is required");
     if (cmd.action === "steer" && (typeof cmd.steerMessage !== "string" || cmd.steerMessage.trim().length === 0)) {
@@ -747,8 +751,13 @@ export function createInbox(opts: InboxOptions): InboxService {
     return withTx(db, () => {
       const cell = cells.get(cellId);
       if (!cell) return { applied: false, epoch: -1, reason: "not_found" };
-      const auth = authorizeControl(cellId, cmd.principalId, cmd.action);
-      if (!auth.ok) return { applied: false, epoch: cell.epoch, reason: auth.reason };
+      if (settledEpoch !== undefined) {
+        if (cell.epoch !== settledEpoch || !cells.isActiveInTree(cellId))
+          return { applied: false, epoch: cell.epoch, reason: "claim is no longer current" };
+      } else {
+        const auth = authorizeControl(cellId, cmd.principalId, cmd.action);
+        if (!auth.ok) return { applied: false, epoch: cell.epoch, reason: auth.reason };
+      }
       // Physical guardrail (BUG-020): a root cell (e.g. desk) can never be paused or cancelled regardless of authorizer.
       if (cell.parentId === null && (cmd.action === "pause" || cmd.action === "cancel")) {
         return { applied: false, epoch: cell.epoch, reason: "cannot pause or cancel a root cell" };
@@ -783,7 +792,12 @@ export function createInbox(opts: InboxOptions): InboxService {
         }
         case "pause": {
           for (const t of [cell, ...cells.descendants(cellId, { status: ["active", "paused"] })]) {
-            if (t.status === "active" || (t.id === cellId && cmd.pauseReason === "parked")) cells.setStatus(t.id, "paused", undefined, cmd.pauseReason);
+            if (t.status === "active" || t.id === cellId) {
+              cells.setStatus(t.id, "paused", undefined, cmd.pauseReason);
+              run(db, "UPDATE cells SET pause_owner=? WHERE id=?", [cellId, t.id]);
+            } else if (t.parentId && t.id !== cellId && get(db, "SELECT 1 FROM cells WHERE id=? AND pause_owner IN (SELECT id FROM cells WHERE depth < ?)", [t.id, cell.depth])) {
+              run(db, "UPDATE cells SET pause_owner=? WHERE id=?", [cellId, t.id]);
+            }
             affected.push({ cellId: t.id, epoch: t.epoch });
           }
           break;
@@ -793,6 +807,8 @@ export function createInbox(opts: InboxOptions): InboxService {
             return { applied: false, epoch: cell.epoch, reason: "an ancestor is paused or closed" };
           }
           for (const t of [cell, ...cells.descendants(cellId, { status: ["active", "paused"] })]) {
+            if (t.status === "paused" && t.id !== cellId && !get(db, "SELECT 1 FROM cells WHERE id=? AND pause_owner=?", [t.id, cellId])) continue;
+            if (t.parentId && !cells.isActiveInTree(t.parentId)) continue;
             if (t.status === "paused") cells.setStatus(t.id, "active");
             if (t.status === "paused" || t.id === cellId) affected.push({ cellId: t.id, epoch: t.epoch });
             if (isClaimable(t.id, now)) wake.push(t.id);
@@ -859,7 +875,7 @@ export function createInbox(opts: InboxOptions): InboxService {
 
     // Missed occurrences (process down, long pause) coalesce into this one firing.
     const next = nextCronAt(s.cron, s.tz, now);
-    if (cell.status === "paused") {
+    if (!cells.isActiveInTree(cell.id)) {
       setNext(next, null);
       return none;
     }
@@ -976,7 +992,7 @@ export function createInbox(opts: InboxOptions): InboxService {
     if (!started || manualClock) return;
     const next = nextWakeAtSync();
     if (timer !== undefined) {
-      if (next === timerAt) return;
+      if (next === timerAt && next !== null && next > clock.now()) return;
       clearTimeout(timer);
       timer = undefined;
     }
@@ -1026,104 +1042,6 @@ export function createInbox(opts: InboxOptions): InboxService {
 
   // ==================== reads ====================
 
-  function listMessagesSync(filter: InboxMessageFilter = {}): InboxMessageRecord[] {
-    const where: string[] = [];
-    const params: SqlParam[] = [];
-    if (filter.cellId !== undefined) {
-      where.push("cell_id = ?");
-      params.push(filter.cellId);
-    }
-    if (filter.status !== undefined) {
-      if (filter.status.length === 0) return [];
-      where.push(`status IN (${filter.status.map(() => "?").join(", ")})`);
-      params.push(...filter.status);
-    }
-    if (filter.type !== undefined) {
-      where.push("type = ?");
-      params.push(filter.type);
-    }
-    if (filter.cancelGroup !== undefined) {
-      where.push("cancel_group = ?");
-      params.push(filter.cancelGroup);
-    }
-    if (filter.envelopeId !== undefined) {
-      where.push("envelope_id = ?");
-      params.push(filter.envelopeId);
-    }
-    if (filter.claimId !== undefined) {
-      where.push("claim_id = ?");
-      params.push(filter.claimId);
-    }
-    if (filter.deliverAfter !== undefined) {
-      where.push("deliver_at > ?");
-      params.push(filter.deliverAfter);
-    }
-    let sql = `SELECT * FROM inbox_messages${where.length > 0 ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY seq`;
-    if (filter.limit !== undefined) {
-      sql += " LIMIT ?";
-      params.push(Math.max(0, Math.floor(filter.limit)));
-    }
-    return all<MessageRow>(db, sql, params).map(toMessage);
-  }
-
-  function listSchedulesSync(filter: { cellId?: string; activeOnly?: boolean } = {}): InboxScheduleRecord[] {
-    const where: string[] = [];
-    const params: SqlParam[] = [];
-    if (filter.cellId !== undefined) {
-      where.push("cell_id = ?");
-      params.push(filter.cellId);
-    }
-    if (filter.activeOnly) where.push("active = 1");
-    const sql = `SELECT * FROM inbox_schedules${where.length > 0 ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY created_at, id`;
-    return all<ScheduleRow>(db, sql, params).map(toSchedule);
-  }
-
-  function pendingCountsSync(cellIds?: readonly string[]): Record<string, number> {
-    const out: Record<string, number> = {};
-    const params: SqlParam[] = [];
-    let sql = "SELECT cell_id, expected_epoch, COUNT(*) AS n FROM inbox_messages WHERE status = 'pending'";
-    if (cellIds !== undefined) {
-      if (cellIds.length === 0) return out;
-      for (const id of cellIds) out[id] = 0;
-      sql += ` AND cell_id IN (${cellIds.map(() => "?").join(", ")})`;
-      params.push(...cellIds);
-    }
-    sql += " GROUP BY cell_id, expected_epoch";
-    const epochs = new Map<string, number | undefined>();
-    for (const r of all<{ cell_id: string; expected_epoch: number | null; n: number }>(db, sql, params)) {
-      if (!epochs.has(r.cell_id)) epochs.set(r.cell_id, cells.getEpoch(r.cell_id));
-      // Stale-epoch rows are still `pending` until the next claim drops them; they will never be delivered.
-      if (r.expected_epoch !== null && r.expected_epoch !== epochs.get(r.cell_id)) continue;
-      out[r.cell_id] = (out[r.cell_id] ?? 0) + r.n;
-    }
-    return out;
-  }
-
-  function getClaimSync(claimId: string): InboxClaimRecord | undefined {
-    const r = get<ClaimRow>(db, "SELECT * FROM inbox_claims WHERE claim_id = ?", [claimId]);
-    return r ? toClaim(r) : undefined;
-  }
-
-  function listClaimsSync(filter: { cellId?: string; status?: readonly InboxClaimStatus[]; limit?: number } = {}): InboxClaimRecord[] {
-    const where: string[] = [];
-    const params: SqlParam[] = [];
-    if (filter.cellId !== undefined) {
-      where.push("cell_id = ?");
-      params.push(filter.cellId);
-    }
-    if (filter.status !== undefined) {
-      if (filter.status.length === 0) return [];
-      where.push(`status IN (${filter.status.map(() => "?").join(", ")})`);
-      params.push(...filter.status);
-    }
-    let sql = `SELECT * FROM inbox_claims${where.length > 0 ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY claimed_at, claim_id`;
-    if (filter.limit !== undefined) {
-      sql += " LIMIT ?";
-      params.push(Math.max(0, Math.floor(filter.limit)));
-    }
-    return all<ClaimRow>(db, sql, params).map(toClaim);
-  }
-
   function recoverClaimsSync(ropts: { workerId?: string; reason?: string; ownerAlive?: (id: string) => boolean } = {}): number {
     return withTx(db, () => {
       const now = clock.now();
@@ -1151,7 +1069,7 @@ export function createInbox(opts: InboxOptions): InboxService {
     claimNextRunSync,
     completeSync,
     handbackSync,
-    controlSync,
+    controlSync: (id, cmd) => controlSync(id, cmd),
     renewLeaseSync,
     releaseSync,
     drainSteerSync,
@@ -1163,12 +1081,25 @@ export function createInbox(opts: InboxOptions): InboxService {
     nextWakeAtSync,
     dueCellIdsSync,
     listMessagesSync,
+    retryPendingSync(cellId, envelopeId, reason, delayMs) {
+      withTx(db, () => {
+        const now = clock.now();
+        const row = get<{ seq: number; status: string }>(db, `UPDATE inbox_messages
+          SET attempts=attempts+1, status=CASE WHEN attempts+1 >= ? THEN 'dead' ELSE 'pending' END,
+              deliver_at=?, updated_at=?, status_reason=? WHERE cell_id=? AND envelope_id=? AND status='pending'
+          RETURNING seq,status`, [maxAttempts, now + Math.max(1, delayMs), now, reason, cellId, envelopeId]);
+        if (row?.status === "pending") scheduleChanged();
+        if (row?.status === "dead") afterCommit(db, () => bus.emit("inbox.dead", {
+          cellId, seqs: [row.seq], envelopeIds: [envelopeId], claimId: null, reason,
+        }));
+      });
+    },
     consumePendingSync(cellId, envelopeId, epoch, settle) {
       return withTx(db, () => {
         const now = clock.now();
-        const touched = run(db, `UPDATE inbox_messages SET status='done', first_claimed_at=COALESCE(first_claimed_at,?), updated_at=?
+        const touched = run(db, `UPDATE inbox_messages SET status='done', updated_at=?
           WHERE cell_id=? AND envelope_id=? AND status='pending' AND deliver_at <= ?
-          AND (expected_epoch IS NULL OR expected_epoch=?)`, [now, now, cellId, envelopeId, now, epoch]);
+          AND (expected_epoch IS NULL OR expected_epoch=?)`, [now, cellId, envelopeId, now, epoch]);
         if (!touched.changes) return false;
         settle?.();
         return true;
@@ -1234,49 +1165,6 @@ export function createInbox(opts: InboxOptions): InboxService {
 }
 
 // ==================== module-level helpers ====================
-
-function checkEnvelope(env: Envelope): void {
-  const bad = (what: string) => new NgError("invalid_argument", `envelope ${what}`);
-  if (env === null || typeof env !== "object") throw bad("must be an object");
-  if (typeof env.id !== "string" || env.id.length === 0) throw bad("id must be a non-empty string");
-  if (typeof env.from !== "string" || env.from.length === 0) throw bad(`"${env.id}": from is required`);
-  if (typeof env.principalId !== "string" || env.principalId.length === 0) throw bad(`"${env.id}": principalId is required`);
-  if (env.kind !== "event" && env.kind !== "result") throw bad(`"${env.id}": kind must be "event" or "result"`);
-  if (typeof env.type !== "string" || env.type.length === 0) throw bad(`"${env.id}": type is required`);
-  if (typeof env.createdAt !== "number" || !Number.isFinite(env.createdAt)) throw bad(`"${env.id}": createdAt must be a number`);
-  if (env.delivery !== undefined && env.delivery !== "wakeup" && env.delivery !== "silent_inject") {
-    throw bad(`"${env.id}": delivery must be "wakeup" or "silent_inject"`);
-  }
-  const expected = env.expectedEpoch ?? null;
-  if (expected !== null && !Number.isInteger(expected)) throw bad(`"${env.id}": expectedEpoch must be an integer`);
-}
-
-function normalizeRule(s: ScheduleRule | undefined): Rule {
-  if (s === undefined || s === null) return { kind: "now", cancelGroup: null };
-  const cancelGroup = s.cancelGroup ?? null;
-  if (cancelGroup !== null && (typeof cancelGroup !== "string" || cancelGroup.length === 0)) {
-    throw new NgError("invalid_argument", "schedule.cancelGroup must be a non-empty string");
-  }
-  const given = [s.deliverAt, s.cron, s.coalesce].filter((v) => v !== undefined && v !== null).length;
-  if (given > 1) throw new NgError("invalid_argument", "schedule: at most one of deliverAt, cron, coalesce");
-  if (s.coalesce !== undefined && s.coalesce !== null) {
-    const { key, windowMs } = s.coalesce;
-    if (typeof key !== "string" || key.length === 0) throw new NgError("invalid_argument", "schedule.coalesce.key must be a non-empty string");
-    if (typeof windowMs !== "number" || !Number.isFinite(windowMs) || windowMs < 0) throw new NgError("invalid_argument", "schedule.coalesce.windowMs must be >= 0");
-    // The key is the row's cancel group: one name for "this window", so a separate cancelGroup would be ambiguous.
-    if (cancelGroup !== null && cancelGroup !== key) throw new NgError("invalid_argument", "schedule.coalesce cannot be combined with a different cancelGroup");
-    return { kind: "coalesce", key, windowMs };
-  }
-  if (s.deliverAt !== undefined && s.deliverAt !== null) {
-    if (typeof s.deliverAt !== "number" || !Number.isFinite(s.deliverAt)) throw new NgError("invalid_argument", "schedule.deliverAt must be a timestamp");
-    return { kind: "at", deliverAt: s.deliverAt, cancelGroup };
-  }
-  if (s.cron !== undefined && s.cron !== null) {
-    if (typeof s.cron !== "string" || s.cron.trim().length === 0) throw new NgError("invalid_argument", "schedule.cron must be a cron expression");
-    return { kind: "cron", cron: s.cron.trim(), tz: s.tz ?? null, cancelGroup };
-  }
-  return { kind: "now", cancelGroup };
-}
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return v !== null && typeof v === "object" && !Array.isArray(v);

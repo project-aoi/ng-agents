@@ -53,7 +53,7 @@ describe("restart on the same database", () => {
         registry.prompts.register({name:"test.release", text:"first release prompt"});
       },
     });
-    await first.ui.capture({text:"materialize the prompt"});
+    await first.ui.capture({text:"materialize the prompt"}, "owner");
     await first.kernel.idle();
     expect(first.count("prompt_prefixes WHERE cell_id = 'desk'")).toBe(1);
     await first.kernel.close();
@@ -71,16 +71,16 @@ describe("restart on the same database", () => {
 
     // ---------- first life ----------
     const a = await boot({ dataDir, clock, setup });
-    a.kernel.spawnCell("desk", { id: "job", preset: "worker", processor: { kind: "code", entry: "test.job_worker" } }, "build");
+    a.kernel.spawnCell("desk", { id: "job", preset: "worker", processor: { kind: "code", entry: "test.job_worker" } }, "build", { principalId: a.kernel.ownerPrincipal });
     // a sensor lives on its cron as a persistent cell (a leaf would report every Run to the desk)
-    a.kernel.spawnCell("desk", { id: "sensor", preset: "worker", lifetime: "persistent", processor: { kind: "code", entry: "test.counter" }, schedules: [{ cron: "0 * * * *" }] });
+    a.kernel.spawnCell("desk", { id: "sensor", preset: "worker", lifetime: "persistent", processor: { kind: "code", entry: "test.counter" }, schedules: [{ cron: "0 * * * *" }] }, undefined, { principalId: a.kernel.ownerPrincipal });
     a.script.add("desk", tool("set_reminder", { label: "给牙医打电话", inSeconds: 2 * 3600 }), { text: "reminder set" });
-    await a.ui.capture({ text: "两小时后提醒我给牙医打电话" });
+    await a.ui.capture({ text: "两小时后提醒我给牙医打电话" }, "owner");
     await a.kernel.idle();
     await waitFor(() => a.kernel.workspace.listJobsSync({ cellId: "job", state: ["running"] }).length === 1, 10_000, "job");
     // a Run in flight when the process stops
     a.script.add("desk", { text: "never answered", delayMs: 60_000 });
-    await a.ui.capture({ text: "interrupted message" });
+    await a.ui.capture({ text: "interrupted message" }, "owner");
     await waitFor(() => a.kernel.activeRuns().length === 1, 5_000, "in-flight run");
     await a.kernel.close();
 

@@ -8,7 +8,6 @@ import { TOOL_KINDS, type Address, type BoundsInit } from "@ng/protocol";
 export const DEFAULT_ROOT_BOUNDS: Readonly<Required<BoundsInit>> = {
   tools: [...TOOL_KINDS],
   canSendTo: ["channel:*", "inbox:*"] as Address[],
-  isolation: "none",
   maxConcurrentChildren: 16,
   maxDepth: 4,
 };

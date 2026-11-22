@@ -35,6 +35,7 @@ export interface ReadModel {
    * The children that stand in the way of closing or parking `cellId`: persistent children that are still open, and
    * leaf children that are not dormant.
    */
+  pendingSettlement(cellId: string, stopChildren?: boolean): string[];
   blockingChildren(cellId: string): Array<{ cell: CellRecord; why: string }>;
   /** Leaf children of `cellId` that hold a slot of maxConcurrentChildren: active and not dormant. */
   busyLeafChildren(cellId: string): CellRecord[];
@@ -158,6 +159,15 @@ export function createReadModel(core: KernelCore): ReadModel {
     return activities(cellIds.flatMap((id) => cells.get(id) ?? []));
   }
 
+  function pendingSettlement(cellId: string, stopChildren?: boolean): string[] {
+    const c = cells.require(cellId);
+    if (!isProjectRoot(core.registry, c)) return [];
+    const preset = c.preset ? core.registry.presets.get(c.preset) : undefined;
+    const actions = preset?.actionBooks?.(core, cellId)?.list() ?? [];
+    return [...actions.filter(a => a.status === "open" && !(stopChildren && a.owner !== "human" && a.cellId && cells.get(a.cellId)?.parentId === cellId)).map(a => a.title),
+      ...core.workspace.listJobsSync({cellId, state: ["running"]}).map(j => j.command)];
+  }
+
   function blockingChildren(cellId: string): Array<{ cell: CellRecord; why: string }> {
     const open = cells.children(cellId, { status: ["active", "paused"] });
     const act = activities(open);
@@ -269,6 +279,7 @@ export function createReadModel(core: KernelCore): ReadModel {
         a === undefined || a.state === "closed" ? undefined : a.state === "idle" ? "waiting" : a.state;
       return {
         cellId: r.cellId,
+        ...(child && {processorKind: child.spec.processor.kind}),
         title: r.title,
         preset: r.preset,
         status: r.status,
@@ -287,15 +298,12 @@ export function createReadModel(core: KernelCore): ReadModel {
   // ---------- directory occupancy: a fact the kernel shows, not a lock it holds ----------
 
   function activeWorkspaces(): WorkspaceOccupancy[] {
-    const running = new Set(core.dispatcher.running().map((r) => r.cellId));
-    const jobCells = new Set(core.workspace.listJobsSync({ state: ["running"] }).map((j) => j.cellId));
+    const runs = core.dispatcher.running().map(r => ({ ...r, state: "running" as const }));
+    const jobs = core.workspace.listJobsSync({ state: ["running"] }).map(j => ({ ...j, state: "job" as const }));
     const byKey = new Map<string, WorkspaceOccupancy>();
-    // A Job of a cell that was just closed still works in its tree until the process is gone.
-    for (const id of new Set([...running, ...jobCells])) {
-      const c = cells.get(id);
-      // The desk and other cells nobody gave a directory are not part of this picture.
-      if (!c || (!c.spec.cwd && !core.repoPath)) continue;
-      const cwd = effectiveCwd(core, c);
+    for (const { cellId, cwd, state } of [...runs, ...jobs]) {
+      const c = cells.get(cellId);
+      if (!c || !cwd) continue;
       let key: string;
       try {
         key = workTreeKey(cwd);
@@ -312,12 +320,12 @@ export function createReadModel(core: KernelCore): ReadModel {
         projectCellId: projectId,
         projectTitle: project?.title ?? null,
         cwd,
-        state: running.has(id) ? "running" : "job",
+        state,
         statusLine: formatStatus(statusOf(context.readStateSync(c.id, CELL_STATUS_KEY))),
       };
       let o = byKey.get(key);
       if (!o) byKey.set(key, (o = { key, active: [] }));
-      o.active.push(user);
+      if (!o.active.some(u => u.cellId === c.id && u.cwd === cwd)) o.active.push(user);
     }
     for (const o of byKey.values()) o.active.sort((a, b) => a.cellId.localeCompare(b.cellId));
     return [...byKey.values()].sort((a, b) => a.key.localeCompare(b.key));
@@ -381,12 +389,31 @@ export function createReadModel(core: KernelCore): ReadModel {
     if (own.length) {
       notes.push(`[your open waits]\n${own.map((w) => `- waiting for ${w.waitingFor}: ${w.reason} [${w.waitId}]${w.timeoutAt ? ` (times out ${new Date(w.timeoutAt).toISOString()})` : ""}`).join("\n")}`);
     }
-    const waiting = all<{cell_id: string; wait_id: string; reason: string}>(db, `SELECT w.cell_id, w.wait_id, w.reason FROM cell_waits w
+    const waiting = all<{cell_id: string; wait_id: string; ref_id: string | null; reason: string}>(db, `SELECT w.cell_id, w.wait_id, w.ref_id, w.reason FROM cell_waits w
       JOIN cells c ON c.id=w.cell_id AND c.epoch=w.epoch AND c.status='active' WHERE w.waiting_for=? ORDER BY w.created_at`, [`inbox:${cellId}`]);
-    if (waiting.length) notes.push("[cells waiting on you]\n" + waiting.map(w => `${w.cell_id} [${w.wait_id}] ${w.reason}`).join("\n"));
-    const cards = all<{action_id: string; subject_key: string; status: string}>(db, `SELECT action_id,subject_key,status FROM human_items
+    if (waiting.length) notes.push("[cells waiting on you]\n" + waiting.map(w => `${w.cell_id} [waitId=${w.wait_id}${w.ref_id && w.ref_id !== w.wait_id ? `, refId=${w.ref_id}` : ""}] ${w.reason}`).join("\n"));
+    if (isProjectRoot(core.registry, cell)) {
+      const preset = cell.preset ? core.registry.presets.get(cell.preset) : undefined;
+      const openActions = (preset?.actionBooks?.(core, cellId)?.list() ?? []).filter(a => a.status === "open");
+      if (openActions.length) {
+        notes.push("[your open actions]\n" + openActions.map(a =>
+          `- ${a.id} [${a.owner}] "${a.title}"${a.cellId ? ` (cell ${a.cellId})` : ""}${a.phase ? ` (phase ${a.phase})` : ""}${a.nextStep && a.nextStep !== a.title ? ` — ${a.nextStep}` : ""}`
+        ).join("\n"));
+      }
+    }
+    const cards = all<{action_id: string; category: string; subject_key: string; status: string; card: string}>(db, `SELECT action_id,category,subject_key,status,card FROM human_items
       WHERE cell_id=? AND status IN ('pending','snoozed')`, [cellId]);
-    if (cards.length) notes.push("[your open cards]\n" + cards.map(c => `${c.action_id} ${c.subject_key} (${c.status})`).join("\n"));
+    if (cards.length) notes.push("[your open cards]\n" + cards.map(c => {
+      let title = "";
+      let body = "";
+      try {
+        const parsed = JSON.parse(c.card) as { title?: string; body?: string };
+        title = parsed.title?.trim() ?? "";
+        body = parsed.body?.trim() ?? "";
+      } catch { /* ignore malformed card json */ }
+      const detail = c.category === "action" && body && body !== title ? ` — ${body.replace(/\s+/g, " ").slice(0, 120)}` : "";
+      return `${c.action_id} [${c.category}]${title ? ` "${title}"` : ""} ${c.subject_key} (${c.status})${detail}`;
+    }).join("\n"));
     const jobs = core.workspace.listJobsSync({ cellId, state: ["running"] });
     if (jobs.length) notes.push("[your running jobs]\n" + jobs.map(j => `${j.jobId} ${j.command.slice(0,120)}`).join("\n"));
     const authors = leaf ? [cellId] : [cellId, ...cells.descendants(cellId).map(c => c.id)];
@@ -397,10 +424,11 @@ export function createReadModel(core: KernelCore): ReadModel {
         AND json_extract(e.content,'$.phase')='start' AND e.at>a.updated_at)))
       ORDER BY a.updated_at DESC LIMIT 12`, [JSON.stringify(authors), clock.now()-86_400_000, cellId]);
     if (edits.length) notes.push("[human-edited artifacts]\n" + edits.map(a => `${a.artifact_id} v${a.version}`).join("\n"));
-    const watches = all<{id:number; thread:string | null}>(db, "SELECT id,thread FROM cell_watches WHERE active=1 AND cell_id=?", [cellId]);
+    const watches = all<{id:number; thread:string | null; cancel_group:string | null}>(db, "SELECT id,thread,cancel_group FROM cell_watches WHERE active=1 AND cell_id=?", [cellId]);
     const schedules = inbox.listSchedulesSync({cellId, activeOnly:true});
     if (watches.length || schedules.length) notes.push("[your active watches & schedules]\n" + [
-      ...watches.map(w => `watch ${w.id} ${w.thread ?? ""}`), ...schedules.map(s => `schedule ${s.id} next ${s.nextFireAt}`),
+      ...watches.map(w => `watch ${w.id}${w.thread ? ` thread ${w.thread}` : ""}${w.cancel_group ? ` cancelGroup "${w.cancel_group}"` : ""}`),
+      ...schedules.map(s => `schedule ${s.id}${s.cron ? ` cron "${s.cron}"${s.tz ? ` (${s.tz})` : ""}` : ""}${s.cancelGroup ? ` cancelGroup "${s.cancelGroup}"` : ""} next ${s.nextFireAt !== null ? new Date(s.nextFireAt).toISOString() : "none"}`),
     ].join("\n"));
     const occ = occupancyNote(cell);
     if (occ) notes.push(occ);
@@ -452,30 +480,40 @@ export function createReadModel(core: KernelCore): ReadModel {
     const working = new Set(core.dispatcher.running().filter(r => !r.stallOnly).map(r => r.cellId));
     const cards = all<{cell_id:string; subject_key:string; related_project_ids:string}>(db, `SELECT cell_id, subject_key, related_project_ids FROM human_items
       WHERE cell_id IS NOT NULL AND category='decision' AND status IN ('pending','snoozed')`);
+    const incidents = openIncidentWaits();
     const cardOwners = new Set(cards.map(card => card.cell_id));
     const hasSource = (id: string) => working.has(id) || f.jobs.has(id) || f.due.has(id) || f.watching.has(id) || f.nextTimer.has(id) || cardOwners.has(id);
     const requests = inbox.listMessagesSync({status:["pending","claimed"]}).filter(m => m.envelope.delivery !== "silent_inject" &&
       (m.expectedEpoch === null || m.expectedEpoch === live.get(m.cellId)?.epoch));
-    function canAnswer(from: string, target: string, seen: Set<string>): boolean {
+    function canAnswer(from: string, target: string, seen: Set<string>, wait?: WaitRecord): boolean {
       const t = live.get(target);
       if (!t || seen.has(target) || inCycle(target)) return false;
       const path = new Set(seen).add(target);
       if (!localCells.has(target) && !isLeafLifetime(t.spec.lifetime)) {
         // An outside coordinator must have work for this particular requester.
         const owner = cells.require(from);
-        const project = isProjectRoot(core.registry, owner) ? from : projectCellIdOf(owner.spec) ?? cells.ancestors(from).find(c => isProjectRoot(core.registry, c))?.id;
+        const project = isProjectRoot(core.registry, owner) ? from : cells.ancestors(from).find(c => isProjectRoot(core.registry, c))?.id;
         if (requests.some(m => m.cellId === target && waitTargetCell(m.envelope.from) === from)) return true;
-        const refs = new Set(internal.filter(w => w.cellId === from && w.waitingFor === inboxAddr(target))
-          .flatMap(w => [w.refId, w.waitId]).filter(Boolean));
-        if (cards.some(c => c.cell_id === target && (c.subject_key === `cell:${from}` || refs.has(c.subject_key) ||
-          (project && JSON.parse(c.related_project_ids).includes(project))))) return true;
+        if (wait && incidents.some(i => i.cell_id === target && i.cellId === from &&
+          i.waitId === wait.waitId && i.registrationId === wait.registrationId)) return true;
+        const refs = [wait?.refId, wait?.waitId];
+        if (cards.some(c => c.cell_id === target && !c.subject_key.startsWith("kernel:stalled:") &&
+          (c.subject_key === `cell:${from}` || refs.includes(c.subject_key) ||
+          (!wait?.refId && project && JSON.parse(c.related_project_ids).includes(project))))) return true;
         if (!project) return false;
         return cells.children(target,{status:["active"]}).some(c => isLeafLifetime(c.spec.lifetime) &&
           Array.isArray(c.spec.meta?.relatedProjectIds) && c.spec.meta.relatedProjectIds.includes(project) && canAnswer(target, c.id, path));
       }
       return hasSource(target) || (edges.get(target) ?? []).some(next => canAnswer(target, next, path));
     }
-    return internal.filter(w => live.get(w.cellId)?.epoch === w.epoch && canAnswer(w.cellId, waitTargetCell(w.waitingFor)!, new Set([w.cellId])));
+    return internal.filter(w => live.get(w.cellId)?.epoch === w.epoch && canAnswer(w.cellId, waitTargetCell(w.waitingFor)!, new Set([w.cellId]), w));
+  }
+
+  function openIncidentWaits() {
+    return all<{cell_id: string; wait_ids: string; action_id: string}>(db, `SELECT h.cell_id,i.wait_ids,h.action_id
+      FROM stall_incidents i JOIN human_items h ON h.action_id=i.escalation_id WHERE h.status IN ('pending','snoozed')`)
+      .flatMap(row => (JSON.parse(row.wait_ids) as Pick<WaitRecord, "cellId" | "waitId" | "registrationId">[])
+        .map(wait => ({...wait, cell_id: row.cell_id, actionId: row.action_id})));
   }
 
   function anchorsOf(cellId: string): AnchorReport {
@@ -489,7 +527,7 @@ export function createReadModel(core: KernelCore): ReadModel {
     const subtree = [root, ...cells.descendants(cellId, { status: ["active", "paused"] })].filter((c) => c.status !== "closed");
     const ids = subtree.map((c) => c.id);
     const idSet = new Set(ids);
-    const projectId = isProjectRoot(core.registry, root) ? cellId : projectCellIdOf(root.spec) ?? cells.ancestors(cellId).find(c=>isProjectRoot(core.registry, c))?.id;
+    const projectId = isProjectRoot(core.registry, root) ? cellId : cells.ancestors(cellId).find(c=>isProjectRoot(core.registry, c))?.id;
     const why: string[] = [];
 
     // Descendants are ordered by depth. A manually parked ancestor suspends its whole branch.
@@ -498,7 +536,7 @@ export function createReadModel(core: KernelCore): ReadModel {
       if (cell.status === "active" && (cell.id === cellId || active.has(cell.parentId!))) active.add(cell.id);
     }
     const available = [...active];
-    const waits = core.waits.list(ids);
+    const waits = core.waits.list(available);
     const f = facts(waits.some(w => waitTargetCell(w.waitingFor) !== null) ? undefined : available);
     const working = new Set(core.dispatcher.running().filter(r => !r.stallOnly).map(r => r.cellId));
     const agent = available.find(id => working.has(id) || f.jobs.has(id) || f.due.has(id));
@@ -515,7 +553,8 @@ export function createReadModel(core: KernelCore): ReadModel {
     // A card about this project is the owner's ball whoever holds it (the desk raises some on a project's behalf).
     const open=all<{action_id:string;cell_id:string|null;related_project_ids:string;subject_key:string;category:string}>(db,
       "SELECT action_id,cell_id,related_project_ids,subject_key,category FROM human_items WHERE status IN ('pending','snoozed')");
-    const cards=open.filter(h=>(h.cell_id && idSet.has(h.cell_id)) || (JSON.parse(h.related_project_ids) as string[]).includes(projectId ?? cellId));
+    const incidents = new Set(openIncidentWaits().filter(i => waits.some(w => w.cellId === i.cellId && w.waitId === i.waitId && w.registrationId === i.registrationId)).map(i => i.actionId));
+    const cards=open.filter(h=>incidents.has(h.action_id) || (h.cell_id && idSet.has(h.cell_id)) || (JSON.parse(h.related_project_ids) as string[]).includes(projectId ?? cellId));
     const stranded = waits.some(w => waitTargetCell(w.waitingFor) !== null && !backed.includes(w));
     const human = cards.some(card => !stranded || card.category === "decision");
     if (human) why.push(`${cards.length} card(s) await the owner`);
@@ -589,5 +628,5 @@ export function createReadModel(core: KernelCore): ReadModel {
     };
   }
 
-  return { rosterFor, childSummaries, tree, stats, activeWorkspaces, anchorsOf, groundedWaits, tailNotes, activityOf, blockingChildren, busyLeafChildren };
+  return { rosterFor, childSummaries, tree, stats, activeWorkspaces, anchorsOf, groundedWaits, tailNotes, activityOf, pendingSettlement, blockingChildren, busyLeafChildren };
 }

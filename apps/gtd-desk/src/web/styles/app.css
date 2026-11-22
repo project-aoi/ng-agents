@@ -235,12 +235,6 @@ code {
   color: var(--text-3);
 }
 
-.focus-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--human);
-}
 
 .topbar-right {
   margin-left: auto;
@@ -249,14 +243,6 @@ code {
   gap: var(--sp-3);
 }
 
-.mode-badge {
-  font-size: var(--fs-xs);
-  color: var(--text-3);
-  white-space: nowrap;
-  padding: 1px 8px;
-  border: 1px dashed var(--border-strong);
-  border-radius: var(--r-pill);
-}
 
 /* the model switch (CLI backends): the top bar's backend · model label opens it */
 .model-switch {
@@ -3909,7 +3895,6 @@ textarea:focus-visible {
   .desk-link {
     display: none;
   }
-  .mode-badge,
   .model-switch {
     display: none;
   }

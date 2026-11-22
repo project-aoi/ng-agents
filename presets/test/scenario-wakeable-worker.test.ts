@@ -33,7 +33,7 @@ describe("the project and its resting workers", () => {
       {},
     );
     h.script.add("worker", { text: "退避已实现，最大重试 5 次，提交 9f2c1" });
-    const { projectId } = startProjectSync(h.kernel, { title: "支付重试", outcome: "支付回调失败自动重试", brief: "做支付重试", cwd: repo });
+    const { projectId } = startProjectSync(h.kernel, { title: "支付重试", outcome: "支付回调失败自动重试", brief: "做支付重试", cwd: repo }, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     expect(h.actions(projectId)).toEqual([expect.objectContaining({ title: "实现退避重试", status: "done", cellId: worker })]);
     const projectRuns = runsOf(h, projectId);
@@ -62,7 +62,7 @@ describe("the project and its resting workers", () => {
       },
       {},
     );
-    expect(h.kernel.directMessage(worker, { text: "把最大重试次数从 5 改成 3" })).toMatchObject({ status: "delivered", ccTo: projectId });
+    expect(h.kernel.directMessage(worker, { text: "把最大重试次数从 5 改成 3" }, { principalId: h.kernel.ownerPrincipal })).toMatchObject({ status: "delivered", ccTo: projectId });
     await h.kernel.idle();
 
     // One wake-up of the project, for the settled turn — the copy of the owner's words came with it, not before it.
@@ -89,7 +89,7 @@ describe("the project and its resting workers", () => {
       next = requestText(req);
       return {};
     });
-    h.kernel.sendToCell(projectId, { text: "进展如何？" });
+    h.kernel.sendToCell(projectId, { text: "进展如何？" }, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     expect(next).toContain("主人直接让它把最大重试从 5 改成 3（提交 7aa01）");
   });
@@ -134,7 +134,7 @@ describe("the project and its resting workers", () => {
         return tool("report_to_parent", { kind: "result", text: "并发测试已补，提交 c3d4e" });
       },
     );
-    const { projectId } = startProjectSync(h.kernel, { title: "支付重试", outcome: "支付回调失败自动重试", brief: "做支付重试", cwd: repo });
+    const { projectId } = startProjectSync(h.kernel, { title: "支付重试", outcome: "支付回调失败自动重试", brief: "做支付重试", cwd: repo }, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
 
     expect(h.script.pending("project")).toBe(0);
@@ -183,7 +183,7 @@ describe("the project and its resting workers", () => {
       },
     );
     h.script.add("worker", { text: "已实现，提交 9f2c1" });
-    const { projectId } = startProjectSync(h.kernel, { title: "支付重试", outcome: "上线", brief: "做支付重试", cwd: repo });
+    const { projectId } = startProjectSync(h.kernel, { title: "支付重试", outcome: "上线", brief: "做支付重试", cwd: repo }, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     expect(h.script.pending("project")).toBe(0);
     expect(h.kernel.activityOf([worker]).get(worker)!.state).toBe("dormant");

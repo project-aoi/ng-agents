@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  ISOLATION_LEVELS,
   TOOL_KINDS,
   anyCovers,
   boundsViolations,
@@ -56,8 +55,6 @@ function randomParent(r: () => number): PolicyBounds {
   return makeBounds({
     tools: subset(r, TOOL_KINDS),
     canSendTo: subset(r, PARENT_PATTERNS, 0.3) as PolicyBounds["canSendTo"],
-
-    isolation: pick(r, ISOLATION_LEVELS),
     maxConcurrentChildren: Math.floor(r() * 6),
 
     maxDepth: Math.floor(r() * 5),
@@ -78,7 +75,7 @@ function randomRequest(r: () => number): Partial<PolicyBounds> | undefined {
   const req: Record<string, unknown> = {};
   if (r() < 0.6) req["tools"] = randomList(r, [...TOOL_KINDS, "rm", "", 5, null]);
   if (r() < 0.6) req["canSendTo"] = randomList(r, REQUEST_PATTERNS);
-  if (r() < 0.6) req["isolation"] = pick(r, [...ISOLATION_LEVELS, "contianer", 3, null]);
+
   for (const k of ["maxConcurrentChildren", "maxDepth"]) {
     if (r() < 0.6) req[k] = r() < 0.5 ? pick(r, NUMBERS) : Math.floor(r() * 2_000_000);
   }
@@ -157,18 +154,16 @@ describe("attenuateBounds — field rules", () => {
   const parent = makeBounds({
     tools: ["read", "write", "bash"],
     canSendTo: ["inbox:desk", "inbox:p1", "channel:memory:oc_1", "channel:ui:*"],
-
-    isolation: "none",
     maxConcurrentChildren: 4,
 
     maxDepth: 2,
   });
 
-  it("omitted fields: parent's tools/isolation/limits, the parent inbox plus the parent's inboxes (no channels), depth − 1", () => {
+  it("omitted fields: parent's tools/limits, the parent inbox plus the parent's inboxes (no channels), depth − 1", () => {
     const c = attenuateBounds(parent, "proj");
     expect([...c.tools].sort()).toEqual(["bash", "read", "write"]);
     expect(c.canSendTo).toEqual(["inbox:desk", "inbox:p1", "inbox:proj"]);
-    expect(c.isolation).toBe("none");
+
     expect([c.maxConcurrentChildren, c.maxDepth]).toEqual([4, 1]);
   });
 
@@ -176,8 +171,6 @@ describe("attenuateBounds — field rules", () => {
     const c = attenuateBounds(parent, "proj", {
       tools: new Set(["read"]),
       canSendTo: ["channel:memory:oc_1"],
-
-      isolation: "none",
       maxConcurrentChildren: 1,
 
       maxDepth: 0,
@@ -185,8 +178,6 @@ describe("attenuateBounds — field rules", () => {
     expect(serializeBounds(c)).toEqual({
       tools: ["read"],
       canSendTo: ["channel:memory:oc_1", "inbox:desk", "inbox:p1", "inbox:proj"],
-
-      isolation: "none",
       maxConcurrentChildren: 1,
 
       maxDepth: 0,
@@ -197,8 +188,6 @@ describe("attenuateBounds — field rules", () => {
     const c = attenuateBounds(parent, "proj", {
       tools: new Set(["read", "edit"]),
       canSendTo: ["channel:other:C1", "channel:memory:*", "inbox:*"],
-
-      isolation: "none",
       maxConcurrentChildren: 99,
 
       maxDepth: 5,
@@ -206,7 +195,7 @@ describe("attenuateBounds — field rules", () => {
     expect([...c.tools]).toEqual(["read"]);
     // memory:* ∩ {memory:oc_1} = oc_1 ; inbox:* ∩ {inbox:desk, inbox:p1, inbox:proj} = those three; the other channel is dropped.
     expect(c.canSendTo).toEqual(["channel:memory:oc_1", "inbox:desk", "inbox:p1", "inbox:proj"]);
-    expect(c.isolation).toBe("none");
+
     expect([c.maxConcurrentChildren, c.maxDepth]).toEqual([4, 1]);
   });
 
@@ -264,12 +253,12 @@ describe("attenuateBounds — field rules", () => {
 describe("stored bounds", () => {
   it("never exceeds the stored parent bounds even when the caller passes wider ones", () => {
     const f = setup();
-    f.addCell("narrow", "desk", { tools: ["read"], canSendTo: ["inbox:desk"], isolation: "none", maxDepth: 1, maxConcurrentChildren: 1 });
-    const wide = makeBounds({ tools: TOOL_KINDS, canSendTo: ["inbox:*", "channel:*" as Address], isolation: "none", maxConcurrentChildren: 9, maxDepth: 5 });
+    f.addCell("narrow", "desk", { tools: ["read"], canSendTo: ["inbox:desk"], maxDepth: 1, maxConcurrentChildren: 1 });
+    const wide = makeBounds({ tools: TOOL_KINDS, canSendTo: ["inbox:*", "channel:*" as Address], maxConcurrentChildren: 9, maxDepth: 5 });
     const c = f.gate.attenuate(wide, "narrow", { tools: new Set(TOOL_KINDS), canSendTo: ["channel:memory:x"] });
     expect(isSubsetBounds(c, f.cells.require("narrow").bounds, { parentCellId: "narrow" })).toBe(true);
     // the request's channel is outside the stored parent; the stored parent's own inbox reach is inherited
-    expect(serializeBounds(c)).toMatchObject({ tools: ["read"], canSendTo: ["inbox:desk", "inbox:narrow"], isolation: "none", maxDepth: 0 });
+    expect(serializeBounds(c)).toMatchObject({ tools: ["read"], canSendTo: ["inbox:desk", "inbox:narrow"], maxDepth: 0 });
   });
 
   it("randomized: always ⊆ the passed parent and the stored parent", () => {

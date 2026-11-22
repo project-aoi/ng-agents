@@ -37,7 +37,7 @@ describe("docs/05 scenario 5 — an idea for later: research, park, bring it bac
       tool("update_project", { summary: "调研完成：主流做法是只保留摘要输出" }),
       tool("finish_project", { outcome: "someday", summary: "调研报告已完成，先放进以后再说", retro: "none：这次没有新的习惯" }),
     );
-    await h.ui.capture({ text: "/todo 做个极简模式（以后再说）" });
+    await h.ui.capture({ text: "/todo 做个极简模式（以后再说）" }, "owner");
     await h.kernel.idle();
 
     const [project] = projects(h);
@@ -85,7 +85,7 @@ describe("docs/05 scenario 5 — an idea for later: research, park, bring it bac
       "project",
       tool("request_approval", { kind: "action", title: "阶段 1 完成，是否开始阶段 2", summary: "阶段 1 已交付 --minimal；阶段 2 做配置开关", action: { name: "gtd.next_phase", args: { phase: 2 } } }),
     );
-    await h.ui.capture({ text: "/todo 要做个极简模式" });
+    await h.ui.capture({ text: "/todo 要做个极简模式" }, "owner");
     await h.kernel.idle();
 
     expect(h.kernel.getCell(project!)).toMatchObject({ status: "active" });

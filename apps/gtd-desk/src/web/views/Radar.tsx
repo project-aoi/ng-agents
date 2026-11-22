@@ -9,13 +9,13 @@ import { dueText, whenText } from "../text";
 export function RadarView() {
   // The weekly review rides along in /api/radar, so a review-only change refetches the same view.
   const res = useResource<RadarDTO>("radar", api.radar, ["radar", "review"]);
-  const ended = useResource("recently-closed", () => request<{ projects: { id: string; title: string }[] }>("GET", "/api/projects/closed"), ["radar"]);
+  const ended = useResource("recently-closed", api.closedProjects, ["radar"]);
   const { setStatus } = useStatus();
   const toast = useToast();
 
   const reopen = async (id: string) => {
     try {
-      const result = await request<{ deskStatus: StatusDTO }>("POST", `/api/projects/${encodeURIComponent(id)}/reopen`);
+      const result = await api.reopen(id);
       setStatus(result.deskStatus);
       res.reload();
       ended.reload();

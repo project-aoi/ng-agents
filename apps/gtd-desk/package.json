@@ -3,6 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
+  "bin": { "ng-desk-mcp": "./bin/ng-mcp.mjs" },
   "exports": {
     ".": "./src/index.ts"
   },

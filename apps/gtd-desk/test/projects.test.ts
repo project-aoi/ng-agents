@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { gtdKeys, startProjectSync } from "@ng/presets";
-import {  type ProjectRecord} from "@ng/protocol";
+import type { ProjectRecord } from "@ng/presets/records";
 import type { ProjectMutationResponse } from "../src/shared/api";
 import { bootRealDesk, cellMessages, cleanupAll, requestsOf, tempDir, tool, type TestDesk } from "./helpers";
 
@@ -20,7 +20,7 @@ describe("someday and back", () => {
       tool("save_artifact", { artifactId: "art_minimal", title: "极简模式调研报告", body: "## 结论\n先做极简档" }),
       tool("track_action", { title: "看一眼报告", owner: "human", nextStep: "读调研报告，决定要不要做" }),
     );
-    const { projectId } = startProjectSync(d.kernel, { title: "极简模式", outcome: "一份调研报告", brief: "先调研其他产品的做法" });
+    const { projectId } = startProjectSync(d.kernel, { title: "极简模式", outcome: "一份调研报告", brief: "先调研其他产品的做法" }, { principalId: d.kernel.ownerPrincipal });
     await d.kernel.idle();
     expect(d.kernel.context.getArtifactSync("art_minimal")).toMatchObject({ version: 1, cellId: projectId });
     const firstRun = requestsOf(d.script, projectId);
@@ -63,7 +63,7 @@ describe("closing and the directory", () => {
     writeFileSync(join(repo, "src", "a.ts"), "export const a = 1;\n");
     d.script.add("project", tool("dispatch", { title: "改 a.ts", instruction: "把 a 改成 2" }));
     d.script.add("worker", tool("wait", { reason: "等 CI" }));
-    const { projectId } = startProjectSync(d.kernel, { title: "改 a", outcome: "a = 2", brief: "改 a", cwd: repo });
+    const { projectId } = startProjectSync(d.kernel, { title: "改 a", outcome: "a = 2", brief: "改 a", cwd: repo }, { principalId: d.kernel.ownerPrincipal });
     await d.kernel.idle();
     const human = d.kernel.humanItems.create({ title: "看改动", subjectKey: "project-review", category: "action", options: [{ id: "done", label: "看过了", effect: "reply" }] }, projectId);
     const worker = d.kernel.listCells({ parentId: projectId })[0]!;

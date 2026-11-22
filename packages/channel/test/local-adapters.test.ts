@@ -8,7 +8,7 @@ describe("UiChannel", () => {
     const { hub, clock, received } = setup();
     const ui = new UiChannel({ clock });
     hub.register(ui);
-    const env = await ui.capture({ text: "  周五下午 3 点提醒我给牙医打电话 ", clientId: "c-1", voice: true, attachments: [{ label: "图", uri: "res://1" }] });
+    const env = await ui.capture({ text: "  周五下午 3 点提醒我给牙医打电话 ", clientId: "c-1", voice: true, attachments: [{ label: "图", uri: "res://1" }] }, "owner");
     expect(env).toEqual({
       id: "ui:c-1",
       from: "channel:ui:owner",
@@ -26,7 +26,7 @@ describe("UiChannel", () => {
     });
     expect(validatePayload(env)).toEqual({ ok: true });
     expect(received.map((r) => r.channelId)).toEqual(["ui"]);
-    await expect(ui.capture({ text: "   " })).rejects.toThrow(/empty/);
+    await expect(ui.capture({ text: "   " }, "owner")).rejects.toThrow(/empty/);
   });
 
   it("a failing sink makes capture reject, so the UI can tell the user it was not saved", async () => {
@@ -36,7 +36,7 @@ describe("UiChannel", () => {
     hub.onIngress(async () => {
       throw new Error("disk full");
     });
-    await expect(ui.capture({ text: "x" })).rejects.toThrow("disk full");
+    await expect(ui.capture({ text: "x" }, "owner")).rejects.toThrow("disk full");
   });
 
 });

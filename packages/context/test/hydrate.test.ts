@@ -81,7 +81,7 @@ describe("hydrate: frozen system prefix", () => {
         "You are the desk. Triage every inbound item.",
         '# Skills\nPlaybooks you can load on demand. Before doing one of these kinds of task, read its full instructions with read_resource("skill://<name>").\n- weekly-review: 周回顾',
         "# Skill: triage\n先判断是否零副作用",
-        "# Your bounds\nTools: read.\nMay send to: inbox:*.\nIsolation: none.\nChildren: up to 3 concurrent, 2 more level(s) of spawning.",
+        "# Your bounds\nTools: read.\nMay send to: inbox:*.\nChildren: up to 3 concurrent, 2 more level(s) of spawning.",
         "# Long-term preferences\n- language: Always answer in Chinese.",
       ].join("\n\n"),
     );
@@ -474,7 +474,7 @@ describe("hydrate: fork_prefix", () => {
       preset: "worker",
       title: "修支付回调",
       spec: { preset: "worker", contextMode: "fork_prefix", fork: { fromCellId: "desk", uptoSeq }, processor: { kind: "llm", prompt: "worker" } },
-      bounds: makeBounds({ tools: ["read", "edit", "bash"], canSendTo: ["inbox:desk"], isolation: "none" }),
+      bounds: makeBounds({ tools: ["read", "edit", "bash"], canSendTo: ["inbox:desk"] }),
     });
     h.store.appendEvidenceSync("desk", { kind: "tool_result", toolUseId: "spawn1", name: "spawn_cell", output: "inbox:fixer", runId, at: 4 });
     h.store.appendEvidenceSync("desk", { kind: "run_boundary", phase: "end", epoch: 0, outcome: "completed", runId, at: 5 });

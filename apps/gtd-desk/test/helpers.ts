@@ -1,23 +1,21 @@
-import { gtdKeys, createScriptSensor} from "@ng/presets";
-import {gtdLifecycle, writeActionRecordSync} from "@ng/presets";
+import { gtdKeys, sensorPreset, createScriptSensor } from "@ng/presets";
+import { gtdLifecycle, writeActionRecordSync } from "@ng/presets";
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryChannel } from "@ng/channel";
 import { STANDARD_TOOLSETS } from "@ng/loop";
 import { createScriptedLoop, type ModelRequest, ScriptedModelClient, type ScriptResponder, type ScriptTurn } from "@ng/loop/testing";
+import type { ActivityRecord, ProjectRecord, SourceState } from "@ng/presets/records";
 import {
   ManualClock,
   newId,
   PAYLOAD,
   subjectKeys,
   type ActionRecord,
-  type ActivityRecord,
   type Envelope,
   createRegistry,
-  type ProjectRecord,
   type Registry,
-  type SourceRecord,
 } from "@ng/protocol";
 import type { Kernel } from "@ng/cell";
 import { registerPresets } from "@ng/presets";
@@ -93,13 +91,19 @@ export function registerTestPresets(registry: Registry): void {
   const T = STANDARD_TOOLSETS;
   registry.presets.register({...gtdLifecycle,
     name: "inline",
+    approvedSpawn(record) {
+      if (record.action.type === "project.start") return {
+        spec: { id: `project-${record.actionId}`, preset: "project", processor: {kind:"llm"} },
+        task: { instruction: record.action.proposal?.outcome ?? record.action.summary },
+      };
+    },
     description: "test desk",
     defaults: { processor: { kind: "llm", toolsets: [T.context, T.comms, T.schedule, T.cells] }, meta: { role: "desk" } },
   });
   registry.presets.register({...gtdLifecycle, name: "project", projectRoot: true, description:"test project", defaults:{lifetime:"persistent",processor:{kind:"llm",toolsets:[T.context,T.comms,T.cells]},meta:{role:"project"}}});
   registry.presets.register({...gtdLifecycle, name: "worker", description: "test worker", defaults: { processor: { kind: "llm", toolsets: [T.context, T.comms] }, ccParent:true,lifetime:"wakeable",meta: { role: "worker" } } });
   registry.presets.register({...gtdLifecycle, name: "checker", description: "test checker", defaults: { processor: { kind: "llm", modelTier: "fast", toolsets: [T.context, T.comms, T.schedule] }, ccParent:true,lifetime:"one_shot",meta: { role: "checker" } } });
-  registry.presets.register({...gtdLifecycle, name: "sensor", description: "test sensor", defaults: { processor: { kind: "llm", modelTier: "fast", toolsets: [T.context, T.comms] }, meta: { role: "sensor" } } });
+  registry.presets.register({...sensorPreset(), ...gtdLifecycle, name: "sensor", description: "test sensor", defaults: { processor: { kind: "llm", modelTier: "fast", toolsets: [T.context, T.comms] }, meta: { role: "sensor" } } });
 }
 
 // ==================== a desk server on an in-memory kernel ====================
@@ -136,7 +140,7 @@ export async function bootDesk(opts: Partial<DeskServerOptions> & { clock?: Manu
   script.kernel = server.kernel;
   cleanups.push(() => server.close());
   async function req<T>(method: string, path: string, body?: unknown, headers: Record<string, string> = {}) {
-    const init: RequestInit = { method, headers: { ...(body !== undefined ? { "content-type": "application/json" } : {}), ...headers } };
+    const init: RequestInit = { method, headers: { ...(body !== undefined ? { "content-type": "application/json" } : {}), ...(server.security.generatedOwnerToken && !path.startsWith('/api/agent/') ? {authorization: `Bearer ${server.security.token}`} : {}), ...headers } };
     if (body !== undefined) init.body = JSON.stringify(body);
     const res = await server.app.request(path, init);
     const text = await res.text();
@@ -150,12 +154,12 @@ export async function bootDesk(opts: Partial<DeskServerOptions> & { clock?: Manu
     memory,
     req,
     async get<T>(path: string) {
-      const r = await req<T>("GET", path);
+      const r = await req<T>("GET", path, undefined, { authorization: `Bearer ${server.security.token}` });
       if (r.status !== 200) throw new Error(`GET ${path} → ${r.status} ${JSON.stringify(r.json)}`);
       return r.json;
     },
     async post<T>(path: string, body: unknown = {}) {
-      const r = await req<T>("POST", path, body);
+      const r = await req<T>("POST", path, body, { authorization: `Bearer ${server.security.token}` });
       if (r.status !== 200) throw new Error(`POST ${path} → ${r.status} ${JSON.stringify(r.json)}`);
       return r.json;
     },
@@ -191,8 +195,8 @@ type ProjectSetup = Partial<Omit<ProjectRecord, "lifecycle">> & {cwd?: string; l
 export function writeProject(kernel: Kernel, cellId: string, p: ProjectSetup & Pick<ProjectRecord, "title">): ProjectRecord {
   const t = kernel.clock.now();
   const { cwd, lifecycle = "active", ...fields } = p;
-  if (cwd) kernel.updateCell(cellId, { cwd });
-  if (lifecycle === "someday") kernel.control(cellId, { action: "pause", pauseReason: "parked" });
+  if (cwd) kernel.updateCell(cellId, { cwd }, { principalId: kernel.ownerPrincipal });
+  if (lifecycle === "someday") kernel.control(cellId, { action: "pause", pauseReason: "parked" }, { principalId: kernel.ownerPrincipal });
   const record: ProjectRecord = { lifecycle: lifecycle === "someday" ? "active" : lifecycle, createdAt: t, updatedAt: t, ...fields };
   kernel.context.commitSync(cellId, { statePatches: { [gtdKeys.project]: record } });
   return record;
@@ -204,9 +208,9 @@ export function writeActivity(kernel: Kernel, a: Partial<ActivityRecord> & Pick<
   return record;
 }
 
-export function writeSource(kernel: Kernel, cellId: string, s: Partial<SourceRecord> & Pick<SourceRecord, "title">): SourceRecord {
+export function writeSource(kernel: Kernel, cellId: string, s: Partial<SourceState> & Pick<SourceState, "title">): SourceState {
   const t = kernel.clock.now();
-  const record: SourceRecord = { kind: "cron", mode: "active", status: "ok", processor: "llm", runCount: 0, hitCount: 0, createdAt: t, updatedAt: t, ...s };
+  const record: SourceState = { mode: "active", runCount: 0, hitCount: 0, createdAt: t, updatedAt: t, ...s };
   kernel.context.commitSync(cellId, { statePatches: { [gtdKeys.source]: record } });
   return record;
 }
@@ -214,7 +218,7 @@ export function writeSource(kernel: Kernel, cellId: string, s: Partial<SourceRec
 /** A project root cell under the desk holding `gtd:project`. */
 export function makeProject(kernel: Kernel, title: string, p: ProjectSetup = {}): string {
   const id = newId("proj", kernel.clock);
-  kernel.spawnCell("desk", { id, preset: "project", title, meta: { projectCellId: id }, stallPolicy: "monitor" });
+  kernel.spawnCell("desk", { id, preset: "project", title, meta: { projectCellId: id }, stallPolicy: "monitor" }, undefined, { principalId: kernel.ownerPrincipal });
   writeProject(kernel, id, { title, ...p });
   return id;
 }

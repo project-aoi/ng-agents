@@ -15,7 +15,7 @@ declare module "@ng/protocol" {
      * Messages that exceeded the retry limit (release or lease expiry) and became `dead`. The kernel escalates them
      * (e.g. a card on the desk); they are never retried automatically.
      */
-    "inbox.dead": { cellId: string; claimId: string; seqs: number[]; envelopeIds: string[]; reason: string };
+    "inbox.dead": { cellId: string; claimId: string | null; seqs: number[]; envelopeIds: string[]; reason: string };
   }
 }
 

@@ -53,7 +53,7 @@ const greedySpawner: CodeProcessor = {
           preset: "worker",
           title: "greedy grandchild",
           processor: { kind: "code", entry: "test.idle" },
-          bounds: { tools: new Set(["read", "write", "edit", "bash"]), canSendTo: ["channel:*", "inbox:*"] as unknown as Address[], isolation: "none", maxDepth: 9 },
+          bounds: { tools: new Set(["read", "write", "edit", "bash"]), canSendTo: ["channel:*", "inbox:*"] as unknown as Address[], maxDepth: 9 },
         },
         "go",
       );
@@ -74,12 +74,30 @@ function setupWith(...procs: CodeProcessor[]) {
   };
 }
 
+it("rejects an omitted host identity before creating, controlling, messaging or closing a cell", async () => {
+  const {kernel} = await boot({start:false});
+  const owner = {principalId:kernel.ownerPrincipal};
+  kernel.spawnCell("desk", {id:"child",preset:"worker"}, undefined, owner);
+  for (const invoke of [
+    () => Reflect.apply(kernel.ensureRootCell, kernel, [{id:"desk",preset:"inline"}]),
+    () => Reflect.apply(kernel.spawnCell, kernel, ["desk",{id:"missing-actor",preset:"worker"}]),
+    () => Reflect.apply(kernel.updateCell, kernel, ["child",{title:"changed"}]),
+    () => Reflect.apply(kernel.control, kernel, ["child",{action:"pause"}]),
+    () => Reflect.apply(kernel.directMessage, kernel, ["child",{text:"test"}]),
+    () => Reflect.apply(kernel.sendToCell, kernel, ["child",{text:"test"}]),
+  ]) expect(invoke).toThrow(expect.objectContaining({code:"bounds_violation"}));
+  await expect(Reflect.apply(kernel.closeCell,kernel,["child","cancelled"])).rejects.toMatchObject({code:"bounds_violation"});
+  expect(kernel.getCell("child")?.status).toBe("active");
+  expect(kernel.getCell("missing-actor")).toBeUndefined();
+  expect(kernel.inbox.listMessagesSync({cellId:"child"})).toHaveLength(0);
+});
+
 describe("spawnCell", () => {
   it("attenuates: a child never gets more than its parent, whatever it asks for, and spawning from a Run is held to the same rule", async () => {
     const h = await boot({ setup: setupWith(greedySpawner, idle), desk: false });
     h.kernel.createRootCell(
       { id: "desk", preset: "inline" },
-      { bounds: { tools: ["read", "write"], canSendTo: ["channel:ui:*"], isolation: "none", maxDepth: 2, maxConcurrentChildren: 3 } },
+      { principalId: h.kernel.ownerPrincipal, bounds: { tools: ["read", "write"], canSendTo: ["channel:ui:*"], maxDepth: 2, maxConcurrentChildren: 3 } },
     );
     h.kernel.spawnCell(
       "desk",
@@ -88,16 +106,14 @@ describe("spawnCell", () => {
         preset: "inline",
         lifetime: "persistent",
         processor: { kind: "code", entry: "test.greedy" },
-        bounds: { tools: new Set(["read", "write", "bash"]), canSendTo: ["channel:*"] as unknown as Address[], isolation: "none", maxDepth: 7, maxConcurrentChildren: 99 },
+        bounds: { tools: new Set(["read", "write", "bash"]), canSendTo: ["channel:*"] as unknown as Address[], maxDepth: 7, maxConcurrentChildren: 99 },
       },
-      "go",
+      "go", { principalId: h.kernel.ownerPrincipal },
     );
     const child = h.kernel.getCell("child")!;
     expect(serializeBounds(child.bounds)).toEqual({
       tools: ["read", "write"],
       canSendTo: ["channel:ui:*", "inbox:desk"], // asked for channel:*, got the parent's narrower channel:ui:*
-
-      isolation: "none",
       maxConcurrentChildren: 3,
 
       maxDepth: 1,
@@ -115,7 +131,6 @@ describe("spawnCell", () => {
       tools: ["read", "write"],
       canSendTo: ["channel:ui:*", "inbox:child", "inbox:desk"],
 
-      isolation: "none",
       maxDepth: 0,
     });
     expect(grand).toMatchObject({ status: "active", bounds: { maxDepth: 0 } });
@@ -125,34 +140,34 @@ describe("spawnCell", () => {
 
   it("enforces maxConcurrentChildren on leaf children at work only and frees the slot on close", async () => {
     const h = await boot({ setup: setupWith(idle), desk: false });
-    h.kernel.createRootCell({ id: "desk", preset: "inline" }, { bounds: { maxConcurrentChildren: 2 } });
+    h.kernel.createRootCell({ id: "desk", preset: "inline" }, { principalId: h.kernel.ownerPrincipal, bounds: { maxConcurrentChildren: 2 } });
     // a timer of its own keeps each worker "waiting" (not dormant), so it holds a slot
     const spec = { preset: "worker" as const, processor: { kind: "code" as const, entry: "test.idle" }, schedules: [{ deliverAt: T0 + DAY }] };
-    const a = h.kernel.spawnCell("desk", spec);
-    const b = h.kernel.spawnCell("desk", spec);
+    const a = h.kernel.spawnCell("desk", spec, undefined, { principalId: h.kernel.ownerPrincipal });
+    const b = h.kernel.spawnCell("desk", spec, undefined, { principalId: h.kernel.ownerPrincipal });
     expect([a, b].map((x) => h.kernel.activityOf([x.slice(6)]).get(x.slice(6))!.state)).toEqual(["waiting", "waiting"]);
-    expectNgError(() => h.kernel.spawnCell("desk", spec), "bounds_violation", /already has 2 children at work \(maxConcurrentChildren 2\)/);
+    expectNgError(() => h.kernel.spawnCell("desk", spec, undefined, { principalId: h.kernel.ownerPrincipal }), "bounds_violation", /already has 2 children at work \(maxConcurrentChildren 2\)/);
     // docs/05 §3.1: the cap is on execution — persistent children (projects, hubs) never take a slot ...
-    const proj = h.kernel.spawnCell("desk", { preset: "project", processor: { kind: "code", entry: "test.idle" } });
-    h.kernel.spawnCell("desk", { preset: "hub", processor: { kind: "code", entry: "test.idle" } });
+    const proj = h.kernel.spawnCell("desk", { preset: "project", processor: { kind: "code", entry: "test.idle" } }, undefined, { principalId: h.kernel.ownerPrincipal });
+    h.kernel.spawnCell("desk", { preset: "hub", processor: { kind: "code", entry: "test.idle" } }, undefined, { principalId: h.kernel.ownerPrincipal });
     expect(h.kernel.getCell(proj.slice(6))!.spec.lifetime).toBe("persistent");
-    expectNgError(() => h.kernel.spawnCell("desk", spec), "bounds_violation", /already has 2 children at work/);
+    expectNgError(() => h.kernel.spawnCell("desk", spec, undefined, { principalId: h.kernel.ownerPrincipal }), "bounds_violation", /already has 2 children at work/);
     // ... and neither does a paused leaf
-    h.kernel.control(a.slice(6), { action: "pause" });
-    const c = h.kernel.spawnCell("desk", spec);
-    expectNgError(() => h.kernel.spawnCell("desk", spec), "bounds_violation", /already has 2 children at work/);
-    await h.kernel.closeCell(b.slice(6), "completed");
-    expect(() => h.kernel.spawnCell("desk", spec)).not.toThrow();
+    h.kernel.control(a.slice(6), { action: "pause" }, { principalId: h.kernel.ownerPrincipal });
+    const c = h.kernel.spawnCell("desk", spec, undefined, { principalId: h.kernel.ownerPrincipal });
+    expectNgError(() => h.kernel.spawnCell("desk", spec, undefined, { principalId: h.kernel.ownerPrincipal }), "bounds_violation", /already has 2 children at work/);
+    await h.kernel.closeCell(b.slice(6), "completed", { principalId: h.kernel.ownerPrincipal });
+    expect(() => h.kernel.spawnCell("desk", spec, undefined, { principalId: h.kernel.ownerPrincipal })).not.toThrow();
     expect(h.kernel.listCells({ parentId: "desk", status: ["active"] }).filter((x) => x.spec.lifetime === "wakeable").map((x) => x.id)).toHaveLength(2);
     expect(h.kernel.getCell(c.slice(6))!.status).toBe("active");
   });
 
   it("maxDepth 0: no children, and the spawn tools are not even offered to the model", async () => {
     const h = await boot({ desk: false });
-    h.kernel.createRootCell({ id: "desk", preset: "inline" }, { bounds: { maxDepth: 1 } });
-    h.kernel.spawnCell("desk", { id: "leaf", preset: "worker", processor: { kind: "llm", toolsets: ["kernel.cells", "kernel.comms"] } }, "do it");
+    h.kernel.createRootCell({ id: "desk", preset: "inline" }, { principalId: h.kernel.ownerPrincipal, bounds: { maxDepth: 1 } });
+    h.kernel.spawnCell("desk", { id: "leaf", preset: "worker", processor: { kind: "llm", toolsets: ["kernel.cells", "kernel.comms"] } }, "do it", { principalId: h.kernel.ownerPrincipal });
     expect(h.kernel.getCell("leaf")!.bounds.maxDepth).toBe(0);
-    expectNgError(() => h.kernel.spawnCell("leaf", { preset: "worker" }), "bounds_violation", /maxDepth 0/);
+    expectNgError(() => h.kernel.spawnCell("leaf", { preset: "worker" }, undefined, { principalId: h.kernel.ownerPrincipal }), "bounds_violation", /maxDepth 0/);
     await h.kernel.idle();
     const [req] = h.script.callsOf("worker");
     expect(req!.tools.map((t) => t.name)).not.toContain("spawn_cell");
@@ -170,15 +185,15 @@ describe("spawnCell", () => {
     h.kernel.context.upsertSkillOrNoteSync("desk", {
       kind:"preference", name:"new-role", description:"Release checklist", body:"Use the release checklist.", scope:"global", mode:"upsert", applies:{roles:["release-lead"]},
     });
-    await h.ui.capture({text:"prepare work"}); await h.kernel.idle();
+    await h.ui.capture({text:"prepare work"}, "owner"); await h.kernel.idle();
     upto = h.kernel.context.lastEvidenceSeqSync("desk");
     hash = get<{hash:string}>(h.kernel.db,"SELECT hash FROM prompt_prefixes WHERE cell_id='desk'")!.hash;
     h.kernel.context.commitSync("desk",{statePatches:{"cli:session":{sessionId:"parent-run",systemHash:hash,lastDeliveredEvidenceSeq:upto}}});
-    h.kernel.spawnCell("desk",{id:"forked",preset:"project",contextMode:"fork_prefix",processor:{kind:"code",entry:probe.name}},"inspect");
+    h.kernel.spawnCell("desk",{id:"forked",preset:"project",contextMode:"fork_prefix",processor:{kind:"code",entry:probe.name}},"inspect", { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     expect(checks[0]).toMatchObject({canFork:true});
-    h.kernel.updateCell("desk",{meta:{role:"release-lead"}});
-    h.kernel.sendToCell("forked",{text:"check the role"});
+    h.kernel.updateCell("desk",{meta:{role:"release-lead"}}, { principalId: h.kernel.ownerPrincipal });
+    h.kernel.sendToCell("forked",{text:"check the role"}, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     expect(checks[1]).toMatchObject({canFork:false,prefix:expect.stringContaining("Use the release checklist.")});
   });
@@ -186,14 +201,14 @@ describe("spawnCell", () => {
   it("a fork_prefix child records the parent's evidence position; meta.projectCellId is inherited", async () => {
     const h = await boot({ setup: setupWith(idle) });
     h.script.add("desk", { text: "let me think" });
-    await h.ui.capture({ text: "讨论一下这个 bug" });
+    await h.ui.capture({ text: "讨论一下这个 bug" }, "owner");
     await h.kernel.idle();
     const upto = h.kernel.context.lastEvidenceSeqSync("desk");
     expect(upto).toBeGreaterThan(0);
-    h.kernel.spawnCell("desk", { id: "proj", preset: "project", processor: { kind: "code", entry: "test.idle" }, meta: { projectCellId: "proj" } });
-    h.kernel.spawnCell("proj", { id: "fix", preset: "worker", contextMode: "fork_prefix", processor: { kind: "code", entry: "test.idle" } });
+    h.kernel.spawnCell("desk", { id: "proj", preset: "project", processor: { kind: "code", entry: "test.idle" }, meta: { projectCellId: "proj" } }, undefined, { principalId: h.kernel.ownerPrincipal });
+    h.kernel.spawnCell("proj", { id: "fix", preset: "worker", contextMode: "fork_prefix", processor: { kind: "code", entry: "test.idle" } }, undefined, { principalId: h.kernel.ownerPrincipal });
     expect(h.kernel.getCell("fix")!.spec).toMatchObject({ fork: { fromCellId: "proj", uptoSeq: 0 }, meta: { projectCellId: "proj" }, parentId: "proj" });
-    h.kernel.spawnCell("desk", { id: "fork2", preset: "worker", contextMode: "fork_prefix", processor: { kind: "code", entry: "test.idle" } });
+    h.kernel.spawnCell("desk", { id: "fork2", preset: "worker", contextMode: "fork_prefix", processor: { kind: "code", entry: "test.idle" } }, undefined, { principalId: h.kernel.ownerPrincipal });
     expect(h.kernel.getCell("fork2")!.spec.fork).toEqual({ fromCellId: "desk", uptoSeq: upto });
   });
 });
@@ -202,14 +217,14 @@ describe("updateCell", () => {
   it("owner may widen within the parent (授权 1 对 1 直连); a cell may only narrow; narrowing cascades down", async () => {
     const h = await boot({ setup: setupWith(idle) });
     // given spawn depth (a worker has none by default) so the narrowing can be seen to cascade
-    h.kernel.spawnCell("desk", { id: "w", preset: "inline", processor: { kind: "code", entry: "test.idle" }, bounds: { maxDepth: 1 } });
-    h.kernel.spawnCell("w", { id: "ww", preset: "worker", processor: { kind: "code", entry: "test.idle" }, bounds: { tools: new Set(["read", "bash"]) } });
+    h.kernel.spawnCell("desk", { id: "w", preset: "inline", processor: { kind: "code", entry: "test.idle" }, bounds: { maxDepth: 1 } }, undefined, { principalId: h.kernel.ownerPrincipal });
+    h.kernel.spawnCell("w", { id: "ww", preset: "worker", processor: { kind: "code", entry: "test.idle" }, bounds: { tools: new Set(["read", "bash"]) } }, undefined, { principalId: h.kernel.ownerPrincipal });
     // the desk holds `inbox:*` (DEFAULT_ROOT_BOUNDS): internal messaging inside the tree is inherited; no channel unasked
     expect(h.kernel.getCell("w")!.bounds.canSendTo).toEqual(["inbox:*"]);
     expect(h.kernel.getCell("ww")!.bounds.canSendTo).toEqual(["inbox:*"]);
 
     // owner grants the direct line + a thread watch
-    h.kernel.updateCell("w", { bounds: { canSendTo: ["inbox:desk", "channel:ui:owner"] }, watches: [{ threadOrFilter: { thread: "ui:direct-w" } }] });
+    h.kernel.updateCell("w", { bounds: { canSendTo: ["inbox:desk", "channel:ui:owner"] }, watches: [{ threadOrFilter: { thread: "ui:direct-w" } }] }, { principalId: h.kernel.ownerPrincipal });
     expect(h.kernel.getCell("w")!.bounds.canSendTo).toEqual(["channel:ui:owner", "inbox:*"]);
 
     // the parent cell can narrow (the channel is gone) but not widen (channel:memory:* is not granted); the inbox
@@ -233,7 +248,7 @@ describe("updateCell", () => {
     // ...and nothing of a cell that is not its descendant (a child may not touch its parent)
     expectNgError(() => h.kernel.updateCell("w", { title: "y" }, { principalId: "cell:ww" }), "bounds_violation", /own descendants/);
     expect(h.kernel.getCell("w")!.title).toBe("x");
-    expectNgError(() => h.kernel.updateCell("w", { preset: "checker" }), "invalid_argument", /cannot change "preset"/);
+    expectNgError(() => h.kernel.updateCell("w", { preset: "checker" }, { principalId: h.kernel.ownerPrincipal }), "invalid_argument", /cannot change "preset"/);
   });
 
   it("replaces watches; schedules are diffed so an unchanged timer is untouched and a removed one is cancelled", async () => {
@@ -241,14 +256,14 @@ describe("updateCell", () => {
     const keep = { deliverAt: T0 + DAY };
     const drop = { deliverAt: T0 + 2 * DAY, cancelGroup: "x" };
     const cron = { cron: "0 9 * * 1" };
-    h.kernel.spawnCell("desk", { id: "s", preset: "worker", processor: { kind: "code", entry: "test.idle" }, schedules: [keep, drop, cron], watches: [{ threadOrFilter: { thread: "memory:a" } }] });
+    h.kernel.spawnCell("desk", { id: "s", preset: "worker", processor: { kind: "code", entry: "test.idle" }, schedules: [keep, drop, cron], watches: [{ threadOrFilter: { thread: "memory:a" } }] }, undefined, { principalId: h.kernel.ownerPrincipal });
     const keepId = scheduleEnvelopeId("s", keep);
     const keepRow = h.kernel.inbox.listMessagesSync({ cellId: "s", envelopeId: keepId })[0]!;
     expect(keepRow.status).toBe("pending");
     expect(h.kernel.inbox.listSchedulesSync({ cellId: "s", activeOnly: true })).toHaveLength(1);
 
     const added = { deliverAt: T0 + 3 * DAY };
-    h.kernel.updateCell("s", { schedules: [keep, added], watches: [{ threadOrFilter: { thread: "memory:b" } }] });
+    h.kernel.updateCell("s", { schedules: [keep, added], watches: [{ threadOrFilter: { thread: "memory:b" } }] }, { principalId: h.kernel.ownerPrincipal });
     expect(h.kernel.inbox.listMessagesSync({ cellId: "s", envelopeId: keepId })[0]).toEqual(keepRow);
     expect(h.kernel.inbox.listMessagesSync({ cellId: "s", envelopeId: scheduleEnvelopeId("s", drop) })[0]!.status).toBe("cancelled");
     expect(h.kernel.inbox.listSchedulesSync({ cellId: "s", activeOnly: true })).toHaveLength(0);
@@ -257,7 +272,7 @@ describe("updateCell", () => {
     expect(h.count("cell_watches WHERE cell_id = 's' AND active = 1")).toBe(1);
 
     // a removed deliverAt rule that comes back gets a fresh row instead of being swallowed by dedupe
-    h.kernel.updateCell("s", { schedules: [keep, added, drop] });
+    h.kernel.updateCell("s", { schedules: [keep, added, drop] }, { principalId: h.kernel.ownerPrincipal });
     const again = h.kernel.inbox.listMessagesSync({ cellId: "s", status: ["pending"] }).map((m) => m.envelope.id);
     expect(again).toContain(`${scheduleEnvelopeId("s", drop)}~1`);
   });
@@ -266,15 +281,15 @@ describe("updateCell", () => {
 describe("closeCell", () => {
   it("cascade leaves nothing running: no pending rows, schedules, watches, approvals or jobs; the directory is left as it was; late results are dropped", async () => {
     const h = await boot({ setup: setupWith(startJob, idle) });
-    h.kernel.spawnCell("desk", { id: "proj", preset: "project", processor: { kind: "code", entry: "test.idle" }, meta: { projectCellId: "proj" } });
+    h.kernel.spawnCell("desk", { id: "proj", preset: "project", processor: { kind: "code", entry: "test.idle" }, meta: { projectCellId: "proj" } }, undefined, { principalId: h.kernel.ownerPrincipal });
     h.kernel.spawnCell("proj", {
       id: "watch",
       preset: "checker",
       processor: { kind: "code", entry: "test.idle" },
       watches: [{ threadOrFilter: { thread: "memory:t1" }, cancelGroup: "w" }],
       schedules: [{ deliverAt: T0 + DAY, cancelGroup: "timeout" }, { cron: "*/5 * * * *" }],
-    });
-    h.kernel.spawnCell("proj", { id: "build", preset: "worker", processor: { kind: "code", entry: "test.start_job", args: { command: "sleep 30" } } }, "build it");
+    }, undefined, { principalId: h.kernel.ownerPrincipal });
+    h.kernel.spawnCell("proj", { id: "build", preset: "worker", processor: { kind: "code", entry: "test.start_job", args: { command: "sleep 30" } } }, "build it", { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     await waitFor(() => h.kernel.workspace.listJobsSync({ cellId: "build", state: ["running"] }).length === 1, 10_000, "job running");
     // docs/05: a host cell nobody gave a directory works in the kernel's own per-cell directory
@@ -288,11 +303,11 @@ describe("closeCell", () => {
       { cellId: "watch", principalId: "cell:watch", epoch: 0 },
     );
     expect(r.type).toBe("defer");
-    h.kernel.control("watch", { action: "pause" });
+    h.kernel.control("watch", { action: "pause" }, { principalId: h.kernel.ownerPrincipal });
     await h.memory.inject({ from: "carol", text: "route to desk while paused", threads: ["memory:t1"] });
     const epochs = Object.fromEntries(["proj", "watch", "build"].map((id) => [id, h.kernel.getCell(id)!.epoch]));
 
-    const res = await h.kernel.closeCell("proj", "cancelled");
+    const res = await h.kernel.closeCell("proj", "cancelled", { principalId: h.kernel.ownerPrincipal });
     expect(res.closed.sort()).toEqual(["build", "proj", "watch"]);
     const ids = ["proj", "watch", "build"];
     for (const id of ids) {
@@ -330,14 +345,14 @@ describe("closeCell", () => {
 
   it("pausing the parent through the inbox stops descendant runs and jobs, including a job just launched", async () => {
     const { kernel, clock, script } = await boot({ setup: setupWith(startJob) });
-    kernel.spawnCell("desk", { id: "project", preset: "project" });
+    kernel.spawnCell("desk", { id: "project", preset: "project" }, undefined, { principalId: kernel.ownerPrincipal });
     script.add("worker", { text: "waiting", delayMs: 60_000 });
-    kernel.spawnCell("project", { id: "worker", preset: "worker" }, "work");
+    kernel.spawnCell("project", { id: "worker", preset: "worker" }, "work", { principalId: kernel.ownerPrincipal });
     await waitFor(() => script.callsOf("worker").length > 0, 5_000, "worker's run");
     kernel.bus.on("job.changed", event => {
       if (event.state === "running") kernel.inbox.controlSync("project", { action: "pause", principalId: "owner" });
     });
-    kernel.spawnCell("project", { id: "job", preset: "worker", processor: { kind: "code", entry: startJob.name } }, "build");
+    kernel.spawnCell("project", { id: "job", preset: "worker", processor: { kind: "code", entry: startJob.name } }, "build", { principalId: kernel.ownerPrincipal });
     await kernel.idle({ jobs: true });
     expect(kernel.activeRuns()).toHaveLength(0);
     expect(["project", "worker", "job"].map(id => kernel.getCell(id)?.status)).toEqual(["paused", "paused", "paused"]);
@@ -352,11 +367,11 @@ describe("closeCell", () => {
 
   it("a cancelled worker's Job is killed and its late job.result is dropped by the epoch (control cancel)", async () => {
     const h = await boot({ setup: setupWith(startJob) });
-    h.kernel.spawnCell("desk", { id: "w", preset: "worker", processor: { kind: "code", entry: "test.start_job", args: { command: "sleep 30" } } }, "go");
+    h.kernel.spawnCell("desk", { id: "w", preset: "worker", processor: { kind: "code", entry: "test.start_job", args: { command: "sleep 30" } } }, "go", { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     await waitFor(() => h.kernel.workspace.listJobsSync({ cellId: "w", state: ["running"] }).length === 1, 10_000, "job running");
     const t0 = Date.now();
-    expect(h.kernel.control("w", { action: "cancel" })).toMatchObject({ applied: true });
+    expect(h.kernel.control("w", { action: "cancel" }, { principalId: h.kernel.ownerPrincipal })).toMatchObject({ applied: true });
     await h.kernel.idle({ jobs: true });
     expect(Date.now() - t0).toBeLessThan(5_000);
     expect(h.kernel.getCell("w")).toMatchObject({ status: "closed", closeReason: "cancelled" });
@@ -375,20 +390,20 @@ describe("closeCell", () => {
     const results = () => h.kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.cellResult }).map((m) => (m.envelope.payload as CellResultPayload).summary);
     // a one-shot probe: the kernel delivers its single final result and closes it in the same transaction
     h.script.add("checker", tool("report_to_parent", { kind: "result", text: "做完了" }));
-    h.kernel.spawnCell("desk", { id: "a", preset: "checker" }, "work");
+    h.kernel.spawnCell("desk", { id: "a", preset: "checker" }, "work", { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     expect(h.kernel.getCell("a")).toMatchObject({ status: "closed", closeReason: "completed" });
     expect(h.kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.cellResult }).map((m) => m.envelope.id)).toEqual([finalResultEnvelopeId("a", 0)]);
-    expect(await h.kernel.closeCell("a", "completed")).toEqual({ closed: [] });
+    expect(await h.kernel.closeCell("a", "completed", { principalId: h.kernel.ownerPrincipal })).toEqual({ closed: [] });
     expect(results()).toEqual(["做完了"]);
 
     // a wakeable worker reports its turn and stays; when the owner closes it later the parent is told it is gone, and
     // that its turns were already reported (no result is outstanding)
     h.script.add("worker", tool("report_to_parent", { kind: "result", text: "第一轮完成" }));
-    h.kernel.spawnCell("desk", { id: "w", preset: "worker" }, "work");
+    h.kernel.spawnCell("desk", { id: "w", preset: "worker" }, "work", { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     expect(h.kernel.getCell("w")!.status).toBe("active");
-    await h.kernel.closeCell("w", "completed");
+    await h.kernel.closeCell("w", "completed", { principalId: h.kernel.ownerPrincipal });
     expect(results()).toEqual(["做完了", "第一轮完成", "Closed (completed) by owner; its turns were already reported."]);
     expect(h.kernel.inbox.listMessagesSync({ cellId: "desk", envelopeId: "w:0:closed" })[0]!.envelope.payload).toMatchObject({
       status: "completed",
@@ -399,26 +414,26 @@ describe("closeCell", () => {
     // a persistent child reports an interim result at once and stays open; when the owner closes it later the parent is
     // told — an earlier phase report is not the cell's final word
     h.script.add("p", tool("report_to_parent", { kind: "result", text: "阶段一完成" }));
-    h.kernel.spawnCell("desk", { id: "p", preset: "inline", lifetime: "persistent", meta: { role: "p" } }, "phase one");
+    h.kernel.spawnCell("desk", { id: "p", preset: "inline", lifetime: "persistent", meta: { role: "p" } }, "phase one", { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     expect(h.kernel.getCell("p")!.status).toBe("active");
-    await h.kernel.closeCell("p", "completed");
+    await h.kernel.closeCell("p", "completed", { principalId: h.kernel.ownerPrincipal });
     expect(results().slice(3)).toEqual(["阶段一完成", "Closed (completed) by owner before it reported a result."]);
     expect(h.kernel.inbox.listMessagesSync({ cellId: "desk", envelopeId: "p:0:closed" })).toHaveLength(1);
 
     // the parent closing its own child: no synthetic report
-    h.kernel.spawnCell("desk", { id: "b", preset: "worker", processor: { kind: "code", entry: "test.idle" } });
+    h.kernel.spawnCell("desk", { id: "b", preset: "worker", processor: { kind: "code", entry: "test.idle" } }, undefined, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.closeCell("b", "completed", { principalId: "cell:desk" });
     expect(results()).toHaveLength(5);
     // the owner closing it: the parent is told
-    h.kernel.spawnCell("desk", { id: "c", preset: "worker", processor: { kind: "code", entry: "test.idle" } });
-    await h.kernel.closeCell("c", "completed");
+    h.kernel.spawnCell("desk", { id: "c", preset: "worker", processor: { kind: "code", entry: "test.idle" } }, undefined, { principalId: h.kernel.ownerPrincipal });
+    await h.kernel.closeCell("c", "completed", { principalId: h.kernel.ownerPrincipal });
     expect(results()).toHaveLength(6);
     expect(h.kernel.inbox.listMessagesSync({ cellId: "desk", envelopeId: "c:0:closed" })[0]!.envelope.payload).toMatchObject({ status: "completed", data: { synthetic: true } });
 
     // closing twice is a no-op; a non-ancestor cell may not close
-    expect(await h.kernel.closeCell("c")).toEqual({ closed: [] });
-    h.kernel.spawnCell("desk", { id: "d", preset: "worker", processor: { kind: "code", entry: "test.idle" } });
+    expect(await h.kernel.closeCell("c", undefined, { principalId: h.kernel.ownerPrincipal })).toEqual({ closed: [] });
+    h.kernel.spawnCell("desk", { id: "d", preset: "worker", processor: { kind: "code", entry: "test.idle" } }, undefined, { principalId: h.kernel.ownerPrincipal });
     await expect(h.kernel.closeCell("d", "cancelled", { principalId: "cell:a" })).rejects.toThrow(/own descendants/);
     expect(HOUR).toBeGreaterThan(0);
   });
