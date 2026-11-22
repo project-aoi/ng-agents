@@ -96,7 +96,7 @@ describe("Radar projection — docs/05", () => {
     const { kernel } = await bootDesk();
     const p = makeProject(kernel, "竞品调研", { summary: "A、B 两家已整理完", cwd: process.cwd() });
     kernel.updateCell(p,{cwd:process.cwd()});
-    kernel.spawnCell(p, { id: "w1", preset: "worker", title: "扒 A 公司" });
+    kernel.spawnCell(p, { id: "w1", preset: "inline", title: "扒 A 公司" });
     kernel.spawnCell("w1", { id: "w1a", preset: "worker", title: "扒 A 的定价" });
     kernel.spawnCell(p, { id: "wt", preset: "checker", title: "等 C 报价", watches: [{ threadOrFilter: { thread: "memory:quote-c" } }] });
     const radar = projectRadar(view(kernel));

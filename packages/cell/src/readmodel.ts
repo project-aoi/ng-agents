@@ -1,4 +1,4 @@
-import {
+import { inboxAddr,
   all,
   get,
   CELL_STATUS_KEY,
@@ -12,7 +12,7 @@ import {
   type WorkspaceOccupancy,
   type WorkspaceUser,
 } from "@ng/protocol";
-import type { KernelCore } from "./core";
+import { isProjectRoot, type KernelCore } from "./core";
 import type { AnchorReport, CellActivity, CellNode, KernelStats, RosterEntry } from "./types";
 import { waitTargetCell, type WaitRecord } from "./waits";
 import { effectiveCwd, workTreeKey } from "./workdir";
@@ -117,7 +117,7 @@ export function createReadModel(core: KernelCore): ReadModel {
     const schedules = perCell ? cellIds.flatMap((cellId) => inbox.listSchedulesSync({ cellId, activeOnly: true })) : inbox.listSchedulesSync({ activeOnly: true });
     for (const s of schedules) timer(s.cellId, s.nextFireAt);
     const pending = all<{cell_id:string; count:number}>(db, `SELECT cell_id, COUNT(*) AS count FROM human_items
-      WHERE cell_id IS NOT NULL AND status IN ('pending','snoozed') GROUP BY cell_id`);
+      WHERE cell_id IS NOT NULL AND category='decision' AND status IN ('pending','snoozed') GROUP BY cell_id`);
     for (const a of pending) if (keep(a.cell_id)) f.pending.set(a.cell_id, a.count);
     return f;
   }
@@ -450,8 +450,8 @@ export function createReadModel(core: KernelCore): ReadModel {
 
     const f = cachedFacts ?? facts();
     const working = new Set(core.dispatcher.running().filter(r => !r.stallOnly).map(r => r.cellId));
-    const cards = all<{cell_id:string; category:string; related_project_ids:string}>(db, `SELECT cell_id, category, related_project_ids FROM human_items
-      WHERE cell_id IS NOT NULL AND status IN ('pending','snoozed')`);
+    const cards = all<{cell_id:string; subject_key:string; related_project_ids:string}>(db, `SELECT cell_id, subject_key, related_project_ids FROM human_items
+      WHERE cell_id IS NOT NULL AND category='decision' AND status IN ('pending','snoozed')`);
     const cardOwners = new Set(cards.map(card => card.cell_id));
     const hasSource = (id: string) => working.has(id) || f.jobs.has(id) || f.due.has(id) || f.watching.has(id) || f.nextTimer.has(id) || cardOwners.has(id);
     const requests = inbox.listMessagesSync({status:["pending","claimed"]}).filter(m => m.envelope.delivery !== "silent_inject" &&
@@ -463,10 +463,13 @@ export function createReadModel(core: KernelCore): ReadModel {
       if (!localCells.has(target) && !isLeafLifetime(t.spec.lifetime)) {
         // An outside coordinator must have work for this particular requester.
         const owner = cells.require(from);
-        const project = owner.preset === "project" ? from : projectCellIdOf(owner.spec) ?? cells.ancestors(from).find(c => c.preset === "project")?.id;
+        const project = isProjectRoot(core.registry, owner) ? from : projectCellIdOf(owner.spec) ?? cells.ancestors(from).find(c => isProjectRoot(core.registry, c))?.id;
         if (requests.some(m => m.cellId === target && waitTargetCell(m.envelope.from) === from)) return true;
+        const refs = new Set(internal.filter(w => w.cellId === from && w.waitingFor === inboxAddr(target))
+          .flatMap(w => [w.refId, w.waitId]).filter(Boolean));
+        if (cards.some(c => c.cell_id === target && (c.subject_key === `cell:${from}` || refs.has(c.subject_key) ||
+          (project && JSON.parse(c.related_project_ids).includes(project))))) return true;
         if (!project) return false;
-        if (cards.some(c => c.cell_id === target && c.category === "decision" && JSON.parse(c.related_project_ids).includes(project))) return true;
         return cells.children(target,{status:["active"]}).some(c => isLeafLifetime(c.spec.lifetime) &&
           Array.isArray(c.spec.meta?.relatedProjectIds) && c.spec.meta.relatedProjectIds.includes(project) && canAnswer(target, c.id, path));
       }
@@ -480,19 +483,19 @@ export function createReadModel(core: KernelCore): ReadModel {
     const empty: AnchorReport = { cellId, agent: false, external: false, internal: false, human: false, parked: true, stalled: false, detail: "no such cell" };
     if (!root) return empty;
 
+    if (root.status !== "active" || cells.ancestors(cellId).some(c => c.status !== "active")) {
+      return { ...empty, detail: "cell or ancestor is inactive" };
+    }
     const subtree = [root, ...cells.descendants(cellId, { status: ["active", "paused"] })].filter((c) => c.status !== "closed");
     const ids = subtree.map((c) => c.id);
     const idSet = new Set(ids);
-    const projectId = root.preset === "project" ? cellId : projectCellIdOf(root.spec) ?? cells.ancestors(cellId).find(c=>c.preset==="project")?.id;
+    const projectId = isProjectRoot(core.registry, root) ? cellId : projectCellIdOf(root.spec) ?? cells.ancestors(cellId).find(c=>isProjectRoot(core.registry, c))?.id;
     const why: string[] = [];
-
-    const parked = root.status !== "active" || cells.ancestors(cellId).some(c => c.status === "paused");
-    if (parked) why.push("cell or ancestor is parked");
 
     // Descendants are ordered by depth. A manually parked ancestor suspends its whole branch.
     const active = new Set<string>();
     for (const cell of subtree) {
-      if (!parked && cell.status === "active" && (cell.id === cellId || active.has(cell.parentId!))) active.add(cell.id);
+      if (cell.status === "active" && (cell.id === cellId || active.has(cell.parentId!))) active.add(cell.id);
     }
     const available = [...active];
     const waits = core.waits.list(ids);
@@ -510,20 +513,21 @@ export function createReadModel(core: KernelCore): ReadModel {
 
     // 4. @Human — a card, or an open action that is the owner's to do.
     // A card about this project is the owner's ball whoever holds it (the desk raises some on a project's behalf).
-    const open=all<{action_id:string;cell_id:string|null;related_project_ids:string;subject_key:string}>(db,
-      "SELECT action_id,cell_id,related_project_ids,subject_key FROM human_items WHERE status IN ('pending','snoozed')");
+    const open=all<{action_id:string;cell_id:string|null;related_project_ids:string;subject_key:string;category:string}>(db,
+      "SELECT action_id,cell_id,related_project_ids,subject_key,category FROM human_items WHERE status IN ('pending','snoozed')");
     const cards=open.filter(h=>(h.cell_id && idSet.has(h.cell_id)) || (JSON.parse(h.related_project_ids) as string[]).includes(projectId ?? cellId));
-    const human = cards.length > 0;
+    const stranded = waits.some(w => waitTargetCell(w.waitingFor) !== null && !backed.includes(w));
+    const human = cards.some(card => !stranded || card.category === "decision");
     if (human) why.push(`${cards.length} card(s) await the owner`);
 
-    const stalled = !parked && !agent && !external && !internal && !human;
+    const stalled = !agent && !external && !internal && !human;
     return {
       cellId,
       agent: agent !== undefined,
       external: external !== undefined,
       internal,
       human,
-      parked,
+      parked: false,
       stalled,
       detail: stalled ? "nothing is running or queued, no watch or timer is set, no open wait points at a live cell, and the owner has no card or open action" : why.join("; "),
     };

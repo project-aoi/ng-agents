@@ -4,6 +4,22 @@ import { boot, cleanupAll, HOUR } from "./helpers";
 
 afterEach(cleanupAll);
 
+it("scopes matching subjects to their issuer when refreshing or undoing a decision", async () => {
+  const { kernel } = await boot({ start: false });
+  kernel.spawnCell("desk", { id: "sibling", preset: "worker" });
+  const draft = { title: "确认", subjectKey: "shared", options: [{ id: "yes", label: "同意", effect: "reply" as const }] };
+  const first = kernel.humanItems.create(draft, "desk");
+  const other = kernel.humanItems.create({ ...draft, title: "另一项确认" }, "sibling");
+  expect(other.id).not.toBe(first.id);
+  const updated = kernel.humanItems.create({ ...draft, title: "更新确认" }, "desk");
+  expect(updated.id).toBe(first.id);
+  expect(kernel.humanItems.get(other.id)).toMatchObject({ title: "另一项确认", itemRevision: 1 });
+  const decision = await kernel.humanItems.decide(first.id, { optionId: "yes", seenItemRevision: updated.itemRevision }, "owner");
+  await kernel.humanItems.undo(decision.activityId!, "owner");
+  expect(kernel.humanItems.get(first.id)?.status).toBe("pending");
+  expect(kernel.humanItems.get(other.id)).toMatchObject({ status: "pending", itemRevision: 1 });
+});
+
 it("commits one of two competing choices with its exact callback and preserves the losing choice as a conflict", async () => {
   const { kernel } = await boot();
   const item = kernel.humanItems.create(
@@ -217,6 +233,39 @@ it("a direct owner message clears one named wait even when its reference is abse
   expect(kernel.listWaits(["helper"])).toEqual([]);
 });
 
+it("keeps human waits through silent copies and ignores replies addressed to another wait", async () => {
+  const {kernel, script, clock} = await boot();
+  script.add("project", {toolCalls: [{name: "wait", input: {waitingFor: "human", waitId: "review", reason: "等评审"}}]});
+  kernel.spawnCell("desk", {id: "project", preset: "project"}, "review changes");
+  kernel.spawnCell("project", {id: "leaf", preset: "worker"});
+  await kernel.idle();
+  kernel.directMessage("leaf", {text: "先继续", clientId: "chat"});
+  kernel.inbox.enqueueSync("project", {id: "wake", from: "timer:project", principalId: "owner", kind: "event",
+    type: PAYLOAD.timerFired, payload: {label: "check"}, createdAt: clock.now()});
+  await kernel.idle();
+  expect(kernel.listWaits(["project"])).toMatchObject([{waitId: "review"}]);
+  for (const mode of ["enqueue", "steer"] as const) {
+    kernel.directMessage("project", {mode, text: "这是另一件事", replyToId: "another"});
+    await kernel.idle();
+    expect(kernel.listWaits(["project"])).toMatchObject([{waitId: "review"}]);
+  }
+  kernel.directMessage("project", {mode: "steer", text: "评审完了", replyToId: "review"});
+  await kernel.idle();
+  expect(kernel.listWaits(["project"])).toEqual([]);
+});
+
+it("acknowledges a retried message after the worker closed without reopening it", async () => {
+  const {kernel} = await boot({start:false});
+  kernel.spawnCell("desk", {id: "worker", preset: "worker"});
+  const message = {text: "核对交付物", clientId: "same-message"};
+  expect(kernel.directMessage("worker", message)).toMatchObject({duplicate: false});
+  await kernel.closeCell("worker", "completed");
+  const closed = kernel.getCell("worker")!;
+  expect(kernel.directMessage("worker", message)).toMatchObject({duplicate:true, reopened:false, targetStatus:"closed"});
+  expect(kernel.getCell("worker")).toMatchObject({epoch:closed.epoch, status:"closed"});
+  expect(kernel.inbox.listMessagesSync({cellId:"desk",type:PAYLOAD.cellDirectChat})).toHaveLength(1);
+});
+
 it("copies a direct message according to ccParent independently of lifetime", async () => {
   const { kernel } = await boot({ start: false });
   kernel.spawnCell("desk", { id: "listener", preset: "inline", ccParent: true, lifetime: "persistent" });
@@ -249,4 +298,31 @@ it("routes a subtree's cancel receipt to desk, restores the reopened epoch, and 
   expect(kernel.inbox.claimNextRunSync("desk", "test", 10_000)).toBeTruthy();
   await expect(kernel.humanItems.undo(again, "owner")).rejects.toThrow("reopen_project");
   expect(kernel.getCell("project")?.status).toBe("closed");
+});
+
+it("issues a correction when undo reopens the project but its issuing probe is archived", async () => {
+  const {kernel, of} = await boot({start: false});
+  kernel.spawnCell("desk", {id: "project", preset: "project"});
+  kernel.spawnCell("project", {id: "probe", preset: "checker"});
+  const other = kernel.humanItems.create({title: "另一项决定", subjectKey: "review:scope", options: [{id:"reply",label:"回答",effect:"reply"}]}, "probe");
+  const item = kernel.humanItems.create({title: "结束项目", subjectKey: "review:end", relatedProjectIds: ["project"],
+    options: [{id:"end",label:"结束",effect:"terminate",terminateMode:"cancel_task",targetCellIds:["project"],confirm:"确认结束"}]}, "probe");
+  const decision = await kernel.humanItems.decide(item.id, {optionId:"end", seenItemRevision:item.itemRevision, confirmedTargets:["project"]}, "owner");
+  expect(of("approval.changed")).toContainEqual(expect.objectContaining({actionId:other.id, cellId:"probe", status:"cancelled"}));
+  const result = await kernel.humanItems.undo(decision.activityId!, "owner");
+  expect(result.status).toBe("corrected");
+  expect(kernel.getCell("project")?.status).toBe("active");
+  expect(kernel.getCell("probe")?.status).toBe("closed");
+  expect(kernel.humanItems.get(item.id)?.status).toBe("cancelled");
+  expect(kernel.inbox.listMessagesSync({cellId:"desk", envelopeId:`${decision.activityId}:correction`, status:["pending"]})).toHaveLength(1);
+});
+
+it("keeps a closed worker archived when its parent lost spawn authority", async () => {
+  const {kernel} = await boot({start:false});
+  kernel.spawnCell("desk",{id:"project",preset:"project"});
+  kernel.spawnCell("project",{id:"worker",preset:"worker"});
+  await kernel.closeCell("worker","completed");
+  kernel.updateCell("project", {bounds: {maxDepth: 0}});
+  expect(kernel.directMessage("worker", {text:"再做一轮"})).toMatchObject({status:"refused", reason:"archived"});
+  expect(kernel.getCell("worker")?.status).toBe("closed");
 });

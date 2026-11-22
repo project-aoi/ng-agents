@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS cells (
   parent_id     TEXT REFERENCES cells(id),
   root_id       TEXT NOT NULL,
   depth         INTEGER NOT NULL DEFAULT 0,
-  preset        TEXT,                          -- PresetName, validated by the kernel (PRESET_NAMES)
+  preset        TEXT,                          -- registered preset
   title         TEXT,
   spec          TEXT NOT NULL,                 -- JSON CellSpec, resolved (preset defaults applied)
   bounds        TEXT NOT NULL,                 -- JSON SerializedBounds, effective (after attenuate)
@@ -67,9 +67,10 @@ CREATE TABLE IF NOT EXISTS cell_closures(
 );
 CREATE INDEX IF NOT EXISTS idx_closure_members ON cell_closures(closure_id);
 CREATE TABLE IF NOT EXISTS stall_incidents (
-  cause_key TEXT PRIMARY KEY, wait_ids TEXT NOT NULL DEFAULT '[]',
+  incident_id TEXT PRIMARY KEY, cause_key TEXT NOT NULL, wait_ids TEXT NOT NULL DEFAULT '[]',
   wake_envelope_id TEXT, escalation_id TEXT, updated_at INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_stall_cause ON stall_incidents(cause_key);
 
 `,
 };

@@ -12,7 +12,7 @@ import {
   type ItemSource,
 } from "@ng/protocol";
 import { KERNEL_ESCALATION, KERNEL_ESCALATION_PRINCIPAL } from "./constants";
-import type { KernelCore } from "./core";
+import { isProjectRoot, type KernelCore } from "./core";
 
 /** `action.args` of a kernel-raised escalation card. */
 export interface KernelEscalationArgs {
@@ -80,8 +80,8 @@ export function createEscalations(core: KernelCore): Escalations {
   function raise(cell: CellRecord, args: KernelEscalationArgs, title: string, explanation: string, envs: Envelope[]): ApprovalRecord | null {
     const subjectKey = `kernel:${cell.id}:${args.stepLimit ? "step_limit" : args.reason}`;
     // One card per item: an item that already waits on the owner is not given a second one.
-    const existing = gate.findPendingBySubjectSync(subjectKey);
-    const projectId = cell.preset === "project" ? cell.id : projectCellIdOf(cell.spec);
+    const existing = gate.findPendingBySubjectSync(subjectKey, cell.id);
+    const projectId = isProjectRoot(core.registry, cell) ? cell.id : projectCellIdOf(cell.spec);
     function associate(rec: ApprovalRecord) {
       if (projectId && run(core.db, `UPDATE human_items SET related_project_ids=json_insert(related_project_ids,'$[#]',?),
         item_revision=item_revision+1 WHERE action_id=? AND NOT EXISTS (SELECT 1 FROM json_each(related_project_ids) WHERE value=?)`,

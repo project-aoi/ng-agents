@@ -27,7 +27,7 @@ import {
   type ProposedAction,
 } from "@ng/protocol";
 import { ownerOnlyApproval } from "@ng/gate";
-import type { KernelCore } from "./core";
+import { isProjectRoot, type KernelCore } from "./core";
 import { RESURFACE_MARKER } from "./constants";
 import { isKernelEscalation } from "./escalations";
 
@@ -291,7 +291,7 @@ export function createHumanItems(core: KernelCore) {
     const art = r.artifact_id ? context.getArtifactSync(r.artifact_id) : null;
     const related = JSON.parse(r.related_project_ids) as string[];
     const holder = r.cell_id ? core.cells.get(r.cell_id) : undefined;
-    const projectId = holder && (holder.preset === "project" ? holder.id : projectCellIdOf(holder.spec));
+    const projectId = holder && (isProjectRoot(core.registry, holder) ? holder.id : projectCellIdOf(holder.spec));
     if (projectId && !related.includes(projectId)) related.push(projectId);
     const humanEdited =
       !!r.human_edited ||
@@ -336,7 +336,7 @@ export function createHumanItems(core: KernelCore) {
       const cell = cellId === null ? null : core.cells.require(cellId);
       if (cell?.status === "closed") throw new NgError("conflict", "issuing cell is closed");
       const related = [...new Set(draft.relatedProjectIds ?? [])];
-      for (const pid of related) if (core.cells.get(pid)?.preset !== "project") throw new NgError("invalid_argument", "unknown related project");
+      for (const pid of related) if (!isProjectRoot(core.registry, core.cells.get(pid))) throw new NgError("invalid_argument", "unknown related project");
       for (const o of draft.options)
         if (o.terminateMode === "cancel_task" && !related.includes(o.targetCellIds![0]!))
           throw new NgError("invalid_argument", "cancel target must be an explicitly related project");
@@ -344,8 +344,8 @@ export function createHumanItems(core: KernelCore) {
       if (draft.dueAt !== undefined && !Number.isFinite(draft.dueAt)) throw new NgError("invalid_argument", "invalid due date");
       const prior = get<ItemRow>(
         db,
-        "SELECT * FROM human_items WHERE subject_key = ? AND status IN ('pending','snoozed')",
-        [draft.subjectKey],
+        "SELECT * FROM human_items WHERE subject_key = ? AND cell_id IS ? AND status IN ('pending','snoozed')",
+        [draft.subjectKey, cellId],
       );
       const card = JSON.stringify({
         format: "card",
@@ -355,7 +355,7 @@ export function createHumanItems(core: KernelCore) {
       });
       const action = { type: "custom", name: "human.reply", summary: draft.title, sideEffect: "none", subjectKey: draft.subjectKey };
       if (prior) {
-        if (prior.action_hash !== "" || !prior.options || prior.cell_id !== cellId || prior.epoch !== (cell?.epoch ?? null))
+        if (prior.action_hash !== "" || !prior.options || prior.epoch !== (cell?.epoch ?? null))
           throw new NgError("conflict", "this subject has an open item");
         id = prior.action_id;
         run(
@@ -548,7 +548,7 @@ export function createHumanItems(core: KernelCore) {
         if (o.terminateMode === "cancel_task") {
           if (
             !target ||
-            core.cells.get(target)?.preset !== "project" ||
+            !isProjectRoot(core.registry, core.cells.get(target)) ||
             !item.relatedProjectIds.includes(target) ||
             d.confirmedTargets?.length !== 1 ||
             d.confirmedTargets[0] !== target
@@ -673,10 +673,22 @@ export function createHumanItems(core: KernelCore) {
           ? core.inbox.listMessagesSync({ cellId: event.receipt_cell, envelopeId: event.receipt_id })[0]
           : undefined;
       if (event.receipt_id && !receipt) throw new NgError("conflict", "无法确认后台是否已读");
-      const claimed = receipt && receipt.firstClaimedAt !== null;
+      const claimed = !!receipt && receipt.firstClaimedAt !== null;
       if (claimed && event.target_project) throw new NgError("conflict", "后台已读这次中止决定，请使用 reopen_project 重新打开项目");
-      if (claimed) {
-        const issuer = core.cells.require(receipt.cellId);
+      let corrected = claimed;
+      if (event.target_project && epoch !== null && !claimed) {
+        const target = cells.require(event.target_project);
+        if (target.status === "closed" && target.epoch === epoch) {
+          try {
+            core.lifecycle.reopenProjectSync(target.id, actor, epoch);
+          } catch (error) {
+            if (!(error instanceof NgError) || (error.code !== "bounds_violation" && error.code !== "conflict")) throw error;
+          }
+        }
+        corrected = cells.require(target.id).status !== "active" || !!current.cell_id && cells.require(current.cell_id).status !== "active";
+      }
+      if (corrected) {
+        const issuer = cells.require(receipt?.cellId ?? event.target_project ?? current.cell_id ?? core.deskCellId);
         const target = issuer.status !== "closed" ? issuer : core.cells.ancestors(issuer.id).find((c) => c.status !== "closed");
         if (!target) throw new NgError("conflict", "找不到可接收更正的后台分身");
         const result = core.inbox.enqueueSync(
@@ -691,7 +703,7 @@ export function createHumanItems(core: KernelCore) {
               expectedEpoch: target.epoch,
               payload: {
                 fromCellId: core.deskCellId,
-                replyToId: receipt.envelope.id,
+                ...(receipt ? {replyToId: receipt.envelope.id} : {}),
                 text: `主人已撤回对事项 ${event.item_id} 的决定。请核实现状并更正，必要时重新请求确认。`,
               },
             },
@@ -707,13 +719,12 @@ export function createHumanItems(core: KernelCore) {
         if (
           get(
             db,
-            `SELECT 1 FROM human_items WHERE subject_key=? AND action_id<>? AND status IN ('pending','snoozed')`,
-            [current.subject_key, current.action_id],
+            `SELECT 1 FROM human_items WHERE subject_key=? AND cell_id IS ? AND action_id<>? AND status IN ('pending','snoozed')`,
+            [current.subject_key, current.cell_id, current.action_id],
           )
         )
           throw new NgError("conflict", "同一事项已有新的待处理决定");
         if (receipt && receipt.status === "pending") core.inbox.cancelScheduledSync({ cellId: receipt.cellId, envelopeId: receipt.envelope.id });
-        if (event.target_project && epoch !== null) core.lifecycle.reopenProjectSync(event.target_project, actor, epoch);
         const prior = JSON.parse(event.before_state);
         run(
           db,
@@ -724,7 +735,7 @@ export function createHumanItems(core: KernelCore) {
         changed(row(event.item_id)!);
       }
       run(db, "UPDATE human_item_activity SET undone_at=? WHERE id=?", [clock.now(), activityId]);
-      return { status: claimed ? ("corrected" as const) : ("undone" as const), message: claimed ? "已通知后台更正" : "已撤销" };
+      return { status: corrected ? ("corrected" as const) : ("undone" as const), message: corrected ? "已通知后台更正" : "已撤销" };
     });
   }
 

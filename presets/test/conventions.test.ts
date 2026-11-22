@@ -112,6 +112,52 @@ function mentionedTools(text: string): string[] {
   return [...new Set([...snake, ...ticked])].filter((n) => !NOT_TOOLS.has(n) && !n.startsWith("cell_")).sort();
 }
 
+it("enforces scope at the run port even when a processor calls it directly", async () => {
+  const results: PromiseSettledResult<void>[] = [];
+  const h = await boot({ setup(registry) {
+    registry.codeProcessors.register({
+      name: "test.knowledge",
+      async run({ ports }) {
+        const upsert = ports.context.upsertSkillOrNote;
+        const base = { name: "rule", body: "new", description: "", mode: "upsert" as const };
+        results.push(...await Promise.allSettled([
+          upsert(ports.self.cellId, { ...base, kind: "preference", scope: "cell" }),
+          upsert(ports.self.cellId, { ...base, kind: "reference", scope: "global" }),
+          upsert(ports.self.cellId, { ...base, kind: "working_note", scope: "cell" }),
+        ]));
+        return "completed";
+      },
+    });
+  } });
+  h.kernel.spawnCell("desk", { id: "child", preset: "worker", processor: { kind: "code", entry: "test.knowledge" } }, "整理笔记");
+  await h.kernel.idle();
+  expect(results).toMatchObject([
+    {status:"rejected", reason:{code:"bounds_violation"}},
+    {status:"rejected", reason:{code:"bounds_violation"}},
+    {status:"fulfilled"},
+  ]);
+  expect(h.kernel.context.getKnowledgeSync({kind:"working_note", scope:"cell", cellId:"child", name:"rule"})?.body).toBe("new");
+  expect(h.kernel.context.getKnowledgeSync({kind:"reference", scope:"global", name:"rule"})).toBeNull();
+});
+
+it("protects preset records from model writes while leaving its own topic notes writable", async () => {
+  const h = await boot();
+  const keys = ["gtd:project", "gtd:activity:completed", "gtd:source", "gtd:action:task", "watch:state", "probe:state", "desk:suggestion:skill:x"];
+  for (const key of keys) {
+    h.script.add("desk", tool("set_state", { patches: { [key]: "forged" } }), req => {
+      expect(lastToolResult(req)).toContain("reserved");
+      return {};
+    });
+    await h.ui.capture({ text: key });
+    await h.kernel.idle();
+    expect(h.kernel.context.readStateSync("desk", key)).toBeNull();
+  }
+  h.script.add("desk", tool("set_state", { patches: { "hub:topics": ["weekly"] } }), {});
+  await h.ui.capture({ text: "设置主题" });
+  await h.kernel.idle();
+  expect(h.kernel.context.readStateSync("desk", "hub:topics")).toEqual(["weekly"]);
+});
+
 describe("conventions: every prompt names only tools its role has", () => {
   it("role prompts and the playbooks they rely on", async () => {
     const h = await boot();

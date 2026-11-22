@@ -347,7 +347,7 @@ export type DirectMessageResult =
       duplicate: boolean;
       /** The cell had been closed and was brought back for this message. */
       reopened: boolean;
-      targetStatus: "active" | "paused";
+      targetStatus: CellStatus;
       /** The parent that got the carbon copy, when there is one. */
       ccTo: string | null;
     }

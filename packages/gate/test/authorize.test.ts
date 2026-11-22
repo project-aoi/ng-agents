@@ -19,6 +19,11 @@ it("binds decisions to the issuer, its epoch, its lineage and the proposed artif
   const first = f.gate.authorizeSync(draft, meta("desk"));
   expect(first).toMatchObject({type:"defer",boundArtifactVersion:1});
   expect(f.gate.authorizeSync(draft, meta("desk"))).toEqual(first);
-  expect(f.gate.authorizeSync(draft, meta("w1")).type).toBe("deny");
-  expect(f.gate.listPendingSync()).toHaveLength(1);
+  const child = f.gate.authorizeSync(draft, meta("w1"));
+  expect(child).toMatchObject({type:"defer",boundArtifactVersion:1});
+  if (first.type !== "defer" || child.type !== "defer") throw Error("both cells need independent decisions");
+  expect(child.actionId).not.toBe(first.actionId);
+  expect(f.gate.findPendingBySubjectSync(draft.subjectKey, "desk")?.actionId).toBe(first.actionId);
+  expect(f.gate.findPendingBySubjectSync(draft.subjectKey, "w1")?.actionId).toBe(child.actionId);
+  expect(f.gate.listPendingSync()).toHaveLength(2);
 });

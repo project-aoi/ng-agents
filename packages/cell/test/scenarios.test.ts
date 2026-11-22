@@ -123,7 +123,7 @@ describe("docs/03 §四 — five granularities through the real primitives", () 
         if (!task) return "completed";
         const i = (task.payload as { input: { i: number } }).input.i;
         // A child stages its result; the kernel delivers it once when its turn settles (docs/05 guard 1).
-        const candidate: CellResultCandidate = { status: "completed", summary: `item ${i}`, at: clock.now() };
+        const candidate: CellResultCandidate = { runId: snapshot.runId, status: "completed", summary: `item ${i}`, at: clock.now() };
         await ports.context.commit(ports.self.cellId, { statePatches: { [CELL_RESULT_CANDIDATE_KEY]: candidate } });
         if (i === 0) {
           // a second report through the raw port: for a leaf it only refreshes the staged candidate

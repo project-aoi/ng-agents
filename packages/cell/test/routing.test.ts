@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { PAYLOAD, type HandbackPayload } from "@ng/protocol";
+import { cellsRepo, PAYLOAD, type HandbackPayload } from "@ng/protocol";
 import { boot, cleanupAll, tool } from "./helpers";
 
 afterEach(cleanupAll);
@@ -36,6 +36,29 @@ describe("ingress routing", () => {
     h.kernel.control("watch",{action:"resume"});
     expect(await route("active-thread",true)).toMatchObject({cellIds:["watch"]});
     expect(await route("active-filter",false)).toMatchObject({cellIds:["watch"]});
+  });
+
+  it("keeps an active descendant of a paused project out of routing and execution", async () => {
+    const { kernel, clock } = await boot({ start: false });
+    kernel.spawnCell("desk", { id: "project", preset: "project" });
+    kernel.spawnCell("project", { id: "hub", preset: "hub", watches: [{ threadOrFilter: { thread: "team" } }] });
+    kernel.inbox.controlSync("project", { action: "pause", principalId: "owner" });
+    expect(kernel.control("hub", { action: "resume" }).applied).toBe(false);
+    expect(() => kernel.spawnCell("project", { id: "late", preset: "worker" })).toThrow(/paused/);
+
+    cellsRepo(kernel.db).setStatus("hub", "active");
+    expect(() => kernel.spawnCell("hub", { id: "deep", preset: "worker" })).toThrow(/paused/);
+    const event = { id: "thread", from: "channel:ui:owner", principalId: "owner", kind: "event",
+      type: PAYLOAD.userMessage, threads: ["team"], payload: { text: "ping" }, createdAt: clock.now() } as const;
+    expect(await kernel.ingest({ ...event, threads: ["team"] }, "ui")).toMatchObject({ cellIds: ["desk"] });
+    kernel.inbox.enqueueSync("hub", { ...event, threads: ["team"], id: "queued" });
+    expect(kernel.inbox.claimNextRunSync("hub", "probe")).toBeNull();
+    await kernel.start();
+    await kernel.idle();
+    expect(kernel.inbox.listMessagesSync({ cellId: "hub", envelopeId: "queued" })[0]?.status).toBe("pending");
+    expect(kernel.control("project", { action: "resume" }).applied).toBe(true);
+    await kernel.idle();
+    expect(kernel.inbox.listMessagesSync({ cellId: "hub", envelopeId: "queued" })[0]?.status).toBe("done");
   });
 
   it("ingress needs a desk when nobody watches it (so an HTTP adapter answers non-2xx and the sender retries)", async () => {

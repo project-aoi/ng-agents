@@ -180,6 +180,7 @@ export interface ApprovalRevisePayload {
 }
 
 export interface ControlSteerPayload {
+  replyToId?: string;
   message: string;
 }
 

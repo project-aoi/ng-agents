@@ -411,7 +411,7 @@ export interface TopologyNodeDTO {
   parentId: string | null;
   /** The project it belongs to (itself, for a project node); null for the desk, sources and hubs. */
   projectId: string | null;
-  preset: "inline" | "worker" | "checker" | "sensor" | "project" | "hub" | null;
+  preset: string | null;
   /** "总助理" | "项目协调" | "执行分身" | "外部盯梢" | "信源巡检" | "领域中枢" */
   roleLabel: string;
   title: string;

@@ -4,6 +4,8 @@ import {
   defineTool,
   MAX_RESOURCE_PAGE_CHARS,
   newId,
+  NgError,
+  type Registry,
   type Deliverable,
   type ToolResult,
   type Toolset,
@@ -15,18 +17,6 @@ export const CONTEXT_TOOLSET = "kernel.context";
 
 
 
-/**
- * Authoritative kernel / GTD / CLI state keys that models must never overwrite directly through `set_state`
- * (BUG-020). Dedicated workbench tools manage these records. Note: `gtd:action:*` and
- * `hub:topics` remain writable model state.
- */
-const RESERVED_STATE_KEYS: ReadonlySet<string> = new Set(["gtd:project", "gtd:source", "gtd:activity", "desk:arbitration"]);
-const RESERVED_STATE_PREFIXES: readonly string[] = ["desk:reply:", "desk:proposal:", "desk:reminder:", "gtd:project:", "gtd:source:", "gtd:activity:", "cli:", "sys:", "cell:", "pull:"];
-
-export function isReservedStateKey(key: string): boolean {
-  return RESERVED_STATE_KEYS.has(key) || RESERVED_STATE_PREFIXES.some((p) => key.startsWith(p));
-}
-
 function describeArtifact(a: VersionedArtifact, withBody: boolean): string {
   const head = `${a.artifactId} v${a.version} (last edited by ${a.updatedBy})${a.content.title ? ` — ${a.content.title}` : ""}`;
   return withBody ? `${head}\nformat: ${a.content.format}\n---\n${a.content.body}` : head;
@@ -36,7 +26,7 @@ const readState = defineTool({
   name: "read_state",
   kind: "kernel",
   description:
-    "Read saved state: one key, or every key under a prefix. Yours by default; pass cellId to read another cell's (a child's records or a project's `gtd:project` entry). Reading is open; writing is always your own.",
+    "Read saved state: one key, or every key under a prefix. Yours by default; pass cellId to read another cell's (a child's records). Reading is open; writing is always your own.",
   input: z.object({ key: z.string().min(1).optional(), prefix: z.string().optional(), cellId: z.string().min(1).optional().describe("default: this cell") }),
   async handler(args, ctx) {
     const cellId = args.cellId ?? selfId(ctx);
@@ -49,25 +39,27 @@ const readState = defineTool({
     return entries.map((e) => `${e.key} = ${json(e.value)}`).join("\n");
   },
 });
-const setState = defineTool({
-  name: "set_state",
-  kind: "kernel",
-  description: "Save values in this cell's state (JSON per key; null deletes the key). All keys are written atomically.",
-  input: z.object({ patches: z.record(z.string(), z.unknown()) }),
-  async handler(args, ctx) {
-    const keys = Object.keys(args.patches);
-    if (keys.length === 0) return { output: "No keys given.", isError: true };
-    const blocked = keys.filter(isReservedStateKey);
-    if (blocked.length > 0) {
-      return {
-        output: `Refused: reserved state key(s) ${blocked.join(", ")} cannot be written directly with set_state (gtd:project, gtd:source, gtd:activity, cli:*, sys:*, cell:*, pull:* are managed by dedicated tools and the kernel).`,
-        isError: true,
-      };
-    }
-    await ctx.ports.context.commit(selfId(ctx), { statePatches: args.patches });
-    return `Saved ${keys.join(", ")}.`;
-  },
-});
+function setState(registry: Registry) {
+  return defineTool({
+    name: "set_state",
+    kind: "kernel",
+    description: "Save values in this cell's state (JSON per key; null deletes the key). All keys are written atomically.",
+    input: z.object({ patches: z.record(z.string(), z.unknown()) }),
+    async handler(args, ctx) {
+      const keys = Object.keys(args.patches);
+      if (keys.length === 0) return { output: "No keys given.", isError: true };
+      const blocked = keys.filter(key => registry.isReservedStateKey(key));
+      if (blocked.length > 0) {
+        return {
+          output: `Refused: reserved state key(s) ${blocked.join(", ")} cannot be written directly with set_state.`,
+          isError: true,
+        };
+      }
+      await ctx.ports.context.commit(selfId(ctx), { statePatches: args.patches });
+      return `Saved ${keys.join(", ")}.`;
+    },
+  });
+}
 
 const readArtifact = defineTool({
   name: "read_artifact",
@@ -364,7 +356,7 @@ const saveNote = defineTool({
   kind: "kernel",
   description:
     "Use working_note for your working memory, reference for a bookmark or observation read on demand, and preference for an owner instruction shared with future runs. Same name replaces it unless append is set. " +
-    "A preference is shown to every cell unless you limit it: a rule that only makes sense in one repository or for one kind of cell — e.g. a Rust repo's commit gate — should name that directory (cwdPrefix) and/or role (roles); leave both out for a rule about how the owner wants things done everywhere. " +
+    "Only the desk can save preferences or write to global scope. A preference is shown to every cell unless you limit it: a rule that only makes sense in one repository or for one kind of cell — e.g. a Rust repo's commit gate — should name that directory (cwdPrefix) and/or role (roles); leave both out for a rule about how the owner wants things done everywhere. " +
     "Saving a preference again replaces its limits too (absent = everywhere), so restate them when you refine a limited one; append keeps them.",
   input: z.object({
     name: z.string().min(1),
@@ -389,6 +381,8 @@ const saveNote = defineTool({
       return { output: `cwdPrefix and roles only limit a preference; a ${kind} cannot take them. Leave them out, or save with kind "preference".`, isError: true };
     }
     const scope = args.scope ?? (kind === "preference" ? "global" : "cell");
+    if (ctx.ports.self.parentId !== null && (kind === "preference" || scope === "global"))
+      throw new NgError("bounds_violation", "只有主台可以保存共享偏好和全局知识");
     const applies = { ...(args.cwdPrefix !== undefined ? { cwdPrefix: args.cwdPrefix } : {}), ...(args.roles?.length ? { roles: args.roles } : {}) };
     const limits = [applies.cwdPrefix ? `cells in ${applies.cwdPrefix}` : "", applies.roles ? `roles ${applies.roles.join(", ")}` : ""].filter(Boolean);
     await ctx.ports.context.upsertSkillOrNote(selfId(ctx), {
@@ -464,10 +458,10 @@ const readResource = defineTool({
  * `kernel.context`: read_state, set_state, read_artifact, save_artifact, patch_artifact, save_note,
  * search_history, read_resource.
  */
-export function contextToolset(): Toolset {
+export function contextToolset(registry: Registry): Toolset {
   return {
     name: CONTEXT_TOOLSET,
     description: "State, versioned drafts, notes/skills, history search and paged resources.",
-    tools: [readState, setState, readArtifact, saveArtifact, patchArtifact, saveNote, searchHistory, readResource],
+    tools: [readState, setState(registry), readArtifact, saveArtifact, patchArtifact, saveNote, searchHistory, readResource],
   };
 }

@@ -2,7 +2,7 @@ import {
   CELL_STATUS_KEY,
   gtdKeys,
   isEnvelopeOfType,
-  newId,
+  newId, sha256Hex,
   PAYLOAD,
   type ActionRecord,
   type CellResultPayload,
@@ -39,11 +39,11 @@ export function waitingFor(description: string, parties: WaitingSet["parties"] =
 function seedActions(self: string, planned: readonly PlannedAction[], clock: Clock): ActionRecord[] {
   const now = clock.now();
   return planned
-    .filter((p) => p && p.owner !== "human" && typeof p.title === "string" && p.title.trim())
-    .map((p) =>
+    .filter((p) => p && typeof p.title === "string" && p.title.trim())
+    .map((p, index) =>
       newAction(
         {
-          id: newId("act", clock),
+          id: `act_${sha256Hex(self).slice(0, 24)}_${String(index).padStart(8, "0")}`,
           title: p.title,
           owner: p.owner === "human" || p.owner === "waiting" ? p.owner : "agent",
           projectCellId: self,
@@ -98,10 +98,10 @@ export async function prepareProjectRun({ snapshot, ports, clock }: PrepareRunIn
   const patches: Record<string, unknown> = {};
   let project = await readProject(ports);
   const actions = new Map((await readActions(ports)).map((a) => [a.id, a]));
+  const updates = new Map<string, ActionRecord>();
   const set = (a: ActionRecord) => {
     actions.set(a.id, a);
-    if (a.owner === "human") ports.actionBooks!.write(a);
-    else patches[gtdKeys.action(a.id)] = a;
+    updates.set(a.id, a);
   };
 
   // The task message carries the seed. The record may already be there (a project parked straight from a proposal has
@@ -114,7 +114,7 @@ export async function prepareProjectRun({ snapshot, ports, clock }: PrepareRunIn
       patches[gtdKeys.project] = project;
       patches[CELL_STATUS_KEY] = statusLine(project.outcome ? `目标：${project.outcome}` : project.title, now);
     }
-    if (actions.size === 0) for (const a of seeded.actions) set(a);
+    for (const a of seeded.actions) if (!actions.has(a.id)) set(a);
   }
 
   const carrying = (cellId: string) => [...actions.values()].find((a) => a.status === "open" && a.cellId === cellId);
@@ -152,5 +152,5 @@ export async function prepareProjectRun({ snapshot, ports, clock }: PrepareRunIn
     patches[gtdKeys.project] = project;
   }
 
-  if (Object.keys(patches).length > 0) await ports.context.commit(self, { statePatches: patches });
+  if (updates.size || Object.keys(patches).length) ports.actionBooks!.commit([...updates.values()], patches);
 }

@@ -35,7 +35,7 @@ import {
 import { createWorkspaceManager } from "@ng/workspace";
 import { createKeepAwake } from "./awake";
 import { DEFAULT_ROOT_BOUNDS, DEFAULTS } from "./constants";
-import type { KernelCore } from "./core";
+import { isProjectRoot, type KernelCore } from "./core";
 import { createDispatcher } from "./dispatcher";
 import { createEscalations } from "./escalations";
 import { createLifecycle } from "./lifecycle";
@@ -100,6 +100,7 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
 
   // ---------- primitives ----------
   const gate = createGate({
+    isProjectRoot: cell => isProjectRoot(registry, cell),
     db,
     bus,
     clock,
@@ -316,10 +317,9 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     } catch (err) {
       onError(err, "workspace recovery");
     }
-    // A cell that was closed (its settle transaction committed) just before the previous kernel died may have left
-    // Jobs running: their runtime is stopped before the dispatcher hands anyone that directory (docs/05 guard 4).
-    const orphaned = new Set(workspace.listJobsSync({ state: ["running"] }).filter((j) => cells.get(j.cellId)?.status === "closed").map((j) => j.cellId));
-    await Promise.all([...orphaned].map((id) => workspace.cancelJobsForCell(id).catch((err: unknown) => onError(err, `stop runtime of closed cell ${id}`))));
+    // A committed pause or close can survive a crash that interrupted physical process cleanup.
+    const orphaned = new Set(workspace.listJobsSync({ state: ["running"] }).filter((j) => !cells.isActiveInTree(j.cellId)).map((j) => j.cellId));
+    await Promise.all([...orphaned].map((id) => workspace.cancelJobsForCell(id).catch((err: unknown) => onError(err, `stop runtime of inactive cell ${id}`))));
     // Leases are renewed before the inbox looks at a moved ManualClock, so a live Run is never expired by a test step.
     const sweep = () => {
       dispatcher.renewAll();

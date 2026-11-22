@@ -68,7 +68,7 @@ describe("docs/05 scenario 2 — a small code change, follow-ups in the same dir
 
     // 3. "继续用 /ship-mr 跟进": the desk passes it on. It is more work on what the worker just did, so the project sends
     // it to that worker — recorded as a new action carried by it — instead of starting another one from nothing.
-    h.script.add("desk", tool("steer_item", { itemId: project, message: "继续用 /ship-mr 跟进" }), tool("wait", { reason: "passed on" }));
+    h.script.add("desk", tool("save_note", { name: "code-change-followup", kind: "preference", body: "改完代码后直接用 /ship-mr 提 MR，并附一段验证录屏，不用再等主人说。" }), tool("steer_item", { itemId: project, message: "继续用 /ship-mr 跟进" }), tool("wait", { reason: "passed on" }));
     h.script.add(
       "project",
       (req) => {
@@ -141,7 +141,7 @@ describe("docs/05 scenario 2 — a small code change, follow-ups in the same dir
         return {};
       },
     );
-    await h.ui.capture({ text: "继续用 /ship-mr 跟进，另外补个录屏" });
+    await h.ui.capture({ text: "继续用 /ship-mr 跟进，另外补个录屏。记住以后改完代码也这样处理。" });
     await h.kernel.idle();
 
     // One worker did both the change and the MR, in two turns.
@@ -162,9 +162,8 @@ describe("docs/05 scenario 2 — a small code change, follow-ups in the same dir
     });
     h.script.add(
       "project",
-      tool("save_note", { name: "code-change-followup", kind: "preference", scope: "global", body: "改完代码后直接用 /ship-mr 提 MR，并附一段验证录屏，不用再等主人说。" }),
       // finish_project ends the Run: nothing after it is asked of the model.
-      tool("finish_project", { outcome: "completed", summary: "MR !12 已合入，录屏已附上。", retro: "保存了偏好 code-change-followup：改完代码直接 /ship-mr 并附录屏" }),
+      tool("finish_project", { outcome: "completed", summary: "MR !12 已合入，录屏已附上。", retro: "主台已保存偏好 code-change-followup：改完代码直接 /ship-mr 并附录屏" }),
     );
     await h.kernel.idle({ jobs: true });
     await h.kernel.idle();

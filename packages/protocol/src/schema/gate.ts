@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS human_item_activity (
   id TEXT PRIMARY KEY, item_id TEXT NOT NULL REFERENCES human_items(action_id), before_state TEXT NOT NULL,
   after_revision INTEGER NOT NULL, receipt_cell TEXT, receipt_id TEXT, target_project TEXT, at INTEGER NOT NULL, undone_at INTEGER
 );
-CREATE UNIQUE INDEX IF NOT EXISTS ux_human_items_active ON human_items(subject_key)
+CREATE UNIQUE INDEX IF NOT EXISTS ux_human_items_active ON human_items(COALESCE(cell_id,''), subject_key)
   WHERE status IN ('pending','snoozed');
 CREATE INDEX IF NOT EXISTS idx_items_cell ON human_items(cell_id, status);
 CREATE INDEX IF NOT EXISTS idx_items_due ON human_items(due_at) WHERE due_at IS NOT NULL;

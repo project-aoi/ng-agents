@@ -110,7 +110,7 @@ export interface Inbox {
   start(): void;
   stop(): void;
 
-  consumeTimerSync(cellId: string, envelopeId: string, epoch: number, settle: () => void): boolean;
+  consumePendingSync(cellId: string, envelopeId: string, epoch: number, settle?: () => void): boolean;
   listMessagesSync(filter?: InboxMessageFilter): InboxMessageRecord[];
   listSchedulesSync(filter?: { cellId?: string; activeOnly?: boolean }): InboxScheduleRecord[];
   /** Count of due-or-future pending messages per cell (UI badges, idle detection). */
@@ -140,6 +140,7 @@ export interface ControlCommand {
    * what was typed.
    */
   steerEnvelopeId?: string;
+  steerReplyToId?: string;
 }
 /**
  * Queue-side effects of `control` (the kernel does the rest when it sees the `inbox.control` bus event):

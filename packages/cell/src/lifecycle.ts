@@ -33,7 +33,7 @@ import {
   type ScheduleRule,
   type TimerFiredPayload,
 } from "@ng/protocol";
-import type { KernelCore } from "./core";
+import { isProjectRoot, type KernelCore } from "./core";
 import { jsonSafeBounds, resolveSpec, scheduleEnvelopeId, validateSpec } from "./spec";
 import type { ActorOptions, CellSpecInput, CloseResult, RootCellOptions, SpawnOptions } from "./types";
 import { assertDirectory, normalizeCwd } from "./workdir";
@@ -233,7 +233,7 @@ export function createLifecycle(core: KernelCore): Lifecycle {
       validateSpec(registry, resolved);
       if (resolved.cwd !== undefined) assertDirectory(resolved.cwd, "cwd");
       const bounds = rootBounds(opts.bounds);
-      if (resolved.preset === "worker" || resolved.preset === "checker") bounds.maxDepth = 0;
+      if (isLeafLifetime(resolved.lifetime)) bounds.maxDepth = 0;
       delete resolved.bounds;
       return insertCell({ id, parentId: null, spec: { ...resolved, id }, bounds, principalId });
     });
@@ -266,7 +266,7 @@ export function createLifecycle(core: KernelCore): Lifecycle {
       if (actor.kind === "cell" && actor.cellId !== parent.id && !isStrictAncestor(actor.cellId, parent.id)) {
         throw new NgError("bounds_violation", `cell "${actor.cellId}" may only spawn children of itself or of its descendants`);
       }
-      if (parent.status === "closed") throw new NgError("conflict", `cell "${parent.id}" is closed; it cannot have new children`);
+      if (!cells.isActiveInTree(parentId)) throw new NgError("conflict", `cell "${parent.id}" or an ancestor is paused or closed; it cannot have new children`);
 
       const { spec: resolved, boundsRequest } = resolveSpec(registry, spec, parent);
       validateSpec(registry, resolved);
@@ -288,6 +288,7 @@ export function createLifecycle(core: KernelCore): Lifecycle {
       }
       // Never trust requested bounds: Gate clamps them to the parent's effective bounds.
       const bounds = gate.attenuate(parent.bounds, parent.id, boundsRequest);
+      if (isLeafLifetime(resolved.lifetime)) bounds.maxDepth = 0;
 
       const id = spec.id ?? newId("cell", clock);
       if (cells.get(id)) throw new NgError("duplicate", `cell "${id}" already exists`);
@@ -356,7 +357,7 @@ export function createLifecycle(core: KernelCore): Lifecycle {
 
       let bounds = cell.bounds;
       if (given.bounds !== undefined) {
-        if ((cell.preset === "worker" || cell.preset === "checker") && (given.bounds.maxDepth ?? 0) > 0)
+        if (isLeafLifetime(cell.spec.lifetime) && (given.bounds.maxDepth ?? 0) > 0)
           throw new NgError("bounds_violation", `preset "${cell.preset}" has maxDepth 0`);
         bounds = updatedBounds(cell, given.bounds, isOwner);
         next.bounds = jsonSafeBounds({ ...(cell.spec.bounds ?? {}), ...definedEntries(given.bounds) });
@@ -459,8 +460,14 @@ export function createLifecycle(core: KernelCore): Lifecycle {
       }
       // Cancel pending decisions held by this subtree.
       for (const c of closed) {
-        run(db,`UPDATE human_items SET disposition='cancelled',status_reason='issuer_closed',updated_at=?,item_revision=item_revision+1
-          WHERE cell_id=? AND epoch<? AND action_hash='' AND status IN ('pending','snoozed')`, [clock.now(),c.id,c.epoch]);
+        const now = clock.now();
+        const cancelled = all<{ action_id: string; subject_key: string }>(db, `UPDATE human_items
+          SET disposition='cancelled',status_reason='issuer_closed',resolved_at=?,updated_at=?,item_revision=item_revision+1
+          WHERE cell_id=? AND epoch<? AND action_hash='' AND status IN ('pending','snoozed') RETURNING action_id,subject_key`,
+          [now, now, c.id, c.epoch]);
+        afterCommit(db, () => {
+          for (const row of cancelled) bus.emit("approval.changed", { actionId: row.action_id, subjectKey: row.subject_key, cellId: c.id, status: "cancelled" });
+        });
       }
       gate.revokeSync(target.id);
       afterCommit(db, () => {
@@ -516,13 +523,20 @@ export function createLifecycle(core: KernelCore): Lifecycle {
     return reopenProjectSync(id,principalId,epoch);
   }
 
-  function restoreBounds(cell:CellRecord):void {
+  function restoreBounds(cell: CellRecord): boolean {
     const parent = cells.require(cell.parentId!);
-    const bounds = meetBounds(cell.bounds, attenuateBounds(parent.bounds,parent.id,cell.bounds));
+    let bounds: PolicyBounds;
+    try {
+      bounds = meetBounds(cell.bounds, attenuateBounds(parent.bounds, parent.id, cell.bounds));
+    } catch (error) {
+      if (error instanceof NgError && error.code === "bounds_violation") return false;
+      throw error;
+    }
     if (!sameBounds(bounds,cell.bounds)) {
       cells.update(cell.id,{bounds});
       context.refreshPrefixSync(cell.id);
     }
+    return true;
   }
 
   function reopenProjectSync(id: string, principalId: string, expectedEpoch:number): string[] {
@@ -532,7 +546,7 @@ export function createLifecycle(core: KernelCore): Lifecycle {
     return withTx(db, () => {
       const project = cells.require(id);
       if (project.epoch !== expectedEpoch) throw new NgError("conflict","project changed while reopening");
-      if (!project.parentId || project.preset !== "project" || project.status !== "closed") throw new NgError("conflict","the project must be closed");
+      if (!project.parentId || !isProjectRoot(registry, project) || project.status !== "closed") throw new NgError("conflict","the project must be closed");
       if (cells.ancestors(id).some(c => c.status === "closed")) throw new NgError("conflict","an ancestor is closed");
       const closure = get<{closure_id:string}>(db,"SELECT closure_id FROM cell_closures WHERE cell_id=? AND epoch=?",[id,project.epoch]);
       const members = closure ? all<{cell_id:string;epoch:number;was_revoked:number}>(db,
@@ -545,14 +559,17 @@ export function createLifecycle(core: KernelCore): Lifecycle {
           if (c.id===id) throw new NgError("bounds_violation","the project was revoked before closure");
           continue;
         }
-        restoreBounds(c);
+        if (!restoreBounds(c)) {
+          if (c.id === id) throw new NgError("bounds_violation", "当前权限不允许重开这个项目");
+          continue;
+        }
         const epoch = cells.bumpEpoch(c.id);
         cells.setStatus(c.id,"active");
         gate.reinstateSync(c.id);
         afterCommit(db, () => bus.emit("cell.changed",{cellId:c.id,change:"status",status:"active",epoch}));
         restored.push(c.id);
       }
-      registry.presets.get("project")?.onCellReopened?.(cells.require(id),context,clock);
+      registry.presets.get(project.preset!)?.onCellReopened?.(cells.require(id),context,clock);
       const delivered = inbox.enqueueSync(id,createEnvelope({id:`${id}:reopened:${cells.require(id).epoch}`,from:KERNEL_FROM.control,
         principalId,kind:"event",type:PAYLOAD.cellMessage,expectedEpoch:cells.require(id).epoch,
         payload:{fromCellId:core.deskCellId,text:"主人重新打开了这个项目。请核对当前状态，确认下一步。"}},clock));
@@ -569,7 +586,7 @@ export function createLifecycle(core: KernelCore): Lifecycle {
       if (cells.ancestors(cellId).some((a) => a.status === "closed")) return false;
       const closure=get<{was_revoked:number}>(db,"SELECT was_revoked FROM cell_closures WHERE cell_id=? AND epoch=?",[cellId,cell.epoch]);
       if (closure?.was_revoked) return false;
-      restoreBounds(cell);
+      if (!restoreBounds(cell)) return false;
       const epoch = cells.bumpEpoch(cellId);
       core.waits.dropFor([cellId]);
       cells.setStatus(cellId, "active");

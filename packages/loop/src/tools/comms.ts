@@ -332,6 +332,7 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
         // docs/05 guard 1: nothing is sent from here. The candidate is stored; the kernel delivers it when the run has
         // settled and the inbox is drained (and closes a one-shot cell in that same transaction).
         const candidate: CellResultCandidate = {
+          runId: ctx.snapshot.runId,
           status: args.status ?? "completed",
           summary: args.text,
           ...(args.artifactId ? { artifactId: args.artifactId } : {}),

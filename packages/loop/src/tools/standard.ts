@@ -18,7 +18,7 @@ export type StandardToolsetOptions = CommsToolsetOptions;
 
 /** The five standard toolsets (not registered). `registry` is read lazily by spawn_cell for preset defaults. */
 export function standardToolsets(registry: Registry, opts: StandardToolsetOptions = {}): Toolset[] {
-  return [workspaceToolset(), cellsToolset(registry), contextToolset(), commsToolset(opts), scheduleToolset()];
+  return [workspaceToolset(), cellsToolset(registry), contextToolset(registry), commsToolset(opts), scheduleToolset()];
 }
 
 /** Registers the five standard toolsets; call once at startup, before presets that reference them are used. */

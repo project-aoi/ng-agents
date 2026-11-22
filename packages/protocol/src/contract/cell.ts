@@ -15,7 +15,7 @@ export interface CellSpec {
   stallPolicy?: "monitor";
   id?: string;
   parentId?: string;                    // forms the supervision tree; closing/cancelling the parent recursively reclaims the subtree
-  preset?: "inline" | "worker" | "checker" | "sensor" | "project" | "hub"; // [ext] project, hub (docs/05)
+  preset?: string;
   watches?: Array<{ threadOrFilter: Record<string, unknown>; cancelGroup?: string; coalesceMs?: number /* [ext] */ }>;
   schedules?: ScheduleRule[];
   contextMode?: "isolated" | "fork_prefix";
@@ -92,7 +92,6 @@ export type SpawnSpec = Omit<CellSpec, "processor"> & { processor?: ProcessorSpe
 // - [docs/05] cwd is inherited from the parent when absent; lifetime comes from the preset's defaults.
 
 export type PresetName = NonNullable<CellSpec["preset"]>;
-export const PRESET_NAMES = ["inline", "worker", "checker", "sensor", "project", "hub"] as const satisfies readonly PresetName[];
 export type CellLifetime = NonNullable<CellSpec["lifetime"]>;
 /** A leaf executor (wakeable worker or one-shot probe), as opposed to a persistent coordinator. */
 export function isLeafLifetime(lifetime: CellSpec["lifetime"]): lifetime is "one_shot" | "wakeable" {
@@ -125,6 +124,7 @@ export interface ActionStore {
 export interface ActionBooks {
   list(): import("../gtd").ActionRecord[];
   write(record: import("../gtd").ActionRecord): void;
+  commit(records: import("../gtd").ActionRecord[], statePatches: Record<string, unknown>): void;
 }
 
 export interface RunPorts extends CellPorts {
@@ -338,6 +338,7 @@ export function pullCursorKey(targetCellId: string): string {
  */
 export const CELL_RESULT_CANDIDATE_KEY = "cell:result";
 export interface CellResultCandidate {
+  runId: string;
   status: "completed" | "failed" | "cancelled";
   summary: string;
   artifactId?: string;
@@ -375,6 +376,8 @@ export interface EmitOptions {
  * request goes through Gate.attenuate, so nothing a preset or caller asks for can exceed the parent.
  */
 export interface PresetDef {
+  /** This preset coordinates an independently reopenable project. */
+  projectRoot?: boolean;
   onCellClosed?(cell:CellRecord, reason:CloseReason, store:ContextStore, clock:Clock):void;
   onCellReopened?(cell:CellRecord, store:ContextStore, clock:Clock):void;
   actionBooks?(store: ActionStore, cellId: string): ActionBooks;

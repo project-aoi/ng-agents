@@ -20,6 +20,7 @@ import { createFakeRun, fakeInspection, type FakeRun, type FakeRunOptions } from
 import { clock, makeRegistry } from "./helpers";
 
 const registry = makeRegistry();
+registry.reserveState(["example:ledger"], ["example:ledger:"]);
 
 function tool(name: string): ToolDef {
   for (const ts of registry.toolsets.list()) {
@@ -159,6 +160,7 @@ describe("kernel.comms request_approval / report_to_parent / handback / wait", (
     // progress still goes out at once (silent); the result does not
     expect(run.ports.log.emitted.map((e) => e.type)).toEqual([PAYLOAD.cellProgress]);
     expect(run.ports.state.get(CELL_RESULT_CANDIDATE_KEY)).toEqual({
+      runId: run.snapshot.runId,
       status: "completed",
       summary: "测试全过，分支 fix/ci",
       artifactId: "art_rep",
@@ -180,7 +182,7 @@ describe("kernel.comms request_approval / report_to_parent / handback / wait", (
       data: { staged: true },
     });
     expect(run.ports.log.emitted).toEqual([]);
-    expect(run.ports.state.get(CELL_RESULT_CANDIDATE_KEY)).toEqual({ status: "failed", summary: "失败：上游接口 502", artifactId: "art_log", at: c.now() });
+    expect(run.ports.state.get(CELL_RESULT_CANDIDATE_KEY)).toEqual({ runId: run.snapshot.runId, status: "failed", summary: "失败：上游接口 502", artifactId: "art_log", at: c.now() });
     expect(run.ports.state.get(CELL_STATUS_KEY)).toMatchObject({ text: "失败：上游接口 502" });
     // a leaf's turns are settled by the kernel: complete_self / pause_self are not offered to it
     for (const name of ["complete_self", "pause_self"]) {
@@ -370,7 +372,7 @@ describe("kernel.context", () => {
   });
 
   it("reads/writes state, notes, skills, search and resources", async () => {
-    const run = fakeRun();
+    const run = fakeRun({cellId:"desk", parentId:null});
     await invoke(run, "set_state", { patches: { "gtd:action:a1": { title: "x" }, tmp: 1 } });
     await invoke(run, "set_state", { patches: { tmp: null } });
     expect(await invoke(run, "read_state", { prefix: "gtd:" })).toMatchObject({ output: expect.stringContaining('"title": "x"') });
@@ -402,22 +404,15 @@ describe("kernel.context", () => {
     expect((await invoke(run, "read_resource", { uri: "res://cell1/big", offset: 100_000, limit: 64_000 })).output).toBe("z".repeat(50_000));
   });
 
-  it("BUG-020: set_state blocks reserved authoritative keys/prefixes while allowing normal and gtd:action:* keys", async () => {
+  it("protects registered keys and prefixes without writing part of a rejected patch", async () => {
     const run = fakeRun();
-    for (const key of ["gtd:project", "gtd:project:x", "gtd:source", "gtd:source:1", "gtd:activity", "gtd:activity:a1", "cli:session", "sys:meta"]) {
-      const r = await invoke(run, "set_state", { patches: { [key]: { v: 1 } } });
-      expect(r.isError, key).toBe(true);
-      expect(r.output, key).toContain("reserved");
-      expect(run.ports.state.has(key), key).toBe(false);
+    for (const key of ["example:ledger", "example:ledger:open"]) {
+      const result = await invoke(run, "set_state", { patches: { normal: 1, [key]: 2 } });
+      expect(result).toMatchObject({ isError: true, output: expect.stringContaining(key) });
+      expect(run.ports.state.size).toBe(0);
     }
-    // Allowed keys still succeed cleanly.
-    const ok = await invoke(run, "set_state", {
-      patches: { "gtd:action:a1": { title: "ok" }, "hub:topics": ["a"], "memo:1": "hi" },
-    });
-    expect(ok.isError).toBeUndefined();
-    expect(run.ports.state.get("gtd:action:a1")).toEqual({ title: "ok" });
-    expect((await invoke(run, "set_state", {patches:{"desk:arbitration":{}}})).isError).toBe(true);
-    expect(run.ports.state.get("hub:topics")).toEqual(["a"]);
+    await invoke(run, "set_state", { patches: { normal: 1 } });
+    expect(run.ports.state.get("normal")).toBe(1);
   });
 
   describe("patch_artifact", () => {
@@ -566,8 +561,15 @@ describe("kernel.context", () => {
     });
   });
 
+  it("refuses preference or global knowledge writes from a child", async () => {
+    const child = fakeRun();
+    for (const input of [{kind:"preference",scope:"cell"}, {kind:"reference",scope:"global"}]) {
+      await expect(invoke(child, "save_note", { name:"规则", body:"替换", ...input })).rejects.toMatchObject({code:"bounds_violation"});
+    }
+    expect(child.ports.log.knowledge).toEqual([]);
+  });
   it("save_note limits a preference to a directory and roles; refuses the limits on a note", async () => {
-    const run = fakeRun();
+    const run = fakeRun({cellId:"desk", parentId:null});
     const gate = await invoke(run, "save_note", { name: "commit-gate", body: "提交前跑 cargo clippy", kind: "preference", cwdPrefix: "/work/trae-x", roles: ["worker"] });
     expect(gate.output).toBe('Saved preference "commit-gate" (global; only for cells in /work/trae-x and roles worker).');
     await invoke(run, "save_note", { name: "report-style", body: "报告先写结论", kind: "preference", roles: ["project", "worker"] });
@@ -769,9 +771,9 @@ describe("kernel.schedule", () => {
 
 describe("workspace", () => {
 
-  it("Review fix (BUG-020): set_state blocks kernel-owned cell:* and pull:* keys alongside gtd:project/source/activity, cli:*, sys:*", async () => {
+  it("Review fix (BUG-020): set_state blocks kernel-owned cell:* and pull:* keys and cli:* and sys:*", async () => {
     const run = fakeRun();
-    for (const key of ["cell:turn", "cell:direct_chat", "cell:result", "pull:w1", "gtd:project", "gtd:source:1", "gtd:activity:1", "cli:session", "sys:flag"]) {
+    for (const key of ["cell:turn", "cell:direct_chat", "cell:result", "pull:w1", "cli:session", "sys:flag"]) {
       const r = await invoke(run, "set_state", { patches: { [key]: { bad: true } } });
       expect(r.isError, `expected ${key} to be blocked`).toBe(true);
     }

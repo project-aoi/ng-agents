@@ -72,6 +72,37 @@ describe("leaf settlement", () => {
     expect(h.kernel.inbox.enqueueSync("desk", again)).toBe("deduped");
   });
 
+  it.each(["worker", "checker"] as const)("keeps a new %s wait when a previous run left a report", async preset => {
+    const h = await boot();
+    const id = "reporter";
+    h.kernel.spawnCell("desk", {id, preset, meta: {role: id}}, "first task");
+    h.script.add(id, () => {
+      h.kernel.sendToCell(id, {text: "new task", id: "follow-up"});
+      return tool("report_to_parent", {kind: "result", text: "first result"});
+    }, tool("wait", {waitingFor: "human", waitId: "confirm", reason: "need a decision"}));
+    await h.kernel.idle();
+    const [first, second] = runsOf(h, id);
+    expect(first).toBeTruthy();
+    expect(second).toBeTruthy();
+    expect(h.kernel.context.readStateSync(id, CELL_RESULT_CANDIDATE_KEY)).toMatchObject({runId: first, summary: "first result"});
+    expect(h.kernel.listWaits([id])).toMatchObject([{waitId: "confirm", registeredRun: second}]);
+    expect(h.kernel.getCell(id)?.status).toBe("active");
+    expect(results(h)).toEqual([]);
+  });
+
+  it("consumes a human wait when the answering run refuses", async () => {
+    const h = await boot();
+    worker(h, "reply");
+    h.script.add("reply", tool("wait", {waitingFor: "human", waitId: "review", reason: "need review"}));
+    await h.kernel.idle();
+    expect(h.kernel.listWaits(["reply"])).toHaveLength(1);
+    h.script.add("reply", { text: "I cannot proceed", stopReason: "refusal" });
+    h.kernel.directMessage("reply", {text: "结束检查", replyToId: "review"});
+    await h.kernel.idle();
+    expect(h.kernel.listWaits(["reply"])).toEqual([]);
+    expect(results(h)).toMatchObject([{status: "failed", turn: {outcome: "refused"}}]);
+  });
+
   it("a follow-up that lands after a one-shot probe's report but before the settle: no stale result goes out, the probe stays, takes it, reports once and only then closes", async () => {
     const h = await boot();
     probe(h, "p1");
@@ -168,35 +199,22 @@ describe("leaf settlement", () => {
     expect(h.kernel.listWaits(["waiting"])).toMatchObject([{ waitingFor: "inbox:desk", reason: "等 desk 裁决" }]);
   });
 
-  it("a one-shot cell with a child still at work is not closed by its own report; it closes once the child's turn is over", async () => {
-    const h = await boot();
-    // a one-shot worker given spawn depth
-    worker(h, "w1", "do it", {preset:"inline", lifetime: "one_shot", bounds: { maxDepth: 1 } });
-    const g = gate();
-    h.script.add("w1", tool("spawn_cell", { preset: "worker", title: "helper", instruction: "help", meta: { role: "helper" } }));
-    h.script.add("w1", tool("report_to_parent", { kind: "result", text: "premature" }));
-    h.script.add("helper", async () => {
-      await g.wait;
-      return tool("report_to_parent", { kind: "result", text: "helped" });
-    });
-    // woken by the helper's result
-    h.script.add("w1", tool("report_to_parent", { kind: "result", text: "final, with the helper's part" }));
-    await waitFor(() => h.script.callsOf("w1").length === 2 && h.kernel.activeRuns().some((r) => r.cellId !== "w1"), 5_000, "w1 reported while its helper runs");
-    await new Promise((r) => setTimeout(r, 30));
-    expect(h.kernel.getCell("w1")!.status).toBe("active");
-    expect(results(h)).toEqual([]);
-    g.open();
-    await h.kernel.idle();
-    expect(h.kernel.getCell("w1")!.status).toBe("closed");
-    expect(results(h).map((r) => r.summary)).toEqual(["final, with the helper's part"]);
-    // the helper — a worker, dormant once it had reported — was archived with it
-    const [helper] = h.kernel.listCells({ parentId: "w1" });
-    expect(helper).toMatchObject({ status: "closed", closeReason: "completed" });
-    expect(results(h, "w1").map((r) => [r.summary, r.childState])).toEqual([["helped", "dormant"]]);
-  });
 });
 
 describe("step limit and refusal are never 'completed'", () => {
+  it("queues the continuation before deciding whether a stalled project needs the owner", async () => {
+    const h = await boot({kernel: {stallGraceMs: 500}});
+    h.kernel.spawnCell("desk", {id:"p", preset:"project", meta:{role:"p"},
+      processor:{kind:"llm", maxSteps:1, toolsets:["kernel.context","kernel.comms"]}});
+    await h.kernel.idle();
+    h.script.add("p", tool("set_state", {patches: {step: 1}}), tool("wait", {reason:"等人审阅", waitingFor:"human"}));
+    h.clock.advance(500);
+    await h.kernel.idle();
+    expect(h.of("run.finished").filter(r => r.cellId === "p").map(r => r.outcome)).toEqual(["step_limit", "yielded_waiting"]);
+    expect(h.kernel.humanItems.list()).toEqual([]);
+    expect(h.kernel.listWaits(["p"])).toMatchObject([{waitingFor:"human"}]);
+  });
+
   it("step_limit: the kernel queues a continuation each time, then asks the owner instead of looping; 'continue' grants one more", async () => {
     const h = await boot({ kernel: { maxStepContinuations: 2 } });
     h.kernel.spawnCell("desk", { id: "w1", preset: "worker", meta: { role: "w1" }, processor: { kind: "llm", toolsets: ["kernel.context", "kernel.comms"], maxSteps: 1 } }, "long job");

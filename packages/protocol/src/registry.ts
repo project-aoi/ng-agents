@@ -19,6 +19,8 @@ export interface NamedRegistry<T extends { readonly name: string }> {
  * and Loop read from the same instance.
  */
 export interface Registry {
+  reserveState(keys: readonly string[], prefixes: readonly string[]): void;
+  isReservedStateKey(key: string): boolean;
   readonly toolsets: NamedRegistry<Toolset>;
   readonly codeProcessors: NamedRegistry<CodeProcessor>;
   readonly presets: NamedRegistry<PresetDef>;
@@ -57,7 +59,16 @@ export function createRegistry(): Registry {
       seen.add(tool.name);
     }
   });
+  const protectedKeys = new Set<string>();
+  const protectedPrefixes = new Set(["cli:", "sys:", "cell:", "pull:"]);
   return {
+    reserveState(keys, prefixes) {
+      for (const key of keys) protectedKeys.add(key);
+      for (const prefix of prefixes) protectedPrefixes.add(prefix);
+    },
+    isReservedStateKey(key) {
+      return protectedKeys.has(key) || [...protectedPrefixes].some(prefix => key.startsWith(prefix));
+    },
     toolsets,
     codeProcessors: namedRegistry<CodeProcessor>("code processor", (p) => {
       if (p.name.startsWith("script:")) throw new NgError("invalid_argument", `code processor names cannot start with "script:"`);

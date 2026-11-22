@@ -460,7 +460,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
   /** Cards about the project held outside its own cells (e.g. by the desk) go with it. */
   async function withdrawProjectCards(projectId: string, reason: string, as: DeskActor): Promise<void> {
     principalOf(as);
-    const rec = gate.findPendingBySubjectSync(subjectKeys.project(projectId));
+    const rec = gate.findPendingBySubjectSync(subjectKeys.project(projectId), desk);
     if (rec) gate.withdrawSync(rec.actionId, reason, { seenItemRevision: rec.itemRevision });
   }
 

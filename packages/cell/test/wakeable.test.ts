@@ -457,27 +457,9 @@ describe("what a coordinator sees at every wake-up", () => {
   });
 });
 
-describe("a leaf that was given spawn depth on purpose", () => {
-  it("is not dormant, and its turn is not reported, while a cell it started is still at work", async () => {
-    const h = await boot();
-    project(h);
-    worker(h, "lead", "proj", "split the work", {preset:"inline",lifetime:"wakeable", bounds: { maxDepth: 1 } });
-    let release!: () => void;
-    const held = new Promise<void>((r) => (release = r));
-    h.script.add("lead", tool("spawn_cell", { preset: "worker", title: "helper", instruction: "do the part", meta: { role: "helper" } }));
-    h.script.add("helper", async () => {
-      await held;
-      return { text: "part done" };
-    });
-    await waitFor(() => h.kernel.listCells({ parentId: "lead" }).length === 1 && h.kernel.activeRuns().length === 1);
-    const helper = h.kernel.listCells({ parentId: "lead" })[0]!.id;
-    expect(h.kernel.activeRuns().map((r) => r.cellId)).toEqual([helper]);
-    expect(activity(h, "lead")).toBe("waiting");
-    expect(results(h, "proj")).toEqual([]);
-    h.script.add("lead", { text: "all parts in" });
-    release();
-    await h.kernel.idle();
-    expect(activity(h, "lead")).toBe("dormant");
-    expect(results(h, "proj").map((r) => r.summary)).toEqual(["all parts in"]);
-  });
+it.each(["one_shot", "wakeable"] as const)("enforces the leaf boundary for the %s lifetime even on a custom spec", async lifetime => {
+  const h = await boot();
+  h.kernel.spawnCell("desk", { id: "leaf", preset: "inline", lifetime, bounds: { maxDepth: 3 } });
+  expect(h.kernel.getCell("leaf")?.bounds.maxDepth).toBe(0);
+  expect(() => h.kernel.spawnCell("leaf", { preset: "worker" })).toThrow(/maxDepth 0/);
 });

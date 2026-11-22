@@ -2,7 +2,7 @@ import type { createHumanItems } from "./human-items";
 import type { ChannelHub } from "@ng/protocol";
 import type { GateService } from "@ng/gate";
 import type { InboxService } from "@ng/inbox";
-import type { AgentLoop, BoundsInit, Bus, CellsRepo, Clock, ContextStore, Db, Registry } from "@ng/protocol";
+import type { AgentLoop, BoundsInit, Bus, CellRecord, CellsRepo, Clock, ContextStore, Db, Registry } from "@ng/protocol";
 import type { WorkspaceManager } from "@ng/workspace";
 import type { Dispatcher } from "./dispatcher";
 import type { Escalations } from "./escalations";
@@ -52,4 +52,8 @@ export interface KernelCore {
   readModel: ReadModel;
   waits: Waits;
   stall: StallMonitor;
+}
+
+export function isProjectRoot(registry: Registry, cell: CellRecord | undefined): boolean {
+  return !!cell?.preset && registry.presets.get(cell.preset)?.projectRoot === true;
 }

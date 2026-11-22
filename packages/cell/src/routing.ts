@@ -24,7 +24,7 @@ export function matchWatches(core: KernelCore, env: Omit<Envelope, "to">): Watch
     for (const r of rows) {
       if (hits.has(r.cell_id)) continue;
       const filter = JSON.parse(r.filter) as Record<string, unknown>;
-      if (watchFilterMatches(filter, env as unknown as Record<string, unknown>)) hits.set(r.cell_id, { cellId: r.cell_id, watchId: r.id, coalesceMs: r.coalesce_ms });
+      if (watchFilterMatches(filter, env as unknown as Record<string, unknown>) && core.cells.isActiveInTree(r.cell_id)) hits.set(r.cell_id, { cellId: r.cell_id, watchId: r.id, coalesceMs: r.coalesce_ms });
     }
   };
   for (const thread of env.threads ?? []) {

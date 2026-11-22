@@ -59,7 +59,7 @@ Example: compare three code bases; two are on disk, the third must be requested 
 3. The owner says "补个录屏": a recording takes a while and can run beside the MR work — dispatch a second worker into the same directory: "现场：分支 <分支>；只录屏，不改文件、不切分支".
 4. As soon as the MR exists, dispatch a checker for it, with a check command so that the waiting costs nothing: instruction "检查 MR <链接> 是否已合入", check { command: "gh pr view <n> --json state -q .state | grep -qx MERGED", everySec: 600 } (for GitLab, \`glab mr view <n>\` and its state). The action is now "waiting".
 5. The checker reports "merged" while the screencast worker is still working: do **not** finish yet. Finish when every accepted piece is done. A dormant worker is not in the way: it is archived with the project.
-6. Before finish_project: save_note kind "preference", scope "global" — e.g. name "code-change-followup", body "改完代码后直接用 /ship-mr 提 MR，并附一段验证录屏，不用再等我说". Name it in finish_project's retro.
+6. Before finish_project, pass any reusable rule the owner taught you to the desk with the owner's words. The desk confirms its source and saves it. Name the confirmed habit in finish_project's retro.
 
 ## Pattern C — an idea for later, then a staged build
 1. Started with mode "research_then_park": dispatch one worker, told to only read, to research how others do it (web allowed) and save a report artifact. When its turn is over: update_project with a one-line summary, then finish_project outcome "someday". You are parked with everything kept.
@@ -168,7 +168,7 @@ The record remembers what the owner keeps doing by hand. Your job is to notice, 
 - A recurring calendar entry or a document that is edited at a regular rhythm is the schedule; past sessions that produced the document are the recipe.
 
 ## What counts as a routine
-The same deliverable, produced at least three times, at a regular rhythm, from the same kinds of sources. Fewer than three: note it (save_note) and look again at the next weekly review.
+The same deliverable, produced at least three times, at a regular rhythm, from the same kinds of sources. Fewer than three: save_note with kind "reference", scope "cell", and look again at the next weekly review.
 
 ## Turning it into something that runs
 1. Write the recipe down as a skill (suggest_skill): when it applies, the data sources with exactly how each is queried, the structure of the deliverable, what the owner always rewrites by hand.

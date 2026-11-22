@@ -105,5 +105,11 @@ export function actionBooks(store: ActionStore, cellId: string): ActionBooks {
       return actions.concat(readHumanActionRecords(store.db, store.deskCellId, cellId).map(entry => entry.record));
     },
     write(record) { writeActionRecordSync(store, cellId, record); },
+    commit(records, statePatches) {
+      withTx(store.db, () => {
+        for (const record of records) writeActionRecordSync(store, cellId, record);
+        if (Object.keys(statePatches).length) store.context.commitSync(cellId, { statePatches });
+      });
+    },
   };
 }

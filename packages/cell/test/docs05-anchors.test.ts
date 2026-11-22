@@ -185,10 +185,10 @@ describe("waits (the internal anchor)", () => {
 
     await h.kernel.closeCell("w1", "cancelled");
     expect(h.kernel.listWaits(["w1"])).toEqual([]);
-    // The project's own wait on the dead worker was answered by the synthetic close report; nothing holds it now.
+    // The closure notice informs the parent without answering its outstanding question.
     h.script.add("proj", { text: "w1 被关了" });
     await h.kernel.idle();
-    expect(h.kernel.listWaits(["proj"])).toEqual([]);
+    expect(h.kernel.listWaits(["proj"])).toMatchObject([{waitingFor:"inbox:w1"}]);
     expect(h.kernel.anchorsOf("proj")).toMatchObject({ internal: false, stalled: true });
   });
 });
@@ -355,7 +355,7 @@ it("arbitrates each affected project separately and re-arms a resolved incident 
   h.kernel.humanItems.create({category:"action", title:"普通待办", subjectKey:"action:b", relatedProjectIds:["b"],
     options:[{id:"done",label:"完成",effect:"reply"}]}, "b");
   const cause = "arb:shared";
-  const escalations = () => h.kernel.humanItems.list().filter(i => i.subjectKey === `kernel:stalled:${cause}`);
+  const escalations = () => h.kernel.humanItems.list().filter(i => i.subjectKey.startsWith(`kernel:stalled:${cause}:`));
   await accept(decision(cause, ["a", "b", "c"]), "ok");
   expect(escalations()).toMatchObject([{relatedProjectIds:["b"]}]);
   await accept(escalations()[0]!, "reply");
@@ -385,6 +385,10 @@ it("settles multiple waits on an owner's direct answer even when the new run def
   h.kernel.inbox.enqueueSync("proj", {id:"answer", from:"inbox:desk", principalId:"cell:desk", kind:"event",
     type:PAYLOAD.cellMessage, payload:{ fromCellId:"desk", text:"answered", replyToId:"transport-message" }, createdAt:h.clock.now()});
   await h.kernel.idle();
+  expect(h.kernel.listWaits(["proj"])).toMatchObject([{waitId:"named"}]);
+  h.kernel.inbox.enqueueSync("proj", {id:"matched-answer", from:"inbox:desk", principalId:"cell:desk", kind:"event",
+    type:PAYLOAD.cellMessage, payload:{fromCellId:"desk",text:"确认",replyToId:"named"},createdAt:h.clock.now()});
+  await h.kernel.idle();
   expect(h.kernel.listWaits(["proj"])).toEqual([]);
 });
 
@@ -402,4 +406,32 @@ it("shows a coordinator a human edit on a descendant's shared artifact", async (
   const prompt = requestText(h.script.callsOf("proj").at(-1)!);
   expect(prompt).toContain("[human-edited artifacts]");
   expect(prompt).toContain("art_report v2");
+});
+
+it("grounds a detached leaf on its own decision at the desk", async () => {
+  const h = await boot({start:false});
+  h.kernel.spawnCell("desk", {id:"leaf",preset:"worker"});
+  addWait(h, "leaf", "desk", "scope");
+  const decision = {title:"选择范围", options:[{id:"reply",label:"回复",effect:"reply" as const}]};
+  h.kernel.humanItems.create({...decision, category:"action", subjectKey:"scope"}, "desk");
+  h.kernel.humanItems.create({...decision, subjectKey:"cell:another"}, "desk");
+  expect(h.kernel.anchorsOf("leaf")).toMatchObject({internal:false,stalled:true});
+  h.kernel.humanItems.create({...decision, subjectKey:"cell:leaf"}, "desk");
+  expect(h.kernel.anchorsOf("leaf")).toMatchObject({internal:true,stalled:false});
+});
+
+it("keeps concurrent escalations with the same cause separate by wait registration", async () => {
+  const h = await boot();
+  for (const id of ["alpha","beta"]) {
+    project(h,id);
+    addWait(h,id,"desk","review");
+    const decision = h.kernel.humanItems.create({
+      title:"选择范围", subjectKey:"shared-review", relatedProjectIds:[id],
+      options:[{id:"ok",label:"确认",effect:"reply"}],
+    }, "desk");
+    await h.kernel.humanItems.decide(decision.id, {optionId:"ok",seenItemRevision:decision.itemRevision}, "owner");
+    await h.kernel.idle();
+  }
+  const open = h.kernel.humanItems.list().filter(i => i.subjectKey.startsWith("kernel:stalled:shared-review:"));
+  expect(open.map(i => i.relatedProjectIds[0]).sort()).toEqual(["alpha","beta"]);
 });

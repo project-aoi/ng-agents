@@ -128,7 +128,6 @@ describe("app × real presets", () => {
       { title: "和市场部对齐风格", owner: "human", effort: "15m" },
       { title: "拉一份现有页面清单", owner: "agent" },
     ]);
-    d.script.add("project",tool("track_action",{title:"和市场部对齐风格",owner:"human",nextStep:"联系市场部"}));
     await approve(d, cardId);
     await d.kernel.idle();
     const projectId = (await d.get<RadarDTO>("/api/radar")).projects[0]!.id;

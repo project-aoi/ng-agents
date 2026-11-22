@@ -21,8 +21,7 @@ function setup(registry: Registry): void {
 describe("read models", () => {
   it("roster, tree and stats describe what is in flight; the roster reaches the parent's snapshot tail", async () => {
     const h = await boot({ setup });
-    // a leaf given spawn depth on purpose (a worker has none by default)
-    h.kernel.spawnCell("desk", { id: "proj", preset: "inline", lifetime:"wakeable", title: "官网改版", processor: { kind: "code", entry: "test.idle" }, meta: { projectCellId: "proj" }, bounds: { maxDepth: 1 } });
+    h.kernel.spawnCell("desk", { id: "proj", preset: "project", title: "官网改版", processor: { kind: "code", entry: "test.idle" }, meta: { projectCellId: "proj" }, bounds: { maxDepth: 1 } });
     h.kernel.spawnCell("proj", { id: "build", preset: "worker", title: "跑测试", processor: { kind: "code", entry: "test.long_job" } }, "go");
     h.kernel.spawnCell("proj", { id: "wait", preset: "checker", title: "等报价", processor: { kind: "code", entry: "test.idle" }, watches: [{ threadOrFilter: { thread: "memory:q" } }], schedules: [{ deliverAt: T0 + DAY }] });
     h.kernel.context.commitSync("wait", { statePatches: { [CELL_STATUS_KEY]: { text: "已回", at: T0, progress: { done: 2, total: 3, label: "家" } } } });
@@ -30,7 +29,6 @@ describe("read models", () => {
     await waitFor(() => h.kernel.workspace.listJobsSync({ state: ["running"] }).length === 1, 10_000, "job");
 
     const roster = h.kernel.rosterFor("proj");
-    // a leaf sees its direct children; a persistent one (the desk) its whole live subtree in tree order
     expect(roster.map((r) => [r.cellId, r.depth, r.parentId])).toEqual([
       ["build", 1, "proj"],
       ["wait", 1, "proj"],
@@ -77,10 +75,9 @@ describe("read models", () => {
     const h = await boot({
       setup(registry: Registry) {
         setup(registry);
-        // docs/05: no test preset asks for isolation any more (host is the default); one that still opts in explicitly
         registry.presets.register({
           name: "sensor",
-          description: "test sensor in an explicit worktree",
+          description: "sensor with an explicit tool set",
           defaults: { processor: { kind: "code", entry: "test.idle" }, lifetime: "persistent", bounds: { isolation: "none", tools: new Set(["read", "bash"]) } },
         });
       },

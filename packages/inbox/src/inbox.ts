@@ -124,6 +124,7 @@ export function createInbox(opts: InboxOptions): InboxService {
   let ticking = false;
   let recheckAfterTick = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let timerAt: number | null = null;
   let unsubscribeClock: (() => void) | undefined;
 
   // ---------- host suspend detection ----------
@@ -163,7 +164,7 @@ export function createInbox(opts: InboxOptions): InboxService {
 
   function isClaimable(cellId: string, now: number): boolean {
     const cell = cells.get(cellId);
-    if (!cell || cell.status !== "active") return false;
+    if (!cell || !cells.isActiveInTree(cellId)) return false;
     const serialHeld = get(
       db,
       "SELECT 1 AS x FROM inbox_claims WHERE cell_id = ? AND status = 'active' AND lease_expires_at > ? LIMIT 1",
@@ -358,7 +359,7 @@ export function createInbox(opts: InboxOptions): InboxService {
     return rows;
   }
 
-  function claimNextRunSync(cellId: string, workerId: string, leaseMs?: number): ClaimedBatch | null {
+  function claimNextRunSync(cellId: string, workerId: string, leaseMs?: number, beforeTake?: () => void): ClaimedBatch | null {
     if (typeof workerId !== "string" || workerId.length === 0) throw new NgError("invalid_argument", "workerId is required");
     const lease = leaseMs ?? defaultLeaseMs;
     if (!Number.isFinite(lease) || lease <= 0) throw new NgError("invalid_argument", `leaseMs must be > 0 (got ${lease})`);
@@ -370,14 +371,14 @@ export function createInbox(opts: InboxOptions): InboxService {
       if (cells.getEpoch(cellId) === undefined) throw new NgError("not_found", `cell "${cellId}" not found`);
       if (get(db, SQL_MAYBE_CLAIMABLE, [cellId, now, cellId, now]) === undefined) {
         // The wall clock can fall back between the enqueue announcement and this claim. An immediate row now needs a timer.
-        if (started && !manualClock && timer === undefined) rearmTimer();
+        if (started && !manualClock) rearmTimer();
         return null;
       }
     }
 
     return withTx(db, () => {
       const cell = requireCell(cellId);
-      if (cell.status !== "active") return null;
+      if (!cells.isActiveInTree(cellId)) return null;
       const now = clock.now();
       absorbSuspend(now);
       expireClaims(now, cellId);
@@ -385,7 +386,11 @@ export function createInbox(opts: InboxOptions): InboxService {
 
       const blocked = get(db, "SELECT 1 FROM inbox_claims WHERE cell_id = ? AND status = 'active' LIMIT 1", [cellId]);
       if (blocked) return null;
-      if (!hasDueWakeup(cellId, now, cell.epoch)) return null;
+      beforeTake?.();
+      if (!hasDueWakeup(cellId, now, cell.epoch)) {
+        scheduleChanged();
+        return null;
+      }
 
       const claimId = newId("run", clock);
       const rows = all<{ seq: number; envelope: string }>(db, SQL_TAKE_SERIAL, [
@@ -784,9 +789,12 @@ export function createInbox(opts: InboxOptions): InboxService {
           break;
         }
         case "resume": {
-          for (const t of [cell, ...cells.descendants(cellId, { status: ["paused"] })]) {
+          if (cell.parentId && !cells.isActiveInTree(cell.parentId)) {
+            return { applied: false, epoch: cell.epoch, reason: "an ancestor is paused or closed" };
+          }
+          for (const t of [cell, ...cells.descendants(cellId, { status: ["active", "paused"] })]) {
             if (t.status === "paused") cells.setStatus(t.id, "active");
-            affected.push({ cellId: t.id, epoch: t.epoch });
+            if (t.status === "paused" || t.id === cellId) affected.push({ cellId: t.id, epoch: t.epoch });
             if (isClaimable(t.id, now)) wake.push(t.id);
           }
           break;
@@ -800,7 +808,7 @@ export function createInbox(opts: InboxOptions): InboxService {
               principalId: cmd.principalId,
               kind: "event",
               type: PAYLOAD.controlSteer,
-              payload: { message: cmd.steerMessage! },
+              payload: { message: cmd.steerMessage!, ...(cmd.steerReplyToId && { replyToId: cmd.steerReplyToId }) },
               expectedEpoch: cell.epoch,
               delivery: "wakeup",
               createdAt: now,
@@ -965,12 +973,14 @@ export function createInbox(opts: InboxOptions): InboxService {
   }
 
   function rearmTimer(): void {
+    if (!started || manualClock) return;
+    const next = nextWakeAtSync();
     if (timer !== undefined) {
+      if (next === timerAt) return;
       clearTimeout(timer);
       timer = undefined;
     }
-    if (!started || manualClock) return;
-    const next = nextWakeAtSync();
+    timerAt = next;
     if (next === null) return;
     const delay = Math.min(Math.max(0, next - clock.now()), maxTimerDelayMs);
     timer = setTimeout(backgroundTick, delay);
@@ -985,6 +995,7 @@ export function createInbox(opts: InboxOptions): InboxService {
     } catch (err) {
       onError(err);
       if (started && !manualClock) {
+        timerAt = clock.now() + Math.min(1000, maxTimerDelayMs);
         timer = setTimeout(backgroundTick, Math.min(1000, maxTimerDelayMs));
         timer.unref?.();
       }
@@ -1151,14 +1162,14 @@ export function createInbox(opts: InboxOptions): InboxService {
     nextWakeAtSync,
     dueCellIdsSync,
     listMessagesSync,
-    consumeTimerSync(cellId, envelopeId, epoch, settle) {
+    consumePendingSync(cellId, envelopeId, epoch, settle) {
       return withTx(db, () => {
         const now = clock.now();
-        const touched = run(db, `UPDATE inbox_messages SET status='done', first_claimed_at=?, updated_at=?
-          WHERE cell_id=? AND envelope_id=? AND type='timer.fired' AND status='pending' AND deliver_at <= ?
+        const touched = run(db, `UPDATE inbox_messages SET status='done', first_claimed_at=COALESCE(first_claimed_at,?), updated_at=?
+          WHERE cell_id=? AND envelope_id=? AND status='pending' AND deliver_at <= ?
           AND (expected_epoch IS NULL OR expected_epoch=?)`, [now, now, cellId, envelopeId, now, epoch]);
         if (!touched.changes) return false;
-        settle();
+        settle?.();
         return true;
       });
     },

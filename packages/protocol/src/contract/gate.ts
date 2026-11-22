@@ -12,7 +12,7 @@ export interface Gate {
   reinstateSync(cellId: string): void;
   listPendingSync(filter?: PendingFilter): ApprovalRecord[];
   getApprovalSync(actionId: string): ApprovalRecord | undefined;
-  findPendingBySubjectSync(subjectKey: string, cellId?: string): ApprovalRecord | undefined;
+  findPendingBySubjectSync(subjectKey: string, cellId: string): ApprovalRecord | undefined;
   snoozeSync(actionId: string, until: number, opts?: { seenItemRevision?: number }): "snoozed" | "not_pending" | "revision_mismatch";
   denySync(actionId: string, approverId: string, reason?: string, opts?: { seenItemRevision?: number }): "denied" | "not_pending" | "revision_mismatch";
   /** Record an accepted revise instruction against a pending card: checks & increments itemRevision in the same tx. */

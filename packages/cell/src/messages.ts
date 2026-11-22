@@ -18,15 +18,15 @@ import {
   type SendToCellResult,
   type UserMessagePayload,
 } from "@ng/protocol";
-import type { KernelCore } from "./core";
+import { isProjectRoot, type KernelCore } from "./core";
 import type { DirectMessage, DirectMessageResult } from "./types";
 
-type MessageCore = Pick<KernelCore, "db" | "cells" | "inbox" | "clock" | "context" | "ownerPrincipal">;
+type MessageCore = Pick<KernelCore, "registry" | "db" | "cells" | "inbox" | "clock" | "context" | "ownerPrincipal">;
 
 const clip = (text: string) => (text.length > 400 ? `${text.slice(0, 400)}…` : text);
 
 /** The owner, or an agent on the control plane speaking for them — as opposed to a cell or an outside sender. */
-export function isPersonPrincipal(core: Pick<KernelCore, "ownerPrincipal">, principalId: string): boolean {
+export function isPersonPrincipal(core: Pick<KernelCore, "registry" | "ownerPrincipal">, principalId: string): boolean {
   const kind = parsePrincipal(principalId, core.ownerPrincipal).kind;
   return kind === "owner" || kind === "agent";
 }
@@ -102,7 +102,7 @@ export function sendCellMessage(
     if (!target) return { status: "not_found" };
     if (target.status === "closed") return { status: "closed", closeReason: target.closeReason };
     const sender = core.cells.get(o.sender);
-    const projectId = sender && (sender.preset === "project" ? sender.id : projectCellIdOf(sender.spec));
+    const projectId = sender && (isProjectRoot(core.registry, sender) ? sender.id : projectCellIdOf(sender.spec));
     const payload: CellMessagePayload = {
       ...(sender?.title ? { fromTitle: sender.title } : {}),
       ...(projectId ? { fromProjectCellId: projectId } : {}),
@@ -139,7 +139,7 @@ export function sendCellMessage(
 
 /** Kernel.directMessage — see the interface for the contract. */
 export function directMessage(
-  core: Pick<KernelCore, "db" | "cells" | "inbox" | "clock" | "context" | "ownerPrincipal" | "lifecycle">,
+  core: Pick<KernelCore, "registry" | "db" | "cells" | "inbox" | "clock" | "context" | "ownerPrincipal" | "lifecycle">,
   cellId: string,
   message: DirectMessage,
   principalId: string,
@@ -159,7 +159,7 @@ export function directMessage(
     }
     const id = message.clientId ?? newId("msg", core.clock);
     const seen = core.context.readStateSync<CellDirectChatState>(cellId, CELL_DIRECT_CHAT_KEY)?.seen ?? [];
-    if (seen.includes(id) && target.status !== "closed") {
+    if (seen.includes(id) || (message.clientId && core.inbox.listMessagesSync({ cellId, envelopeId: id }).some(m => m.envelope.from === KERNEL_FROM.control))) {
       return { status: "delivered", envelopeId: id, duplicate: true, reopened: false, targetStatus: target.status, ccTo: null };
     }
     let reopened = false;
@@ -179,7 +179,7 @@ export function directMessage(
     const common = { text, mode, messageId: id, principalId, ...(message.notifyParent ? { notifyParent: message.notifyParent } : {}), ...refs };
     let ccTo: string | null;
     if (mode === "steer") {
-      const r = core.inbox.controlSync(cellId, { action: "steer", principalId, steerMessage: text, steerEnvelopeId: id });
+      const r = core.inbox.controlSync(cellId, { action: "steer", principalId, steerMessage: text, steerEnvelopeId: id, ...(message.replyToId && { steerReplyToId: message.replyToId }) });
       if (!r.applied) return { status: "refused", reason: "not_allowed", detail: r.reason ?? "the steer was refused" };
       ccTo = ccDirectChat(core, target, common);
     } else if (target.parentId === null) {

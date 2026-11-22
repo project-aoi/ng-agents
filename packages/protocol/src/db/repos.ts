@@ -79,6 +79,8 @@ export interface CellsRepo {
   children(id: string, opts?: { status?: readonly CellStatus[] }): CellRecord[];
   /** Nearest first (parent, grandparent, …, root). */
   ancestors(id: string): CellRecord[];
+  /** Whether this cell and every ancestor can run. */
+  isActiveInTree(id: string): boolean;
   /** Breadth-first by depth, excluding the cell itself. */
   descendants(id: string, opts?: { status?: readonly CellStatus[] }): CellRecord[];
   getEpoch(id: string): number | undefined;
@@ -152,6 +154,17 @@ export function cellsRepo(db: Db, clock: Clock = systemClock): CellsRepo {
          SELECT cells.*, up.lvl FROM up JOIN cells ON cells.id = up.id ORDER BY up.lvl`,
         [id],
       ).map(toCell);
+    },
+    isActiveInTree(id) {
+      const row = get<{ runnable: number | null }>(db, `
+        WITH RECURSIVE lineage(parent_id, status) AS (
+          SELECT parent_id, status FROM cells WHERE id = ?
+          UNION ALL
+          SELECT c.parent_id, c.status FROM cells c JOIN lineage ON c.id = lineage.parent_id
+        )
+        SELECT MIN(status = 'active') AS runnable FROM lineage
+      `, [id]);
+      return row?.runnable === 1;
     },
     descendants(id, opts = {}) {
       const params: SqlParam[] = [id];

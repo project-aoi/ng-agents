@@ -130,7 +130,7 @@ export function registerTestPresets(registry: Registry): void {
     defaults: { processor: { kind: "llm", toolsets: all }, lifetime: "persistent", meta: { role: "desk" } },
   });
   registry.presets.register({...gtdLifecycle,
-    name: "project",
+    name: "project", projectRoot: true,
     description: "test project coordinator",
     defaults: { stallPolicy:"monitor",processor: { kind: "llm", toolsets: all }, lifetime: "persistent", meta: { role: "project" } },
   });

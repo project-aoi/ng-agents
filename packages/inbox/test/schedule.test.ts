@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { cellsRepo, createBus, openDatabase, systemClock, type TimerFiredPayload } from "@ng/protocol";
+import { cellsRepo, createBus, openDatabase, systemClock, withTx, type TimerFiredPayload } from "@ng/protocol";
 import { createInbox } from "../src";
 import { msg, setup, T0, timer } from "./helpers";
 
@@ -190,7 +190,11 @@ describe("cron", () => {
 
 
 describe("start()/stop() with the system clock", () => {
-  it("re-arms an immediate row when the wall clock rolls back between its announcement and its claim", () => {
+  it.each([
+    { armed: false, nested: false },
+    { armed: true, nested: false },
+    { armed: true, nested: true },
+  ])("re-arms the earliest message on clock rollback with armed=$armed and nested=$nested", ({armed, nested}) => {
     vi.useFakeTimers();
     vi.setSystemTime(T0);
     const db = openDatabase(":memory:");
@@ -201,10 +205,12 @@ describe("start()/stop() with the system clock", () => {
     bus.on("inbox.enqueued", event => reasons.push(event.reason));
     try {
       inbox.start();
+      if (armed) inbox.enqueueSync("desk", msg({ id: "later" }), { deliverAt: T0 + 4 * MIN });
       inbox.enqueueSync("desk", msg({id:"immediate"}));
-      vi.setSystemTime(T0 - MIN);
-      expect(inbox.claimNextRunSync("desk","k")).toBeNull();
-      vi.advanceTimersByTime(MIN);
+      vi.setSystemTime(T0 - 2_000);
+      const claim = () => inbox.claimNextRunSync("desk","k");
+      expect(nested ? withTx(db, claim) : claim()).toBeNull();
+      vi.advanceTimersByTime(2_000);
       expect(reasons.at(-1)).toBe("due");
       expect(inbox.claimNextRunSync("desk","k")?.envelopes[0]?.id).toBe("immediate");
     } finally {

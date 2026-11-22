@@ -77,8 +77,8 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
   function assertLive(what: string): void {
     if (runSignal.aborted) throw new NgError("stale_epoch", `${what}: this run was stopped; end your turn`);
     const cur = cells.get(cellId);
-    if (!cur || cur.status === "closed" || cur.epoch !== self.epoch) {
-      throw new NgError("stale_epoch", `${what}: this task was cancelled or closed; stop here`);
+    if (!cur || cur.epoch !== self.epoch || !cells.isActiveInTree(cellId)) {
+      throw new NgError("stale_epoch", `${what}: this task was stopped; end your turn`);
     }
   }
 
@@ -206,6 +206,8 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
     async upsertSkillOrNote(id, patch) {
       pinned(id, "upsertSkillOrNote");
       assertLive("upsertSkillOrNote");
+      if ((cell.parentId !== null || cellId !== core.deskCellId) && (patch.kind === "preference" || patch.scope === "global"))
+        throw new NgError("bounds_violation", "只有主台可以保存共享偏好和全局知识");
       context.upsertSkillOrNoteSync(cellId, patch);
     },
     async getArtifactVersion(id,version) { return context.getArtifactVersionSync(id,version); },
@@ -285,6 +287,7 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
     ...(actionBooks && { actionBooks: {
       list: () => actionBooks.list(),
       write(record) { assertLive("write action"); actionBooks.write(record); },
+      commit(records, patches) { assertLive("commit actions"); actionBooks.commit(records, patches); },
     } }),
     createHumanItem(draft) {
       assertLive("createHumanItem");
@@ -322,6 +325,7 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
         // the parent would get two results, and one of them before the inbox was drained.
         const p = (payload ?? {}) as Partial<CellResultPayload>;
         const candidate: CellResultCandidate = {
+          runId: runId,
           status: p.status ?? "completed",
           summary: typeof p.summary === "string" && p.summary ? p.summary : "Finished without a report.",
           ...(p.artifactId ? { artifactId: p.artifactId } : {}),

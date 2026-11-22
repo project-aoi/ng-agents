@@ -13,6 +13,7 @@ import { actionShapeFeedback, ownerOnlyApproval } from "./policy";
 const CONTROL_ACTIONS: readonly ControlAction[] = ["cancel", "pause", "resume", "steer"];
 
 export interface GateOptions {
+  isProjectRoot?(cell: CellRecord): boolean;
   onSuperseded?(old: ApprovalRecord, principalId: string): void;
   db: Db;
   bus: Bus;
@@ -130,9 +131,9 @@ export function createGate(opts: GateOptions): GateService {
     return get<ApprovalRow>(db, `${approvalSelect} WHERE action_id = ? AND cell_id IS NOT NULL AND action_hash <> ''`, [actionId]);
   }
 
-  function pendingBySubject(subjectKey: string, cellId?: string): ApprovalRow | undefined {
-    return get<ApprovalRow>(db, `${approvalSelect} WHERE subject_key = ? AND disposition = 'pending'
-      ${cellId === undefined ? "" : "AND cell_id = ?"} ORDER BY created_at DESC, action_id DESC LIMIT 1`, cellId === undefined ? [subjectKey] : [subjectKey, cellId]);
+  function pendingBySubject(subjectKey: string, cellId: string): ApprovalRow | undefined {
+    return get<ApprovalRow>(db, `${approvalSelect} WHERE subject_key=? AND cell_id=? AND disposition='pending'`,
+      [subjectKey, cellId]);
   }
 
   function resolveRow(row: ApprovalRow, status: ApprovalStatus, reason: string | null): void {
@@ -164,7 +165,7 @@ export function createGate(opts: GateOptions): GateService {
     const actionHash = hashAction(action);
     const artifactId = action.artifactId ?? null;
     const related = new Set(action.relatedProjectIds ?? []);
-    const issuerProject = cell.preset === "project" ? cell.id : projectCellIdOf(cell.spec);
+    const issuerProject = opts.isProjectRoot?.(cell) ? cell.id : projectCellIdOf(cell.spec);
     if (issuerProject) related.add(issuerProject);
     if (action.cardOptions) {
       checkCardOptions(action.cardOptions, { callback: true, controlled: action.type !== "custom" || !!ownerOnlyApproval(action) });
@@ -172,14 +173,16 @@ export function createGate(opts: GateOptions): GateService {
         if (option.terminateMode === "cancel_task" && !related.has(option.targetCellIds![0]!)) throw new NgError("invalid_argument", "unrelated cancel target");
       }
     }
-    for (const id of action.relatedProjectIds ?? []) if (cells.get(id)?.preset !== "project") throw new NgError("invalid_argument","unknown related project");
-    const existing = pendingBySubject(action.subjectKey);
-    if (existing && (existing.cell_id !== cell.id || !existing.action_hash)) return {type:"deny", feedback:`Subject ${action.subjectKey} already has a pending card from ${existing.cell_id}`};
+    for (const id of action.relatedProjectIds ?? []) {
+      const target = cells.get(id);
+      if (!target || !opts.isProjectRoot?.(target)) throw new NgError("invalid_argument", "unknown related project");
+    }
+    const existing = pendingBySubject(action.subjectKey, cell.id);
+    if (existing && !existing.action_hash) return {type:"deny", feedback:`Subject ${action.subjectKey} already has a pending card from ${existing.cell_id}`};
     let actionId: string;
 
     if (
       existing &&
-      existing.cell_id === cell.id &&
       existing.action_type === action.type &&
       existing.epoch === cell.epoch &&
       existing.action_hash === actionHash && existing.artifact_id === artifactId

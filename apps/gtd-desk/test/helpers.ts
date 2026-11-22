@@ -98,7 +98,7 @@ export function registerTestPresets(registry: Registry): void {
     description: "test desk",
     defaults: { processor: { kind: "llm", toolsets: [T.context, T.comms, T.schedule, T.cells] }, meta: { role: "desk" } },
   });
-  registry.presets.register({...gtdLifecycle, name:"project", description:"test project", defaults:{lifetime:"persistent",processor:{kind:"llm",toolsets:[T.context,T.comms,T.cells]},meta:{role:"project"}}});
+  registry.presets.register({...gtdLifecycle, name: "project", projectRoot: true, description:"test project", defaults:{lifetime:"persistent",processor:{kind:"llm",toolsets:[T.context,T.comms,T.cells]},meta:{role:"project"}}});
   registry.presets.register({...gtdLifecycle, name: "worker", description: "test worker", defaults: { processor: { kind: "llm", toolsets: [T.context, T.comms] }, ccParent:true,lifetime:"wakeable",meta: { role: "worker" } } });
   registry.presets.register({...gtdLifecycle, name: "checker", description: "test checker", defaults: { processor: { kind: "llm", modelTier: "fast", toolsets: [T.context, T.comms, T.schedule] }, ccParent:true,lifetime:"one_shot",meta: { role: "checker" } } });
   registry.presets.register({...gtdLifecycle, name: "sensor", description: "test sensor", defaults: { processor: { kind: "llm", modelTier: "fast", toolsets: [T.context, T.comms] }, meta: { role: "sensor" } } });

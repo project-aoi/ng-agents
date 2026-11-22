@@ -381,7 +381,7 @@ describe("desk tools for projects in flight", () => {
     expect(h.script.callsOf("desk")).toHaveLength(deskCalls); // the approval wake-up was pure bookkeeping
     expect(h.kernel.getCell(started!.projectId)).toMatchObject({ preset: "project", spec: { cwd: repo } });
     expect(h.project(started!.projectId)).toMatchObject({ title: "官网改版", lifecycle: "active", source: { label: "随手记" }, proposal: { outcome: "新版官网上线" } });
-    expect(h.actions(started!.projectId).map((a) => [a.title, a.owner])).toEqual([["盘点页面", "agent"]]);
+    expect(h.actions(started!.projectId).map((a) => [a.title, a.owner])).toEqual([["盘点页面", "agent"], ["对齐风格", "human"]]);
   });
 });
 

@@ -86,8 +86,7 @@ describe("spawnCell", () => {
       {
         id: "child",
         preset: "inline",
-        // one-shot: the kernel closes it once it is done, which waits for its child (the maxDepth it asks for: it gets 1)
-        lifetime: "one_shot",
+        lifetime: "persistent",
         processor: { kind: "code", entry: "test.greedy" },
         bounds: { tools: new Set(["read", "write", "bash"]), canSendTo: ["channel:*"] as unknown as Address[], isolation: "none", maxDepth: 7, maxConcurrentChildren: 99 },
       },
@@ -119,10 +118,8 @@ describe("spawnCell", () => {
       isolation: "none",
       maxDepth: 0,
     });
-    // the one-shot child closed only after its grandchild's turn was over (closing cascades; it waits for children at
-    // work); the grandchild, a dormant worker by then, was archived with it — completed, not cancelled
-    expect(grand).toMatchObject({ status: "closed", closeReason: "completed" });
-    expect(h.kernel.getCell("child")).toMatchObject({ status: "closed", closeReason: "completed" });
+    expect(grand).toMatchObject({ status: "active", bounds: { maxDepth: 0 } });
+    expect(h.kernel.getCell("child")!.status).toBe("active");
     expect(h.of("run.started").filter((e) => e.cellId === "child")).toHaveLength(2);
   });
 
@@ -306,6 +303,28 @@ describe("closeCell", () => {
     ]);
   });
 
+  it("pausing the parent through the inbox stops descendant runs and jobs, including a job just launched", async () => {
+    const { kernel, clock, script } = await boot({ setup: setupWith(startJob) });
+    kernel.spawnCell("desk", { id: "project", preset: "project" });
+    script.add("worker", { text: "waiting", delayMs: 60_000 });
+    kernel.spawnCell("project", { id: "worker", preset: "worker" }, "work");
+    await waitFor(() => script.callsOf("worker").length > 0, 5_000, "worker's run");
+    kernel.bus.on("job.changed", event => {
+      if (event.state === "running") kernel.inbox.controlSync("project", { action: "pause", principalId: "owner" });
+    });
+    kernel.spawnCell("project", { id: "job", preset: "worker", processor: { kind: "code", entry: startJob.name } }, "build");
+    await kernel.idle({ jobs: true });
+    expect(kernel.activeRuns()).toHaveLength(0);
+    expect(["project", "worker", "job"].map(id => kernel.getCell(id)?.status)).toEqual(["paused", "paused", "paused"]);
+    const [job] = kernel.workspace.listJobsSync({ cellId: "job" });
+    expect(job).toMatchObject({ state: "cancelled" });
+    expect(() => process.kill(-job!.pid!, 0)).toThrow();
+    const port = await kernel.workspace.acquire("job");
+    await expect(port.startJob({ command: "true" })).rejects.toThrow(/paused/);
+    expect(kernel.inbox.listMessagesSync({ cellId: "worker", type: PAYLOAD.cellTask })[0])
+      .toMatchObject({ status: "pending", attempts: 0, firstClaimedAt: clock.now() });
+  });
+
   it("a cancelled worker's Job is killed and its late job.result is dropped by the epoch (control cancel)", async () => {
     const h = await boot({ setup: setupWith(startJob) });
     h.kernel.spawnCell("desk", { id: "w", preset: "worker", processor: { kind: "code", entry: "test.start_job", args: { command: "sleep 30" } } }, "go");
@@ -355,7 +374,7 @@ describe("closeCell", () => {
     // a persistent child reports an interim result at once and stays open; when the owner closes it later the parent is
     // told — an earlier phase report is not the cell's final word
     h.script.add("p", tool("report_to_parent", { kind: "result", text: "阶段一完成" }));
-    h.kernel.spawnCell("desk", { id: "p", preset: "worker", lifetime: "persistent", meta: { role: "p" } }, "phase one");
+    h.kernel.spawnCell("desk", { id: "p", preset: "inline", lifetime: "persistent", meta: { role: "p" } }, "phase one");
     await h.kernel.idle();
     expect(h.kernel.getCell("p")!.status).toBe("active");
     await h.kernel.closeCell("p", "completed");

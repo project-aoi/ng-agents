@@ -214,7 +214,7 @@ describe("Radar", () => {
   it("project cancel closes its cell tree and records the cancellation", async () => {
     const d = await bootDesk();
     const p = makeProject(d.kernel, "竞品调研");
-    d.kernel.spawnCell(p, { id: "w1", preset: "worker", title: "扒 A 公司" });
+    d.kernel.spawnCell(p, { id: "w1", preset: "inline", title: "扒 A 公司" });
     d.kernel.spawnCell("w1", { id: "w1a", preset: "worker", title: "扒 A 的定价" });
     const a = writeAction(d.kernel, "w1", { title: "整理竞品", owner: "agent", progress: { done: 3, total: 15, label: "正在并发整理竞品资料" } });
 

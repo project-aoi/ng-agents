@@ -140,13 +140,12 @@ export class JobManager {
       withTx(db, () => {
         const cell = this.d.cells.get(cellId);
         if (!cell) throw new NgError("not_found", `cell "${cellId}" not found`);
-        if (cell.status === "closed") throw new NgError("conflict", `cell "${cellId}" is closed`);
+        if (!this.d.cells.isActiveInTree(cellId)) throw new NgError("conflict", `cell "${cellId}" or an ancestor is paused or closed`);
         if (store.countRunning(cellId) >= this.d.limits.maxJobsPerCell) {
           throw new NgError("conflict", `cell "${cellId}" already has ${this.d.limits.maxJobsPerCell} running jobs; wait for one or cancel one`);
         }
         // The epoch is read in the same transaction that records the job: it becomes the result's expectedEpoch.
         store.insertJob({ jobId, cellId, epoch: cell.epoch, command: spec.command, cwd: root, logPath, timeoutMs });
-        afterCommit(db, () => bus.emit("job.changed", { jobId, cellId, state: "running" }));
       });
     } catch (err) {
       closeSync(fd);
@@ -161,10 +160,12 @@ export class JobManager {
         cwd: root, env: { ...this.d.hostEnv(), [JOB_MARKER]: jobId }, detached: true, stdio: ["pipe", fd, fd],
       });
       child.on("error", (err) => console.error(`[workspace] job ${jobId} process error:`, err));
-      await new Promise<void>((resolve, reject) => {
-        child.once("spawn", resolve);
-        child.once("error", reject);
-      });
+      if (child.pid === undefined) {
+        await new Promise<void>((resolve, reject) => {
+          child.once("spawn", resolve);
+          child.once("error", reject);
+        });
+      }
     } catch (err) {
       closeSync(fd);
       this.#failStart(jobId, cellId, errorMessage(err));
@@ -195,6 +196,7 @@ export class JobManager {
         code === 0 ? { state: "succeeded", exitCode: 0, error: null } : { state: "failed", exitCode: code, error: signal ? `terminated by ${signal}` : null };
       this.#settle(live, outcome);
     });
+    afterCommit(db, () => bus.emit("job.changed", { jobId, cellId, state: "running" }));
     return { jobId };
   }
 

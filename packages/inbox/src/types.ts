@@ -1,6 +1,7 @@
 import type {
   Bus,
   Clock,
+  ClaimedBatch,
   ControlAction,
   ControlAuthorizer,
   Db,
@@ -88,6 +89,8 @@ export interface InboxReleaseOptions extends ReleaseOptions {
 }
 
 export interface InboxService extends Inbox {
+  /** Once this consumer holds the write lock, it can settle due kernel events before collecting its batch. */
+  claimNextRunSync(cellId: string, workerId: string, leaseMs?: number, beforeTake?: () => void): ClaimedBatch | null;
   releaseSync(claimId: string, reason: string, opts?: InboxReleaseOptions): ReleaseResult;
   /** Listeners run synchronously after the control transaction commits, before `inbox.control` is emitted. */
   onControl(listener: ControlListener): () => void;

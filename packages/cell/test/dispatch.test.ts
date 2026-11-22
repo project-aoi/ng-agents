@@ -38,6 +38,21 @@ function maxOverlap(h: Harness, cellIds?: string[]): number {
 const userTexts = (req: ModelRequest) => (requestText(req).match(/msg-\d+/g) ?? []).sort();
 
 describe("dispatcher", () => {
+  it("settles an obsolete stall check without marking its silent companion as read", async () => {
+    const { kernel, clock } = await boot({ start: false });
+    kernel.inbox.enqueueSync("desk", { id: "quiet", from: "inbox:desk", principalId: "owner", kind: "event",
+      type: PAYLOAD.userMessage, delivery: "silent_inject", payload: { text: "background" }, createdAt: clock.now() });
+    kernel.inbox.enqueueSync("desk", { id: "stale", from: "inbox:desk", principalId: "owner", kind: "event",
+      type: PAYLOAD.stalledCheck, payload: { projectCellId: "desk", stalledSince: 0, detail: "check" }, createdAt: clock.now() });
+    await kernel.start();
+    await kernel.idle();
+    expect(kernel.inbox.listMessagesSync({ envelopeId: "stale" })[0]?.status).toBe("done");
+    expect(kernel.inbox.listMessagesSync({ envelopeId: "quiet" })[0]).toMatchObject({ status: "pending", firstClaimedAt: null });
+    kernel.sendToCell("desk", { text: "read updates" });
+    await kernel.idle();
+    expect(kernel.inbox.listMessagesSync({ envelopeId: "quiet" })[0]).toMatchObject({ status: "done", firstClaimedAt: clock.now() });
+  });
+
   it("one Run per cell: messages arriving mid-Run coalesce into the next batch", async () => {
     const h = await boot();
     const g = gate();

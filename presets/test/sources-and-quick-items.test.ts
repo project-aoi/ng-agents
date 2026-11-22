@@ -101,8 +101,12 @@ describe("docs/03 §四 row 1 — a sensor is a source, not a task", () => {
     expect(acts.map((a) => [a.title, a.owner, a.status, a.nextStep ?? null])).toEqual([
       ["拉取近两周注册漏斗数据，定位下跌环节", "agent", "open", null],
       ["确认埋点没有漏报", "agent", "open", null],
+      ["和增长组同步结论", "human", "open", "约增长组开 15 分钟短会"],
     ]);
     expect(acts.every((a) => a.projectCellId === project)).toBe(true);
+    expect(h.kernel.humanItems.get(acts.find(a => a.owner === "human")!.id)).toMatchObject({
+      relatedProjectIds: [project], category: "action", title: "和增长组同步结论", effort: "15m",
+    });
     expect(h.cards()).toEqual([]);
     expect(h.notices()).toContain("已立项：排查注册转化率下跌，后台开始推进");
   });

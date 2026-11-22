@@ -3,7 +3,6 @@ import {
   cellIdOf,
   defineTool,
   isAddress,
-  PRESET_NAMES,
   TOOL_KINDS,
   ISOLATION_LEVELS,
   type Address,
@@ -103,12 +102,11 @@ export function cellsToolset(registry: Registry): Toolset {
     availableFor: canSpawn,
     description: [
       "Start a child cell for work that should not block you. It runs in the background and reports to your inbox (cell.result / cell.progress); your in-flight cells are listed at the end of every wake-up message.",
-      "Presets — worker: an executor for one piece of work (reads/changes code, runs commands, researches). When its turn is over you are told, and it stays dormant — costing nothing — until a message wakes it with everything it knows; it is closed with you. project: a persistent coordinator that owns one outcome over many steps (keeps the plan, the records and the shared artifacts; hands every piece of heavy work to workers). checker: a light one-shot checker that looks at a condition now and then (an MR merged? a file appeared?), reports when it holds and is then closed. sensor: a persistent scheduled source. hub: a persistent coordinator for one internal topic. inline: a light helper.",
       "cwd is the directory on this machine the child works in (an absolute path that exists; ask the owner when you do not know it — never guess). A child without cwd inherits yours. It starts at once: nothing queues or locks a directory. The note \"active workspaces\" at the end of your wake-up message shows who is working where right now — if someone is already changing that repository, say in the instruction how to share it (only look; or work in a `git worktree` of its own), or send the work to the cell that is already there.",
       "Its permissions are always a subset of yours. Give it everything it needs in the instruction: it does not see your conversation (unless contextMode fork_prefix).",
     ].join(" "),
     input: z.object({
-      preset: z.enum(PRESET_NAMES),
+      preset: z.string().min(1).describe("registered preset for the child"),
       title: z.string().min(1).describe("short name shown to the user"),
       instruction: z.string().min(1).describe("what to do, the context it needs (branch, earlier findings, artifact ids), what done looks like, what to report back"),
       input: z.unknown().optional().describe("structured data for the child"),

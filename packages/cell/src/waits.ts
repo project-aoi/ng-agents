@@ -75,11 +75,13 @@ export function createWaits(core: Pick<KernelCore, "db" | "clock" | "inbox" | "b
   const touched = (cellId: string) => afterCommit(db, () => bus.emit("cell.changed", { cellId, change: "updated" }));
 
   function answers(wait: WaitRecord, env: Envelope): boolean {
+    if (env.delivery === "silent_inject" || env.type === PAYLOAD.cellDirectChat || env.type === PAYLOAD.arbitrationUnanswered ||
+        env.type === PAYLOAD.stalledCheck || env.type === PAYLOAD.runContinue) return false;
+    if (env.type === PAYLOAD.cellResult && (env.payload as { data?: { synthetic?: boolean } } | null)?.data?.synthetic === true) return false;
     if (env.type === PAYLOAD.waitTimeout) {
       const timer = env.payload as WaitTimeoutPayload;
       return (timer.waitId ?? timer.waitingFor) === wait.waitId && (timer.registrationId ?? null) === wait.registrationId;
     }
-    if (env.type === PAYLOAD.stalledCheck || env.type === PAYLOAD.runContinue) return false;
     // The owner (or their agent) writing to the cell directly — as a message or as an interruption — outranks whoever
     // it was waiting for: a worker that asked its project what to do about a dirty directory and is told by the owner
     // has its answer. A steer from another cell is a correction, not an answer.
@@ -91,7 +93,8 @@ export function createWaits(core: Pick<KernelCore, "db" | "clock" | "inbox" | "b
     if (wait.waitingFor === WAIT_HUMAN) {
       // The owner spoke, decided a card, or an agent acting for them on the control plane did.
       const p = parsePrincipal(env.principalId, core.ownerPrincipal);
-      return p.kind === "owner" || p.kind === "agent" || env.type === PAYLOAD.approvalResolved;
+      return env.type === PAYLOAD.approvalResolved ||
+        ((env.type === PAYLOAD.userMessage || env.type === PAYLOAD.cellMessage) && (p.kind === "owner" || p.kind === "agent"));
     }
     if (wait.waitingFor === WAIT_EXTERNAL) {
       // The vague party: "something outside me will happen". An outside message, a source hit, and also the things a
@@ -168,13 +171,13 @@ export function createWaits(core: Pick<KernelCore, "db" | "clock" | "inbox" | "b
         for (const env of envelopes) {
           const p = env.payload as Record<string, unknown> | null;
           const data = p?.data as Record<string, unknown> | undefined;
-          const refs = [p?.refId, p?.waitId, p?.replyToId, data?.refId, data?.waitId].filter((x) => typeof x === "string");
+          const refs = [p?.refId, p?.waitId, p?.replyToId, data?.refId, data?.waitId, data?.replyToId].filter((x) => typeof x === "string");
           const candidates = open.filter(w => !done.has(w.waitId) && w.registeredRun !== runId && answers(w, env));
           const keys = p?.actionId ? [...refs, p.actionId] : refs;
           const explicit = candidates.filter(w => keys.includes(w.waitId) || (w.refId !== null && keys.includes(w.refId)));
           const direct = env.from === KERNEL_FROM.control && ["owner", "agent"].includes(parsePrincipal(env.principalId, core.ownerPrincipal).kind);
-          const legacy = direct || (candidates.length === 1 && ![p?.refId, p?.waitId, data?.refId, data?.waitId].some(Boolean)) ? candidates : [];
-          const matches = env.type === PAYLOAD.waitTimeout ? candidates : explicit.length ? explicit : legacy;
+          const unqualified = refs.length === 0 && (direct || candidates.length === 1);
+          const matches = env.type === PAYLOAD.waitTimeout ? candidates : explicit.length ? explicit : unqualified ? candidates : [];
           for (const w of matches) if (remove(cellId, w.waitId)) done.add(w.waitId);
         }
         return [...done];

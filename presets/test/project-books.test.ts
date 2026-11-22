@@ -51,11 +51,15 @@ describe("a project's books are kept before its model runs", () => {
     const acts = h.actions(projectId);
     expect(acts.map((a) => [a.title, a.owner, a.status, a.nextStep ?? null, a.phase ?? null, a.projectCellId])).toEqual(
       expect.arrayContaining([
+        ["和市场部对齐风格", "human", "open", "约市场部 15 分钟", null, projectId],
         ["拉一份现有页面清单", "agent", "open", null, 1, projectId],
         ["等设计稿", "waiting", "open", null, null, projectId],
       ]),
     );
-    expect(acts).toHaveLength(2);
+    expect(acts).toHaveLength(3);
+    const human = acts.find(a => a.owner === "human")!;
+    expect(h.kernel.humanItems.get(human.id)).toMatchObject({ category: "action", relatedProjectIds: [projectId] });
+    expect(h.kernel.context.readStateSync(projectId, gtdKeys.action(human.id))).toBeNull();
     expect(h.project(projectId)?.proposal?.actions).toContainEqual(expect.objectContaining({title:"和市场部对齐风格",owner:"human"}));
     expect(acts.find((a) => a.owner === "waiting")?.waiting).toMatchObject({ description: "等设计稿", parties: [] });
   });

@@ -37,6 +37,10 @@ export interface RegisteredPresets {
  * registered by the kernel. Afterwards, `seedBuiltinSkills` installs the playbooks the prompts refer to.
  */
 export function registerPresets(registry: Registry, opts: RegisterPresetsOptions = {}): RegisteredPresets {
+  registry.reserveState(
+    ["gtd:project", "gtd:source", "gtd:activity", "desk:arbitration", "watch:state", "probe:state"],
+    ["gtd:project:", "gtd:source:", "gtd:activity:", "gtd:action:", "desk:suggestion:"],
+  );
   const cfg = resolveConfig(opts);
   const books = createDeskBooks(cfg);
   const presets = [deskPreset(books), projectPreset(), workerPreset(), checkerPreset(), sensorPreset(), hubPreset()];
