@@ -56,7 +56,7 @@ describe("Phase 0 (@ng/cell) — BUG-020, BUG-027, BUG-028, BUG-034", () => {
     // Revise carries humanEdited: true and humanDiff!
     h.script.add("desk", { text: "saw human diff" });
     expect(
-      await h.kernel.resolveApproval(card!.actionId, { decision: "revise", approverId: "owner", instruction: "把第三行也润色下" }),
+      await h.kernel.humanItems.decide(card!.actionId, { optionId: "system.revise", seenItemRevision: card!.itemRevision, seenArtifactVersion: 2, note: "把第三行也润色下" }, "owner"),
     ).toMatchObject({ status: "revising" });
     await h.kernel.idle();
     const [reviseMsg] = h.kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.approvalRevise });
@@ -69,8 +69,8 @@ describe("Phase 0 (@ng/cell) — BUG-020, BUG-027, BUG-028, BUG-034", () => {
     // Approve v2 → approval.resolved also carries humanEdited: true and humanDiff!
     h.script.add("desk", { text: "noted" });
     expect(
-      await h.kernel.resolveApproval(card!.actionId, { decision: "approve", approverId: "owner", seenArtifactVersion: 2 }),
-    ).toMatchObject({ status: "approved" });
+      await h.kernel.humanItems.decide(card!.actionId, { optionId: "system.reply", seenItemRevision: h.kernel.humanItems.get(card!.actionId)!.itemRevision, seenArtifactVersion: 2 }, "owner"),
+    ).toMatchObject({ status: "resolved" });
     await h.kernel.idle();
     const [resMsg] = h.kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.approvalResolved });
     const resPayload = resMsg!.envelope.payload as ApprovalResolvedPayload;

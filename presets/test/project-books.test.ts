@@ -39,7 +39,8 @@ describe("a project's books are kept before its model runs", () => {
     expect({ projectId, started }).toEqual({ projectId: "proj_site", started: true });
     expect(startProjectSync(h.kernel, { id: "proj_site", title: "官网改版", outcome: "x", brief: "x" })).toEqual({ projectId: "proj_site", started: false });
     const task = h.kernel.inbox.listMessagesSync({ cellId: "proj_site" })[0]!.envelope.payload as { input: ProjectTaskInput };
-    expect(task.input).toMatchObject({ mode: "now", phases: ["盘点现有页面", "改版上线"], project: { title: "官网改版", cwd: repo, proposal: { actions: expect.any(Array) } } });
+    expect(h.kernel.getCell(projectId)?.spec.cwd).toBe(repo);
+    expect(task.input).toMatchObject({ mode: "now", phases: ["盘点现有页面", "改版上线"], project: { title: "官网改版", proposal: { actions: expect.any(Array) } } });
     await h.kernel.idle();
     h.clock.advance(2_000); // the failed run is retried after its backoff
     await h.kernel.idle();
@@ -68,7 +69,7 @@ describe("a project's books are kept before its model runs", () => {
           { name: "dispatch", input: { title: "写方案", instruction: "写方案" } },
           { name: "dispatch", input: { title: "跑基准", instruction: "跑基准" } },
           { name: "spawn_cell", input: { preset: "worker", title: "顺手查一下日志", instruction: "查日志" } },
-          { name: "spawn_cell", input: { preset: "watcher", title: "盯一下 CI", instruction: "CI 绿了告诉我" } },
+          { name: "spawn_cell", input: { preset: "checker", title: "盯一下 CI", instruction: "CI 绿了告诉我" } },
         ],
       },
       {},

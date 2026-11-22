@@ -13,6 +13,7 @@ import {
   parsePrincipal,
   PAYLOAD,
   projectCellIdOf,
+  stableStringify,
   run,
   withTx,
   type ApprovalStatus,
@@ -25,7 +26,6 @@ import {
   type HumanItemStatus,
   type ProposedAction,
 } from "@ng/protocol";
-import type { ApprovalDecision, ResolveApprovalResult } from "./types";
 import { ownerOnlyApproval } from "@ng/gate";
 import type { KernelCore } from "./core";
 import { RESURFACE_MARKER } from "./constants";
@@ -58,10 +58,10 @@ interface ItemRow {
 
 const HUMAN_DIFF_MAX = 1_500;
 
-interface InflightEntry {
-  decision: ApprovalDecision["decision"];
-  startedRevision: number | null;
-  promise: Promise<ResolveApprovalResult>;
+interface DecisionResult {
+  status: string;
+  activityId?: string;
+  restorable?: boolean;
 }
 
 /** Compact line-level diff capped to `maxChars` so the agent sees exactly what the human changed without bloating prompts. */
@@ -119,28 +119,7 @@ function compactLineDiff(before: string, after: string, maxChars = HUMAN_DIFF_MA
 
 export function createHumanItems(core: KernelCore) {
   const { inbox, cells, db, clock, gate, context } = core;
-  const inflight = new Map<string, InflightEntry>();
-
-  function currentVersion(rec: ApprovalRecord): number | null {
-    return rec.artifactId ? (context.getArtifactSync(rec.artifactId)?.version ?? null) : null;
-  }
-
-  function assertExplicitActor(approverId: unknown, what: string): string {
-    if (typeof approverId !== "string" || !approverId.trim()) {
-      throw new NgError("invalid_argument", `${what}: approverId is required`);
-    }
-    const kind = parsePrincipal(approverId, core.ownerPrincipal).kind;
-    if (kind !== "owner" && kind !== "agent") {
-      throw new NgError("bounds_violation", `${what} needs the owner or an agent on the control plane; ${approverId} may not`);
-    }
-    return approverId;
-  }
-  function assertMayDecide(rec: ApprovalRecord, approverId: string, what: string): void {
-    assertExplicitActor(approverId, what);
-    if (parsePrincipal(approverId, core.ownerPrincipal).kind === "owner") return;
-    const why = ownerOnlyApproval({ ...rec.action, card: rec.card });
-    if (why) throw new NgError("bounds_violation", `${what} needs the owner (${why}); ${approverId} may not`);
-  }
+  const inflight = new Map<string, { key: string; acceptedRevision: number; promise: Promise<DecisionResult> }>();
 
   function humanEditInfo(
     rec: Pick<ApprovalRecord, "artifactId" | "humanEdited" | "proposedVersion" | "boundVersion">,
@@ -463,12 +442,29 @@ export function createHumanItems(core: KernelCore) {
     ).map(project);
   }
 
-  async function decide(
+  async function decide(id: string, decision: HumanDecision, actor: string, onAccepted?: () => void): Promise<DecisionResult> {
+    const key = stableStringify({ actor, decision });
+    const existing = inflight.get(id);
+    if (existing?.key === key) {
+      const current = row(id);
+      if (current?.item_revision === existing.acceptedRevision &&
+          (!current.artifact_id || context.getArtifactSync(current.artifact_id)?.version === decision.seenArtifactVersion)) return existing.promise;
+    }
+    if (existing) await existing.promise.catch(() => undefined);
+    const result = applyDecision(id, decision, actor, onAccepted);
+    const promise = Promise.resolve(result).finally(() => {
+      if (inflight.get(id)?.promise === promise) inflight.delete(id);
+    });
+    inflight.set(id, { key, acceptedRevision: row(id)!.item_revision, promise });
+    return promise;
+  }
+
+  function applyDecision(
     id: string,
     d: HumanDecision,
     actor: string,
     onAccepted?: () => void,
-  ): Promise<{ status: string; activityId?: string; restorable?: boolean }> {
+  ): DecisionResult {
     if (typeof actor !== "string" || !["owner", "agent"].includes(parsePrincipal(actor, core.ownerPrincipal).kind))
       throw new NgError("bounds_violation", "a control-plane actor is required");
     const r = row(id);
@@ -492,59 +488,60 @@ export function createHumanItems(core: KernelCore) {
       seenItemRevision: d.seenItemRevision,
       ...(d.seenArtifactVersion === undefined ? {} : { seenArtifactVersion: d.seenArtifactVersion }),
     };
-    if (o.effect === "execute") {
-      if (o.id === "system.someday") throw new NgError("invalid_argument", "请通过工作台将方案放进以后再说");
-      if (item.action?.type === "custom") {
-        return resolve(
-          id,
-          {
-            ...locks,
-            decision: "continue",
-            ...(d.note ? { note: d.note } : {}),
-            ...(d.until !== undefined ? { until: d.until } : {}),
-          },
-          onAccepted,
-        );
-      }
-      return resolve(id, { ...locks, decision: "approve" }, onAccepted);
-    }
-    if (o.effect === "revise" && r.action_hash !== "")
-      return resolve(id, { ...locks, decision: "revise", instruction: d.note?.trim() || o.label }, onAccepted);
     return withTx(db, () => {
       let receiptCell: string | null = null;
       let receiptId: string | null = null;
       let activityId: string | undefined;
       if (row(id)?.item_revision !== d.seenItemRevision) throw new NgError("conflict", "item changed");
+      if (o.id === "system.someday") throw new NgError("invalid_argument", "请通过工作台将方案放进以后再说");
       if (o.effect !== "defer") onAccepted?.();
+      if (o.effect === "execute") {
+        const rec = gate.getApprovalSync(id);
+        if (rec?.status !== "pending" || gate.approveSync(id, actor, d.seenArtifactVersion, locks) !== "approved")
+          throw new NgError("conflict", "事项已变动");
+        if (rec.action.type === "project.start") {
+          const approved = gate.getApprovalSync(id)!;
+          const issuer = cells.require(approved.cellId);
+          const spawn = issuer.preset ? core.registry.presets.get(issuer.preset)?.approvedSpawn?.(approved, context, clock) : undefined;
+          if (spawn) core.lifecycle.spawnCell(issuer.id, spawn.spec, spawn.task, { principalId: cellPrincipal(issuer.id) });
+          deliverResolved(approved, "approved", actor);
+          return { status: "approved" };
+        }
+        const retry = isKernelEscalation(rec.action) && rec.action.args.reason === "retry_limit" ? rec.action.args : null;
+        gate.recordOutcomeSync(id, "executed", { note: d.note ?? "continued by the owner" });
+        if (retry?.stepLimit) continueSteps(retry.cellId, id);
+        else if (retry) requeueDead(retry.cellId, retry.envelopeIds ?? []);
+        deliverResolved(rec, "executed", actor, { decision: "continue", silent: !!retry, note: d.note, until: d.until });
+        return { status: "continued" };
+      }
       if (o.effect === "revise") {
         if (!r.cell_id) throw new NgError("conflict", "修改意见没有接收方");
-        sendRevision(r.cell_id, r.epoch!, actor, {
+        const rec = gate.getApprovalSync(id);
+        if (rec && gate.reviseSync(id, actor, locks) !== "revised") throw new NgError("conflict", "草稿已变动");
+        const target = rec ? deliveryTarget(rec) : { to: r.cell_id, expectedEpoch: r.epoch! };
+        sendRevision(target.to, target.expectedEpoch, actor, {
           actionId: id,
           subjectKey: r.subject_key,
           instruction: d.note?.trim() || o.label,
           ...(r.artifact_id ? { artifactId: r.artifact_id } : {}),
-          ...humanEditInfo(
-            {
-              artifactId: r.artifact_id,
-              humanEdited: item.humanEdited,
-              proposedVersion: r.proposed_version,
-              boundVersion: item.artifactVersion,
-            },
-            item.artifactVersion,
-          ),
+          ...humanEditInfo({ artifactId: r.artifact_id, humanEdited: item.humanEdited, proposedVersion: r.proposed_version,
+            boundVersion: item.artifactVersion }, item.artifactVersion),
         });
-        run(db, "UPDATE human_items SET item_revision=item_revision+1,updated_at=? WHERE action_id=?", [clock.now(), id]);
-        changed(row(id)!);
+        if (!rec) {
+          run(db, "UPDATE human_items SET item_revision=item_revision+1,updated_at=? WHERE action_id=?", [clock.now(), id]);
+          changed(row(id)!);
+        }
         return { status: "revising" };
       }
       if (o.effect === "defer") {
         const until = d.until ?? clock.now() + 86_400_000;
         if (!Number.isSafeInteger(until) || until <= clock.now()) throw new NgError("invalid_argument", "choose a future time");
-        run(db, "UPDATE human_items SET snoozed_until=?, updated_at=?, item_revision=item_revision+1 WHERE action_id=?", [
-          until,
-          clock.now(),
-          id,
-        ]);
+        if (r.action_hash) {
+          if (gate.snoozeSync(id, until, locks) !== "snoozed") throw new NgError("conflict", "事项已变动");
+        } else {
+          run(db, "UPDATE human_items SET snoozed_until=?, updated_at=?, item_revision=item_revision+1 WHERE action_id=?",
+            [until, clock.now(), id]);
+        }
         armResurface(id, until, actor);
       } else {
         const target = o.targetCellIds?.[0];
@@ -643,7 +640,7 @@ export function createHumanItems(core: KernelCore) {
           ],
         );
       }
-      changed(updated);
+      if (!(r.action_hash && (o.effect === "defer" || o.effect === "terminate"))) changed(updated);
       return { status: updated.status, ...(activityId ? { activityId, restorable: true } : {}) };
     });
   }
@@ -731,124 +728,6 @@ export function createHumanItems(core: KernelCore) {
     });
   }
 
-  async function decideApproval(actionId: string, d: ApprovalDecision, onAccepted?:()=>void): Promise<ResolveApprovalResult> {
-    if (d.decision === "approve") return withTx(db, (): ResolveApprovalResult => {
-      const before = gate.getApprovalSync(actionId);
-      if (!before) return { status: "not_found", actionId };
-      const result = gate.approveSync(actionId, d.approverId, d.seenArtifactVersion, d.seenItemRevision === undefined ? {} : { seenItemRevision: d.seenItemRevision });
-      if (result === "version_mismatch") return { status: result, actionId, currentVersion: currentVersion(before) };
-      if (result === "revision_mismatch") return { status: result, actionId, currentRevision: before.itemRevision };
-      if (result !== "approved") return { status: result, actionId };
-      if (before.status === "pending") {
-        onAccepted?.();
-        const rec = gate.getApprovalSync(actionId)!;
-        const issuer = cells.require(rec.cellId);
-        const spawn = issuer.preset ? core.registry.presets.get(issuer.preset)?.approvedSpawn?.(rec, context, clock) : undefined;
-        if (spawn) core.lifecycle.spawnCell(issuer.id, spawn.spec, spawn.task, { principalId: cellPrincipal(issuer.id) });
-        deliverResolved(rec, "approved", d.approverId);
-      }
-      return { status: result, actionId };
-    });
-    const approverId = assertExplicitActor(d.approverId, `deciding "${d.decision}" on a card`);
-    const revOpts = d.seenItemRevision !== undefined ? { seenItemRevision: d.seenItemRevision } : {};
-
-    switch (d.decision) {
-      case "deny":
-      case "snooze": {
-        const item = core.humanItems.get(actionId);
-        if (!item) return {status:"not_found", actionId};
-        if (d.seenItemRevision !== undefined && d.seenItemRevision !== item.itemRevision)
-          return {status:"revision_mismatch", actionId, currentRevision:item.itemRevision};
-        const option = item.options.find(o=>d.decision === "snooze" ? o.effect === "defer" : o.effect === "terminate" && o.terminateMode !== "cancel_task");
-        if (!option || gate.getApprovalSync(actionId)?.status !== "pending") return {status:"not_pending",actionId};
-        // These historical commands act on the card itself, never on its draft.
-        await core.humanItems.decide(actionId, {optionId:option.id, seenItemRevision:item.itemRevision,
-          ...(item.artifactVersion !== null ? {seenArtifactVersion:item.artifactVersion} : {}),
-          ...(d.decision==="snooze" ? {until:d.until} : d.reason ? {note:d.reason} : {})}, approverId);
-        return {status:d.decision === "deny" ? "denied" : "snoozed", actionId};
-      }
-
-      case "revise": {
-        if (typeof d.instruction !== "string" || !d.instruction.trim()) throw new NgError("invalid_argument", "revise needs an instruction");
-        return withTx(db, (): ResolveApprovalResult => {
-          const rec = gate.getApprovalSync(actionId);
-          if (!rec) return { status: "not_found", actionId };
-          if (rec.status !== "pending") return { status: "not_pending", actionId, reason: rec.status };
-          const r = gate.reviseSync(actionId, approverId, {
-            ...revOpts,
-            ...(d.seenArtifactVersion !== undefined ? { seenArtifactVersion: d.seenArtifactVersion } : {}),
-          });
-          if (r === "revision_mismatch") return { status: "revision_mismatch", actionId, currentRevision: rec.itemRevision };
-          if (r === "version_mismatch") return { status: "version_mismatch", actionId, currentVersion: currentVersion(rec) };
-          if (r !== "revised") return { status: "not_pending", actionId };
-          onAccepted?.();
-          const edit = humanEditInfo(rec);
-          // subjectKey/target let the redraft re-defer under the same subject, which updates this card in place.
-          const payload: ApprovalRevisePayload & { subjectKey: string; target?: string } = {
-            actionId,
-            instruction: d.instruction,
-            subjectKey: rec.subjectKey,
-            ...(rec.artifactId ? { artifactId: rec.artifactId } : {}),
-            ...(edit.artifactVersion !== undefined ? { artifactVersion: edit.artifactVersion } : {}),
-            ...(edit.humanEdited ? { humanEdited: true } : {}),
-            ...(edit.humanDiff ? { humanDiff: edit.humanDiff } : {}),
-            ...(d.voice ? { voice: true } : {}),
-          };
-          const {to, expectedEpoch} = deliveryTarget(rec);
-          sendRevision(to, expectedEpoch, approverId, payload);
-          return { status: "revising", actionId };
-        });
-      }
-
-      case "continue": {
-        return withTx(db, (): ResolveApprovalResult => {
-          const rec = gate.getApprovalSync(actionId);
-          if (!rec) return { status: "not_found", actionId };
-          if (rec.status !== "pending") return { status: "not_pending", actionId, reason: rec.status };
-          assertMayDecide(rec, approverId, "continuing this card");
-
-          const kernelArgs = isKernelEscalation(rec.action) ? rec.action.args : null;
-          const a = gate.approveSync(actionId, approverId, d.seenArtifactVersion, revOpts);
-          if (a === "revision_mismatch") return { status: "revision_mismatch", actionId, currentRevision: rec.itemRevision };
-          if (a === "version_mismatch") return {status:"version_mismatch", actionId, currentVersion:currentVersion(rec)};
-          if (a === "already_cancelled") return { status: "already_cancelled", actionId };
-          if (a !== "approved") return { status: "not_pending", actionId };
-          onAccepted?.();
-
-          gate.recordOutcomeSync(actionId, "executed", { note: d.note ?? "continued by the owner" });
-          if (kernelArgs?.reason === "retry_limit") {
-            if (kernelArgs.stepLimit) continueSteps(kernelArgs.cellId, actionId);
-            else requeueDead(kernelArgs.cellId, kernelArgs.envelopeIds ?? []);
-            deliverResolved(rec, "executed", approverId, { decision: "continue", silent: true, ...(d.note ? {note:d.note} : {}), ...(d.until !== undefined ? {until:d.until} : {}) });
-          } else {
-            deliverResolved(rec, "executed", approverId, {
-              decision: "continue",
-              ...(d.note ? { note: d.note } : {}),
-              ...(d.until ? { until: d.until } : {}),
-            });
-          }
-          return { status: "continued", actionId };
-        });
-      }
-
-      case "resolve_offline":
-      case "dismiss": {
-        const offline = d.decision === "resolve_offline";
-        const note = offline ? d.note : d.reason;
-        const reason = note ?? (offline ? "resolved offline by the owner" : "dismissed by the owner");
-        return withTx(db, (): ResolveApprovalResult => {
-          const rec = gate.getApprovalSync(actionId);
-          if (!rec) return { status: "not_found", actionId };
-          const result = gate.withdrawSync(actionId, reason, revOpts);
-          if (result === "revision_mismatch") return {status:result, actionId, currentRevision:rec.itemRevision};
-          if (result !== "cancelled") return {status:"not_pending", actionId};
-          deliverResolved(rec, "cancelled", approverId, {decision:d.decision, ...(note ? {note} : offline ? {note:"已在线下解决"} : {})});
-          return offline ? {status:"resolved_offline",actionId,closedCellIds:[]} : {status:"dismissed",actionId};
-        });
-      }
-    }
-  }
-
   function sendRevision(cellId:string, epoch:number, actor:string, payload:ApprovalRevisePayload & {subjectKey:string; target?:string}) {
     const env = createEnvelope({from:KERNEL_FROM.approval, principalId:actor, kind:"event", type:PAYLOAD.approvalRevise,
       expectedEpoch:epoch, payload},clock);
@@ -880,58 +759,7 @@ export function createHumanItems(core: KernelCore) {
     }
   }
 
-  async function resolve(actionId: string, decision: ApprovalDecision, onAccepted?: () => void): Promise<ResolveApprovalResult> {
-    // BUG-020: Validate actor identity & ownerOnly policy BEFORE consulting inflight.
-    const approverId = assertExplicitActor(decision.approverId, `deciding "${decision.decision}" on a card`);
-    const pre = gate.getApprovalSync(actionId);
-    if (pre && (decision.decision === "approve" || decision.decision === "continue")) {
-      assertMayDecide(pre, approverId, decision.decision === "approve" ? "approving this card" : "continuing this card");
-    }
-
-    const existing = inflight.get(actionId);
-    if (existing) {
-      if (decision.decision === "approve" && existing.decision === "approve") {
-        // Validate caller-held version & revision before sharing the in-flight approve promise.
-        if (pre && pre.artifactId !== null && (pre.status === "pending" || pre.status === "approved")) {
-          const curVer = currentVersion(pre);
-          if (curVer !== null && (decision.seenArtifactVersion !== curVer || decision.seenArtifactVersion !== pre.boundVersion)) {
-            return { status: "version_mismatch", actionId, currentVersion: curVer };
-          }
-        }
-        if (
-          decision.seenItemRevision !== undefined &&
-          existing.startedRevision !== null &&
-          decision.seenItemRevision !== existing.startedRevision &&
-          decision.seenItemRevision !== pre?.itemRevision
-        ) {
-          return { status: "revision_mismatch", actionId, currentRevision: pre?.itemRevision ?? existing.startedRevision };
-        }
-        return existing.promise;
-      }
-      // Fast-reject an already-stale non-matching concurrent decision before waiting on inflight.
-      if (pre && pre.status === "pending" && decision.seenItemRevision !== undefined && decision.seenItemRevision !== pre.itemRevision) {
-        return { status: "revision_mismatch", actionId, currentRevision: pre.itemRevision };
-      }
-      // Serialize different concurrent decisions (e.g. deny racing an in-flight approve).
-      await existing.promise.catch(() => undefined);
-    }
-
-    const startRev = gate.getApprovalSync(actionId)?.itemRevision ?? null;
-    const entry: InflightEntry = {
-      decision: decision.decision,
-      startedRevision: startRev,
-      promise: Promise.resolve({ status: "not_found", actionId }),
-    };
-    const p = core.track(decideApproval(actionId, decision, onAccepted)).finally(() => {
-      if (inflight.get(actionId) === entry) inflight.delete(actionId);
-    });
-    entry.promise = p;
-    inflight.set(actionId, entry);
-    return p;
-  }
-
   return {
-    resolve,
     superseded(rec: ApprovalRecord, actor: string) { deliverResolved(rec, "superseded", actor, {forwardIfClosed:true}); },
     resurfaced(env: Envelope) {
       const data = (env.payload as TimerFiredPayload).data as { actionId?: string; until?: number } | undefined;

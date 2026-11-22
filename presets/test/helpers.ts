@@ -1,10 +1,11 @@
+import { readHumanActionRecords } from "../src";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryChannel, UiChannel } from "@ng/channel";
 import { createKernel, type Kernel, type KernelOptions } from "@ng/cell";
-import { ScriptedModelClient, type ScriptResponder, type ScriptTurn } from "@ng/loop/testing";
+import { createScriptedLoop, ScriptedModelClient, type ModelRequest, type ScriptResponder, type ScriptTurn } from "@ng/loop/testing";
 import {
   asClarifyCard,
   createRegistry,
@@ -16,7 +17,6 @@ import {
   type BusTopic,
   type BusTopics,
   type ClarifyCard,
-  type ModelRequest,
   type ProjectRecord,
   type Registry,
   type SourceRecord,
@@ -55,7 +55,7 @@ export type Turn = ScriptTurn | ScriptResponder;
 
 /**
  * One scripted model for the whole kernel. Each request is answered from the queue of the requesting cell's role
- * (`spec.meta.role` — the presets set desk / project / worker / checker / watcher / sensor / hub), then from that
+ * (`spec.meta.role` — the presets set desk / project / worker / checker / checker / sensor / hub), then from that
  * role's default responder; otherwise an empty end_turn.
  */
 export class RoleScript {
@@ -123,7 +123,7 @@ export interface Harness {
   of<K extends BusTopic>(topic: K): Array<BusTopics[K]>;
   /** Owner notifications, oldest first. */
   notices(): string[];
-  /** Pending Clarify cards (snoozed included). */
+  /** Pending decision cards (snoozed included). */
   cards(): Array<ApprovalRecord & { clarify: ClarifyCard }>;
   actions(cellId?: string): ActionRecord[];
   activities(): ActivityRecord[];
@@ -154,7 +154,7 @@ export async function boot(opts: BootOptions = {}): Promise<Harness> {
     dataDir,
     clock,
     registry,
-    model: script.model,
+    loop: createScriptedLoop({ model: script.model, registry, clock }),
     channels: [memory, ui],
     retryBackoffMs: 1_000,
     workspace: { limits: { killGraceMs: 300, jobPollMs: 40 } },
@@ -185,9 +185,13 @@ export async function boot(opts: BootOptions = {}): Promise<Harness> {
         if (!clarify) throw new Error(`approval ${a.actionId} has no ClarifyCard`);
         return { ...a, clarify };
       }),
-    actions: (cellId) => kernel.context.queryStateSync({ keyPrefix: gtdKeys.actionPrefix, ...(cellId ? { cellIds: [cellId] } : {}) }).map((e) => e.value as ActionRecord),
+    actions: (cellId) => kernel.context.queryStateSync({ keyPrefix: gtdKeys.actionPrefix, ...(cellId ? { cellIds: [cellId] } : {}) }).map((e) => e.value as ActionRecord).concat(readHumanActionRecords(kernel.db, kernel.deskCellId, cellId).map(e=>e.record)),
     activities: () => kernel.context.queryStateSync({ keyPrefix: gtdKeys.activityPrefix, cellIds: ["desk"] }).map((e) => e.value as ActivityRecord),
-    project: (rootId) => kernel.context.readStateSync<ProjectRecord>(rootId, gtdKeys.project),
+    project: (rootId) => {
+      const record = kernel.context.readStateSync<ProjectRecord>(rootId, gtdKeys.project);
+      const cell = kernel.getCell(rootId);
+      return record && cell ? { ...record, ...(cell.spec.cwd && { cwd: cell.spec.cwd }), ...(cell.pauseReason === "parked" && { lifecycle: "someday" }) } : null;
+    },
     source: (cellId) => kernel.context.readStateSync<SourceRecord>(cellId, gtdKeys.source),
     state: (cellId, key) => kernel.context.readStateSync(cellId, key),
     deskRuns: () => events.filter((e) => e.topic === "run.started" && (e.data as { cellId: string }).cellId === "desk").length,

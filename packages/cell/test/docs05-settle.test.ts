@@ -26,9 +26,9 @@ function worker(h: Harness, id: string, task = "do it", extra: Record<string, un
   h.kernel.spawnCell("desk", { id, preset: "worker", title: id, meta: { role: id }, ...extra }, task);
 }
 
-/** A one-shot probe (the watcher preset) with its own script queue. */
+/** A one-shot probe (the checker preset) with its own script queue. */
 function probe(h: Harness, id: string, task = "check it"): void {
-  h.kernel.spawnCell("desk", { id, preset: "watcher", title: id, meta: { role: id } }, task);
+  h.kernel.spawnCell("desk", { id, preset: "checker", title: id, meta: { role: id } }, task);
 }
 
 const runsOf = (h: Harness, cellId: string) => h.of("run.started").filter((e) => e.cellId === cellId).map((e) => e.runId);
@@ -375,7 +375,7 @@ describe("complete_self / pause_self (persistent cells)", () => {
     h.script.add("w1", tool("request_approval", { kind: "escalation", title: "需要你确认", summary: "blocked", escalation: { reason: "blocked", explanation: "目录里有未提交改动" } }));
     await h.kernel.idle();
     const [card] = h.kernel.gate.listPendingSync();
-    expect(await h.kernel.resolveApproval(card!.actionId, { decision: "snooze", approverId: "owner", until: h.clock.now() + 60_000 })).toMatchObject({ status: "snoozed" });
+    expect(await h.kernel.humanItems.decide(card!.actionId, { optionId: "system.defer", seenItemRevision: card!.itemRevision, until: h.clock.now() + 60_000 }, "owner")).toMatchObject({ status: "snoozed" });
     h.clock.advance(60_000);
     await h.kernel.idle();
     // The card is back; the probe still waits behind it, unreported.

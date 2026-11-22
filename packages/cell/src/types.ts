@@ -3,7 +3,7 @@ import type { ChannelHub } from "@ng/protocol";
 import type { ContextStoreOptions } from "@ng/context";
 import type { GateService } from "@ng/gate";
 import type { InboxService } from "@ng/inbox";
-import type { AgentBackendSetting, AgentLoopOptions, CliAgentLoopOptions } from "@ng/loop";
+import type { AgentBackendSetting, CliAgentLoopOptions } from "@ng/loop";
 import type {
   AgentEngine,
   AgentLoop,
@@ -23,7 +23,6 @@ import type {
   Db,
   Envelope,
   InboxAddr,
-  ModelClient,
   PresetName,
   CellMessageDraft,
   CellInspection,
@@ -55,9 +54,7 @@ export interface KernelOptions {
   dataDir?: string;
   /** An open database, or a path (":memory:" works). Default `<dataDir>/ng.db`. */
   db?: Db | string;
-  /** Deterministic model injected by in-memory tests. */
-  model?: ModelClient;
-  /** A ready-made AgentLoop used instead of building one around `model` (no engine routing then). */
+  /** Executes local processors and cells without a selected CLI. */
   loop?: AgentLoop;
   /** The installed CLI to use when the processor does not select its own engine. */
   agentBackend?: AgentBackendSetting;
@@ -91,7 +88,6 @@ export interface KernelOptions {
   repoPath?: string;
   workspace?: Omit<WorkspaceManagerOptions, "db" | "bus" | "clock" | "dataDir" | "inbox" | "resources" | "defaultRepoPath">;
   context?: Pick<ContextStoreOptions, "summarize" | "limits" | "rescanSkillsOnCreate">;
-  loopOptions?: Omit<AgentLoopOptions, "model" | "registry" | "clock">;
   /** Runs in flight across all cells. Default 8. */
   maxConcurrentRuns?: number;
   /** Claim lease; renewed while the Run is alive. Default 10 minutes. */
@@ -146,23 +142,6 @@ export interface IdleOptions {
   timeoutMs?: number;
 }
 
-export type ApprovalDecision =
-  | { decision: "approve"; approverId: string; seenArtifactVersion?: number; seenItemRevision?: number }
-  | { decision: "deny"; approverId: string; reason?: string; seenItemRevision?: number }
-  | { decision: "snooze"; until: number; approverId: string; seenItemRevision?: number }
-  | { decision: "revise"; instruction: string; voice?: boolean; approverId: string; seenArtifactVersion?: number; seenItemRevision?: number }
-  | { decision: "continue"; approverId: string; seenArtifactVersion?: number; until?: number; note?: string; seenItemRevision?: number }
-  | { decision: "resolve_offline"; approverId: string; note?: string; seenItemRevision?: number }
-  | { decision: "dismiss"; approverId: string; reason?: string; seenItemRevision?: number };
-
-export type ResolveApprovalResult =
-  | { status: "approved"; actionId: string }
-  | { status: "version_mismatch"; actionId: string; currentVersion: number | null }
-  | { status: "revision_mismatch"; actionId: string; currentRevision: number }
-  | { status: "already_cancelled" | "not_found" | "not_pending"; actionId: string; reason?: string }
-  | { status: "denied" | "snoozed" | "revising" | "continued" | "dismissed"; actionId: string }
-  | { status: "resolved_offline"; actionId: string; closedCellIds: string[] };
-
 // ==================== read models ====================
 
 /** One in-flight child, richer than Context's ChildSummary (which is derived from it for the snapshot tail). */
@@ -213,7 +192,7 @@ export interface KernelStats {
   runningJobs: number;
   /** Non-closed cells holding a watch or a future timer, with nothing in flight (🟡 waiting). */
   waitingCells: number;
-  /** Cards visible in Clarify now (snoozed ones excluded). */
+  /** Decision cards visible now (snoozed ones excluded). */
   pendingApprovals: number;
   snoozedApprovals: number;
 }
@@ -278,7 +257,6 @@ export interface Kernel {
   /** The hub's ingress sink: route by watches (thread / filter), else to the desk; durably enqueued before it resolves. */
   ingest(raw: Omit<Envelope, "to">, channelId: string): Promise<IngestResult>;
   reopenProject(cellId: string, principalId: string): Promise<string[]>;
-  resolveApproval(actionId: string, decision: ApprovalDecision): Promise<ResolveApprovalResult>;
 
   // ---------- read models ----------
   getCell(cellId: string): CellRecord | undefined;

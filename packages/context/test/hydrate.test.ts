@@ -173,8 +173,7 @@ describe("hydrate: preferences limited to a directory or a role", () => {
         { id: "p", parentId: "desk", preset: "project", spec: { preset: "project", cwd: "/work/trae-x", processor: code, meta: { role: "project" } } },
         { id: "w", parentId: "p", preset: "worker", spec: { preset: "worker", cwd: "/work/trae-x/crates/core", processor: code, meta: { role: "worker" } } },
         { id: "w-old", parentId: "desk", preset: "worker", spec: { preset: "worker", cwd: "/work/trae-x-old", processor: code, meta: { role: "worker" } } },
-        { id: "chk", parentId: "p", preset: "watcher", spec: { preset: "watcher", cwd: "/work/trae-x", processor: code, meta: { role: "checker" } } },
-        { id: "reply", parentId: "desk", preset: "watcher", spec: { preset: "watcher", processor: code, meta: { role: "watcher" } } },
+        { id: "chk", parentId: "p", preset: "checker", spec: { preset: "checker", cwd: "/work/trae-x", processor: code, meta: { role: "checker" } } },
       ],
     });
     return {
@@ -196,19 +195,15 @@ describe("hydrate: preferences limited to a directory or a role", () => {
     h.pref("rust-commit-gate", { cwdPrefix: "/work/trae-x", roles: ["worker"] });
     h.pref("repo-notes", { cwdPrefix: "/work/trae-x/" });
     h.pref("report-format", { roles: ["project"] });
-    h.pref("quiet-watch", { roles: ["watcher"] });
+    h.pref("quiet-watch", { roles: ["checker"] });
     expect(h.prefsOf("desk")).toEqual(["language"]);
     expect(h.prefsOf("p")).toEqual(["language", "repo-notes", "report-format"]);
     expect(h.prefsOf("w")).toEqual(["language", "repo-notes", "rust-commit-gate"]);
     // a sibling directory that only shares the name's beginning is outside
     expect(h.prefsOf("w-old")).toEqual(["language"]);
-    // "watcher" names the preset as well as the reply watcher's role
     expect(h.prefsOf("chk")).toEqual(["language", "quiet-watch", "repo-notes"]);
-    expect(h.prefsOf("reply")).toEqual(["language", "quiet-watch"]);
-    // the role "checker" alone reaches only the checker; preset "inline" reaches the desk
     h.pref("quiet-watch", { roles: ["checker", "inline"] });
     expect(h.prefsOf("chk")).toEqual(["language", "quiet-watch", "repo-notes"]);
-    expect(h.prefsOf("reply")).toEqual(["language"]);
     expect(h.prefsOf("desk")).toEqual(["language", "quiet-watch"]);
     // a filtered-out preference leaves no trace in that cell's prompt
     const deskText = h.store.hydrateSync("desk", batchOf("desk", []), "isolated").system.text;
@@ -291,7 +286,7 @@ describe("hydrate: history and tail", () => {
   it("puts the in-flight children roster in the volatile tail only", () => {
     const h = deskHarness();
     h.cells.insert({ id: "w1", parentId: "desk", preset: "worker", title: "竞品资料整理" });
-    h.cells.insert({ id: "w2", parentId: "desk", preset: "watcher", title: "等报价" });
+    h.cells.insert({ id: "w2", parentId: "desk", preset: "checker", title: "等报价" });
     h.cells.insert({ id: "done", parentId: "desk", status: "closed" });
     h.store.commitSync("w1", { statePatches: { [CELL_STATUS_KEY]: { text: "正在并发整理竞品资料", at: 1, progress: { done: 11, total: 15 } } } });
     const s1 = simulateRun(h, "desk", [userEnvelope(h.clock, "进度如何？")], reply("11/15"));
@@ -300,7 +295,7 @@ describe("hydrate: history and tail", () => {
       ["w2", null],
     ]);
     expect((s1.tail.messages[0]!.content[0] as { text: string }).text).toBe(
-      '[in-flight child cells: live status, not part of the conversation]\n- w1 · "竞品资料整理" · worker · active: 正在并发整理竞品资料 (11/15)\n- w2 · "等报价" · watcher · active',
+      '[in-flight child cells: live status, not part of the conversation]\n- w1 · "竞品资料整理" · worker · active: 正在并发整理竞品资料 (11/15)\n- w2 · "等报价" · checker · active',
     );
     h.store.commitSync("w1", { statePatches: { [CELL_STATUS_KEY]: { text: "整理完毕", at: 2 } } });
     const s2 = simulateRun(h, "desk", [userEnvelope(h.clock, "现在呢？")], reply("done"));
@@ -310,7 +305,7 @@ describe("hydrate: history and tail", () => {
     expect(custom.hydrateSync("desk", batchOf("desk", []), "isolated").tail.messages).toEqual([]);
   });
 
-  it("renders a provider's deeper roster: descendants indented by depth, cwd and its mode appended", () => {
+  it("renders each descendant at its depth with its working directory", () => {
     const base: Omit<ChildSummary, "cellId"> = { title: null, preset: "worker", status: "active", epoch: 0, lastRunAt: null, statusLine: null };
     const h = deskHarness({
       store: {
@@ -318,7 +313,7 @@ describe("hydrate: history and tail", () => {
           { ...base, cellId: "proj", preset: "project", title: "Harness 对比", depth: 1, parentId: "desk", cwd: "/src/trae" },
           { ...base, cellId: "w1", depth: 2, parentId: "proj", cwd: "/src/trae/docs", statusLine: "写报告 (1/3)" },
           { ...base, cellId: "w1a", preset: null, depth: 3, parentId: "w1" },
-          { ...base, cellId: "watch", preset: "watcher", status: "paused", depth: 1, cwd: "/tmp/probe" },
+          { ...base, cellId: "watch", preset: "checker", status: "paused", depth: 1, cwd: "/tmp/probe" },
           { ...base, cellId: "plain" },
         ],
       },
@@ -330,7 +325,7 @@ describe("hydrate: history and tail", () => {
         '- proj · "Harness 对比" · project · active · cwd /src/trae',
         "  - w1 · worker · active · cwd /src/trae/docs: 写报告 (1/3)",
         "    - w1a · active",
-        "- watch · watcher · paused · cwd /tmp/probe",
+        "- watch · checker · paused · cwd /tmp/probe",
         "- plain · worker · active",
       ].join("\n"),
     );

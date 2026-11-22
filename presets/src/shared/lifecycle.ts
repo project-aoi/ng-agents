@@ -5,9 +5,8 @@ export const gtdLifecycle: Pick<PresetDef, "onCellClosed" | "onCellReopened"> = 
     const now = clock.now();
     const changes: Record<string, unknown> = {};
     const project = context.readStateSync<ProjectRecord>(cell.id, gtdKeys.project);
-    if (project && ["active", "someday"].includes(project.lifecycle)) {
-      const { stalledSince, stalledNotifiedAt, ...fields } = project;
-      changes[gtdKeys.project] = { ...fields, lifecycle: reason, updatedAt: now, ...(reason === "completed" ? { completedAt: now } : {}) };
+    if (project?.lifecycle === "active") {
+      changes[gtdKeys.project] = { ...project, lifecycle: reason, updatedAt: now, ...(reason === "completed" ? { completedAt: now } : {}) };
     }
     for (const entry of context.listStateSync(cell.id, gtdKeys.actionPrefix)) {
       const a = entry.value as ActionRecord;
@@ -23,7 +22,7 @@ export const gtdLifecycle: Pick<PresetDef, "onCellClosed" | "onCellReopened"> = 
   onCellReopened(cell, context, clock) {
     const project = context.readStateSync<ProjectRecord>(cell.id, gtdKeys.project);
     if (!project) return;
-    const { completedAt, stalledSince, stalledNotifiedAt, ...fields } = project;
+    const { completedAt, ...fields } = project;
     context.commitSync(cell.id, { statePatches: { [gtdKeys.project]: { ...fields, lifecycle: "active", updatedAt: clock.now() } } });
   },
 };

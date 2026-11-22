@@ -211,7 +211,7 @@ describe("updateCell", () => {
     // ...and nothing of a cell that is not its descendant (a child may not touch its parent)
     expectNgError(() => h.kernel.updateCell("w", { title: "y" }, { principalId: "cell:ww" }), "bounds_violation", /own descendants/);
     expect(h.kernel.getCell("w")!.title).toBe("x");
-    expectNgError(() => h.kernel.updateCell("w", { preset: "watcher" }), "invalid_argument", /cannot change "preset"/);
+    expectNgError(() => h.kernel.updateCell("w", { preset: "checker" }), "invalid_argument", /cannot change "preset"/);
   });
 
   it("replaces watches; schedules are diffed so an unchanged timer is untouched and a removed one is cancelled", async () => {
@@ -247,7 +247,7 @@ describe("closeCell", () => {
     h.kernel.spawnCell("desk", { id: "proj", preset: "project", processor: { kind: "code", entry: "test.idle" }, meta: { projectCellId: "proj" } });
     h.kernel.spawnCell("proj", {
       id: "watch",
-      preset: "watcher",
+      preset: "checker",
       processor: { kind: "code", entry: "test.idle" },
       watches: [{ threadOrFilter: { thread: "memory:t1" }, cancelGroup: "w" }],
       schedules: [{ deliverAt: T0 + DAY, cancelGroup: "timeout" }, { cron: "*/5 * * * *" }],
@@ -282,7 +282,7 @@ describe("closeCell", () => {
     expect(h.count(`inbox_messages WHERE cell_id IN ${inList} AND status IN ('pending','claimed')`)).toBe(0);
     expect(h.count(`inbox_schedules WHERE cell_id IN ${inList} AND active = 1`)).toBe(0);
     expect(h.count(`cell_watches WHERE cell_id IN ${inList} AND active = 1`)).toBe(0);
-    expect(h.count(`approvals WHERE cell_id IN ${inList} AND status = 'pending'`)).toBe(0);
+    expect(h.count(`human_items WHERE cell_id IN ${inList} AND status = 'pending'`)).toBe(0);
     expect(h.kernel.workspace.listJobsSync({ state: ["running"] })).toEqual([]);
     expect(h.kernel.workspace.listJobsSync({ cellId: "build" }).map((j) => j.state)).toEqual(["cancelled"]);
     // guard 4: closing stops the runtime only — the directory, its files and the workspace record stay
@@ -330,8 +330,8 @@ describe("closeCell", () => {
     const h = await boot({ setup: setupWith(idle) });
     const results = () => h.kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.cellResult }).map((m) => (m.envelope.payload as CellResultPayload).summary);
     // a one-shot probe: the kernel delivers its single final result and closes it in the same transaction
-    h.script.add("watcher", tool("report_to_parent", { kind: "result", text: "做完了" }));
-    h.kernel.spawnCell("desk", { id: "a", preset: "watcher" }, "work");
+    h.script.add("checker", tool("report_to_parent", { kind: "result", text: "做完了" }));
+    h.kernel.spawnCell("desk", { id: "a", preset: "checker" }, "work");
     await h.kernel.idle();
     expect(h.kernel.getCell("a")).toMatchObject({ status: "closed", closeReason: "completed" });
     expect(h.kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.cellResult }).map((m) => m.envelope.id)).toEqual([finalResultEnvelopeId("a", 0)]);

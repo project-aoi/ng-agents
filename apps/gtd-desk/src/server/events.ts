@@ -3,14 +3,14 @@ import { CELL_DIRECT_CHAT_KEY, CELL_TURN_KEY, gtdKeys, type BusTopic, type BusTo
 import type { DeskEvent, NotificationDTO, ViewName } from "../shared/api";
 import { SENSOR_SUGGESTION_PREFIX, SKILL_SUGGESTION_PREFIX } from "./projections/common";
 
-const ALL: readonly ViewName[] = ["clarify", "engage", "radar", "agents", "review", "status", "sources", "activity"];
+const ALL: readonly ViewName[] = ["inbox", "radar", "agents", "review", "status", "sources", "activity"];
 
 function stateViews(keys: readonly string[]): ViewName[] {
   const v = new Set<ViewName>();
   for (const k of keys) {
-    if (k.startsWith(gtdKeys.actionPrefix)) ["engage", "radar", "review", "status", "clarify"].forEach((x) => v.add(x as ViewName));
-    else if (k === gtdKeys.project) ["radar", "review", "status", "engage"].forEach((x) => v.add(x as ViewName));
-    else if (k.startsWith(gtdKeys.activityPrefix)) ["activity", "status", "clarify"].forEach((x) => v.add(x as ViewName));
+    if (k.startsWith(gtdKeys.actionPrefix)) ["inbox", "radar", "review", "status"].forEach((x) => v.add(x as ViewName));
+    else if (k === gtdKeys.project) ["radar", "review", "status", "inbox"].forEach((x) => v.add(x as ViewName));
+    else if (k.startsWith(gtdKeys.activityPrefix)) ["activity", "status", "inbox"].forEach((x) => v.add(x as ViewName));
     else if (k === gtdKeys.source) ["sources", "review"].forEach((x) => v.add(x as ViewName));
     else if (k.startsWith(SKILL_SUGGESTION_PREFIX) || k.startsWith(SENSOR_SUGGESTION_PREFIX)) v.add("review");
     else if (k === "cell:status") ["radar", "status", "agents"].forEach((x) => v.add(x as ViewName));
@@ -24,9 +24,9 @@ function stateViews(keys: readonly string[]): ViewName[] {
 export function viewsForBusEvent<K extends BusTopic>(topic: K, data: BusTopics[K]): ViewName[] {
   switch (topic) {
     case "approval.changed":
-      return ["clarify", "status", "radar", "agents", "engage", "review"];
+      return ["inbox", "status", "radar", "agents", "review"];
     case "artifact.changed":
-      return ["clarify", "engage", "radar", "agents"];
+      return ["inbox", "radar", "agents"];
     case "state.changed":
       return stateViews((data as BusTopics["state.changed"]).keys);
     case "cell.changed":
@@ -34,16 +34,16 @@ export function viewsForBusEvent<K extends BusTopic>(topic: K, data: BusTopics[K
       return ["radar", "agents", "status", "sources"];
     case "run.started":
     case "run.finished":
-      return ["status", "radar", "agents", "clarify"];
+      return ["status", "radar", "agents", "inbox"];
     case "job.changed":
       return ["status", "radar", "agents"];
     case "owner.notified":
       return ["status"];
     case "knowledge.changed":
-      return ["review", "engage"];
+      return ["review", "inbox"];
     case "inbox.enqueued":
       // Any message can wake a cell (the Agents view shows it about to start); a due one can also surface a card.
-      return (data as BusTopics["inbox.enqueued"]).reason === "due" ? ["clarify", "status", "radar", "agents"] : ["agents"];
+      return (data as BusTopics["inbox.enqueued"]).reason === "due" ? ["inbox", "status", "radar", "agents"] : ["agents"];
     default:
       return [];
   }
@@ -58,7 +58,7 @@ export interface EventHub {
 
 /**
  * One bus subscription for all SSE clients. `refresh` events are coalesced over `debounceMs` so a burst of commits
- * (a Run writing several records) becomes one refetch; drafts and notices are forwarded at once. New records on a
+ * (a Run writing several records) becomes one refetch; drafts and notices are forwarded at once.
  * Timeline changes are coalesced by cell and broadcast with their latest sequence.
  */
 export function createEventHub(kernel: Pick<Kernel, "bus">, opts: { debounceMs?: number } = {}): EventHub {

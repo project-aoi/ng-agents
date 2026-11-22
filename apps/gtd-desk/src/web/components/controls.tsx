@@ -152,8 +152,6 @@ export function ButtonRow(props: {
 }) {
   const visible = props.buttons.filter((b) => !props.hide?.includes(b.id));
   const main = visible.filter((b) => b.group === "main");
-  const lead = main.filter((b) => b.client !== "skip");
-  const tail = main.filter((b) => b.client === "skip");
   const more = visible.filter((b) => b.group === "more");
   const [busy, setBusy] = useState<string | null>(null);
   const [asking, setAsking] = useState<ButtonDTO | null>(null);
@@ -259,7 +257,7 @@ export function ButtonRow(props: {
     <button
       key={b.id}
       type="button"
-      className={`btn${b.primary ? " primary" : ""}${b.client === "skip" ? " ghost" : ""}${size}${inputFor?.id === b.id ? " active" : ""}`}
+      className={`btn${b.primary ? " primary" : ""}${size}${inputFor?.id === b.id ? " active" : ""}`}
       disabled={props.disabled || (busy !== null && busy !== b.id)}
       aria-busy={busy === b.id}
       aria-expanded={b.input ? inputFor?.id === b.id : undefined}
@@ -278,10 +276,9 @@ export function ButtonRow(props: {
   return (
     <div className={`button-row-wrap ${props.className ?? ""}`}>
       <div className="button-row">
-        {lead.map(render)}
-        {(tail.length > 0 || more.length > 0) && (
+        {main.map(render)}
+        {more.length > 0 && (
           <span className="button-row-end">
-            {tail.map(render)}
             {more.length > 0 && (
               <Menu label="⋯ 更多" title="更多操作" disabled={props.disabled || busy !== null}>
                 {(close) =>

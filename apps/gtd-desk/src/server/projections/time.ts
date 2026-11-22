@@ -1,5 +1,5 @@
 // Calendar arithmetic in the server's local time zone (set TZ to change it): day boundaries for "今天", the
-// afternoon snooze slot, the weekly review slot.
+// weekly review slot.
 
 const DAY = 24 * 3_600_000;
 
@@ -24,14 +24,6 @@ export function nextWeekly(now: number, weekday: number, hour: number): number {
   const ahead = (weekday - d.getDay() + 7) % 7;
   d.setDate(d.getDate() + ahead);
   if (d.getTime() <= now) d.setDate(d.getDate() + 7);
-  return d.getTime();
-}
-
-/** "⏱ 推迟到下午": today at `hour` if that is at least an hour away, else tomorrow at `hour`. */
-export function afternoonSlot(now: number, hour: number): number {
-  const d = new Date(localMidnight(now));
-  d.setHours(hour, 0, 0, 0);
-  if (d.getTime() - now < 3_600_000) d.setDate(d.getDate() + 1);
   return d.getTime();
 }
 

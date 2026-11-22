@@ -26,6 +26,28 @@ it("commits one of two competing choices with its exact callback and preserves t
   ]);
 });
 
+it("shares simultaneous identical decisions and rejects other actors and stale draft versions", async () => {
+  const { kernel } = await boot({ start: false });
+  kernel.context.commitSync("desk", { artifact: { artifactId: "plan", content: { format: "text", body: "first" }, updatedBy: "agent" } });
+  const gateResult = kernel.gate.authorizeSync({
+    type: "project.start", subjectKey: "proposal:launch", summary: "启动项目", sideEffect: "external", artifactId: "plan",
+    proposal: { title: "测试项目", outcome: "交付总结", actions: [] },
+  }, { cellId: "desk", epoch: 0, principalId: "cell:desk" });
+  if (gateResult.type !== "defer") throw Error("expected a proposal card");
+  const item = kernel.humanItems.get(gateResult.actionId)!;
+  const choice = { optionId: "system.execute", seenItemRevision: item.itemRevision, seenArtifactVersion: 1 };
+  const calls = [
+    kernel.humanItems.decide(item.id, choice, "owner"),
+    kernel.humanItems.decide(item.id, choice, "owner"),
+    kernel.humanItems.decide(item.id, choice, "agent:helper"),
+  ];
+  kernel.context.commitSync("desk", { artifact: { artifactId: "plan", expectedVersion: 1, content: { format: "text", body: "revised" }, updatedBy: "human" } });
+  calls.push(kernel.humanItems.decide(item.id, choice, "owner"));
+  const results = await Promise.allSettled(calls);
+  expect(results.map(r => r.status)).toEqual(["fulfilled", "fulfilled", "rejected", "rejected"]);
+  expect(kernel.inbox.listMessagesSync({ type: PAYLOAD.approvalResolved })).toHaveLength(1);
+});
+
 it("resurfaces a snoozed personal reminder on time without a model turn, then completes it without a callback", async () => {
   const { kernel, clock, script } = await boot();
   const item = kernel.humanItems.create(

@@ -1,5 +1,5 @@
 import type { NotificationDTO, StatusDTO } from "../../shared/api";
-import { backgroundText, projectClarify } from "./clarify";
+import { get } from "@ng/protocol";
 import { readActivities, readProjects, type DeskKernel, type ProjectionInput } from "./common";
 import { radarProjects } from "./radar";
 import { localMidnight, nextWeekly, whenText } from "./time";
@@ -56,7 +56,10 @@ function agentsLine(kernel: DeskKernel): string {
 export function projectStatus(input: ProjectionInput): StatusDTO {
   const { kernel, now, settings } = input;
   const stats = kernel.stats();
-  const clarify = projectClarify(input);
+  const counts = get<{pending: number; snoozed: number}>(kernel.db, `
+    SELECT COUNT(*) FILTER (WHERE snoozed_until IS NULL OR snoozed_until <= ?) AS pending,
+           COUNT(*) FILTER (WHERE snoozed_until > ?) AS snoozed
+    FROM human_items WHERE status IN ('pending','snoozed')`, [now, now])!;
   const since = localMidnight(now);
   const today = { archivedNotifications: 0, notesSaved: 0, remindersSet: 0, cardsWithdrawn: 0, since };
   for (const a of readActivities(kernel)) {
@@ -64,26 +67,29 @@ export function projectStatus(input: ProjectionInput): StatusDTO {
     if (a.record.kind === "notification_archived") today.archivedNotifications++;
     else if (a.record.kind === "note_saved") today.notesSaved++;
     else if (a.record.kind === "reminder_set") today.remindersSet++;
-    else if (a.record.kind === "card_withdrawn") today.cardsWithdrawn++;
+
   }
+  today.cardsWithdrawn = get<{n: number}>(kernel.db, `SELECT COUNT(*) AS n FROM human_item_activity a
+    JOIN human_items i ON i.action_id=a.item_id WHERE a.at >= ? AND a.undone_at IS NULL
+    AND i.disposition IN ('denied','cancelled')`, [since])!.n;
   const radar = radarProjects(input);
   const nextReviewAt = nextWeekly(now, settings.weeklyReview.weekday, settings.weeklyReview.hour);
 
-  const clarifyLine: string[] = [];
-  if (today.archivedNotifications > 0) clarifyLine.push(`后台已静默归档 ${today.archivedNotifications} 条通知`);
-  if (today.notesSaved > 0) clarifyLine.push(`自动存好 ${today.notesSaved} 条随手笔记`);
-  const bg = backgroundText(stats.busyCells, stats.waitingCells);
-  clarifyLine.push(bg);
+  const inboxLine: string[] = [];
+  if (today.archivedNotifications > 0) inboxLine.push(`后台已静默归档 ${today.archivedNotifications} 条通知`);
+  if (today.notesSaved > 0) inboxLine.push(`自动存好 ${today.notesSaved} 条随手笔记`);
+  const bg = stats.busyCells || stats.waitingCells ? `后台 ${stats.busyCells} 个在跑，${stats.waitingCells} 个在等` : "后台没有在途任务";
+  inboxLine.push(bg);
   const radarLine = [`${radar.counts.active} 个进行中项目`];
   if (radar.counts.stalled > 0) radarLine.push(`${radar.counts.stalled} 个停滞待补下一步`);
   radarLine.push(`下次周回顾 ${whenText(nextReviewAt, now)}`);
 
   return {
-    humanPending:kernel.humanItems.list().length,
+    humanPending: counts.pending,
+    humanSnoozed: counts.snoozed,
     generatedAt: now,
     backend: settings.backend,
     auth: { tokenRequired: settings.tokenRequired },
-    clarify: { pending: clarify.remaining, snoozed: clarify.snoozed },
     background: {
       running: stats.busyCells,
       jobs: stats.runningJobs,
@@ -94,7 +100,7 @@ export function projectStatus(input: ProjectionInput): StatusDTO {
     today,
     radar: { activeProjects: radar.counts.active, stalledProjects: radar.counts.stalled, somedayProjects: radar.counts.someday, nextReviewAt },
     statusLine: {
-      clarify: clarifyLine.join(" · "),
+      inbox: inboxLine.join(" · "),
       radar: radarLine.join(" · "),
       agents: agentsLine(kernel),
     },

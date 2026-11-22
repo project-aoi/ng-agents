@@ -1,8 +1,4 @@
-// @ng/loop — primitive ④: one bounded Run (`llm` with a tool loop, or zero-token `code`), the ModelClient
-// implementations, and the standard toolsets presets list by name in `processor.toolsets`.
-
-export { createAgentLoop, raceAbort, TRUNCATED_CALL_OUTPUT, type AgentLoopOptions } from "./loop";
-export { Conversation } from "./conversation";
+export { createCodeLoop } from "./loop";
 
 export { STANDARD_TOOLSETS, standardToolsets, registerStandardToolsets, type StandardToolsetOptions } from "./tools/standard";
 export { workspaceToolset, WORKSPACE_TOOLSET } from "./tools/workspace";

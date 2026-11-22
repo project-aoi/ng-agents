@@ -42,8 +42,8 @@ describe("docs/05 scenario 5 — an idea for later: research, park, bring it bac
 
     const [project] = projects(h);
     expect(h.notices()).toContain("已记下：极简模式，先做个调研，完成后放进以后再说");
-    expect(h.kernel.getCell(project!)).toMatchObject({ status: "paused" });
-    expect(h.project(project!)).toMatchObject({ lifecycle: "someday", summary: "调研报告已完成，先放进以后再说" });
+    expect(h.kernel.getCell(project!)).toMatchObject({ status: "paused", pauseReason: "parked" });
+    expect(h.project(project!)).toMatchObject({ summary: "调研报告已完成，先放进以后再说" });
     expect(h.kernel.anchorsOf(project!)).toMatchObject({ parked: true, stalled: false });
     expect(h.kernel.context.getArtifactSync(report)).toMatchObject({ version: 1 });
 
@@ -107,7 +107,8 @@ describe("docs/05 scenario 5 — an idea for later: research, park, bring it bac
       {},
     );
     h.script.setDefault("worker", () => tool("wait", { reason: "working", waitingFor: "inbox:desk" }));
-    expect(await h.kernel.resolveApproval(card!.actionId, { decision: "approve", approverId: "owner" })).toMatchObject({ status: "approved" });
+    const decision = h.kernel.humanItems.get(card!.actionId)!;
+    expect(await h.kernel.humanItems.decide(decision.id, { optionId: "system.reply", seenItemRevision: decision.itemRevision }, "owner")).toMatchObject({ status: "resolved" });
     await h.kernel.idle();
     expect(childrenOf(h, project!, "worker")).toHaveLength(3);
     expect(h.actions(project).find((a) => a.id === phase2)).toMatchObject({ status: "open", phase: 2, cellId: childrenOf(h, project!, "worker")[2] });

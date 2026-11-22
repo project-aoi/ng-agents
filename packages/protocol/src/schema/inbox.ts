@@ -3,13 +3,8 @@ import type { SchemaModule } from "./types";
 // Owner: @ng/inbox.
 export const inboxSchema: SchemaModule = {
   owner: "@ng/inbox",
-  version: 2,
-  migrations: [{
-    version: 2,
-    up: `ALTER TABLE inbox_messages ADD COLUMN first_claimed_at INTEGER;
-         UPDATE inbox_messages SET first_claimed_at = updated_at
-         WHERE claim_id IS NOT NULL OR attempts > 0 OR updated_at <> created_at OR status IN ('claimed','done','handed_back','dead');`,
-  }],
+  version: 1,
+  migrations: [],
   ddl: /* sql */ `
 CREATE TABLE IF NOT EXISTS inbox_schedules (
   id             TEXT PRIMARY KEY,

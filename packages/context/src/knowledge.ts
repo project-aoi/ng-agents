@@ -163,7 +163,7 @@ export interface KnowledgeModule {
   listSkills(cellId?: string): SkillIndexEntry[];
   upsert(cellId: string, patch: KnowledgePatch): void;
   rescan(): SkillRescanReport;
-  /** Body for skill:// note:// preference:// URIs (skills read from the file when present). Throws not_found. */
+  /** Reads the nearest visible knowledge entry of this kind, using its file for a skill when present. */
   readBody(cellId: string, kind: KnowledgeKind, name: string): string;
   /** Cells whose cell-scoped knowledge `cellId` sees, nearest first (itself, parent, …, root). */
   chain(cellId: string): string[];

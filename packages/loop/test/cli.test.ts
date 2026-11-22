@@ -374,7 +374,7 @@ describe.each(ENGINES)("CLI loop with a fake %s", (engine) => {
         { role: "assistant", content: [{ type: "text", text: "earlier answer" }] },
       ],
     });
-    const stale: CliSessionRecord = { engine, sessionId: "00000000-0000-4000-8000-000000000000", model: null, cwd: s.root, systemHash: r.snapshot.system.hash, createdAt: 0, updatedAt: 0, runs: 3 };
+    const stale: CliSessionRecord = { engine, sessionId: "00000000-0000-4000-8000-000000000000", model: null, cwd: s.root, systemHash: r.snapshot.system.hash, lastDeliveredEvidenceSeq: 0, createdAt: 0, updatedAt: 0, runs: 3 };
     r.ports.state.set(CLI_SESSION_KEY, stale);
     expect(await runOf(s, r)).toBe("completed");
     const ls = launches(s);

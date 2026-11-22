@@ -8,11 +8,9 @@ import {
   all,
   applySchemas,
   get,
-  isNgError,
   openDatabase,
   run,
   schemaVersions,
-  type SchemaModule,
 } from "../src";
 
 const dirs: string[] = [];
@@ -31,7 +29,7 @@ describe("schema", () => {
     const db = openDatabase(":memory:");
     const names = new Set(all<{ name: string }>(db, "SELECT name FROM sqlite_master WHERE type IN ('table')").map((r) => r.name));
     for (const table of Object.keys(TABLE_OWNERS)) expect(names, table).toContain(table);
-    expect(schemaVersions(db)).toEqual(Object.fromEntries(ALL_SCHEMAS.map((m) => [m.owner, m.version])));
+    expect(schemaVersions(db)).toEqual(Object.fromEntries(ALL_SCHEMAS.map((m) => [m.owner, 1])));
   });
 
   it("applies twice without error (in-memory and on disk, WAL)", () => {
@@ -50,33 +48,28 @@ describe("schema", () => {
     b.close();
   });
 
+  it("reserves a human item's subject while snoozed and releases it when resolved", () => {
+    const db = openDatabase(":memory:");
+    const insertItem = (id: string) => run(db, `
+      INSERT INTO human_items (action_id, principal_id, subject_key, category, action_type, action, action_hash, card, created_at, updated_at)
+      VALUES (?, 'owner', 'dentist', 'action', 'custom', '{}', '', '{}', 1, 1)
+    `, [id]);
+    const status = () => get<{ status: string }>(db, "SELECT status FROM human_items WHERE action_id = 'first'")?.status;
+    insertItem("first");
+    expect(status()).toBe("pending");
+    run(db, "UPDATE human_items SET snoozed_until = 100 WHERE action_id = 'first'");
+    expect(status()).toBe("snoozed");
+    expect(() => insertItem("next")).toThrow(/UNIQUE/);
+    run(db, "UPDATE human_items SET disposition = 'executed' WHERE action_id = 'first'");
+    expect(status()).toBe("resolved");
+    insertItem("next");
+    db.close();
+  });
+
   it("enforces foreign keys to cells", () => {
     const db = openDatabase(":memory:");
     expect(() =>
       run(db, "INSERT INTO cell_state (cell_id, key, value, updated_at) VALUES ('nope', 'k', '1', 1)"),
     ).toThrow(/FOREIGN KEY/);
-  });
-
-  it("runs migrations for older databases and refuses newer ones", () => {
-    const db = openDatabase(":memory:");
-    const v1: SchemaModule = { owner: "@test/x", version: 1, ddl: "CREATE TABLE IF NOT EXISTS x_items (id TEXT PRIMARY KEY);" };
-    applySchemas(db, [v1]);
-    const v2: SchemaModule = {
-      owner: "@test/x",
-      version: 2,
-      ddl: "CREATE TABLE IF NOT EXISTS x_items (id TEXT PRIMARY KEY, note TEXT); CREATE INDEX IF NOT EXISTS idx_x_note ON x_items(note);",
-      migrations: [{ version: 2, up: "ALTER TABLE x_items ADD COLUMN note TEXT;" }],
-    };
-    applySchemas(db, [v2]);
-    expect(all<{ name: string }>(db, "PRAGMA table_info(x_items)").map((c) => c.name)).toEqual(["id", "note"]);
-    expect(schemaVersions(db)["@test/x"]).toBe(2);
-
-    let caught: unknown;
-    try {
-      applySchemas(db, [v1]);
-    } catch (e) {
-      caught = e;
-    }
-    expect(isNgError(caught, "schema")).toBe(true);
   });
 });

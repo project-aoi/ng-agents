@@ -2,8 +2,6 @@ import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import {
   addressCovers,
-  asClarifyCard,
-  cardButtons,
   cellPrincipal,
   channelAddr,
   createRegistry,
@@ -17,9 +15,7 @@ import {
   makeBounds,
   mergeAdjacentMessages,
   parseAddress,
-  parseGtdKey,
   parsePrincipal,
-  gtdKeys,
   selectRunTools,
   stableStringify,
   topBallOwner,
@@ -143,39 +139,10 @@ describe("mergeAdjacentMessages", () => {
 });
 
 describe("gtd conventions", () => {
-  it("builds and parses keys", () => {
-    expect(gtdKeys.action("a1")).toBe("gtd:action:a1");
-    expect(parseGtdKey("gtd:action:a1")).toEqual({ kind: "action", id: "a1" });
-    expect(parseGtdKey("gtd:activity:x")).toEqual({ kind: "activity", id: "x" });
-    expect(parseGtdKey("gtd:project")).toEqual({ kind: "project" });
-    expect(parseGtdKey("gtd:action:")).toBeNull();
-    expect(parseGtdKey("other")).toBeNull();
-  });
-
   it("aggregates the ball owner by priority human > agent > waiting over open actions", () => {
     expect(topBallOwner([{ owner: "waiting", status: "open" }, { owner: "agent", status: "open" }])).toBe("agent");
     expect(topBallOwner([{ owner: "agent", status: "open" }, { owner: "human", status: "open" }])).toBe("human");
     expect(topBallOwner([{ owner: "human", status: "done" }, { owner: "waiting", status: "open" }])).toBe("waiting");
     expect(topBallOwner([{ owner: "human", status: "cancelled" }])).toBeNull();
-  });
-
-  it("gives each card type its buttons", () => {
-    const base = {
-      subjectKey: "msg:1",
-      title: "回复张三",
-      source: { label: "工作台", at: 0 },
-      rawInput: { text: "接口什么时候好？", kind: "message" as const },
-      prep: { summary: "查了 PR #108", checked: [] },
-    };
-    expect(
-      cardButtons({ ...base, cardType: "project_proposal", proposal: { title: "竞品", outcome: "报告", actions: [] } }).map((b) => b.id),
-    ).toEqual(["confirm", "edit_plan", "someday", "skip"]);
-    expect(
-      cardButtons({ ...base, cardType: "escalation", escalation: { reason: "waiting_timeout", explanation: "C 未回" } }).map((b) => b.label),
-    ).toEqual(["⏱ 再等 1 天", "✓ 线下已解决，直接完结", "下一张 →"]);
-    expect(
-      cardButtons({ ...base, cardType: "escalation", escalation: { reason: "blocked", explanation: "需要确认" } })[0],
-    ).toMatchObject({ id: "extend", primary: true });
-    expect(asClarifyCard({ cardType: "nope" })).toBeNull();
   });
 });

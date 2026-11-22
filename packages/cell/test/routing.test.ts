@@ -7,7 +7,7 @@ afterEach(cleanupAll);
 describe("ingress routing", () => {
   it("a filter watch (no thread) captures matching events; everything else goes to the desk", async () => {
     const h = await boot();
-    h.kernel.spawnCell("desk", { id: "ci", preset: "watcher", watches: [{ threadOrFilter: { type: "channel.event", "payload.event": "check_suite" } }] });
+    h.kernel.spawnCell("desk", { id: "ci", preset: "checker", watches: [{ threadOrFilter: { type: "channel.event", "payload.event": "check_suite" } }] });
     const ev = (event: string) => ({ channelId: "memory", event, summary: `${event} happened` });
     const r1 = await h.kernel.ingest(
       { id: "e1", from: "channel:memory:gh", principalId: "memory:gh", kind: "event", type: "channel.event", payload: ev("check_suite"), createdAt: h.clock.now() },
@@ -46,8 +46,8 @@ describe("ingress routing", () => {
   it("an off-topic message in a watched thread is handed back to the desk with its original sender", async () => {
     const h = await boot();
     // Handing back a message does not end a persistent subscription.
-    h.kernel.spawnCell("desk", { id: "w", preset: "watcher", lifetime: "persistent", watches: [{ threadOrFilter: { thread: "memory:pr-108" } }] });
-    h.script.add("watcher", tool("handback", { reason: "a new, unrelated bug report" }));
+    h.kernel.spawnCell("desk", { id: "w", preset: "hub", lifetime: "persistent", watches: [{ threadOrFilter: { thread: "memory:pr-108" } }] });
+    h.script.add("hub", tool("handback", { reason: "a new, unrelated bug report" }));
     h.script.add("desk", { text: "triaged" });
     const env = await h.memory.inject({ from: "dave", text: "顺便说一下，登录页也坏了", threads: ["memory:pr-108"] });
     await h.kernel.idle();

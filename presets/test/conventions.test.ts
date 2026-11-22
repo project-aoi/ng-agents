@@ -97,7 +97,7 @@ describe("conventions the workbench app relies on", () => {
  * (`cell.direct_chat`), the sample cell names of the project's board note, and the subject-matter terms COMMON gives
  * as examples of words that are never translated (`code_cell.rs`, `token`, `queue`, `epoch`).
  */
-const NOT_TOOLS = new Set(["research_then_park", "diff", "show", "check", "direct_chat", "worker_a1", "worker_b2", "code_cell", "token", "queue", "epoch"]);
+const NOT_TOOLS = new Set(["working_note", "research_then_park", "diff", "show", "check", "direct_chat", "worker_a1", "worker_b2", "code_cell", "token", "queue", "epoch"]);
 
 /**
  * Names a prompt mentions that its role does not have, reported to the prompts' owner (see the presets report). The
@@ -106,7 +106,8 @@ const NOT_TOOLS = new Set(["research_then_park", "diff", "show", "check", "direc
 const KNOWN_PROMPT_GAPS: Readonly<Record<string, readonly string[]>> = {};
 
 function mentionedTools(text: string): string[] {
-  const snake = text.match(/\b[a-z]+(?:_[a-z0-9]+)+\b/g) ?? [];
+  const prose = text.replace(/\bkind "[a-z_]+"/g, "");
+  const snake = prose.match(/\b[a-z]+(?:_[a-z0-9]+)+\b/g) ?? [];
   const ticked = [...text.matchAll(/`([a-z][a-z0-9_]*)`/g)].map((m) => m[1]!);
   return [...new Set([...snake, ...ticked])].filter((n) => !NOT_TOOLS.has(n) && !n.startsWith("cell_")).sort();
 }
@@ -116,7 +117,7 @@ describe("conventions: every prompt names only tools its role has", () => {
     const h = await boot();
     const { projectId } = startProjectSync(h.kernel, { title: "p", outcome: "o", brief: "b" });
     h.kernel.spawnCell(projectId, { preset: "worker", title: "w" });
-    h.kernel.spawnCell(projectId, { preset: "watcher", title: "c" });
+    h.kernel.spawnCell(projectId, { preset: "checker", title: "c" });
     h.kernel.spawnCell("desk", { preset: "sensor", title: "s" });
     h.kernel.spawnCell("desk", { preset: "hub", title: "h" });
     const cells = h.kernel.listCells({ status: ["active"] });
@@ -140,7 +141,7 @@ describe("conventions: every prompt names only tools its role has", () => {
       if (gaps.length) missing[c.source] = [...(missing[c.source] ?? []), ...gaps];
     }
     expect(missing).toEqual(KNOWN_PROMPT_GAPS);
-    // A worker and the watcher preset's checker are leaves (maxDepth 0): the tools that start, steer or close cells are
+    // A worker and the checker preset's checker are leaves (maxDepth 0): the tools that start, steer or close cells are
     // not offered to them, so no prompt or playbook of theirs may rely on them. They keep the shell and the files, and
     // update_cell for their own watches.
     for (const prompt of [PROMPTS.worker, PROMPTS.checker]) {
@@ -149,7 +150,7 @@ describe("conventions: every prompt names only tools its role has", () => {
     }
     // The coordinators read what their cells did.
     for (const prompt of [PROMPTS.desk, PROMPTS.project, PROMPTS.hub]) expect(toolsOf(prompt)).toContain("inspect_cell");
-    // Every registered role prompt was checked (the legacy stand-in names no tools).
+    // Every registered role prompt was checked.
     expect(new Set(checks.map((c) => c.prompt))).toEqual(new Set(Object.values(PROMPTS)));
   });
 });

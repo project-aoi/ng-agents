@@ -2,9 +2,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   createEnvelope,
   gtdKeys,
+  get,
   run,
   PAYLOAD,
-  type ActionRecord,
   type Envelope,
   type HandbackPayload,
   type ProjectRecord,
@@ -18,6 +18,7 @@ const GRACE = 2_000;
 
 function project(h: Harness, id = "proj", lifecycle: ProjectRecord["lifecycle"] = "active"): void {
   h.kernel.spawnCell("desk", { id, preset: "project", title: "Harness 对比", meta: { role: id, projectCellId: id } });
+  if (lifecycle === "someday") h.kernel.control(id, {action: "pause", pauseReason: "parked"});
   const now = h.clock.now();
   h.kernel.context.commitSync(id, { statePatches: { [gtdKeys.project]: { title: "Harness 对比", lifecycle, createdAt: now, updatedAt: now } satisfies ProjectRecord } });
 }
@@ -27,15 +28,8 @@ function addWait(h: Harness, from: string, to: string, id = to, registration = i
     VALUES (?,?,?,?,?,?,?)`, [from, id, registration, `inbox:${to}`, "await reply", h.kernel.getCell(from)!.epoch, h.clock.now()]);
 }
 
-const record = (h: Harness, id = "proj") => h.kernel.context.readStateSync<ProjectRecord>(id, gtdKeys.project)!;
+const stall = (h: Harness) => get<{ since: number; notified_at: number | null }>(h.kernel.db, "SELECT since, notified_at FROM cell_stalls WHERE cell_id = 'proj'");
 const checks = (h: Harness, cellId = "proj") => h.kernel.inbox.listMessagesSync({ cellId, type: PAYLOAD.stalledCheck });
-
-function action(h: Harness, cellId: string, id: string, patch: Partial<ActionRecord>): void {
-  const now = h.clock.now();
-  h.kernel.context.commitSync(cellId, {
-    statePatches: { [gtdKeys.action(id)]: { id, title: "要回 Doubao 代码", owner: "human", status: "open", projectCellId: cellId, createdAt: now, updatedAt: now, ...patch } satisfies ActionRecord },
-  });
-}
 
 // docs/05 guard 2 — an active project always has one of five anchors, and when it has none it is told exactly once.
 describe("stall check", () => {
@@ -45,7 +39,7 @@ describe("stall check", () => {
     await h.kernel.idle();
 
     expect(h.kernel.anchorsOf("proj")).toMatchObject({ agent: false, external: false, internal: false, human: false, parked: false, stalled: true });
-    expect(record(h)).toMatchObject({ stalledSince: T0, stalledNotifiedAt: T0 });
+    expect(stall(h)).toMatchObject({ since: T0, notified_at: T0 });
     expect(checks(h).map((m) => [m.status, m.deliverAt])).toEqual([["pending", T0 + GRACE]]);
     expect(h.script.callsOf("proj")).toHaveLength(0);
 
@@ -69,17 +63,19 @@ describe("stall check", () => {
     expect(h.kernel.humanItems.list().filter(item => item.subjectKey.startsWith("kernel:stalled:"))).toHaveLength(1);
 
     // A real anchor (the owner now has an open action) lifts the stall and re-arms the notice…
-    action(h, "proj", "a1", {});
+    const task = h.kernel.humanItems.create({
+      title: "审阅代码", subjectKey: "review:code", relatedProjectIds: ["proj"], category: "action",
+      options: [{ id: "done", label: "已审阅", effect: "reply" }],
+    }, "proj");
     await h.kernel.humanItems.decide(escalation.id, {optionId:"reply", seenItemRevision:escalation.itemRevision}, "owner");
     await h.kernel.idle();
     expect(h.kernel.anchorsOf("proj")).toMatchObject({ human: true, stalled: false });
-    expect(record(h).stalledSince).toBeUndefined();
-    expect(record(h).stalledNotifiedAt).toBeUndefined();
+    expect(stall(h)).toBeUndefined();
     // …so when that anchor goes away without anything taking its place, the project is told once more.
     const again = h.clock.now();
-    action(h, "proj", "a1", { status: "done" });
+    await h.kernel.humanItems.decide(task.id, {optionId: "done", seenItemRevision: task.itemRevision}, "owner");
     await h.kernel.idle();
-    expect(record(h)).toMatchObject({ stalledSince: again, stalledNotifiedAt: again });
+    expect(stall(h)).toMatchObject({ since: again, notified_at: again });
     expect(checks(h).map((m) => m.envelope.id)).toEqual([`proj:stalled:${T0}`, `proj:stalled:${again}`]);
   });
 
@@ -89,8 +85,8 @@ describe("stall check", () => {
     await h.kernel.idle();
     expect(checks(h)).toHaveLength(1);
 
-    // Within the grace period the project gets a watcher with a timer: an external anchor.
-    h.kernel.spawnCell("proj", { id: "mr-watch", preset: "watcher", title: "盯 MR !12", schedules: [{ deliverAt: T0 + HOUR }] });
+    // Within the grace period the project gets a checker with a timer: an external anchor.
+    h.kernel.spawnCell("proj", { id: "mr-watch", preset: "checker", title: "盯 MR !12", schedules: [{ deliverAt: T0 + HOUR }] });
     await h.kernel.idle();
     expect(h.kernel.anchorsOf("proj")).toMatchObject({ external: true, stalled: false });
     // The notice is withdrawn together with the stall it was about.
@@ -98,7 +94,7 @@ describe("stall check", () => {
     h.clock.advance(GRACE);
     await h.kernel.idle();
     expect(h.script.callsOf("proj")).toHaveLength(0);
-    expect(record(h).stalledSince).toBeUndefined();
+    expect(stall(h)).toBeUndefined();
   });
 
   it("each of the five anchors counts; paused and non-active projects are parked, never stalled", async () => {

@@ -19,19 +19,7 @@ export interface VersionedArtifact {    // human-visible deliverables: reply dra
   updatedAt: number;
 }
 
-/** A preset can project a domain record through an older state key without keeping a second writable copy. */
-export interface StateDomain {
-  serialize?(cellId:string,key:string,value:unknown):unknown;
-  project?(entry:StateEntry):StateEntry;
-  id: string;
-  migrate(): void;
-  read(cellId: string, key: string): StateEntry | undefined;
-  query(q: StateQuery): StateEntry[];
-  write(cellId: string, key: string, value: unknown): boolean;
-}
-
 export interface ContextStore {
-  installStateDomain(domain: StateDomain): void;
   // 1. Business state (transactional reads/writes relying on the per-Cell serial lock) and version-protected draft Artifact commits
   readState<T = unknown>(cellId: string, key: string): Promise<T | null>;
   commit(cellId: string, tx: {
@@ -136,7 +124,7 @@ export type ContextMode = "isolated" | "fork_prefix";
  * Resources are addressed `res://<cellId>/<id>`. `offset`/`limit` count UTF-16 characters (JS string indices);
  * default page is the first 8000 chars. [docs/05] Any internal cell may read any cell's resources (a desk checking a
  * worker's log, a project reading a closed worker's output); an unknown URI throws NgError("not_found").
- * Other URIs readResource serves (same paging): `skill://<name>` (SKILL.md body), `note://<name>`,
+ * Other URIs readResource serves (same paging): `skill://<name>` (SKILL.md body), `working_note://<name>`, `reference://<name>`,
  * `preference://<name>` (nearest visible scope: the cell, then its ancestors, then global) and
  * `artifact://<id>[@<version>]` (the Deliverable body; readable by any internal cell).
  */
@@ -323,7 +311,7 @@ export interface EvidenceEntry {
 /**
  * A search hit. `source: "evidence"` → an append-only record (seq = evidence seq, kind = EvidenceKind);
  * `source: "knowledge"` → a note/skill/preference (seq = knowledge row seq, kind = KnowledgeKind, cellId = null for
- * global knowledge, `uri` = note://, skill:// or preference://<name>, `title` = its name).
+ * global knowledge, `uri` = <kind>://<name>, `title` = its name).
  * [docs/05] `source: "artifact"` → an artifact body (kind "artifact", uri `artifact://<id>`, title = its title, seq =
  * its version); `source: "state"` → a cell_state value (kind "state", title = the key, seq 0); `source: "resource"`
  * → the full text of a spilled resource (kind "resource", uri = its res:// URI, seq 0).
@@ -356,7 +344,7 @@ export type KnowledgeScope = "global" | "cell";
  * - `cwdPrefix`: an absolute directory (`~/…` expands to the owner's home); matches cells whose `spec.cwd` is that
  *   directory or below it, compared on path-segment boundaries (`/a/b` covers `/a/b/c`, not `/a/bc`). A cell without
  *   `spec.cwd` never matches. Stored normalized (expanded, resolved, no trailing slash).
- * - `roles`: matches a cell whose `spec.meta.role` or preset name is one of them (e.g. "worker", "project", "watcher",
+ * - `roles`: matches a cell whose `spec.meta.role` or preset name is one of them (e.g. "worker", "project", "checker",
  *   "desk", "hub", "sensor", "checker", "inline"); stored trimmed and lowercased, an empty list is no limit.
  */
 export interface KnowledgeApplies {

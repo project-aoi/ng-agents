@@ -155,10 +155,10 @@ describe("a wakeable worker's turn settles: the parent is told, the worker stays
     expect(results(h, "proj").map((r) => r.summary)).toEqual(["v2 with screencast"]);
   });
 
-  it("a one_shot leaf (a watcher) still reports once and is closed, with its timers", async () => {
+  it("a one_shot leaf (a checker) still reports once and is closed, with its timers", async () => {
     const h = await boot();
     project(h);
-    h.kernel.spawnCell("proj", { id: "wt", preset: "watcher", title: "wt", meta: { role: "wt" }, schedules: [{ cron: "0 9 * * *" }] }, "is the MR merged?");
+    h.kernel.spawnCell("proj", { id: "wt", preset: "checker", title: "wt", meta: { role: "wt" }, schedules: [{ cron: "0 9 * * *" }] }, "is the MR merged?");
     h.script.add("wt", tool("report_to_parent", { kind: "result", text: "merged at 10:02" }));
     await h.kernel.idle();
     expect(h.kernel.getCell("wt")).toMatchObject({ status: "closed", closeReason: "completed" });
@@ -317,7 +317,7 @@ describe("the owner talks to a worker directly", () => {
     expect(h.kernel.getCell("w1")!.status).toBe("active");
     expect(results(h, "proj").at(-1)).toMatchObject({ summary: "v2 done", childState: "dormant" });
 
-    h.kernel.spawnCell("proj", { id: "probe", preset: "watcher", processor: { kind: "code", entry: "test.noop" }, lifetime: "persistent" });
+    h.kernel.spawnCell("proj", { id: "probe", preset: "hub", processor: { kind: "code", entry: "test.noop" }, lifetime: "persistent" });
     expect(h.kernel.directMessage("probe", { text: "hello" })).toMatchObject({ status: "refused", reason: "code" });
     expect(h.kernel.directMessage("nope", { text: "hello" })).toEqual({ status: "not_found" });
     expect(h.kernel.directMessage("w1", { text: "hello" }, { principalId: "cell:desk" })).toMatchObject({ status: "refused", reason: "not_allowed" });

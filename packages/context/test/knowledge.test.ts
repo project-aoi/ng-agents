@@ -27,16 +27,6 @@ describe("SKILL.md files", () => {
 });
 
 describe("upsertSkillOrNote", () => {
-  it("keeps old note links readable after classifying a saved bookmark as reference", () => {
-    const h = setup();
-    h.store.upsertSkillOrNoteSync("desk", {kind:"reference",scope:"cell",name:"my link",description:"Saved link",body:"https://example.org/bookmark",mode:"upsert"});
-    expect(h.store.readResourceSync("desk","note://my%20link")).toBe("https://example.org/bookmark");
-    expect(h.store.listKnowledgeSync({cellId:"desk",kind:"working_note"})).toHaveLength(0);
-    h.store.upsertSkillOrNoteSync("desk", {kind:"working_note",scope:"cell",name:"my link",description:"Saved link",body:"project plan",mode:"upsert"});
-    expect(h.store.readResourceSync("desk","note://my link")).toBe("project plan");
-    expect(h.store.readResourceSync("desk","reference://my link")).toBe("https://example.org/bookmark");
-  });
-
   it("writes a skill file with front matter and keeps the index row in sync", async () => {
     const h = setup();
     await h.store.upsertSkillOrNote("desk", {
@@ -124,16 +114,16 @@ describe("upsertSkillOrNote", () => {
     h.store.upsertSkillOrNoteSync("p", { kind: "working_note", scope: "cell", name: "供应商联系人", description: "联系人", body: "A: 张三", mode: "upsert" });
     h.store.upsertSkillOrNoteSync("w", { kind: "working_note", scope: "global", name: "牙医", description: "电话", body: "周五下午", mode: "upsert" });
     expect(h.store.getKnowledgeSync({ kind: "working_note", scope: "cell", cellId: "p", name: "供应商联系人" })?.body).toBe("A: 张三");
-    expect(h.store.readResourceSync("w", "note://供应商联系人")).toBe("A: 张三");
-    expect(h.store.readResourceSync("w", `note://${encodeURIComponent("供应商联系人")}`)).toBe("A: 张三");
-    expect(h.store.readResourceSync("x", "note://牙医")).toBe("周五下午");
-    expect(() => h.store.readResourceSync("x", "note://供应商联系人")).toThrow(/not found/);
+    expect(h.store.readResourceSync("w", "working_note://供应商联系人")).toBe("A: 张三");
+    expect(h.store.readResourceSync("w", `working_note://${encodeURIComponent("供应商联系人")}`)).toBe("A: 张三");
+    expect(h.store.readResourceSync("x", "working_note://牙医")).toBe("周五下午");
+    expect(() => h.store.readResourceSync("x", "working_note://供应商联系人")).toThrow(/not found/);
     expect(h.store.listKnowledgeSync({ cellId: "p" }).map((k) => k.name)).toEqual(["供应商联系人", "牙医"]);
     expect(h.store.listKnowledgeSync({ cellId: "p", includeGlobal: false }).map((k) => k.name)).toEqual(["供应商联系人"]);
     // nearest scope wins on a name clash
     h.store.upsertSkillOrNoteSync("w", { kind: "working_note", scope: "cell", name: "牙医", description: "电话", body: "改到周六", mode: "upsert" });
-    expect(h.store.readResourceSync("w", "note://牙医")).toBe("改到周六");
-    expect(h.store.readResourceSync("p", "note://牙医")).toBe("周五下午");
+    expect(h.store.readResourceSync("w", "working_note://牙医")).toBe("改到周六");
+    expect(h.store.readResourceSync("p", "working_note://牙医")).toBe("周五下午");
     expect(existsSync(join(h.dataDir, "skills"))).toBe(false);
   });
 

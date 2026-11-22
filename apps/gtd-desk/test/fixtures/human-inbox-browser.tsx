@@ -23,7 +23,7 @@ window.fetch = async (url, init) => {
         submissions.length === 4
           ? []
           : [
-              {id:"legacy", category:"decision", title:"另一件先到的事项", projects:[], actionRefs:[{cellId:"other",actionId:"legacy"}], options:[]},
+              {id:"other", category:"decision", title:"另一件先到的事项", projects:[], options:[]},
               {
                 id: "scope",
                 category: "decision",
@@ -31,7 +31,6 @@ window.fetch = async (url, init) => {
                 itemRevision: revision,
                 artifact,
                 projects: [],
-                actionRefs: [{cellId:"project",actionId:"legacy"}],
                 options: [{ id: "reply", label: "回复", effect: "reply", input: { mode: "optional" } }],
               },
             ],
@@ -60,8 +59,8 @@ function Fixture() {
   const {bump} = useRefresh();
   return <><button id="background" onClick={() => {
     artifact = {...artifact, body:"后台新稿", version:3, versionText:"v3"};
-    bump(["clarify"]);
-  }}>后台改稿</button><HumanInbox actionRef={{cellId:"project",actionId:"legacy"}} /></>;
+    bump(["inbox"]);
+  }}>后台改稿</button><HumanInbox cardId="scope" /></>;
 }
 async function exercise() {
   createRoot(document.getElementById("root")!).render(<RefreshProvider><Fixture /></RefreshProvider>);

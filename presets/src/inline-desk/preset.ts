@@ -1,4 +1,3 @@
-import { humanActionDomain } from "../shared/human-actions";
 import type { PresetDef } from "@ng/protocol";
 import { ROLES } from "../shared/config";
 import { DESK_PROCESSOR } from "../shared/processors";
@@ -12,7 +11,6 @@ export function deskPreset(books: DeskBooks): PresetDef {
     defaults: { processor: DESK_PROCESSOR, lifetime: "persistent", meta: { role: ROLES.desk } },
     // The desk's books (reminders due, decided cards, finished projects) are kept before the model runs, so they never
     // depend on the model calling a tool; a wake-up with nothing else in it does not reach the model at all.
-    stateDomain: humanActionDomain,
     approvedSpawn(rec, store, clock) {
       if (rec.action.type !== "project.start") return;
       const version = rec.artifactId && rec.boundVersion ? store.getArtifactVersionSync(rec.artifactId, rec.boundVersion) : null;

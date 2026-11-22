@@ -1,14 +1,12 @@
 // @ng/loop/testing — in-memory RunPorts and PromptSnapshot for testing Loops, toolsets and code processors.
 export {
   createFakeRun,
-  defaultFakeBounds,
   fakeInspection,
-  renderEnvelope,
-  userMessage,
-  type FakeLog,
   type FakeRun,
   type FakeRunOptions,
   type FakeRunPorts,
 } from "./fake-ports";
-export * from "../models/scripted";
-export { installFakeCli, FAKE_CLI_PATH, type FakeCli, type FakeCliAction, type FakeCliTurn, type FakeCliLogEntry } from "./fake-cli";
+export { createScriptedLoop, TRUNCATED_CALL_OUTPUT } from "./scripted-loop";
+export type { ModelRequest } from "./model";
+export { ScriptedModelClient, call, say, type ScriptResponder, type ScriptTurn } from "../models/scripted";
+export { installFakeCli, type FakeCli, type FakeCliTurn } from "./fake-cli";

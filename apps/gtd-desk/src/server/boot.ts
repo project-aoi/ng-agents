@@ -45,7 +45,7 @@ export interface DeskServerOptions {
   kernel?: Partial<KernelOptions>;
   /** Built web client; default <app>/dist/web; null = API only. */
   webDir?: string | null;
-  settings?: Partial<Pick<DeskSettings, "weeklyReview" | "snoozeAfternoonHour">>;
+  settings?: Partial<Pick<DeskSettings, "weeklyReview">>;
   log?: (line: string) => void;
   onError?: (err: unknown, where: string) => void;
 }

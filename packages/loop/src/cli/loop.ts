@@ -224,10 +224,10 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
     const sameModel = (r: CliSessionRecord) => (r.model ?? "") === (model ?? "");
     let plan: { session?: LaunchRequest["session"]; prompt: string; forkedFrom?: string };
     let releaseParent: (()=>void) | undefined;
-    let forkDelivered: number | undefined;
-    const priorCursor = own?.lastDeliveredEvidenceSeq ?? 0;
+    let sessionBaselineSeq = snapshot.historyUptoSeq;
     if (own && own.engine === engine && own.cwd === access.root && own.systemHash === snapshot.system.hash && sameModel(own)) {
-      const missed = (ports.listEvidence?.({ afterSeq: priorCursor }) ?? []).filter(entry =>
+      sessionBaselineSeq = own.lastDeliveredEvidenceSeq;
+      const missed = (ports.listEvidence?.({ afterSeq: sessionBaselineSeq }) ?? []).filter(entry =>
         entry.seq <= snapshot.historyUptoSeq && (entry.record.kind === "system_note" ||
         (entry.record.kind === "inbound" && !initialBatchIds.has(entry.record.envelope.id))));
       const seenEnvelopes = new Set<string>();
@@ -245,9 +245,9 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
         const parent = await ports.context.readState<CliSessionRecord>(cellId, CLI_FORK_SESSION_KEY);
         const point = snapshot.spec.fork;
         if (parent && point && parent.engine === engine && sameModel(parent) && (engine !== "claude" || parent.cwd===access.root)
-            && !activeCells.has(point.fromCellId) && !readingParent.has(point.fromCellId) && parent.lastDeliveredEvidenceSeq !== undefined &&
+            && !activeCells.has(point.fromCellId) && !readingParent.has(point.fromCellId) &&
             ports.canForkSession(point.fromCellId,point.uptoSeq,parent.sessionId,parent.lastDeliveredEvidenceSeq)) {
-          forkDelivered = parent.lastDeliveredEvidenceSeq;
+          sessionBaselineSeq = parent.lastDeliveredEvidenceSeq;
           plan = { session: { id: parent.sessionId, mode: "fork" }, prompt: freshPrompt(snapshot.history.slice(forkIdx), input), forkedFrom: parent.sessionId };
           // The fork note is the first "earlier" message the child shows; the parent's part is in the forked session.
           plan.prompt = plan.prompt.replace(/^\[Earlier conversation[^\]]*\]\n\n/, "");
@@ -267,7 +267,6 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
     });
 
     let sessionId: string | null = plan.session?.mode === "resume" ? plan.session.id : null;
-    let sessionBaselineSeq = plan.session?.mode === "resume" ? priorCursor : plan.session?.mode === "fork" ? (forkDelivered ?? snapshot.historyUptoSeq) : snapshot.historyUptoSeq;
     let sessionProgress = false;
     let awaitingSessionConfirmation = false;
     let eventChain = Promise.resolve();
@@ -435,7 +434,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
         if (nextSession?.mode === "fork") {
           const point=snapshot.spec.fork!;
           if (activeCells.has(point.fromCellId) || readingParent.has(point.fromCellId) ||
-              !ports.canForkSession(point.fromCellId,point.uptoSeq,nextSession.id,forkDelivered!)) {
+              !ports.canForkSession(point.fromCellId,point.uptoSeq,nextSession.id,sessionBaselineSeq)) {
             nextSession=undefined;
             sessionBaselineSeq = snapshot.historyUptoSeq;
             nextPrompt=freshPrompt(snapshot.history,input);

@@ -329,7 +329,7 @@ function NodeCard(
   const lit = n.gitRoot !== null && props.highlight.has(n.gitRoot);
   const waits = props.waitDrawn ? [] : props.topo.waits.filter((w) => w.fromCellId === n.cellId);
   const dirTitle = n.cwd && n.gitRoot && n.cwd !== n.gitRoot ? `${n.cwd}\n（仓库 ${n.gitRoot}）` : (dir ?? undefined);
-  const hasLinks = n.pendingCardId !== null || n.engageItem !== null || (n.archivedChildren > 0 && !props.includeArchived);
+  const hasLinks = n.pendingCardId !== null || n.humanItemId !== null || (n.archivedChildren > 0 && !props.includeArchived);
 
   return (
     <div
@@ -388,12 +388,12 @@ function NodeCard(
       {hasLinks && (
         <div className="topo-links">
           {n.pendingCardId && (
-            <button type="button" className="link-btn" tabIndex={props.tabStop ? 0 : -1} onClick={() => navigate({ view: "clarify", cardId: n.pendingCardId! })}>
+            <button type="button" className="link-btn" tabIndex={props.tabStop ? 0 : -1} onClick={() => navigate({ view: "inbox", cardId: n.pendingCardId! })}>
               去拍板 →
             </button>
           )}
-          {n.engageItem && (
-            <button type="button" className="link-btn" tabIndex={props.tabStop ? 0 : -1} onClick={() => navigate({ view: "engage", item: n.engageItem! })}>
+          {n.humanItemId && (
+            <button type="button" className="link-btn" tabIndex={props.tabStop ? 0 : -1} onClick={() => navigate({ view: "inbox", cardId: n.humanItemId! })}>
               去处理 →
             </button>
           )}

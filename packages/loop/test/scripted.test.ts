@@ -1,5 +1,6 @@
+import type { ModelRequest } from "../src/testing";
 import { describe, expect, it } from "vitest";
-import { textMessage, type ModelRequest } from "@ng/protocol";
+import { textMessage } from "@ng/protocol";
 import { call, say, ScriptedModelClient } from "../src/testing";
 
 const req = (text: string, extra: Partial<ModelRequest> = {}): ModelRequest => ({

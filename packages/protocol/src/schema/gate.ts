@@ -1,7 +1,9 @@
 import type { SchemaModule } from "./types";
 
 export const gateSchema: SchemaModule = {
-  owner: "@ng/gate", version: 1, migrations: [],
+  owner: "@ng/gate",
+  version: 1,
+  migrations: [],
   ddl: `
 CREATE TABLE IF NOT EXISTS human_items (
   action_id      TEXT PRIMARY KEY,
@@ -36,11 +38,6 @@ CREATE TABLE IF NOT EXISTS human_items (
     WHEN disposition IN ('denied','cancelled','superseded') THEN 'cancelled' ELSE 'resolved' END) VIRTUAL,
   resolved_at    INTEGER
 );
-CREATE TABLE IF NOT EXISTS human_item_origins (
-  cell_id TEXT NOT NULL REFERENCES cells(id), key TEXT NOT NULL, item_id TEXT NOT NULL REFERENCES human_items(action_id),
-  fields TEXT NOT NULL, PRIMARY KEY(cell_id,key)
-);
-CREATE INDEX IF NOT EXISTS idx_item_origins_item ON human_item_origins(item_id);
 CREATE TABLE IF NOT EXISTS human_item_activity (
   id TEXT PRIMARY KEY, item_id TEXT NOT NULL REFERENCES human_items(action_id), before_state TEXT NOT NULL,
   after_revision INTEGER NOT NULL, receipt_cell TEXT, receipt_id TEXT, target_project TEXT, at INTEGER NOT NULL, undone_at INTEGER
@@ -49,7 +46,5 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_human_items_active ON human_items(subject_k
   WHERE status IN ('pending','snoozed');
 CREATE INDEX IF NOT EXISTS idx_items_cell ON human_items(cell_id, status);
 CREATE INDEX IF NOT EXISTS idx_items_due ON human_items(due_at) WHERE due_at IS NOT NULL;
-CREATE VIEW IF NOT EXISTS approvals AS SELECT action_id, cell_id, epoch, principal_id, subject_key, action_type, action, action_hash, card, artifact_id, bound_version, proposed_version, item_revision, disposition AS status, status_reason, snoozed_until, approver_id, human_edited, outcome, created_at, updated_at, resolved_at
-  FROM human_items WHERE cell_id IS NOT NULL AND action_hash <> '';
 `,
 };

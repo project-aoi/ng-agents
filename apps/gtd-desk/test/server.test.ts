@@ -3,10 +3,7 @@ import { projectIdForApproval } from "@ng/presets";
 import { gtdKeys, type ActionRecord, type ProjectProposalCard, type ProjectRecord, type SourceRecord } from "@ng/protocol";
 import type { Kernel } from "@ng/cell";
 import type {
-  ApproveResponse,
-  ClarifyMutationResponse,
-  ClarifyQueueDTO,
-  EngageMutationResponse,
+  PlanSaveResponse,
   ProjectMutationResponse,
   RadarDTO,
   ReviewMutationResponse,
@@ -70,7 +67,7 @@ describe("boot with the real presets", () => {
   it("registers @ng/presets before start, seeds the built-in playbooks, creates the desk with the inline preset and takes a capture", async () => {
     const d = await bootDesk({ registerPresets: undefined as never });
     expect(d.kernel.getCell("desk")).toMatchObject({ preset: "inline", status: "active", title: "主台" });
-    expect(d.kernel.registry.presets.list().map((p) => p.name).sort()).toEqual(["checker", "hub", "inline", "project", "sensor", "watcher", "worker"]);
+    expect(d.kernel.registry.presets.list().map((p) => p.name).sort()).toEqual(["checker", "hub", "inline", "project", "sensor", "worker"]);
     // The playbooks the presets' prompts refer to, as global skills (seedBuiltinSkills at boot).
     expect(d.kernel.context.listSkillsSync().map((x) => x.name).sort()).toEqual(BUILTIN_SKILLS.map((x) => x.name).sort());
     await d.post("/api/capture", { text: "把这篇文章存进阅读清单 https://example.com/a" });
@@ -86,8 +83,8 @@ describe("boot with the real presets", () => {
 
 describe("live updates", () => {
   it("maps bus events to coarse view refreshes", () => {
-    expect(viewsForBusEvent("approval.changed", { actionId: "a", cellId: "desk", subjectKey: "s", status: "pending" })).toContain("clarify");
-    expect(viewsForBusEvent("state.changed", { cellId: "desk", keys: [gtdKeys.action("x")] })).toEqual(expect.arrayContaining(["engage", "radar"]));
+    expect(viewsForBusEvent("approval.changed", { actionId: "a", cellId: "desk", subjectKey: "s", status: "pending" })).toContain("inbox");
+    expect(viewsForBusEvent("state.changed", { cellId: "desk", keys: [gtdKeys.action("x")] })).toEqual(expect.arrayContaining(["inbox", "radar"]));
     expect(viewsForBusEvent("state.changed", { cellId: "s", keys: [gtdKeys.source] })).toEqual(["sources", "review"]);
     expect(viewsForBusEvent("state.changed", { cellId: "desk", keys: ["coord:state"] })).toEqual([]);
   });
@@ -108,7 +105,7 @@ describe("live updates", () => {
     await until("event: hello");
     makeReviewCard(d.kernel);
     await until("event: refresh");
-    expect(text).toMatch(/event: refresh\ndata: \{"views":\[[^\]]*"clarify"/);
+    expect(text).toMatch(/event: refresh\ndata: \{"views":\[[^\]]*"inbox"/);
     await reader.cancel();
   });
 });
@@ -201,21 +198,26 @@ describe("project proposal card", () => {
     const d = await bootRealDesk();
     const id = proposalCard(d.kernel);
     const plan = { outcome: "新官网上线", actions: [{ title: "出设计稿", owner: "agent" }, { title: "约设计师", owner: "human", effort: "15m" }] };
-    const saved = await d.req<ClarifyMutationResponse>("PUT", `/api/clarify/${id}/plan`, { expectedVersion: 1, proposal: plan });
-    expect(saved.json).toMatchObject({ outcome: "saved", card: { sourceBar: { version: 2 }, proposal: { actions: [{}, { title: "约设计师" }] } } });
-    const conflict = await d.req<ClarifyMutationResponse>("PUT", `/api/clarify/${id}/plan`, { expectedVersion: 1, proposal: plan });
+    const saved = await d.req<PlanSaveResponse>("PUT", `/api/human-items/${id}/plan`, { expectedVersion: 1, proposal: plan });
+    expect(saved.json).toMatchObject({ outcome: "saved" });
+    const edited = d.server.desk.listHumanItems().find(i => i.id === id)!;
+    expect(edited).toMatchObject({ artifactVersion: 2, proposal: { actions: [{}, { title: "约设计师" }] } });
+    const conflict = await d.req<PlanSaveResponse>("PUT", `/api/human-items/${id}/plan`, { expectedVersion: 1, proposal: plan });
     expect(conflict.status).toBe(409);
     expect(conflict.json).toMatchObject({ ok: false, outcome: "conflict", current: { version: 2 } });
 
-    const s = await d.post<ClarifyMutationResponse>(`/api/clarify/${id}/someday`, { seenItemRevision: saved.json.card!.itemRevision, seenVersion: saved.json.card!.draft!.version });
-    expect(s).toMatchObject({ outcome: "someday", view: { remaining: 0 } });
-    const projectId = s.projectId!;
+    const parked = await d.post<{status:string;projectId:string}>(`/api/human-items/${id}/decide`, {
+      optionId: "system.someday", seenItemRevision: edited.itemRevision, seenArtifactVersion: edited.artifactVersion,
+    });
+    expect(parked.status).toBe("someday");
+    expect(d.server.desk.listHumanItems()).toHaveLength(0);
+    const projectId = parked.projectId;
     // the real project cell (the id an approval would have given it), paused before it ever ran — not an empty
     // holder that is closed at once
     expect(projectId).toBe(projectIdForApproval(id));
-    expect(d.kernel.getCell(projectId)).toMatchObject({ preset: "project", status: "paused", parentId: "desk" });
+    expect(d.kernel.getCell(projectId)).toMatchObject({ preset: "project", status: "paused", pauseReason: "parked", parentId: "desk" });
     const record = d.kernel.context.readStateSync<ProjectRecord>(projectId, gtdKeys.project)!;
-    expect(record).toMatchObject({ lifecycle: "someday", title: "官网改版" });
+    expect(record).toMatchObject({ lifecycle: "active", title: "官网改版" });
     expect(record.proposal!.actions).toHaveLength(2);
     // its first task waits in the queue, unclaimed
     expect(d.kernel.inbox.listMessagesSync({ cellId: projectId, type: "cell.task" })).toMatchObject([{ status: "pending" }]);
@@ -255,15 +257,14 @@ describe("escalations and completion", () => {
 
   it("unknown ids are 404s; a decided card is a 409", async () => {
     const d = await bootDesk();
-    expect((await d.req("GET", "/api/clarify/act_nope")).status).toBe(404);
-    expect((await d.req("POST", "/api/clarify/act_nope/snooze", { seenItemRevision: 1, until: d.clock.now() + DAY })).status).toBe(404);
-    expect((await d.req("POST", "/api/engage/desk/nope/done")).status).toBe(404);
+    expect((await d.req("POST", "/api/human-items/missing/decide", { optionId: "done", seenItemRevision: 1 })).status).toBe(404);
     expect((await d.req("GET", "/api/artifacts/nope")).status).toBe(404);
     expect((await d.req("POST", "/api/projects/nope/pause")).status).toBe(404);
     expect((await d.req("GET", "/api/nothing-here")).status).toBe(404);
     const { actionId } = makeReviewCard(d.kernel);
-    await d.post(`/api/clarify/${actionId}/approve`, { seenVersion: 1, seenItemRevision: 1 });
-    expect((await d.req("POST", `/api/clarify/${actionId}/someday`, { seenItemRevision: 1 })).status).toBe(409);
+    const choice = { optionId: "system.reply", seenArtifactVersion: 1, seenItemRevision: 1 };
+    await d.post(`/api/human-items/${actionId}/decide`, choice);
+    expect((await d.req("POST", `/api/human-items/${actionId}/decide`, choice)).status).toBe(409);
     const malformed = await d.server.app.request("/api/capture", { method: "POST", body: "{not json", headers: { "content-type": "application/json" } });
     expect(malformed.status).toBe(400);
     expect(await malformed.json()).toEqual({ error: { code: "invalid_json", message: "请求体不是合法的 JSON" } });

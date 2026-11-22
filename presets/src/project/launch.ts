@@ -55,7 +55,6 @@ export interface ProjectInit {
   id?: string;
   /** The owner's original words, quoted in the brief. */
   rawInput?: string;
-  /** Someone outside who asked: the result goes back to them (after the owner confirms the card). */
   /** Continue from the starting cell's conversation (fork_prefix). */
   continueConversation?: boolean;
 }
@@ -65,7 +64,6 @@ export interface ProjectSeed {
   title: string;
   outcome: string;
   source: ItemSource;
-  cwd?: string;
   proposal?: ProjectProposal;
 }
 
@@ -152,7 +150,6 @@ export function projectLaunch(init: ProjectInit, clock: Clock): ProjectLaunch {
     title: init.title,
     outcome: init.outcome,
     source: init.source ?? { label: "立项", at: clock.now() },
-    ...(init.cwd ? { cwd: init.cwd } : {}),
     ...(proposal ? { proposal } : {}),
   };
   const input: ProjectTaskInput = {

@@ -1,3 +1,4 @@
+import { readHumanActionRecords } from "@ng/presets";
 import type { Kernel } from "@ng/cell";
 import {
   get, gtdKeys,
@@ -38,15 +39,12 @@ export interface DeskSettings {
   tokenRequired: boolean;
   /** Weekly review slot in local time: weekday 0 = Sunday … 5 = Friday. */
   weeklyReview: { weekday: number; hour: number };
-  /** "⏱ 推迟到下午" lands at this local hour. */
-  snoozeAfternoonHour: number;
 }
 
 export const DEFAULT_SETTINGS: DeskSettings = {
   backend: "unknown",
   tokenRequired: false,
   weeklyReview: { weekday: 5, hour: 16 },
-  snoozeAfternoonHour: 14,
 };
 
 export interface ProjectionInput {
@@ -85,7 +83,7 @@ export interface SensorSuggestion {
 // ==================== tolerant record readers ====================
 // Records are written by Loops through set_state, so a malformed value must not break a whole view.
 
-const OWNERS = new Set<BallOwner>(["human", "agent", "waiting"]);
+const OWNERS = new Set<BallOwner>(["agent", "waiting"]);
 const ACTION_STATUSES = new Set(["open", "done", "cancelled"]);
 const LIFECYCLES = new Set(["active", "completed", "cancelled", "someday"]);
 const ACTIVITY_KINDS = new Set(["notification_archived", "note_saved", "reminder_set", "card_withdrawn", "action_completed"]);
@@ -151,15 +149,7 @@ export function readActions(kernel: DeskKernel): Array<Located<ActionRecord>> {
     const record = asAction(e.key, e.value, e.updatedAt);
     if (record) out.push({ cellId: e.cellId, key: e.key, record, updatedAt: e.updatedAt });
   }
-  for (const item of kernel.humanItems.list()) {
-    if (item.cellId !== null || !item.subjectKey.startsWith("reminder:")) continue;
-    const at = item.dueAt ?? 0;
-    out.push({ cellId: kernel.deskCellId, key: item.subjectKey, updatedAt: at, record: {
-      id: item.id, title: item.title, nextStep: item.description ?? item.title, owner: "human", status: "open",
-      ...(item.effort === "45m" || item.effort === "15m" || item.effort === "low_energy" ? { effort: item.effort } : {}),
-      ...(item.dueAt !== undefined ? { dueAt: item.dueAt } : {}), createdAt: at, updatedAt: at, source: { label: "定时提醒", at },
-    } });
-  }
+  out.push(...readHumanActionRecords(kernel.db, kernel.deskCellId));
   return out;
 }
 
@@ -168,7 +158,17 @@ export function readProjects(kernel: DeskKernel): Array<Located<ProjectRecord>> 
   for (const e of kernel.context.queryStateSync({ keyPrefix: gtdKeys.project })) {
     if (e.key !== gtdKeys.project) continue;
     const record = asProject(e.value, e.updatedAt);
-    if (record) out.push({ cellId: e.cellId, key: e.key, record, updatedAt: e.updatedAt });
+    if (!record) continue;
+    const cell = kernel.getCell(e.cellId);
+    if (!cell) continue;
+    const stall = get<{since:number;notified_at:number|null}>(kernel.db, "SELECT since,notified_at FROM cell_stalls WHERE cell_id=?", [cell.id]);
+    if (cell.spec.cwd) record.cwd = cell.spec.cwd;
+    if (cell.pauseReason === "parked") record.lifecycle = "someday";
+    if (stall) {
+      record.stalledSince = stall.since;
+      if (stall.notified_at !== null) record.stalledNotifiedAt = stall.notified_at;
+    }
+    out.push({ cellId: e.cellId, key: e.key, record, updatedAt: e.updatedAt });
   }
   return out;
 }
@@ -187,7 +187,14 @@ export function readSources(kernel: DeskKernel): Array<Located<SourceRecord>> {
   for (const e of kernel.context.queryStateSync({ keyPrefix: gtdKeys.source })) {
     if (e.key !== gtdKeys.source) continue;
     const record = asSource(e.value, e.updatedAt);
-    if (record) out.push({ cellId: e.cellId, key: e.key, record, updatedAt: e.updatedAt });
+    const cell = kernel.getCell(e.cellId);
+    if (record && cell) {
+      record.status = cell.status === "paused" ? "paused" : record.lastError ? "error" : "ok";
+      record.processor = cell.spec.processor.kind === "llm" ? "llm" : "code";
+      const rule = cell.spec.schedules?.find(rule => rule.cron);
+      if (rule?.cron) record.schedule = { cron: rule.cron, ...(rule.tz && { tz: rule.tz }) };
+      out.push({ cellId: e.cellId, key: e.key, record, updatedAt: e.updatedAt });
+    }
   }
   return out;
 }
@@ -203,12 +210,6 @@ export function projectOfAction(kernel: DeskKernel, a: Located<ActionRecord>, pr
   return projectCells.has(a.cellId) ? a.cellId : null;
 }
 
-/** Cards converted to "我来处理" keep their approval pending, linked from the human action (`approvalActionId`). */
-export function linkedApprovalId(a: ActionRecord): string | null {
-  const v = (a as ActionRecord & { approvalActionId?: unknown }).approvalActionId;
-  return typeof v === "string" && v ? v : null;
-}
-
 /** Project subject keys look like `project:<cellId>` (gtd.ts subjectKeys.project). */
 export function projectIdOfSubject(subjectKey: string): string | null {
   return subjectKey.startsWith("project:") ? subjectKey.slice("project:".length) || null : null;
@@ -221,31 +222,7 @@ export function approvalProjectId(kernel: DeskKernel, rec: ApprovalRecord): stri
   return typeof meta === "string" && meta ? meta : null;
 }
 
-/**
- * Open actions whose owner part is a Clarify card: the cell carrying the action (`ActionRecord.cellId` — a worker or a
- * watcher of a project) holds a pending card, e.g. a reply watcher's follow-up or a worker that is blocked on the
- * owner's decision. The card is where the owner acts, so such an action is no to-do of its own (not in Engage; Radar
- * points at the card). Keyed by `cellId + action id`.
- */
-export function cardBackedActions(kernel: DeskKernel, actions: ReadonlyArray<Located<ActionRecord>>): Set<string> {
-  const out = new Set<string>();
-  const carded = new Set(kernel.gate.listPendingSync({ includeSnoozed: true }).map((r) => r.cellId));
-  for (const a of actions) {
-    if (a.record.status !== "open" || !a.record.cellId) continue;
-    if (carded.has(a.record.cellId)) out.add(`${a.cellId}\u0000${a.record.id}`);
-  }
-  return out;
-}
-
 /** Cells that hold a project record (`gtd:project`): one Radar row each. */
 export function projectCellIds(kernel: DeskKernel): Set<string> {
   return new Set(readProjects(kernel).map((p) => p.cellId));
 }
-
-export function humanItemForAction(kernel:DeskKernel, cellId:string, actionId:string) {
-  const origin = get<{item_id:string}>(kernel.db,"SELECT item_id FROM human_item_origins WHERE cell_id=? AND key=?",
-    [cellId,gtdKeys.action(actionId)]);
-  return kernel.humanItems.get(origin?.item_id ?? actionId);
-}
-
-export const actionKey = (a: Located<ActionRecord>) => `${a.cellId}\u0000${a.record.id}`;

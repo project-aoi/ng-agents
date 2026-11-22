@@ -65,7 +65,7 @@ describe("versioned artifacts", () => {
   it("a background refresh never overwrites a human edit: it is rejected and parked", async () => {
     const h = setup();
     h.store.commitSync("desk", { artifact: agent("agent draft v1") });
-    // The human opens v1 in the Engage editor and saves.
+    // The owner edits version 1.
     expect(h.store.commitSync("desk", { artifact: human("human rewrite", 1) })).toEqual({ ok: true, artifactVersion: 2 });
     // Meanwhile a new message arrives and the agent refreshes from v1.
     const r = h.store.commitSync("desk", { artifact: agent("agent draft + new info from the supplier", 1) });

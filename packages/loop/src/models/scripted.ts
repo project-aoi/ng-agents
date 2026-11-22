@@ -1,14 +1,11 @@
 import {
   messageText,
-  type ModelClient,
-  type ModelRequest,
-  type ModelResponse,
-  type ModelStopReason,
   type ModelTier,
   type TextBlock,
   type ToolResultBlock,
   type ToolUseBlock,
 } from "@ng/protocol";
+import type { ModelClient, ModelRequest, ModelResponse, ModelStopReason } from "../testing/model";
 
 /** One model turn: text and/or tool calls. */
 export interface ScriptTurn {

@@ -114,7 +114,7 @@ export interface CliSessionRecord {
   cwd: string;
   /** PromptSnapshot.system.hash the session was primed with. */
   systemHash: string;
-  lastDeliveredEvidenceSeq?: number;
+  lastDeliveredEvidenceSeq: number;
   createdAt: number;
   updatedAt: number;
   runs: number;

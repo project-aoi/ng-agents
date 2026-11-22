@@ -106,11 +106,6 @@ describe("approve — version-bound confirmation", () => {
     expect(f.gate.getApprovalSync(d.actionId)!.status).toBe("pending");
   });
 
-  it("the async approve delegates", async () => {
-    const f = setup();
-    const d = expectType(f.gate.authorizeSync(proposal(), meta("desk")), "defer");
-    await expect(f.gate.approve(d.actionId, "owner")).resolves.toBe("approved");
-  });
 });
 
 describe("approve — an external main agent (agent:*) orchestrates but is never the owner (docs/05 guard 3)", () => {
@@ -168,20 +163,6 @@ describe("card lifecycle", () => {
     expect(f.gate.listPendingSync()[0]).toMatchObject({ actionId: d.actionId, snoozedUntil: until });
     expect(f.gate.snoozeSync("act_missing", until)).toBe("not_pending");
     expect(() => f.gate.snoozeSync(d.actionId, Number.NaN)).toThrow();
-  });
-
-  it("rebind moves a pending card to another existing draft version", () => {
-    const f = setup();
-    const d = deferDraft(f);
-    putArtifact(f.db, { artifactId: "a1", cellId: "desk", version: 2, body: "v2" });
-    expect(f.gate.rebindSync(d.actionId, 2)).toBe("rebound");
-    expect(f.gate.getApprovalSync(d.actionId)!.boundVersion).toBe(2);
-    expect(() => f.gate.rebindSync(d.actionId, 3)).toThrow(/no version 3/);
-    expect(() => f.gate.rebindSync(d.actionId, 0)).toThrow(/no version 0/);
-    const plain = expectType(f.gate.authorizeSync(proposal({ subjectKey: "x" }), meta("desk")), "defer");
-    expect(() => f.gate.rebindSync(plain.actionId, 1)).toThrow(/not bound to a draft/);
-    f.gate.approveSync(d.actionId, "owner", 2);
-    expect(f.gate.rebindSync(d.actionId, 1)).toBe("not_pending");
   });
 
   it("BUG-020: itemRevision optimistic locking rejects stale seenItemRevision and bumps on every accepted change (incl. revise)", () => {

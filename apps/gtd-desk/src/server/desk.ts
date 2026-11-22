@@ -1,17 +1,15 @@
 import { ownerOnlyApproval } from "@ng/gate";
 import type { HumanDecision } from "@ng/protocol";
-import type { ApprovalDecision, Kernel, ResolveApprovalResult } from "@ng/cell";
+import type { Kernel } from "@ng/cell";
 import type { UiChannel } from "@ng/channel";
 import {PROCESSORS,createSensorSpec,sensorProcessor} from "@ng/presets";
 const SCRIPT_PREFIX="script:";
 import {
   KEYS,
-  LEGACY,
   notifyProjectOfOwnerChangeSync,
   projectIdForApproval,
-  setProjectLifecycleSync,
-  humanActionDomain,
   startProjectSync,
+  writeActionRecordSync,
   type ProjectInit,
   type ProposalItem,
 } from "@ng/presets";
@@ -48,43 +46,29 @@ import type {
   ActivityKind,
   ActivityMutationResponse,
   AddActionRequest,
-  ApproveOutcome,
-  ApproveRequest,
   ArtifactDTO,
   ArtifactSaveRequest,
   ArtifactSaveResponse,
   CaptureRequest,
   CaptureResponse,
-  ClarifyMutationResponse,
-  ClarifyOutcome,
-  ClarifyQueueDTO,
   CreateSourceRequest,
-  DoneRequest,
-  EngageDetailDTO,
-  EngageListDTO,
-  EngageMutationResponse,
-  ExtendRequest,
-  NoteRequest,
   PlanSaveRequest,
+  PlanSaveResponse,
   ProjectMutationResponse,
   ProjectOutcome,
   RadarDTO,
   ReviewMutationResponse,
-  ReviseRequest,
   SensorToCodeRequest,
-  SnoozeRequest,
   SourceModeRequest,
   SourcesDTO,
   SourcesMutationResponse,
   StatusDTO,
   WeeklyReviewDTO,
   ActivityListDTO,
-  EngageOutcome,
 } from "../shared/api";
 import {
   approvalProjectId,
   inputOf,
-  humanItemForAction, linkedApprovalId,
   projectOfAction,
   readActions,
   readActivities,
@@ -95,15 +79,12 @@ import {
   type Located,
   type SkillSuggestion,
 } from "./projections/common";
-import { clarifyCardById, projectClarify } from "./projections/clarify";
-import { isEffort, projectEngage, projectEngageDetail } from "./projections/engage";
 import { artifactDTO } from "./projections/format";
 import { projectRadar } from "./projections/radar";
 import { projectReview } from "./projections/review";
 import { projectStatus } from "./projections/status";
 import { projectSources } from "./projections/sources";
 import { projectActivity } from "./projections/activity";
-import { afternoonSlot, whenText } from "./projections/time";
 import { createAgentsApi } from "./agents";
 
 const DAY = 24 * 3_600_000;
@@ -159,12 +140,12 @@ export type Desk = ReturnType<typeof createDesk>;
  * DeskActor: the external main agent's control plane calls them as `agent:<id>`.
  */
 export function createDesk({ kernel, ui, settings, onError = (err, where) => console.error(`[desk] ${where}:`, err) }: DeskDeps) {
-  kernel.context.installStateDomain(humanActionDomain(kernel.db, kernel.clock));
   const { context, gate, clock } = kernel;
   const owner = kernel.ownerPrincipal;
   const desk = kernel.deskCellId;
   const input = () => inputOf(kernel, settings);
   const now = () => clock.now();
+  const isEffort = (s: unknown): s is Effort => s === "15m" || s === "45m" || s === "low_energy";
 
   // ==================== reads ====================
 
@@ -174,7 +155,6 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     restamp();
     return projectStatus(input());
   };
-  const clarify = (): ClarifyQueueDTO => projectClarify(input());
   const radar = (): RadarDTO => {
     restamp();
     return projectRadar(input());
@@ -182,14 +162,6 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
   const review = (): WeeklyReviewDTO => projectReview(input());
   const sources = (): SourcesDTO => projectSources(input());
   const activity = (kind?: ActivityKind): ActivityListDTO => projectActivity(input(), kind);
-  const engage = (filter: Effort | "all" = "all"): EngageListDTO => projectEngage(input(), filter);
-
-  function engageDetail(cellId: string, actionId: string): EngageDetailDTO {
-    const d = projectEngageDetail(input(), cellId, actionId);
-    if (!d) throw missing("这件事不在专注工作区里（可能已办完）");
-    return d;
-  }
-
   function artifact(artifactId: string): ArtifactDTO {
     const a = artifactDTO(kernel, artifactId, now());
     if (!a) throw missing(`没有这份草稿 ${artifactId}`);
@@ -209,29 +181,20 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     return full;
   }
 
-  function findAction(cellId: string, actionId: string): Located<ActionRecord> {
-    const value = context.readStateSync(cellId, gtdKeys.action(actionId));
-    const found = readActions(kernel).find((a) => a.cellId === cellId && a.record.id === actionId);
-    if (!value || !found) throw missing("找不到这件事");
-    return found;
-  }
-
   /** Marks open actions finished; returns how many changed. */
   function finishActions(actions: Iterable<Located<ActionRecord>>, statusTo: "done" | "cancelled"): number {
     const t = now();
-    const byCell = new Map<string, Record<string, unknown>>();
-    let n = 0;
-    for (const a of actions) {
-      if (a.record.status !== "open") continue;
-      const patch = byCell.get(a.cellId) ?? {};
-      patch[a.key] = { ...a.record, status: statusTo, updatedAt: t, ...(statusTo === "done" ? { completedAt: t } : {}) };
-      byCell.set(a.cellId, patch);
-      n++;
-    }
-    withTx(kernel.db, () => {
-      for (const [cellId, patch] of byCell) commitState(cellId, patch);
+    return withTx(kernel.db, () => {
+      let count = 0;
+      for (const action of actions) {
+        if (action.record.status !== "open") continue;
+        writeActionRecordSync(kernel, action.cellId, {
+          ...action.record, status: statusTo, updatedAt: t, ...(statusTo === "done" ? { completedAt: t } : {}),
+        });
+        count++;
+      }
+      return count;
     });
-    return n;
   }
 
   function principalOf(as: DeskActor): string {
@@ -246,15 +209,6 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     if (v == null) throw bad("请提供页面上看到的 seenItemRevision");
     if (!Number.isInteger(v) || v < 1) throw bad("seenItemRevision 必须是正整数");
     return v;
-  }
-
-  /** The live project an action belongs to (a cell holding `gtd:project` that is not closed), if any. */
-  function liveProjectOf(a: Located<ActionRecord>): string | null {
-    const projectCells = new Set(readProjects(kernel).map((p) => p.cellId));
-    const pid = projectOfAction(kernel, a, projectCells);
-    if (!pid || !projectCells.has(pid)) return null;
-    const cell = kernel.getCell(pid);
-    return cell && cell.status !== "closed" ? pid : null;
   }
 
   /**
@@ -317,99 +271,6 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     return { rec, card: asClarifyCard(rec.card.data) };
   }
 
-  function clarifyResult(outcome: ClarifyOutcome, ok: boolean, message: string, cardId: string, extra: Partial<ClarifyMutationResponse> = {}): ClarifyMutationResponse {
-    const view = clarify();
-    return { ok, outcome, message, view, status: status(), card: view.cards.find((c) => c.id === cardId) ?? null, ...extra };
-  }
-
-  function kernelRefusal(r: ResolveApprovalResult, cardId: string): ClarifyMutationResponse {
-    if (r.status === "not_found") return clarifyResult("not_found", false, "找不到这张卡", cardId);
-    if (r.status === "revision_mismatch") {
-      return clarifyResult("revision_mismatch", false, "这张卡刚刚变动过，请刷新后再确认", cardId, { currentRevision: r.currentRevision });
-    }
-    return clarifyResult("not_pending", false, "这张卡已经处理过了", cardId);
-  }
-
-  const APPROVE_MESSAGE: Readonly<Record<ApproveOutcome, string>> = {
-    approved: "已确认，Agent 继续推进",
-    version_mismatch: "草稿已更新，请重看",
-    revision_mismatch: "这张卡刚刚变动过，请刷新后再确认",
-    already_cancelled: "这件事已经取消或撤回了",
-    not_found: "找不到这张卡",
-  };
-
-  async function runApprove(
-    cardId: string,
-    seenVersion: number | null | undefined,
-    seenItemRevision: number | null | undefined,
-    as: DeskActor,
-  ) {
-    const approverId = principalOf(as);
-    if (seenVersion !== undefined && seenVersion !== null && (!Number.isInteger(seenVersion) || seenVersion < 1)) throw bad("seenVersion 必须是正整数");
-    const seenRev = seenRevisionOf(seenItemRevision);
-    const before = gate.getApprovalSync(cardId);
-    const r = await kernel.resolveApproval(cardId, {
-      decision: "approve",
-      approverId,
-      ...(seenVersion != null ? { seenArtifactVersion: seenVersion } : {}),
-      seenItemRevision: seenRev,
-    });
-    let outcome: ApproveOutcome;
-    switch (r.status) {
-      case "approved":
-      case "version_mismatch":
-      case "revision_mismatch":
-      case "already_cancelled":
-      case "not_found":
-        outcome = r.status;
-        break;
-      default:
-        outcome = "already_cancelled";
-    }
-    let message = APPROVE_MESSAGE[outcome];
-    if (outcome === "approved" && before?.action.type === "project.start") message = "已确认立项，Agent 开始推进";
-    return {
-      outcome,
-      message,
-      ...(r.status === "version_mismatch" ? { currentVersion: r.currentVersion } : {}),
-      ...(r.status === "revision_mismatch" ? { currentRevision: r.currentRevision } : {}),
-      ...("error" in r && r.error ? { error: r.error } : {}),
-    };
-  }
-
-  async function approve(cardId: string, req: ApproveRequest, as: DeskActor) {
-    const r = await runApprove(cardId, req?.seenVersion, req?.seenItemRevision, as);
-    const view = clarify();
-    const ok = r.outcome === "approved";
-    return { ok, ...r, view, status: status(), card: view.cards.find((c) => c.id === cardId) ?? null };
-  }
-
-  type LegacyCommand<T = ApprovalDecision> = T extends ApprovalDecision ? Omit<T,"approverId"|"seenItemRevision"> : never;
-  async function applyCardCommand(id:string, revision:number | undefined, actor:DeskActor, command:LegacyCommand,
-    expected:ClarifyOutcome, message:string):Promise<ClarifyMutationResponse> {
-    const approverId = principalOf(actor);
-    const seenItemRevision = seenRevisionOf(revision);
-    approval(id);
-    const result = await kernel.resolveApproval(id,{
-      ...command, approverId, seenItemRevision
-    });
-    return result.status === expected ? clarifyResult(expected,true,message,id) : kernelRefusal(result,id);
-  }
-
-  function revise(cardId: string, req: ReviseRequest, as: DeskActor) {
-    const instruction = typeof req?.instruction === "string" ? req.instruction.trim() : "";
-    if (!instruction) throw bad("说说要怎么改");
-    return applyCardCommand(cardId,req.seenItemRevision,as,{decision:"revise",instruction,...(req.voice ? {voice:true} : {})},
-      "revising","收到，正在按你的意见重拟");
-  }
-
-  function snooze(cardId: string, req: SnoozeRequest, as: DeskActor) {
-    const t = now();
-    const until = req?.until ?? afternoonSlot(t, settings.snoozeAfternoonHour);
-    if (!Number.isFinite(until) || until <= t) throw bad("推迟时间必须在将来");
-    return applyCardCommand(cardId,req?.seenItemRevision,as,{decision:"snooze",until},"snoozed",`已推迟到 ${whenText(until,t)}，到点回到待确认`,);
-  }
-
   function proposalOf(rec: ApprovalRecord, card: ClarifyCard | null): ProjectProposal {
     if (card?.cardType !== "project_proposal") throw wrongState("这不是立项卡");
     const draftId = rec.artifactId ?? card.draft?.artifactId;
@@ -424,16 +285,17 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
    * first task stays queued and is its brief when the owner activates it. Its record says someday and keeps the plan.
    * Nothing is closed, nothing runs, and activating it later is the normal "activate".
    */
-  async function someday(cardId: string, req: NoteRequest, as: DeskActor): Promise<ClarifyMutationResponse> {
+  function parkProposal(cardId: string, decision: HumanDecision, as: DeskActor) {
     const approverId = principalOf(as);
-    const seenRev = seenRevisionOf(req?.seenItemRevision);
+    const seenRev = seenRevisionOf(decision.seenItemRevision);
     const { rec, card } = pendingCard(cardId);
     const proposal = proposalOf(rec, card);
     const draftId = rec.artifactId ?? (card?.cardType === "project_proposal" ? card.draft?.artifactId : undefined);
-    if (approverId !== owner) throw wrongState("只有主人可以确认立项");
-    if (draftId && context.getArtifactSync(draftId)?.version !== req.seenVersion) throw wrongState("方案已变动，请重新查看");
+    if (approverId !== owner) throw new NgError("bounds_violation", "只有主人可以确认立项");
+    if (draftId && context.getArtifactSync(draftId)?.version !== decision.seenArtifactVersion) throw wrongState("方案已变动，请重新查看");
     const holder = kernel.getCell(rec.cellId);
-    const parent = holder && holder.status !== "closed" ? holder : kernel.getCell(desk)!;
+    if (!holder || holder.status === "closed" || holder.epoch !== rec.epoch) throw wrongState("事项所属任务已变动");
+    const parent = holder;
     const parentId = parent.id;
     const t = now();
     const source = card?.source ?? { label: "以后再说", at: t };
@@ -452,9 +314,8 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     const record: ProjectRecord = {
       title: proposal.title,
       outcome: proposal.outcome,
-      lifecycle: "someday",
+      lifecycle: "active",
       source,
-      ...(proposal.cwd ? { cwd: proposal.cwd! } : {}),
       summary: "主人把这个方案放进了以后再说，还没有开始推进",
       proposal,
       createdAt: t,
@@ -474,7 +335,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
       if (!kernel.inbox.listMessagesSync({cellId:parentId,envelopeId:receipt.id,status:["pending"]}).length) throw wrongState("立项结果无法送达");
       return started.projectId;
     });
-    return clarifyResult("someday", true, `「${proposal.title}」已放进以后再说`, cardId, { projectId });
+    return { status: "someday", projectId };
   }
 
   /** The first message of a project parked straight from its proposal: the plan the owner saw, as text. */
@@ -489,7 +350,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
       .join("\n\n");
   }
 
-  async function savePlan(cardId: string, req: PlanSaveRequest, as: DeskActor): Promise<ClarifyMutationResponse> {
+  async function savePlan(cardId: string, req: PlanSaveRequest, as: DeskActor): Promise<PlanSaveResponse> {
     principalOf(as);
     const { rec, card } = pendingCard(cardId);
     if (card?.cardType !== "project_proposal") throw wrongState("这不是立项卡");
@@ -521,116 +382,9 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
       },
     });
     if (!r.ok) {
-      return clarifyResult("conflict", false, "方案在你编辑时被更新了，请看一下最新版本再保存", cardId, { current: artifactDTO(kernel, art.artifactId, now())! });
+      return { ok: false, outcome: "conflict", message: "方案在你编辑时被更新了，请看一下最新版本再保存", current: artifact(art.artifactId) };
     }
-    return clarifyResult("saved", true, `已保存方案 v${r.artifactVersion}`, cardId);
-  }
-
-  async function extend(cardId: string, req: ExtendRequest, as: DeskActor): Promise<ClarifyMutationResponse> {
-    const { rec, card } = pendingCard(cardId);
-    if (card?.cardType !== "escalation" && rec.action.type !== "custom") throw wrongState("只有受阻 / 超时的卡可以“继续”");
-    const reason = card?.cardType === "escalation" ? card.escalation.reason : null;
-    const command = {decision:"continue" as const, ...(req.note ? {note:req.note} : {})};
-    if (reason === "waiting_timeout") {
-      const t = now(), until = req.until ?? t + DAY;
-      if (!Number.isFinite(until) || until <= t) throw bad("等待时间必须在将来");
-      return applyCardCommand(cardId,req.seenItemRevision,as,{...command,until},"continued",`好的，再等到 ${whenText(until,t)}`);
-    }
-    return applyCardCommand(cardId,req.seenItemRevision,as,command,"continued","继续推进");
-  }
-
-  function resolveOffline(cardId:string,req:NoteRequest,as:DeskActor) {
-    return applyCardCommand(cardId,req?.seenItemRevision,as,{decision:"resolve_offline",...(req?.note ? {note:req.note} : {})},"resolved_offline","已完结");
-  }
-
-  async function dismiss(cardId: string, req: NoteRequest, as: DeskActor): Promise<ClarifyMutationResponse> {
-    const approverId = principalOf(as);
-    const seenRev = seenRevisionOf(req?.seenItemRevision);
-    const { rec, card } = pendingCard(cardId);
-    const r = await kernel.resolveApproval(cardId, {
-      decision: "dismiss",
-      approverId,
-      reason: req?.note || (byAgent(as) ? "dismissed by the owner's agent" : "dismissed by the owner"),
-      seenItemRevision: seenRev,
-    });
-    if (r.status !== "dismissed") return kernelRefusal(r, cardId);
-    const env = originalEnvelope(card?.source.envelopeId);
-    addActivity({
-      kind: "card_withdrawn",
-      title: card?.title ?? rec.card.title ?? rec.action.summary,
-      detail: byAgent(as) ? "主 Agent 按你的意思撤下了" : "你选择了不处理",
-      ...(card?.source ? { source: card.source } : {}),
-      ...(card?.rawInput.text ? { rawInput: card.rawInput.text } : {}),
-      ...(env ? { envelope: env } : {}),
-      actionId: rec.actionId,
-      restorable: env !== null,
-    });
-    return clarifyResult("dismissed", true, env ? "已归档，可在记录里移回待确认" : "已归档", cardId);
-  }
-
-  function deny(cardId:string,req:NoteRequest,as:DeskActor) {
-    return applyCardCommand(cardId,req?.seenItemRevision,as,{decision:"deny",...(req?.note ? {reason:req.note} : {})},"denied","已拒绝");
-  }
-
-  // ==================== 🎯 Engage ====================
-
-  function engageResult(outcome: EngageOutcome, ok: boolean, message: string, extra: Partial<EngageMutationResponse> = {}): EngageMutationResponse {
-    return { ok, outcome, message, view: engage(), status: status(), ...extra };
-  }
-
-  /** The cells that existed only for this action: not a root, not a project, not a source or hub, nothing else open in them. */
-  function dedicatedCells(a: Located<ActionRecord>): string[] {
-    const cell = kernel.getCell(a.cellId);
-    if (!cell || cell.status === "closed" || cell.parentId === null) return [];
-    if (context.readStateSync(a.cellId, gtdKeys.project) !== null || context.readStateSync(a.cellId, gtdKeys.source) !== null) return [];
-    const others = readActions(kernel).some((x) => x.cellId === a.cellId && x.record.id !== a.record.id && x.record.status === "open");
-    return others ? [] : [a.cellId];
-  }
-
-  /**
-   * The owner's action is done: the record, one line in the activity drawer, and — for an action on a project's books —
-   * the project is told what was done (with the owner's note), so it wakes and continues with whatever waited on it.
-   * The desk's own quick to-dos tell nobody.
-   */
-  async function completeAction(a: Located<ActionRecord>, detail: string, activityId: string | undefined, as: DeskActor, note?: string): Promise<number> {
-    const toClose = dedicatedCells(a);
-    const project = liveProjectOf(a);
-    withTx(kernel.db, () => {
-      finishActions([a], "done");
-      const rec = { kind: "action_completed" as const, title: a.record.title, detail, ...(a.record.source ? { source: a.record.source } : {}), restorable: false };
-      if (activityId) commitState(desk, { [gtdKeys.activity(activityId)]: { ...rec, id: activityId, at: now() } satisfies ActivityRecord });
-      else addActivity(rec);
-      if (project) tellProject(project, `${whoText(as)}已完成：${a.record.title}（动作 ${a.record.id}）${note?.trim() ? `\n${whoText(as)}的说明：${note.trim()}` : ""}`, as);
-    });
-    let closed = 0;
-    for (const id of toClose) closed += (await kernel.closeCell(id, "completed", actorOf(as))).closed.length;
-    return closed;
-  }
-
-  async function done(cellId: string, actionId: string, req: DoneRequest, as: DeskActor): Promise<EngageMutationResponse> {
-    const approverId = principalOf(as);
-    const personal = humanItemForAction(kernel,cellId,actionId);
-    if (personal?.options.some(o => o.id === "done") && (personal.cellId === cellId || (personal.cellId === null && cellId === desk))) {
-      await kernel.humanItems.decide(personal.id, { optionId: "done", ...(req?.seenVersion === undefined ? {} : {seenArtifactVersion:req.seenVersion}), seenItemRevision: seenRevisionOf(req?.seenItemRevision), ...(req?.note ? { note: req.note } : {}) }, approverId);
-      return engageResult("done", true, "已办完", { closedTasks: 0 });
-    }
-    const a = findAction(cellId, actionId);
-    if (a.record.status !== "open") return engageResult("already_done", true, "这件事已经办完了");
-    const linked = linkedApprovalId(a.record);
-    if (linked) {
-      const seen = seenRevisionOf(req?.seenItemRevision);
-      const rec = approval(linked);
-      const stale = (currentRevision: number) => engageResult("revision_mismatch", false, "关联卡片已有更新，请刷新后再确认", { currentRevision });
-      if (rec.itemRevision !== seen) return stale(rec.itemRevision);
-      if (rec.status === "pending") {
-        const result = await kernel.resolveApproval(linked, { decision: "dismiss", approverId, seenItemRevision: seen, reason: "the owner handled it personally" });
-        if (result.status === "revision_mismatch") return stale(result.currentRevision);
-        if (result.status !== "dismissed") throw wrongState("关联卡片正在处理，请刷新");
-      }
-    }
-    const note = typeof req?.note === "string" ? req.note : undefined;
-    const closedTasks = await completeAction(a, note || (byAgent(as) ? "主 Agent 代你勾选了已办完" : "你勾选了已办完"), undefined, as, note);
-    return engageResult("done", true, closedTasks > 0 ? `已办完，并结束了 ${closedTasks} 项相关后台任务` : "已办完", { closedTasks });
+    return { ok: true, outcome: "saved", message: `已保存方案 v${r.artifactVersion}` };
   }
 
   // ==================== drafts ====================
@@ -689,7 +443,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
   // ==================== 🧭 Radar ====================
 
   function projectRecord(projectId: string): ProjectRecord {
-    const v = context.readStateSync<ProjectRecord>(projectId, gtdKeys.project);
+    const v = readProjects(kernel).find(project => project.cellId === projectId)?.record;
     if (!v || typeof v !== "object" || typeof v.title !== "string") throw missing("找不到这个项目");
     return v;
   }
@@ -705,9 +459,9 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
 
   /** Cards about the project held outside its own cells (e.g. by the desk) go with it. */
   async function withdrawProjectCards(projectId: string, reason: string, as: DeskActor): Promise<void> {
-    const approverId = principalOf(as);
+    principalOf(as);
     const rec = gate.findPendingBySubjectSync(subjectKeys.project(projectId));
-    if (rec && kernel.getCell(rec.cellId)?.status !== "closed") await kernel.resolveApproval(rec.actionId, { decision: "dismiss", approverId, reason });
+    if (rec) gate.withdrawSync(rec.actionId, reason, { seenItemRevision: rec.itemRevision });
   }
 
   /**
@@ -715,8 +469,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
    * - pause / resume: kernel.control on the project cell (its whole subtree follows).
    * - someday: pause + lifecycle "someday". Nothing is closed or deleted: records, reports and history stay.
    * - activate: a parked project cell is resumed with lifecycle "active" and told the owner's words, so it wakes and
-   *   continues from its records and report. A parked item from before docs/05 (its cell closed, or an old zero-token
-   *   item root) is migrated to a new project.
+   *   continues from its records and report.
    * - cancel / complete: closeCell — the kernel settles the project's records; the project's actions held elsewhere
    *   (e.g. a card taken over on the desk) and cards about it on the desk follow here.
    */
@@ -746,9 +499,8 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
           return projectResult("not_applied", false, `「${record.title}」已经${record.lifecycle === "completed" ? "完结" : "取消"}了`);
         }
         const how = op === "cancel" ? "cancelled" : "completed";
-        if (open) await kernel.closeCell(projectId, how, actorOf(as));
-        // A cell closed before docs/05 (a parked item) has nothing to close: only its record ends.
-        else setProjectLifecycleSync(context, projectId, how, now());
+        if (!open) return projectResult("not_applied", false, "这个项目已结束");
+        await kernel.closeCell(projectId, how, actorOf(as));
         finishActions(
           projectActions(projectId).filter((a) => a.record.status === "open"),
           op === "cancel" ? "cancelled" : "done",
@@ -761,24 +513,16 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
       case "someday": {
         if (record.lifecycle === "someday") return projectResult("someday", true, "已经在以后再说里了");
         if (!open || record.lifecycle !== "active") return projectResult("not_applied", false, "只有进行中的项目可以移进以后再说");
-        if (cell.status === "active") {
+        {
           const r = kernel.control(projectId,{action:"pause",pauseReason:"parked"},actorOf(as));
           if (!r.applied) return projectResult("not_applied", false, r.reason ?? "暂停没有生效");
         }
-        setProjectLifecycleSync(context, projectId, "someday", now());
         return projectResult("someday", true, `「${record.title}」已移进以后再说，后台任务已暂停，记录和报告都留着`);
       }
       case "activate": {
         if (record.lifecycle !== "someday") return projectResult("not_applied", false, "这个项目不在以后再说里");
-        // Before docs/05 a parked item was either a closed holder cell, or a paused item root run by the old zero-token
-        // coordinator (which now only winds itself down): neither can be resumed as a project.
-        if (!open || isLegacyRoot(cell)) {
-          const projectId2 = await migrateParked(projectId, record, as);
-          return projectResult("migrated", true, `「${record.title}」是旧版本停靠的事项，已按原方案和报告新建项目继续推进`, { projectId: projectId2 });
-        }
+        if (!open) return projectResult("not_applied", false, "这个项目已结束");
         withTx(kernel.db, () => {
-          // The project's own books flip it too when it wakes; doing it here makes the row move at once.
-          setProjectLifecycleSync(context, projectId, "active", now());
           if (cell.status === "paused") {
             const r = control("resume");
             if (!r.applied) throw wrongState(r.reason ?? "继续没有生效");
@@ -790,63 +534,10 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     }
   }
 
-  function isLegacyRoot(cell: { spec: { processor: { kind: string; entry?: string } } }): boolean {
-    const p = cell.spec.processor;
-    return p.kind === "code" && (p.entry === LEGACY.joinAll || p.entry === LEGACY.joinAny);
-  }
-
   function activateText(record: ProjectRecord, as: DeskActor): string {
     const lines = [`${whoText(as)}点了启动：「${record.title}」从以后再说里拿出来了，现在开始推进。先看你的记录和已有报告（read_artifact），从那里接着做，不要从头再来；范围有变化先和主人确认。`];
     if (as.note?.trim()) lines.push(`${whoText(as)}的话：${as.note.trim()}`);
     return lines.join("\n");
-  }
-
-  /**
-   * A parked item from before docs/05 lives in a closed cell, which cannot be resumed: start a new project from its
-   * plan, its outcome and its reports (named by id, so the new project reads them instead of redoing the work). The old
-   * record is ended as "cancelled" with `migratedTo` pointing at its successor, so it leaves the someday list; it is
-   * never deleted.
-   */
-  async function migrateParked(oldId: string, record: ProjectRecord, as: DeskActor): Promise<string> {
-    // Its own reports and those of the cells that worked for it (closed with it).
-    const cells = [oldId];
-    for (let i = 0; i < cells.length; i++) for (const c of kernel.listCells({ parentId: cells[i]! })) cells.push(c.id);
-    const artifacts = cells.flatMap((id) => context.listArtifactsSync(id));
-    const proposal = record.proposal;
-    const owners: Record<BallOwner, string> = { agent: "交给 worker", human: "主人来做", waiting: "等外部" };
-    const brief = [
-      `这件事是主人以前放进“以后再说”的（旧版本的记录 ${oldId}，无法原地恢复），现在主人把它重新启动了，由你接着推进。`,
-      proposal?.background ?? "",
-      proposal?.actions.length ? ["当时的方案：", ...proposal.actions.map((a) => `- [${owners[a.owner]}] ${a.title}${a.nextStep ? `：${a.nextStep}` : ""}`)].join("\n") : "",
-      record.summary ? `当时的进展：${record.summary}` : "",
-      artifacts.length
-        ? [
-            "当时留下的报告和草稿（先用 read_artifact 读，接着它们做，不要重做）：",
-            ...artifacts.map((a) => `- ${a.artifactId} v${a.version}${a.content.title ? `「${a.content.title}」` : ""}（read_artifact artifactId "${a.artifactId}"）`),
-          ].join("\n")
-        : "",
-      as.note?.trim() ? `${whoText(as)}的话：${as.note.trim()}` : "",
-    ]
-      .filter(Boolean)
-      .join("\n\n");
-    const init: ProjectInit = {
-      title: record.title,
-      outcome: record.outcome ?? proposal?.outcome ?? record.title,
-      brief,
-      source: record.source ?? { label: "以后再说", at: now() },
-      ...(proposal ? { proposal } : {}),
-      ...(record.cwd ? { cwd: record.cwd } : {}),
-    };
-    // A legacy item root still open is closed (runtime only; its records and reports stay) before its successor starts.
-    if (kernel.getCell(oldId)?.status !== "closed") await kernel.closeCell(oldId, "cancelled", actorOf(as));
-    return withTx(kernel.db, () => {
-      const started = startProjectSync(kernel, init, actorOf(as));
-      const t = now();
-      const { stalledSince: _s, stalledNotifiedAt: _n, ...rest } = record;
-      const ended: ProjectRecord & { migratedTo: string } = { ...rest, lifecycle: "cancelled", summary: `已重新启动为新项目 ${started.projectId}`, migratedTo: started.projectId, updatedAt: t };
-      commitState(oldId, { [gtdKeys.project]: ended });
-      return started.projectId;
-    });
   }
 
   /**
@@ -878,7 +569,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     };
     const cell = kernel.getCell(projectId);
     withTx(kernel.db, () => {
-      commitState(projectId, { [gtdKeys.action(action.id)]: action });
+      writeActionRecordSync(kernel, projectId, action);
       if (cell && cell.status !== "closed") {
         tellProject(
           projectId,
@@ -1147,28 +838,25 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
       .slice(0,30).map(c=>({id:c.id,title:c.title ?? c.id,reason:c.closeReason})),
     listHumanItems: (includeSnoozed = false) => kernel.humanItems.list(includeSnoozed).map(item => {
       const {project, paused} = decisionCells(item.cellId);
-      const actionRefs = all<{cell_id:string; key:string}>(kernel.db, "SELECT cell_id,key FROM human_item_origins WHERE item_id=?", [item.id])
-        .map(row => ({cellId:row.cell_id, actionId:row.key.slice(gtdKeys.actionPrefix.length)}));
       const rec = kernel.gate.getApprovalSync(item.id);
-      const card = rec ? asClarifyCard(rec.card.data) : null;
       const closeTargets: Record<string,ReturnType<typeof closureMembers>> = {};
       for (const o of item.options) if (o.terminateMode==="cancel_task") closeTargets[o.id]=closureMembers(o.targetCellIds![0]!);
       const projects=item.relatedProjectIds.map(id=>kernel.getCell(id)).filter(p=>p!==undefined)
         .map(p=>({id:p.id,title:p.title ?? p.id}));
       const plan=item.action?.type==="project.start" ? (item.artifactId ? context.getArtifactSync(item.artifactId)?.content.data : item.action.proposal) : undefined;
-      return {...item, actionRefs, resumeTarget:paused ? {id:paused.id, title:paused.title ?? paused.id} : null, proposal:isProjectProposal(plan) ? plan : null, projects, closeTargets, artifact:item.artifactId ? artifactDTO(kernel,item.artifactId,now()) : null,
+      return {...item, resumeTarget:paused ? {id:paused.id, title:paused.title ?? paused.id} : null, proposal:isProjectProposal(plan) ? plan : null, projects, closeTargets, artifact:item.artifactId ? artifactDTO(kernel,item.artifactId,now()) : null,
         project:project ? {id:project.id,title:project.title ?? project.id,paused:project.status==="paused",parked:project.pauseReason==="parked"} : null,
         ownerOnly:rec ? ownerOnlyApproval(rec.action)!==null : false,
       };
     }),
     async decideHumanItem(id: string, decision: HumanDecision, as: DeskActor) {
+      const principal = principalOf(as);
       const item = kernel.humanItems.get(id);
       if (!item) throw missing("找不到这件事项");
       const option = item.options.find(o => o.id === decision.optionId);
       if (decision.optionId === "system.someday") {
         if (!option) throw wrongState("选项已变更");
-        const r = await someday(id,{seenItemRevision:decision.seenItemRevision,...(decision.seenArtifactVersion !== undefined ? {seenVersion:decision.seenArtifactVersion} : {})},as);
-        return {status:r.outcome};
+        return parkProposal(id, decision, as);
       }
       const accept = () => {
         if (option?.terminateMode==="cancel_task") {
@@ -1181,35 +869,18 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
         if (decision.resumeProjectId !== paused.id) throw wrongState(`请先确认恢复「${paused.title ?? paused.id}」`);
         const r = kernel.control(paused.id, {action:"resume"}, actorOf(as));
         if (!r.applied) throw wrongState("任务未能恢复");
-        if (paused.preset === "project") setProjectLifecycleSync(context, paused.id, "active", now());
       };
-      const result = await kernel.humanItems.decide(id,decision,principalOf(as),accept);
-      if (["revision_mismatch","version_mismatch","not_pending","not_unknown","already_cancelled"].includes(result.status)) throw wrongState("事项已变动，请重新查看");
-      if (result.status === "not_found") throw missing("找不到这件事项");
-      return result;
+      return kernel.humanItems.decide(id, decision, principal, accept);
     },
     undoHumanDecision: (activityId: string, as: DeskActor) => kernel.humanItems.undo(activityId,principalOf(as)),
     reopenProject: async (projectId: string, as: DeskActor) => ({restored:await kernel.reopenProject(projectId,principalOf(as))}),
-    clarify,
-    clarifyCard: (cardId: string) => clarifyCardById(input(), cardId),
     radar,
     review,
     sources,
     activity,
-    engage,
-    engageDetail,
     artifact,
     ingest,
-    approve,
-    revise,
-    snooze,
-    someday,
     savePlan,
-    extend,
-    resolveOffline,
-    dismiss,
-    deny,
-    done,
     saveArtifact,
     dismissParked,
     projectOp,

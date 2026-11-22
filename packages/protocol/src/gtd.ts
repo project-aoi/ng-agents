@@ -6,8 +6,6 @@ import type { Envelope } from "./contract/envelope";
 
 // ==================== keys ====================
 
-export const GTD_PREFIX = "gtd:";
-
 export const gtdKeys = {
   /** In a project root cell → ProjectRecord. */
   project: "gtd:project",
@@ -20,24 +18,6 @@ export const gtdKeys = {
   activity: (id: string) => `gtd:activity:${id}`,
   activityPrefix: "gtd:activity:",
 } as const;
-
-export type GtdKey =
-  | { kind: "project" }
-  | { kind: "source" }
-  | { kind: "action"; id: string }
-  | { kind: "activity"; id: string };
-
-export function parseGtdKey(key: string): GtdKey | null {
-  if (key === gtdKeys.project) return { kind: "project" };
-  if (key === gtdKeys.source) return { kind: "source" };
-  if (key.startsWith(gtdKeys.actionPrefix) && key.length > gtdKeys.actionPrefix.length) {
-    return { kind: "action", id: key.slice(gtdKeys.actionPrefix.length) };
-  }
-  if (key.startsWith(gtdKeys.activityPrefix) && key.length > gtdKeys.activityPrefix.length) {
-    return { kind: "activity", id: key.slice(gtdKeys.activityPrefix.length) };
-  }
-  return null;
-}
 
 /**
  * Gate keeps at most one pending card per subjectKey ("同一事项至多一张卡"). Everything inside a project shares the
@@ -68,7 +48,7 @@ export function projectCellIdOf(spec: Pick<CellSpec, "meta">): string | undefine
 export type BallOwner = "human" | "agent" | "waiting";
 
 /** Display priority when aggregating a project's open actions: 🔵 > 🟢 > 🟡. */
-export const BALL_OWNER_PRIORITY: readonly BallOwner[] = ["human", "agent", "waiting"];
+const BALL_OWNER_PRIORITY: readonly BallOwner[] = ["human", "agent", "waiting"];
 
 export const BALL_OWNER_LABEL: Readonly<Record<BallOwner, string>> = {
   human: "🔵 我来处理",
@@ -94,12 +74,6 @@ export function topBallOwner(actions: Iterable<Pick<ActionRecord, "owner" | "sta
 
 export type ProjectLifecycle = "active" | "completed" | "cancelled" | "someday";
 export type Effort = "15m" | "45m" | "low_energy";
-
-export const EFFORT_LABEL: Readonly<Record<Effort, string>> = {
-  "15m": "15m 碎片时间",
-  "45m": "45m 整块时间",
-  low_energy: "低精力杂事",
-};
 
 export interface Progress {
   done: number;
@@ -173,11 +147,9 @@ export interface ActionRecord {
   nextStep?: string;                    // the concrete next physical step (required for owner "human" in Radar)
   progress?: Progress;
   waiting?: WaitingSet;                 // owner "waiting"
-  effort?: Effort;                      // Engage filter
-  artifactId?: string;                  // draft to open in the Engage editor
-  /** A reply card converted to "我来处理" stays pending behind this action; sending/withdrawing it closes the action. */
-  approvalActionId?: string;
-  references?: ReferenceLink[];         // Engage right column ("Context Pack")
+  effort?: Effort;
+  artifactId?: string;
+  references?: ReferenceLink[];
   dueAt?: number;
   source?: ItemSource;
   createdAt: number;
@@ -196,7 +168,7 @@ export type ActivityKind =
   | "card_withdrawn"                    // e.g. someone already answered in the group
   | "action_completed";
 
-/** `gtd:activity:<id>` in the desk cell — the "后台已静默归档 N 条通知" drawer; supports "move back to Clarify". */
+/** `gtd:activity:<id>` in the desk cell — the "后台已静默归档 N 条通知" drawer; records the original item for restoration. */
 export interface ActivityRecord {
   id: string;
   kind: ActivityKind;
@@ -230,8 +202,7 @@ export interface SourceRecord {
   updatedAt: number;
 }
 
-// ==================== Clarify cards (docs/04 §2) ====================
-// A Clarify card is a *pending Gate approval*; its approvalCard Deliverable has format "card" and data: ClarifyCard.
+// ==================== Project proposals and escalations ====================
 
 export type ClarifyCardType = "project_proposal" | "escalation";
 
@@ -310,44 +281,6 @@ export interface EscalationCard extends ClarifyCardBase {
 }
 
 export type ClarifyCard = ProjectProposalCard | EscalationCard;
-
-// ---------- buttons (block 4) ----------
-
-export type CardButtonId = "confirm" | "revise_voice" | "snooze" | "edit_plan" | "someday" | "extend" | "resolve_offline" | "skip";
-
-export interface CardButton {
-  id: CardButtonId;
-  label: string;
-  primary?: boolean;
-}
-
-const SKIP: CardButton = { id: "skip", label: "下一张 →" };
-
-/** Buttons of a card in display order: 1 primary + 2 adjust/defer + skip (docs/04 §2.1 rule 4, §2.2 table). */
-export function cardButtons(card: ClarifyCard): CardButton[] {
-  switch (card.cardType) {
-    case "project_proposal":
-      return [
-        { id: "confirm", label: "✓ 确认立项并让 Agent 开工", primary: true },
-        { id: "edit_plan", label: "✎ 手动改一下安排" },
-        { id: "someday", label: "📦 先放进“以后再说”" },
-        SKIP,
-      ];
-    case "escalation":
-      if (card.escalation.reason === "waiting_timeout") {
-        return [
-          { id: "extend", label: "⏱ 再等 1 天" },
-          { id: "resolve_offline", label: "✓ 线下已解决，直接完结" },
-          SKIP,
-        ];
-      }
-      return [
-        { id: "extend", label: "继续处理", primary: true },
-        { id: "resolve_offline", label: "✓ 线下已解决，直接完结" },
-        SKIP,
-      ];
-  }
-}
 
 /** `approvalCard.data` → ClarifyCard, or null if the card is not a GTD card. */
 export function asClarifyCard(data: unknown): ClarifyCard | null {

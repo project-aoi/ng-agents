@@ -6,11 +6,6 @@ import type { ControlAction } from "./inbox";
 
 export interface Gate {
   attenuate(parent: PolicyBounds, parentCellId: string, requested?: Partial<PolicyBounds>): PolicyBounds; // enforces child ⊆ parent and maxDepth - 1
-  authorize(action: ProposedAction, meta: AuthorizeMeta): Promise<AuthorizeResult>;
-  approve(actionId: string, approverId: string, seenArtifactVersion?: number, opts?: { seenItemRevision?: number }): Promise<
-    ApproveResult
-  >;
-  revoke(cellId: string): Promise<void>;
   authorizeSync(action: ProposedAction, meta: AuthorizeMeta): AuthorizeResult;
   approveSync(actionId: string, approverId: string, seenArtifactVersion?: number, opts?: { seenItemRevision?: number }): ApproveResult;
   revokeSync(cellId: string): void;
@@ -27,9 +22,7 @@ export interface Gate {
     opts?: { seenItemRevision?: number; seenArtifactVersion?: number },
   ): "revised" | "not_pending" | "version_mismatch" | "revision_mismatch";
   withdrawSync(actionId: string, reason: string, opts?: { seenItemRevision?: number }): "cancelled" | "not_pending" | "revision_mismatch";
-  cancelForCellSync(cellId: string, reason: string): number;
   recordOutcomeSync(actionId: string, status: "executed", outcome: ApprovalOutcome): void;
-  rebindSync(actionId: string, version: number): "rebound" | "not_pending";
   listApprovalsSync(filter?: ApprovalFilter): ApprovalRecord[];
   authorizeControlSync(cellId: string, principalId: string, action: ControlAction): { ok: true } | { ok: false; reason: string };
 }

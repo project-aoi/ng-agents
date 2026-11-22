@@ -4,9 +4,9 @@ import { fileURLToPath } from "node:url";
 import type { CliEngine } from "@ng/protocol";
 
 /** The fake CLI agent script (fake-cli-agent.mjs; see its header for the scenario format). */
-export const FAKE_CLI_PATH = join(dirname(fileURLToPath(import.meta.url)), "fake-cli-agent.mjs");
+const FAKE_CLI_PATH = join(dirname(fileURLToPath(import.meta.url)), "fake-cli-agent.mjs");
 
-export type FakeCliAction =
+type FakeCliAction =
   | { text: string }
   | { mcp: string; args?: unknown }
   | { native: string; input?: unknown; output?: string; kind?: string; path?: string }
@@ -23,7 +23,7 @@ export interface FakeCliTurn {
   omitQueuedTurnCount?: boolean;
 }
 
-export interface FakeCliLogEntry {
+interface FakeCliLogEntry {
   engine: string;
   pid: number;
   type: string;

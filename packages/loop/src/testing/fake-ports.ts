@@ -110,7 +110,7 @@ export function fakeInspection(cellId: string): CellInspection {
   };
 }
 
-export interface FakeLog {
+interface FakeLog {
   evidence: StepOrExternalEvidence[];
   authorizations: Array<{ action: ProposedAction; opts?: { artifactVersion?: number }; result: AuthorizeResult }>;
   notifications: Array<{ content: import("@ng/protocol").Deliverable; idempotencyKey: string }>;
@@ -154,7 +154,7 @@ export interface FakeRunPorts extends RunPorts {
   pushInbound(...messages: Array<Envelope | string>): void;
   /** Open waits as the fake kernel holds them (registerWait upserts per party, clearWait removes). */
   readonly openWaits: Map<string, { reason: string; timeoutAt?: number }>;
-  /** Simulate the human saving a new version in the Engage editor. */
+  /** Simulate the owner saving a new version of an artifact. */
   humanEdit(artifactId: string, body: string): VersionedArtifact;
 }
 
@@ -165,7 +165,7 @@ export interface FakeRun {
   controller: AbortController;
 }
 
-export function defaultFakeBounds(): PolicyBounds {
+function defaultFakeBounds(): PolicyBounds {
   return makeBounds({
     tools: TOOL_KINDS,
     canSendTo: ["channel:*", "inbox:*"] as Address[],
@@ -176,7 +176,7 @@ export function defaultFakeBounds(): PolicyBounds {
 }
 
 /** A user.message envelope as a Channel would deliver it. */
-export function userMessage(text: string, opts: { id?: string; from?: Envelope["from"]; principalId?: string; at?: number } = {}): Envelope {
+function userMessage(text: string, opts: { id?: string; from?: Envelope["from"]; principalId?: string; at?: number } = {}): Envelope {
   return createEnvelope(
     {
       ...(opts.id ? { id: opts.id } : {}),
@@ -192,7 +192,7 @@ export function userMessage(text: string, opts: { id?: string; from?: Envelope["
 }
 
 /** How the fake renders a batch envelope into the volatile tail (Context's real rendering differs; tests only need stability). */
-export function renderEnvelope(env: Envelope): string {
+function renderEnvelope(env: Envelope): string {
   const p = env.payload as { text?: unknown } | null;
   const body = p && typeof p.text === "string" ? p.text : JSON.stringify(env.payload);
   return `[${env.type} from ${env.from}] ${body}`;

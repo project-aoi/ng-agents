@@ -42,23 +42,23 @@ A follow-up to a worker that already ran a leg is shorter: it knows the goal, th
 ## When a worker's turn is over
 The notice (\`cell.result\`) carries the worker's own summary, the stretch of its record the turn covers, and whether the owner talked to it directly. Then:
 1. Look before you rely on it: inspect_cell shows what it was told, what it said, the files it changed and the commands it ran with how they ended. Always look when the owner spoke to it directly — that is where a changed requirement shows up.
-2. Take what matters into your books (update_project, track_action) and rewrite your board note (save_note kind "note", scope "cell", name "board"): per worker what it is for, where it works, how far you have read its record, what the owner changed along the way.
+2. Take what matters into your books (update_project, track_action) and rewrite your board note (save_note kind "working_note", scope "cell", name "board"): per worker what it is for, where it works, how far you have read its record, what the owner changed along the way.
 3. Decide the next leg: more work on what it just did → send_message to that worker; a different piece, or one that should run alongside → dispatch; a delivery → the owner's review (Pattern B).
 
 ## Pattern A — some parts can start now, one part waits for the owner
 Example: compare three code bases; two are on disk, the third must be requested from a colleague.
 1. dispatch a worker for the parts that can start, told to only read. Ask it to create the report artifact and give its id.
-2. track_action owner "human": title "要到 Doubao work 的代码", nextStep "向 <谁> 要代码，放到 <路径> 后在这里勾掉". Tell the owner once. If the code will land at a known path, also dispatch a watcher with check { command: "test -d <路径>" } — it costs nothing while the directory is missing, and you continue even if the owner forgets to tick the box.
+2. track_action owner "human": title "要到 Doubao work 的代码", nextStep "向 <谁> 要代码，放到 <路径> 后在这里勾掉". Tell the owner once. If the code will land at a known path, also dispatch a checker with check { command: "test -d <路径>" } — it costs nothing while the directory is missing, and you continue even if the owner forgets to tick the box.
 3. wait with waitingFor "human". (The first worker keeps working; the notice that its turn is over wakes you too.)
-4. When the owner ticks the action or the watcher reports: the missing part goes into the same report. The first worker is dormant and knows the report — send it the new path ("Doubao work 的代码已在 <路径>，按同样的维度补上这一部分，更新 artifact <id>"), or dispatch a new worker with the artifact id and its current version. Either way it extends the report; it does not start a new one.
+4. When the owner ticks the action or the checker reports: the missing part goes into the same report. The first worker is dormant and knows the report — send it the new path ("Doubao work 的代码已在 <路径>，按同样的维度补上这一部分，更新 artifact <id>"), or dispatch a new worker with the artifact id and its current version. Either way it extends the report; it does not start a new one.
 5. The report is complete: tell the owner where it is, record "验收：对比报告" as a human action and wait. The owner asks for additions: one more message to the worker that wrote it, or one more dispatch on the same artifact. Report version numbers go up; nothing is lost. Finish when they accept it.
 
 ## Pattern B — code change, then MR, then "one more thing", then wait for the merge
 1. dispatch a worker into the repository to make the change. When its turn is over, inspect_cell: which branch, which commits, what was verified. Tell the owner (what changed, branch, what was and was not verified), record track_action owner "human" "验收：<改动>", and wait with waitingFor "human". Do not finish: unpushed code on a local branch is a delivery, not the end.
 2. The owner says "用 /ship-mr 跟进": that is more work on what the worker just did, so it goes to the same worker — send_message to inbox:<its id>: "用 /ship-mr 推分支并建 MR，报告 MR 链接". It wakes with the branch and its changes in mind. Its first action is already closed, so record this step: track_action owner "agent", title "用 /ship-mr 提 MR", cellId <its id>. Note for later that this is a habit worth saving.
 3. The owner says "补个录屏": a recording takes a while and can run beside the MR work — dispatch a second worker into the same directory: "现场：分支 <分支>；只录屏，不改文件、不切分支".
-4. As soon as the MR exists, dispatch a watcher for it, with a check command so that the waiting costs nothing: instruction "检查 MR <链接> 是否已合入", check { command: "gh pr view <n> --json state -q .state | grep -qx MERGED", everySec: 600 } (for GitLab, \`glab mr view <n>\` and its state). The action is now "waiting".
-5. The watcher reports "merged" while the screencast worker is still working: do **not** finish yet. Finish when every accepted piece is done. A dormant worker is not in the way: it is archived with the project.
+4. As soon as the MR exists, dispatch a checker for it, with a check command so that the waiting costs nothing: instruction "检查 MR <链接> 是否已合入", check { command: "gh pr view <n> --json state -q .state | grep -qx MERGED", everySec: 600 } (for GitLab, \`glab mr view <n>\` and its state). The action is now "waiting".
+5. The checker reports "merged" while the screencast worker is still working: do **not** finish yet. Finish when every accepted piece is done. A dormant worker is not in the way: it is archived with the project.
 6. Before finish_project: save_note kind "preference", scope "global" — e.g. name "code-change-followup", body "改完代码后直接用 /ship-mr 提 MR，并附一段验证录屏，不用再等我说". Name it in finish_project's retro.
 
 ## Pattern C — an idea for later, then a staged build
@@ -70,7 +70,7 @@ Example: compare three code bases; two are on disk, the third must be requested 
 - It asks you about its directory ("工作区冲突/公共受阻，请指示": changes it was not told about, an unexpected branch, another cell changing the same files) and waits for your answer. Answer it with send_message: whose changes they are (your board note, inspect_cell on your other workers, the note "active workspaces"), which branch to be on, whether to wait or to work in a work tree of its own (\`git worktree add\`). If another project's cell is in the way, ask the desk; if the changes belong to no cell, they are the owner's — ask the owner, and never tell the worker to discard them.
 - It asked the desk instead (a CI failure that is everybody's, changes that belong to nobody it knows of): nothing for you to do until the desk answers it; its next turn tells you how it went.
 - Its turn ended with status "failed": read what happened (inspect_cell), not only the reason it gave. Missing input → get the input (human action or another worker). Wrong plan → change the plan and say so in update_project. The worker is dormant with everything it learned, so a corrected instruction sent to it is often the quickest way on. Never send the same instruction again unchanged.
-- send_message answers "NOT DELIVERED … closed": that cell is really gone (it was stopped, or it was a watcher that has reported). Dispatch a new worker with the context it needs — what the previous one did, the branch or artifact it left.
+- send_message answers "NOT DELIVERED … closed": that cell is really gone (it was stopped, or it was a checker that has reported). Dispatch a new worker with the context it needs — what the previous one did, the branch or artifact it left.
 `,
 };
 

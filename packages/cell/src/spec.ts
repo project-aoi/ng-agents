@@ -47,10 +47,6 @@ export function jsonSafeBounds(b: Partial<PolicyBounds> | undefined): Partial<Po
 export function resolveSpec(registry: Registry, input: CellSpecInput, parent: CellRecord | null): ResolvedSpec {
   if (!input || typeof input !== "object") throw new NgError("invalid_argument", "spec must be an object");
   const { fork: _fork, parentId: _parentId, ...caller } = definedEntries(input) as CellSpec;
-  if (caller.preset === "watcher") {
-    const role = "checker";
-    if (registry.presets.has(role)) caller.preset = role;
-  }
   const preset = caller.preset ? registry.presets.get(caller.preset) : undefined;
   if (caller.preset && !PRESET_NAMES.includes(caller.preset)) throw new NgError("invalid_argument", `unknown preset "${caller.preset}"`);
   if (caller.preset && !preset) throw new NgError("not_found", `preset "${caller.preset}" is not registered`);
@@ -58,7 +54,7 @@ export function resolveSpec(registry: Registry, input: CellSpecInput, parent: Ce
 
   const spec = { ...defaults, ...caller } as CellSpec;
   if (caller.preset === "checker") spec.lifetime = defaults.lifetime;
-  // docs/05: a cell works where its parent works unless it says otherwise (watchers/sensors keep to themselves).
+  // docs/05: a cell works where its parent works unless it says otherwise when the preset enables inheritance.
   if (typeof spec.cwd === "string" && spec.cwd) spec.cwd = normalizeCwd(spec.cwd);
   else if (parent?.spec.cwd && preset?.inheritCwd !== false) spec.cwd = parent.spec.cwd;
   else delete spec.cwd;

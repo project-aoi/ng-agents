@@ -43,7 +43,7 @@ function setup(registry: Registry): void {
 }
 
 describe("restart on the same database", () => {
-  it("loads late-registered preset domains and refreshes stored prompts after startup configuration", async () => {
+  it("refreshes stored prompts after startup configuration", async () => {
     const dataDir = tempDir("restart-presets");
     const first = await boot({
       dataDir,
@@ -59,17 +59,9 @@ describe("restart on the same database", () => {
     await first.kernel.close();
 
     const next = await boot({dataDir, desk:false, start:false});
-    let migrated = false;
-    next.registry.presets.register({
-      name:"sensor", description:"registered after constructing the kernel", defaults:{},
-      stateDomain:() => ({
-        id:"late-domain", migrate() { migrated = true; }, query:() => [], read:() => undefined, write:() => false,
-      }),
-    });
     const prompt = "updated preset prompt";
     next.registry.prompts.register({name:"test.release", text:prompt});
     await next.kernel.start();
-    expect(migrated).toBe(true);
     expect(get<{text:string}>(next.kernel.db, "SELECT text FROM prompt_prefixes WHERE cell_id = 'desk'")?.text).toContain(prompt);
   });
 

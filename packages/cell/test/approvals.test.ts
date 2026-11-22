@@ -7,7 +7,7 @@ afterEach(cleanupAll);
 const resolvedOf = (h: Harness, cellId = "desk") =>
   h.kernel.inbox.listMessagesSync({ cellId, type: PAYLOAD.approvalResolved }).map((m) => ({ row: m.status, ...(m.envelope.payload as ApprovalResolvedPayload) }));
 
-describe("resolveApproval — approve", () => {
+describe("project decisions", () => {
 
   it("a project proposal is approved and handed back to the owning cell", async () => {
     const h = await boot();
@@ -17,7 +17,7 @@ describe("resolveApproval — approve", () => {
     const [card] = h.kernel.gate.listPendingSync();
     expect(card!.action.type).toBe("project.start");
     h.script.add("desk", { text: "creating the project" });
-    expect(await h.kernel.resolveApproval(card!.actionId, { decision: "approve", approverId: "owner", seenArtifactVersion: card!.boundVersion! })).toEqual({ status: "approved", actionId: card!.actionId });
+    expect(await h.kernel.humanItems.decide(card!.actionId, { optionId: "system.execute", seenItemRevision: card!.itemRevision, seenArtifactVersion: card!.boundVersion! }, "owner")).toEqual({ status: "approved" });
     await h.kernel.idle();
     expect(resolvedOf(h)).toEqual([expect.objectContaining({ row: "done", status: "approved" })]);
   });

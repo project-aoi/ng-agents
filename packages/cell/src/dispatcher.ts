@@ -193,21 +193,25 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
       if (inFlight(cellId) === 0) for (const m of inbox.listMessagesSync({ cellId, type: PAYLOAD.timerFired, status: ["pending"] })) {
         if (m.deliverAt > clock.now()) continue;
         const env = m.envelope;
-        const preset = cell.preset && core.registry.presets.get(cell.preset);
-        const reminder = env.from === timerFrom(cellId) && preset ? preset.personalReminder?.(env) : undefined;
-        const resurface = env.from === timerFrom("approval") && isResurface(env);
-        if (!reminder && !resurface) continue;
-        inbox.consumeTimerSync(cellId, env.id, cell.epoch, () => {
-          if (reminder) {
-            core.humanItems.create(reminder.draft, null, reminder.id);
-            core.hub.notifyOwner({
-              cellId,
-              content: { format: "text", body: `⏰ 提醒：${reminder.draft.title}` },
-              idempotencyKey: reminder.draft.subjectKey,
-            });
-          } else core.humanItems.resurfaced(env);
-          if (reminder) context.appendEvidenceSync(cellId, {kind:"inbound", envelope:env, runId:`timer:${env.id}`, at:clock.now()});
-        });
+        try {
+          const preset = cell.preset && core.registry.presets.get(cell.preset);
+          const reminder = env.from === timerFrom(cellId) && preset ? preset.personalReminder?.(env) : undefined;
+          const resurface = env.from === timerFrom("approval") && isResurface(env);
+          if (!reminder && !resurface) continue;
+          inbox.consumeTimerSync(cellId, env.id, cell.epoch, () => {
+            if (reminder) {
+              core.humanItems.create(reminder.draft, null, reminder.id);
+              core.hub.notifyOwner({
+                cellId,
+                content: { format: "text", body: `⏰ 提醒：${reminder.draft.title}` },
+                idempotencyKey: reminder.draft.subjectKey,
+              });
+            } else core.humanItems.resurfaced(env);
+            if (reminder) context.appendEvidenceSync(cellId, {kind:"inbound", envelope:env, runId:`timer:${env.id}`, at:clock.now()});
+          });
+        } catch (err) {
+          core.onError(err, `处理 ${cellId} 的定时事项 ${env.id}`);
+        }
       }
       // A cell with a Run in flight is re-notified when that Run ends; the claim is the real lock either way.
       if (inFlight(cellId) > 0) continue;
@@ -455,7 +459,7 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
       if (handle.cliInput) {
         const session = context.readStateSync<CliSessionRecord>(cellId, CLI_SESSION_KEY);
         if (session?.sessionId === handle.cliInput.sessionId) context.commitSync(cellId, { statePatches: {
-          [CLI_SESSION_KEY]: { ...session, lastDeliveredEvidenceSeq: Math.max(session.lastDeliveredEvidenceSeq ?? 0, handle.cliInput.throughSeq) },
+          [CLI_SESSION_KEY]: { ...session, lastDeliveredEvidenceSeq: Math.max(session.lastDeliveredEvidenceSeq, handle.cliInput.throughSeq) },
         } });
       }
       if (result === "completed" || result === "yielded_waiting" || result === "step_limit" || result === "deferred_for_approval") {

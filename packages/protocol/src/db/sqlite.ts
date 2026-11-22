@@ -141,61 +141,23 @@ function runCallbacks(callbacks: Array<() => void>): void {
 
 // ==================== schema ====================
 
-/**
- * Applies schema modules in order inside one transaction. Per owner: no stored version → run `ddl`; stored version
- * lower → run newer migrations, then `ddl`; stored version higher → refuse (database written by newer code).
- */
+/** Creates all owners' tables atomically and records the schema each owner opened. */
 export function applySchemas(db: Db, modules: readonly SchemaModule[]): void {
-  db.exec(`CREATE TABLE IF NOT EXISTS schema_versions (
-    owner      TEXT PRIMARY KEY,
-    version    INTEGER NOT NULL,
-    applied_at INTEGER NOT NULL
-  )`);
-  const stamp = (owner: string, version: number) =>
-    run(
-      db,
-      `INSERT INTO schema_versions(owner, version, applied_at) VALUES (?, ?, ?)
-       ON CONFLICT(owner) DO UPDATE SET version = excluded.version, applied_at = excluded.applied_at`,
-      // Schema bookkeeping is wall-clock metadata, not domain time, so it does not take an injected Clock.
-      [owner, version, Date.now()],
-    );
-  // Table rebuilds first (see SchemaMigration.rebuild): foreign keys off, own transaction, checked before commit.
-  for (const m of modules) {
-    const row = get<{ version: number }>(db, "SELECT version FROM schema_versions WHERE owner = ?", [m.owner]);
-    if (!row || row.version >= m.version) continue;
-    const pending = [...(m.migrations ?? [])].filter((x) => x.version > row.version && x.version <= m.version).sort((a, b) => a.version - b.version);
-    if (!pending.some((x) => x.rebuild)) continue;
-    if (db.isTransaction) throw new NgError("tx_misuse", `${m.owner}: a table-rebuild migration cannot run inside an open transaction`);
-    db.exec("PRAGMA foreign_keys = OFF");
-    try {
-      db.exec("BEGIN IMMEDIATE");
-      try {
-        for (const mig of pending) db.exec(mig.up);
-        const broken = db.prepare("PRAGMA foreign_key_check").all();
-        if (broken.length > 0) throw new NgError("schema", `${m.owner}: migration to v${m.version} left ${broken.length} dangling foreign key(s)`);
-        stamp(m.owner, m.version);
-        db.exec("COMMIT");
-      } catch (err) {
-        db.exec("ROLLBACK");
-        throw err;
-      }
-    } finally {
-      db.exec("PRAGMA foreign_keys = ON");
-    }
-  }
   withTx(db, () => {
-    for (const m of modules) {
-      const row = get<{ version: number }>(db, "SELECT version FROM schema_versions WHERE owner = ?", [m.owner]);
-      if (row && row.version > m.version) {
-        throw new NgError("schema", `${m.owner}: database schema v${row.version} is newer than code v${m.version}`);
+    db.exec(`CREATE TABLE IF NOT EXISTS schema_versions (
+      owner      TEXT PRIMARY KEY,
+      version    INTEGER NOT NULL,
+      applied_at INTEGER NOT NULL
+    )`);
+    for (const module of modules) {
+      const row = get<{ version: number }>(db, "SELECT version FROM schema_versions WHERE owner = ?", [module.owner]);
+      if (row && row.version !== module.version) {
+        throw new NgError("schema", `${module.owner}: expected schema v${module.version}, found v${row.version}`);
       }
-      if (row && row.version < m.version) {
-        const pending = [...(m.migrations ?? [])].filter((x) => x.version > row.version && x.version <= m.version);
-        pending.sort((a, b) => a.version - b.version);
-        for (const mig of pending) db.exec(mig.up);
+      db.exec(module.ddl);
+      if (!row) {
+        run(db, "INSERT INTO schema_versions(owner, version, applied_at) VALUES (?, ?, ?)", [module.owner, module.version, Date.now()]);
       }
-      db.exec(m.ddl);
-      if (!row || row.version !== m.version) stamp(m.owner, m.version);
     }
   });
 }

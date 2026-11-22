@@ -11,7 +11,7 @@ import { ErrorState, Loading } from "./states";
 // ==================== top bar ====================
 
 const TABS: Array<{ key: ViewKey; icon: string; zh: string; en: string; n: string }> = [
-  { key: "clarify", icon: "📥", zh: "待我处理", en: "", n: "1" },
+  { key: "inbox", icon: "📥", zh: "待我处理", en: "", n: "1" },
   { key: "radar", icon: "🧭", zh: "项目全局", en: "", n: "2" },
   { key: "agents", icon: "👥", zh: "分身实况", en: "", n: "3" },
 ];
@@ -27,7 +27,7 @@ export function TopBar(props: { view: ViewKey; status: StatusDTO | null; onView(
     <header className="topbar">
       <nav className="tabs" aria-label="视图">
         {TABS.map((t) => {
-          const count = t.key === "clarify" ? status?.humanPending ?? status?.clarify.pending : undefined;
+          const count = t.key === "inbox" ? status?.humanPending : undefined;
           // From the status the app already keeps current: no extra request for the live count.
           const live = t.key === "agents" ? (status?.background.running ?? 0) : 0;
           const on = props.view === t.key;
@@ -72,7 +72,7 @@ export function TopBar(props: { view: ViewKey; status: StatusDTO | null; onView(
 
 export function StatusLine(props: { view: ViewKey; status: StatusDTO | null; connected: boolean; open: boolean; onToggle(): void; onClose(): void }) {
   const { status } = props;
-  const text = !status ? "正在连接工作台…" : props.view==="clarify" ? `待我处理 ${status.humanPending ?? status.clarify.pending} 项` : props.view === "agents" ? agentsLine(status) : status.statusLine.radar;
+  const text = !status ? "正在连接工作台…" : props.view==="inbox" ? `待我处理 ${status.humanPending} 项` : props.view === "agents" ? agentsLine(status) : status.statusLine.radar;
   const wrap = useRef<HTMLDivElement>(null);
   useOutsidePress(props.open, wrap, props.onClose);
 
@@ -122,7 +122,7 @@ function StatusPanel({ view, status }: { view: ViewKey; status: StatusDTO }) {
   return (
     <div className="status-panel" id="status-panel" role="region" aria-label="后台记录">
       <div className="sp-summary">
-        {view === "clarify" && (
+        {view === "inbox" && (
           <>
             <p>
               今天：静默归档 {t.archivedNotifications} 条通知 · 存好 {t.notesSaved} 条随手笔记 · 设好 {t.remindersSet} 个提醒 · 撤下 {t.cardsWithdrawn} 张卡
@@ -130,7 +130,7 @@ function StatusPanel({ view, status }: { view: ViewKey; status: StatusDTO }) {
             <p className="muted">
               后台：{bg.running} 项分身运行中 · {bg.waiting} 项{WAITING_WORDS}{bg.jobs > 0 ? ` · ${bg.jobs} 个长任务` : ""}
               {bg.paused > 0 ? ` · ${bg.paused} 项已暂停` : ""}
-              {status.clarify.snoozed > 0 ? ` · ${status.clarify.snoozed} 张卡已推迟` : ""}
+              {status.humanSnoozed > 0 ? ` · ${status.humanSnoozed} 张卡已推迟` : ""}
             </p>
           </>
         )}
@@ -329,7 +329,7 @@ export function BottomBar({ view, inputRef }: { view: ViewKey; inputRef: RefObje
         <span>
           <Kbd>5</Kbd> 信源
         </span>
-        {view === "clarify" && (
+        {view === "inbox" && (
           <>
             <span><Kbd>N</Kbd> 下一张</span>
             <span><Kbd>Ctrl/⌘ S</Kbd> 专注编辑时保存</span>

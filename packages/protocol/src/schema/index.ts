@@ -44,7 +44,6 @@ export const TABLE_OWNERS: Readonly<Record<string, string>> = {
   knowledge_fts: "@ng/context",
   prompt_prefixes: "@ng/context",
   human_item_activity: "@ng/cell",
-  human_item_origins: "@ng/cell",
   human_items: "@ng/cell",
   workspaces: "@ng/workspace",
   jobs: "@ng/workspace",

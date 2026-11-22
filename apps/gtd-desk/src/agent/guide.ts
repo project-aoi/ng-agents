@@ -27,7 +27,7 @@ export const AGENT_INSTRUCTIONS = `This server is the owner's GTD workbench ("ng
 3. **Anything new, vague, or that might duplicate existing work → \`chat_with_desk\`** with the owner's words unedited. The desk finds what exists, asks what is missing (for code: the absolute path of the repository on this machine) and puts the work in the right place. It answers in the background: read its replies with \`chat_with_desk\` and \`since\` when the owner asks or you have a reason — never in a loop. Relay its questions to the owner, and send the owner's answer with \`replyToId\` = the id of the question it answers (so it lands on the right matter even when several are open).
    When the owner has already given you everything (outcome, complete brief, the absolute path) and \`search\` shows nothing on the subject, you may \`create_project\` yourself — never a second project for the same outcome. An idea only to remember: \`create_project\` with mode "research_then_park".
 4. **Work is asynchronous.** Everything returns at once; results arrive minutes later. Tell the owner it is under way and what will happen; do not poll.
-5. Read \`list_human_items\` for decisions and actions waiting on the owner. Submit the displayed option, reviewed versions and the owner’s note with \`decide_human_item\`. \`decide_card\` is a shortcut for standard card decisions. Use \`undo_human_decision\` with the activity ID to undo a reversible decision, and \`reopen_project\` to resume a closed project. For a direct question, send the answer with \`message_cell\` or \`chat_with_desk\` and its \`replyToId\`.
+5. Read \`list_human_items\` for decisions and actions waiting on the owner. Submit the displayed option, reviewed versions and the owner’s note with \`decide_human_item\`. Use \`undo_human_decision\` with the activity ID to undo a reversible decision, and \`reopen_project\` to resume a closed project. For a direct question, send the answer with \`message_cell\` or \`chat_with_desk\` and its \`replyToId\`.
 6. Project confirmation cards require the owner to approve execution in the workbench. On the owner’s instruction you can still defer, decline or request revisions using the displayed options.
 7. **Never do the workbench's work around it.** Nothing locks a directory: several cells may work in one repository at once, and \`list_workspaces\` shows which cells are active where right now. Before you change files yourself in such a directory, tell its project (\`message_project\`) or pause it, so nobody's work is overwritten.
 
@@ -136,27 +136,6 @@ export const AGENT_TOOLS: readonly AgentToolDoc[] = [
   },
   {
     name: "undo_human_decision",description:"撤销尚未认领的决定，或通知后台更正已读决定。",inputSchema:obj({activityId:str("操作 ID")},["activityId"]),
-  },
-  {
-    name: "list_cards",
-    description: "The decisions waiting for the owner, each with what is being asked, who asked (which project), its current draft version (`artifactVersion`), whether the owner edited the draft (`humanEdited`), its card revision (`itemRevision`), and whether execution requires the owner (ownerOnly: project proposals).",
-    inputSchema: obj({}),
-  },
-  {
-    name: "decide_card",
-    description:
-      'Answer a card on the owner\'s explicit instruction. approve: yes / go ahead (for a card with a draft, pass the `artifactVersion` you saw from `list_cards` as `seenVersion` so edited drafts are never approved blindly). deny: no. continue: for a blocked or stuck item — carry on (put the owner\'s answer in the note). snooze: bring it back later (minutes). dismiss: take it down without an answer. Only the owner can approve or execute an ownerOnly card. For a custom choice use decide_human_item with its optionId.',
-    inputSchema: obj(
-      {
-        id: str("card id from list_cards"),
-        decision: { type: "string", enum: ["approve", "deny", "continue", "snooze", "dismiss"] },
-        note: str("the owner's answer or reason, in their words"),
-        minutes: { type: "number", description: "snooze only (default 120)" },
-        seenVersion: { type: "number", description: "the draft version you saw in list_cards (pass for approve on any card with a draft; never guess)" },
-        seenItemRevision: { type: "number", description: "the card's itemRevision from list_cards (required for every decision)" },
-      },
-      ["id", "decision", "seenItemRevision"],
-    ),
   },
   {
     name: "read_artifact",

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { isNgError, type CodeProcessor } from "@ng/protocol";
-import { createAgentLoop } from "../src";
-import { createFakeRun, ScriptedModelClient } from "../src/testing";
+import { createCodeLoop } from "../src";
+import { createFakeRun } from "../src/testing";
 import { makeRegistry } from "./helpers";
 
 describe("code runs", () => {
@@ -17,18 +17,16 @@ describe("code runs", () => {
       },
     };
     registry.codeProcessors.register(join);
-    const model = new ScriptedModelClient([]);
     const { ports, snapshot, controller } = createFakeRun({ spec: { processor: { kind: "code", entry: "join_all_test", args: { expect: 3 } } }, batch: ["a", "b"] });
-    const outcome = await createAgentLoop({ model, registry }).run(snapshot, ports, controller.signal);
+    const outcome = await createCodeLoop(registry).run(snapshot, ports, controller.signal);
     expect(outcome).toBe("yielded_waiting");
     expect(seen).toEqual([{ expect: 3 }, 2]);
     expect(ports.state.get("joined")).toBe(true);
-    expect(model.calls).toHaveLength(0);
   });
 
   it("fails loudly for an unregistered entry, and reports cancelled when aborted mid-processor", async () => {
     const registry = makeRegistry();
-    const loop = createAgentLoop({ model: new ScriptedModelClient([]), registry });
+    const loop = createCodeLoop(registry);
     const a = createFakeRun({ spec: { processor: { kind: "code", entry: "missing" } } });
     await expect(loop.run(a.snapshot, a.ports, a.controller.signal)).rejects.toSatisfy((e) => isNgError(e, "not_found"));
 

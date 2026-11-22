@@ -1,18 +1,17 @@
-import {gtdLifecycle,humanActionDomain} from "../../../presets/src";
+import {gtdLifecycle} from "../../../presets/src";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryChannel, UiChannel } from "@ng/channel";
 import { STANDARD_TOOLSETS } from "@ng/loop";
-import { ScriptedModelClient, type ScriptResponder, type ScriptTurn } from "@ng/loop/testing";
+import { createScriptedLoop, ScriptedModelClient, type ModelRequest, type ScriptResponder, type ScriptTurn } from "@ng/loop/testing";
 import {
   all,
   createRegistry,
   ManualClock,
   type BusTopic,
   type BusTopics,
-  type ModelRequest,
   type Registry,
 } from "@ng/protocol";
 import { createKernel, type CellSpecInput, type Kernel, type KernelOptions } from "../src";
@@ -120,13 +119,13 @@ export const TOOLSETS = STANDARD_TOOLSETS;
 /**
  * Minimal ad-hoc presets: just enough processor wiring for kernel tests (the real presets live in @ng/presets).
  * They mirror the real shapes: the desk, projects and hubs coordinate and persist; a worker is a wakeable leaf on the
- * host (isolation "none") — its parent is told when a turn settles and it stays, dormant; a watcher is a one-shot
+ * host (isolation "none") — its parent is told when a turn settles and it stays, dormant; a checker is a one-shot
  * leaf the kernel closes once it has reported and its inbox is drained.
  */
 export function registerTestPresets(registry: Registry): void {
   const all = [TOOLSETS.context, TOOLSETS.comms, TOOLSETS.schedule, TOOLSETS.cells, TOOLSETS.workspace];
   registry.presets.register({...gtdLifecycle,
-    name: "inline", stateDomain:humanActionDomain,
+    name: "inline",
     description: "test desk",
     defaults: { processor: { kind: "llm", toolsets: all }, lifetime: "persistent", meta: { role: "desk" } },
   });
@@ -151,12 +150,12 @@ export function registerTestPresets(registry: Registry): void {
     requestBounds: () => ({ maxDepth: 0 }),
   });
   registry.presets.register({...gtdLifecycle,
-    name: "watcher",
-    description: "test watcher",
+    name: "checker",
+    description: "test checker",
     defaults: {
       processor: { kind: "llm", modelTier: "fast", toolsets: [TOOLSETS.context, TOOLSETS.comms, TOOLSETS.schedule] },
       ccParent:true,lifetime: "one_shot",
-      meta: { role: "watcher" },
+      meta: { role: "checker" },
     },
     requestBounds: () => ({ maxDepth: 0 }),
   });
@@ -199,7 +198,7 @@ export async function boot(opts: BootOptions = {}): Promise<Harness> {
     dataDir,
     clock,
     registry,
-    model: script.model,
+    loop: createScriptedLoop({ model: script.model, registry, clock }),
     channels: [memory, ui],
     retryBackoffMs: 1_000,
     workspace: { limits: { killGraceMs: 300, jobPollMs: 40 } },

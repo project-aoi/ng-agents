@@ -31,7 +31,7 @@ export const WORKER_PROCESSOR: ProcessorSpec = {
   toolsets: [STD.workspace, STD.context, STD.comms, STD.schedule, STD.cells],
 };
 
-/** The `watcher` preset's default: a light one-shot checker (update_cell on itself for watches, bash for `gh`/`git`). */
+/** The `checker` preset's default: a light one-shot checker (update_cell on itself for watches, bash for `gh`/`git`). */
 export const CHECKER_PROCESSOR: ProcessorSpec = {
   kind: "llm",
   prompt: PROMPTS.checker,

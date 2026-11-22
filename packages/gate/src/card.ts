@@ -10,7 +10,7 @@ export function describeAction(action: ProposedAction): string {
   }
 }
 
-/** The card shown in Clarify: the caller's own Deliverable when it is valid, otherwise a plain one built from the action. */
+/** The card shown to the owner: the caller's own Deliverable when it is valid, otherwise a plain one built from the action. */
 export function approvalCardFor(action: ProposedAction): Deliverable {
   if (action.card !== undefined && deliverableSchema.safeParse(action.card).success) return action.card;
   const lines = [action.summary || describeAction(action), describeAction(action)];

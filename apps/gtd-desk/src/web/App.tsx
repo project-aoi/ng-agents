@@ -31,7 +31,7 @@ import { AgentsView } from "./views/Agents";
 import { HumanInbox } from "./views/HumanInbox";
 import { RadarView } from "./views/Radar";
 
-const ALL_VIEWS: ViewName[] = ["clarify", "engage", "radar", "agents", "review", "status", "sources", "activity"];
+const ALL_VIEWS: ViewName[] = ["inbox", "radar", "agents", "review", "status", "sources", "activity"];
 
 export function App() {
   return (
@@ -104,9 +104,9 @@ function Shell() {
   });
 
   useEffect(() => {
-    const n = status?.humanPending ?? status?.clarify.pending ?? 0;
+    const n = status?.humanPending ?? 0;
     document.title = n > 0 ? `(${n}) GTD 工作台` : "GTD 工作台";
-  }, [status?.humanPending, status?.clarify.pending]);
+  }, [status?.humanPending]);
 
   const closePanel = useCallback(() => setPanelOpen(false), []);
   const openReport = useCallback((r: ArtifactRefDTO) => {
@@ -144,7 +144,7 @@ function Shell() {
       if (isTypingTarget(e.target)) return;
       switch (e.key) {
         case "1":
-          goView("clarify");
+          goView("inbox");
           break;
         case "2":
           goView("radar");
@@ -178,7 +178,7 @@ function Shell() {
   }, [drawer.open, panelOpen, report, goView]);
 
   const statusApi = useMemo(() => ({ status, setStatus }), [status, setStatus]);
-  const view = route.view === "engage" ? "clarify" : route.view;
+  const view = route.view;
   const overlay = drawer.open || report !== null;
 
   return (
@@ -191,7 +191,7 @@ function Shell() {
               <StatusLine view={view} status={status} connected={connected} open={panelOpen} onToggle={() => setPanelOpen((o) => !o)} onClose={closePanel} />
             </div>
             <main className={`stage${route.view === "agents" ? " stage-fill" : ""}`} ref={mainRef} inert={overlay} tabIndex={-1}>
-              {(route.view === "clarify" || route.view==="engage") && <HumanInbox cardId={route.cardId} actionRef={route.item}/>}
+              {route.view === "inbox" && <HumanInbox cardId={route.cardId}/>}
               {route.view === "radar" && <RadarView />}
               {route.view === "agents" && <AgentsView cellId={route.cellId} projectId={route.projectId} />}
             </main>

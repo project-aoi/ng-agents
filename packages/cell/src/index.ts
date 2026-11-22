@@ -5,7 +5,6 @@ export { createKernel } from "./kernel";
 export type {
   ActorOptions,
   AnchorReport,
-  ApprovalDecision,
   CellNode,
   CellSpecInput,
   CloseResult,
@@ -14,7 +13,6 @@ export type {
   Kernel,
   KernelOptions,
   KernelStats,
-  ResolveApprovalResult,
   RootCellOptions,
   RosterEntry,
   RunInfo,

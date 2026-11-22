@@ -6,7 +6,7 @@ import { boot, childrenOf, cleanupAll, gitRepo, lastToolResult, projects, reques
 afterEach(cleanupAll);
 
 describe("docs/05 scenario 2 — a small code change, follow-ups in the same directory, a merge to wait for", () => {
-  it("start → worker → follow-up via the desk goes to the same worker → watcher + screencast → finish refused while a child is still at work → completed, preference visible to the next cell", async () => {
+  it("start → worker → follow-up via the desk goes to the same worker → checker + screencast → finish refused while a child is still at work → completed, preference visible to the next cell", async () => {
     const h = await boot();
     const repo = gitRepo("tui");
 
@@ -93,8 +93,8 @@ describe("docs/05 scenario 2 — a small code change, follow-ups in the same dir
       expect(requestText(req)).toContain("用 /ship-mr 推分支并建 MR");
       return tool("report_to_parent", { kind: "result", text: "MR 已创建：https://git.example.com/tui/-/merge_requests/12" });
     });
-    // 4. The MR exists and the owner also wants a screencast: a watcher for the merge and a third writer, side by side.
-    let watcher = "";
+    // 4. The MR exists and the owner also wants a screencast: a checker for the merge and a third writer, side by side.
+    let checker = "";
     let screencast = "";
     h.script.add(
       "project",
@@ -104,7 +104,7 @@ describe("docs/05 scenario 2 — a small code change, follow-ups in the same dir
         expect(h.actions(project).find((a) => a.title === "用 /ship-mr 提 MR")).toMatchObject({ status: "done", cellId: writer1 });
         return {
           toolCalls: [
-            { name: "dispatch", input: { preset: "watcher", title: "等 MR !12 合入", instruction: "检查 MR !12 是否已合入：先看当前状态，未合入则每 10 分钟再看；合入后报告合入时间。" } },
+            { name: "dispatch", input: { preset: "checker", title: "等 MR !12 合入", instruction: "检查 MR !12 是否已合入：先看当前状态，未合入则每 10 分钟再看；合入后报告合入时间。" } },
             { name: "dispatch", input: { title: "补录屏", instruction: "现场：分支 feat/md-copy。录一段复制表格的演示，附到 MR !12。" } },
           ],
         };
@@ -112,7 +112,7 @@ describe("docs/05 scenario 2 — a small code change, follow-ups in the same dir
       {},
     );
     h.script.add("checker", (req) => {
-      watcher = req.metadata!.cellId!;
+      checker = req.metadata!.cellId!;
       return tool("report_to_parent", { kind: "result", text: "MR !12 已于 10:32 合入 main。" });
     });
     h.script.add(
@@ -147,12 +147,12 @@ describe("docs/05 scenario 2 — a small code change, follow-ups in the same dir
     // One worker did both the change and the MR, in two turns.
     expect(h.of("run.started").filter((e) => e.cellId === writer1)).toHaveLength(2);
     expect(h.kernel.activityOf([writer1]).get(writer1)!.state).toBe("dormant");
-    // The watcher reported once and was closed; it looked from the project's directory.
-    expect(h.kernel.getCell(watcher)).toMatchObject({ preset: "checker", status: "closed", spec: { cwd: repo, lifetime: "one_shot" } });
+    // The checker reported once and was closed; it looked from the project's directory.
+    expect(h.kernel.getCell(checker)).toMatchObject({ preset: "checker", status: "closed", spec: { cwd: repo, lifetime: "one_shot" } });
     expect(h.kernel.getCell(screencast)).toMatchObject({ status: "active", spec: { cwd: repo } });
     expect(h.project(project!)).toMatchObject({ lifecycle: "active" });
     const byTitle = Object.fromEntries(h.actions(project).map((a) => [a.title, a]));
-    expect(byTitle["等 MR !12 合入"]).toMatchObject({ owner: "waiting", status: "done", cellId: watcher });
+    expect(byTitle["等 MR !12 合入"]).toMatchObject({ owner: "waiting", status: "done", cellId: checker });
     expect(byTitle["补录屏"]).toMatchObject({ owner: "agent", status: "open", cellId: screencast });
 
     // 5. The screencast reports: the project looks back, saves the habit, and finishes.
@@ -187,6 +187,6 @@ describe("docs/05 scenario 2 — a small code change, follow-ups in the same dir
     const next = startProjectSync(h.kernel, { title: "另一个改动", outcome: "改完", brief: "再改一处", cwd: repo });
     await h.kernel.idle();
     expect(systemOf(h, next.projectId)).toContain("改完代码后直接用 /ship-mr 提 MR");
-    expect(childrenOf(h, project!)).toEqual([writer1, watcher, screencast]);
+    expect(childrenOf(h, project!)).toEqual([writer1, checker, screencast]);
   });
 });

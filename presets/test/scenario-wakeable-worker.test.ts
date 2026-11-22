@@ -153,31 +153,31 @@ describe("the project and its resting workers", () => {
     expect(h.kernel.getCell(worker)!.status).toBe("active");
   });
 
-  it("finish_project is refused while a watcher is still watching — not because of a resting worker — and succeeds once the watcher has reported", async () => {
+  it("finish_project is refused while a checker is still watching — not because of a resting worker — and succeeds once the checker has reported", async () => {
     const h = await boot();
     const repo = gitRepo("pay");
     let worker = "";
-    let watcher = "";
+    let checker = "";
     h.script.add(
       "project",
       {
         toolCalls: [
           { name: "dispatch", input: { title: "实现退避重试", instruction: "实现退避重试并提交。" } },
-          { name: "dispatch", input: { preset: "watcher", title: "等发布标记", instruction: "等仓库里出现 RELEASED 文件。", check: { command: "test -f RELEASED", everySec: 60 } } },
+          { name: "dispatch", input: { preset: "checker", title: "等发布标记", instruction: "等仓库里出现 RELEASED 文件。", check: { command: "test -f RELEASED", everySec: 60 } } },
         ],
       },
       (req) => {
         const ids = [...lastToolResult(req).matchAll(/Started (?:worker|checker) (\S+)/g)].map((m) => m[1]!);
         worker = ids[0]!;
-        watcher = ids[1]!;
+        checker = ids[1]!;
         return {};
       },
-      // The worker's turn is over; the watcher still watches.
+      // The worker's turn is over; the checker still watches.
       () => tool("finish_project", { outcome: "completed", summary: "退避重试已上线" }),
       (req) => {
         const out = lastToolResult(req);
         expect(out).toContain("Nothing was recorded or closed: 1 child cell(s) are still at work");
-        expect(out).toContain(`${watcher} "等发布标记"`);
+        expect(out).toContain(`${checker} "等发布标记"`);
         expect(out).not.toContain(worker);
         return {};
       },
@@ -189,7 +189,7 @@ describe("the project and its resting workers", () => {
     expect(h.kernel.activityOf([worker]).get(worker)!.state).toBe("dormant");
     expect(h.project(projectId)).toMatchObject({ lifecycle: "active" });
 
-    // The watcher reports; now the only cell left is the resting worker, and finishing goes through.
+    // The checker reports; now the only cell left is the resting worker, and finishing goes through.
     h.script.add("project", (req) => {
       expect(requestText(req)).toContain("条件已满足");
       return tool("finish_project", { outcome: "completed", summary: "退避重试已上线，发布标记已出现" });
@@ -199,9 +199,9 @@ describe("the project and its resting workers", () => {
     await h.kernel.idle();
     expect(h.kernel.getCell(projectId)).toMatchObject({ status: "closed", closeReason: "completed" });
     expect(h.project(projectId)).toMatchObject({ lifecycle: "completed", summary: "退避重试已上线，发布标记已出现" });
-    // The worker is archived with the project — completed, not cancelled; the watcher closed when it reported.
+    // The worker is archived with the project — completed, not cancelled; the checker closed when it reported.
     expect(h.kernel.getCell(worker)).toMatchObject({ status: "closed", closeReason: "completed" });
-    expect(h.kernel.getCell(watcher)).toMatchObject({ status: "closed", closeReason: "completed" });
+    expect(h.kernel.getCell(checker)).toMatchObject({ status: "closed", closeReason: "completed" });
     expect(h.actions(projectId).map((a) => a.status)).toEqual(["done", "done"]);
   });
 });

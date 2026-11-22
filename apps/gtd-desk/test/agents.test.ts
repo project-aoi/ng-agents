@@ -22,7 +22,6 @@ import type {
   CellControlResponse,
   CellTimelineDTO,
   CellTriggerResponse,
-  ClarifyQueueDTO,
   DeskEvent,
   ProjectMutationResponse,
   RadarDTO,
@@ -118,7 +117,7 @@ describe("GET /api/agents/topology", () => {
     worker(d, "w1", "proj", "核心退避编码", "实现指数退避");
     d.script.add("w2", tool("wait", { reason: "目录里有陌生改动，等项目指示", waitingFor: "inbox:proj" }));
     worker(d, "w2", "proj", "压测脚本", "写压测脚本");
-    k.spawnCell("proj", { id: "wt", preset: "watcher", title: "等 CI", lifetime: "one_shot", schedules: [{ deliverAt: k.clock.now() + HOUR }] });
+    k.spawnCell("proj", { id: "wt", preset: "checker", title: "等 CI", lifetime: "one_shot", schedules: [{ deliverAt: k.clock.now() + HOUR }] });
     d.clock.advance(1); // siblings are listed in creation order
     k.spawnCell("desk", { id: "s1", preset: "sensor", title: "报错巡检", schedules: [{ cron: "*/30 * * * *" }] });
     d.clock.advance(1);
@@ -170,8 +169,8 @@ describe("GET /api/agents/topology", () => {
     const act = writeAction(k, "proj", { title: "确认最大重试次数", owner: "human", nextStep: "回复 3 还是 5" });
     const card = makeReviewCard(k);
     const b = await d.get<TopologyDTO>("/api/agents/topology");
-    expect(nodeOf(b, "proj")).toMatchObject({ state: "blocked_human", stateLabel: "等你拍板", stateDetail: "等你处理：确认最大重试次数", engageItem: { cellId: "proj", actionId: act.id } });
-    expect(nodeOf(b, "desk")).toMatchObject({ state: "blocked_human", pendingCardId: card.actionId, engageItem: null });
+    expect(nodeOf(b, "proj")).toMatchObject({ state: "blocked_human", stateLabel: "等你拍板", stateDetail: "等你处理：确认最大重试次数", humanItemId: act.id });
+    expect(nodeOf(b, "desk")).toMatchObject({ state: "blocked_human", pendingCardId: card.actionId, humanItemId: null });
 
     // The project pulls: its inspect_cell moves its cursor and the worker has nothing unread any more.
     d.script.add("project", tool("inspect_cell", { cellId: "w1" }));
@@ -373,7 +372,7 @@ describe("GET /api/cells/:cellId/timeline", () => {
     const d = await boot();
     const k = d.kernel;
     project(d, "proj", "支付重试改造");
-    k.spawnCell("proj", { id: "probe", preset: "watcher", title: "MR 探针", processor: { kind: "code", entry: "test.noop" }, lifetime: "persistent" });
+    k.spawnCell("proj", { id: "probe", preset: "checker", title: "MR 探针", processor: { kind: "code", entry: "test.noop" }, lifetime: "persistent" });
     project(d, "old", "旧项目");
     worker(d, "ow", "old", "旧分身");
     worker(d, "wp", "proj", "暂停的分身");
@@ -395,7 +394,7 @@ describe("GET /api/cells/:cellId/timeline", () => {
     expect(paused.controls.map((b) => b.id)).toEqual(["resume", "cancel"]);
 
     // "立即触发一次检查": the probe runs its check now.
-    const runs = () => d.script.requests.length;
+    const runs = () => d.script.requests.filter(r => r.cellId === "probe").length;
     const before = runs();
     const r = await d.post<CellTriggerResponse>("/api/cells/probe/trigger");
     expect(r).toMatchObject({ ok: true, outcome: "triggered", message: "已触发一次检查" });
@@ -451,7 +450,7 @@ describe("POST /api/cells/:cellId/messages", () => {
     project(d, "proj", "支付重试改造");
     d.script.add("w1", { text: "v1" });
     worker(d, "w1", "proj", "核心退避编码", "实现退避");
-    k.spawnCell("proj", { id: "probe", preset: "watcher", processor: { kind: "code", entry: "test.noop" }, lifetime: "persistent" });
+    k.spawnCell("proj", { id: "probe", preset: "checker", processor: { kind: "code", entry: "test.noop" }, lifetime: "persistent" });
     await k.idle();
     await k.closeCell("w1", "completed");
     d.script.add("w1", { text: "v2" });
@@ -518,7 +517,7 @@ describe("GET /api/resources", () => {
     const rest = await d.get<ResourcePageDTO>(`/api/resources?uri=${encodeURIComponent(uri)}&offset=64000`);
     expect(rest).toMatchObject({ offset: 64_000, limit: 16_000, hasMore: false });
     expect(rest.content).toHaveLength(6_000);
-    expect((await d.req("GET", `/api/resources?uri=${encodeURIComponent("note://x")}`)).status).toBe(400);
+    expect((await d.req("GET", `/api/resources?uri=${encodeURIComponent("reference://x")}`)).status).toBe(400);
     expect((await d.req("GET", `/api/resources?uri=${encodeURIComponent("res://desk/nope")}`)).status).toBe(404);
   });
 });
@@ -578,7 +577,7 @@ describe("Radar: reports and the way into the Agents view (BUG-010); BUG-011", (
     const d = await boot();
     const k = d.kernel;
     project(d, "proj", "发版");
-    k.spawnCell("proj", { id: "wt", preset: "watcher", title: "等 CI", lifetime: "one_shot", schedules: [{ deliverAt: k.clock.now() + HOUR }] });
+    k.spawnCell("proj", { id: "wt", preset: "checker", title: "等 CI", lifetime: "one_shot", schedules: [{ deliverAt: k.clock.now() + HOUR }] });
     const row = (await d.get<RadarDTO>("/api/radar")).projects[0]!;
     expect(row.ball).toMatchObject({ owner: "waiting", label: "🟡 等待外部", text: expect.stringMatching(/^「等 CI」下次检查 /) });
 
@@ -658,7 +657,7 @@ describe("control plane: chat_with_desk, message_cell, inspect_cell, read_resour
     project(d, "proj", "支付重试改造");
     d.script.add("w1", { text: "退避已实现" });
     worker(d, "w1", "proj", "核心退避编码", "实现指数退避");
-    k.spawnCell("proj", { id: "probe", preset: "watcher", processor: { kind: "code", entry: "test.noop" }, lifetime: "persistent" });
+    k.spawnCell("proj", { id: "probe", preset: "checker", processor: { kind: "code", entry: "test.noop" }, lifetime: "persistent" });
     await k.idle();
     d.script.add("w1", { text: "改成 3 次了" });
     const r = await agentOk(d, "message_cell", { id: "w1", text: "最大重试改成 3" });

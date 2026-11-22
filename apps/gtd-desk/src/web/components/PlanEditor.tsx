@@ -5,7 +5,7 @@ import {
   type BallOwner,
   type Effort,
   type ArtifactDTO,
-  type ClarifyMutationResponse,
+  type PlanSaveResponse,
   type HumanItemDTO,
 } from "../../shared/api";
 import { request } from "../api";
@@ -35,8 +35,8 @@ const EFFORTS: Effort[] = ["15m", "45m", "low_energy"];
 export function PlanEditor(props: {
   item: HumanItemDTO;
   onClose(): void;
-  onSaved(r: ClarifyMutationResponse): void;
-  onConflictView(r: ClarifyMutationResponse): void;
+  onSaved(r: PlanSaveResponse): void;
+  onConflictView(r: PlanSaveResponse): void;
 }) {
   const card = props.item;
   const toast = useToast();
@@ -64,7 +64,7 @@ export function PlanEditor(props: {
     setSaving(true);
     setError(null);
     try {
-      const r = await request<ClarifyMutationResponse>("PUT", `/api/clarify/${encodeURIComponent(card.id)}/plan`, {
+      const r = await request<PlanSaveResponse>("PUT", `/api/human-items/${encodeURIComponent(card.id)}/plan`, {
         expectedVersion: version,
         proposal: {
           title: form.title.trim() || undefined,
@@ -81,10 +81,6 @@ export function PlanEditor(props: {
       if (r.outcome === "conflict") {
         setConflict(r.current ?? null);
         props.onConflictView(r);
-        return;
-      }
-      if (!r.ok) {
-        setError(r.message);
         return;
       }
       props.onSaved(r);

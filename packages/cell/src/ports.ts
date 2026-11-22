@@ -1,4 +1,5 @@
 import { renderEnvelope } from "@ng/context";
+import { CLI_SESSION_KEY, type CliSessionRecord } from "@ng/loop";
 import { deliveryAllowed } from "@ng/gate";
 import {
   get, asClarifyCard, CELL_RESULT_CANDIDATE_KEY,
@@ -61,6 +62,7 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
   let emitCounter = 0;
   let lastRenewAt = clock.now();
 
+  const actionBooks = cell.preset && core.registry.presets.get(cell.preset)?.actionBooks?.(core, cellId);
   const self: RunSelf = {
     cellId,
     epoch: batch.epoch,
@@ -280,6 +282,10 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
       return inbox.requeueClaimedSync(runId, envelopeIds, reason, { countAttempt: false });
     },
 
+    ...(actionBooks && { actionBooks: {
+      list: () => actionBooks.list(),
+      write(record) { assertLive("write action"); actionBooks.write(record); },
+    } }),
     createHumanItem(draft) {
       assertLive("createHumanItem");
       return core.humanItems.create(draft, cellId);
@@ -296,7 +302,7 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
 
     canForkSession(parentId,uptoSeq,sessionId,delivered) {
       if (parentId !== self.parentId || context.lastEvidenceSeqSync(parentId) !== uptoSeq || core.dispatcher.running().some(r=>r.cellId===parentId)) return false;
-      const current=context.readStateSync<{sessionId:string;lastDeliveredEvidenceSeq?:number}>(parentId,"cli:session");
+      const current=context.readStateSync<CliSessionRecord>(parentId, CLI_SESSION_KEY);
       return current?.sessionId===sessionId && current.lastDeliveredEvidenceSeq===delivered &&
         !get(core.db,"SELECT 1 FROM evidence WHERE cell_id=? AND seq>? AND seq<=? AND kind IN ('system_note','inbound') LIMIT 1",[parentId,delivered,uptoSeq]);
     },

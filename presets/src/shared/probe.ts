@@ -11,7 +11,7 @@ import { KEYS, PROCESSORS, type PresetsConfig } from "./config";
 import { errorText } from "./inputs";
 import { clip, formatWhen, statusLine } from "./records";
 
-// A watcher dispatched with a check command (BUG-005): zero tokens while the answer is "not yet". Every wake-up — its
+// A checker dispatched with a check command (BUG-005): zero tokens while the answer is "not yet". Every wake-up — its
 // task, then its own timer, or a message routed to it — runs the command in the cell's directory (the project's). The
 // condition holding, the deadline passing, or the command failing to run at all twice in a row ends it with one result
 // for the project; a one_shot cell is then closed by the kernel, timers included. "Not yet" ends the Run as waiting,
@@ -25,7 +25,7 @@ import { clip, formatWhen, statusLine } from "./records";
 
 export type ProbeUntil = "exit_zero" | "output_changes";
 
-/** `processor.args` of a probe watcher, as dispatch writes them. */
+/** `processor.args` of a probe checker, as dispatch writes them. */
 export interface ProbeArgs {
   command: string;
   everySec: number;
@@ -102,7 +102,7 @@ function parseArgs(args: Record<string, unknown>): ProbeArgs | string {
 export function createCheckProbe(cfg: PresetsConfig): CodeProcessor {
   return {
     name: PROCESSORS.checkProbe,
-    description: "Watcher with a check command: runs it on every wake-up, reports to its project only when the condition holds, the deadline passed or the command cannot run. Zero tokens.",
+    description: "Checker with a check command: runs it on every wake-up, reports to its project only when the condition holds, the deadline passed or the command cannot run. Zero tokens.",
     async run({ ports, args, signal, clock, snapshot }) {
       const self = ports.self.cellId;
       const prev = (await ports.context.readState<ProbeState>(self, KEYS.probe)) ?? { v: 1, checks: 0, cannotRun: 0 };

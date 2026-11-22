@@ -778,7 +778,7 @@ export function createInbox(opts: InboxOptions): InboxService {
         }
         case "pause": {
           for (const t of [cell, ...cells.descendants(cellId, { status: ["active", "paused"] })]) {
-            if (t.status === "active") cells.setStatus(t.id, "paused",undefined,cmd.pauseReason);
+            if (t.status === "active" || (t.id === cellId && cmd.pauseReason === "parked")) cells.setStatus(t.id, "paused", undefined, cmd.pauseReason);
             affected.push({ cellId: t.id, epoch: t.epoch });
           }
           break;

@@ -25,7 +25,7 @@ export function useStatus(): StatusApi {
 
 type Ticks = Readonly<Record<ViewName, number>>;
 
-const ZERO: Ticks = { clarify: 0, engage: 0, radar: 0, agents: 0, review: 0, status: 0, sources: 0, activity: 0 };
+const ZERO: Ticks = { inbox: 0, radar: 0, agents: 0, review: 0, status: 0, sources: 0, activity: 0 };
 
 interface RefreshApi {
   ticks: Ticks;
@@ -351,14 +351,12 @@ export function isActivatableTarget(t: EventTarget | null): boolean {
 
 // ==================== routing ====================
 
-export type ViewKey = "clarify" | "engage" | "radar" | "agents";
+export type ViewKey = "inbox" | "radar" | "agents";
 
 export interface Route {
   view: ViewKey;
   /** Clarify: the card to show first. */
   cardId?: string;
-  /** Engage: the open 8/4 workspace. */
-  item?: { cellId: string; actionId: string };
   /** Agents: the selected node ("desk" stands for the desk whatever its id). */
   cellId?: string;
   /** Agents: show only this project's part of the tree. */
@@ -374,8 +372,6 @@ function decode(p: string): string {
 }
 
 /**
- * `#/clarify[/:cardId]` · `#/engage[/:cellId/:actionId]` · `#/radar` ·
- * `#/agents[/:cellId][?project=<projectId>]`. Anything else is Clarify.
  */
 export function parseRoute(hash: string): Route {
   const raw = hash.replace(/^#\/?/, "");
@@ -384,21 +380,19 @@ export function parseRoute(hash: string): Route {
   const query = new URLSearchParams(q >= 0 ? raw.slice(q + 1) : "");
   const parts = path.split("/").filter(Boolean).map(decode);
   const [view, a, b] = parts;
-  if (view === "engage") return a && b ? { view: "engage", item: { cellId: a, actionId: b } } : { view: "engage" };
   if (view === "radar") return { view: "radar" };
   if (view === "agents") {
     const project = query.get("project");
     return { view: "agents", ...(a ? { cellId: a } : {}), ...(project ? { projectId: project } : {}) };
   }
-  return a ? { view: "clarify", cardId: a } : { view: "clarify" };
+  return view === "inbox" && a ? { view: "inbox", cardId: a } : { view: "inbox" };
 }
 
 export function routeHash(r: Route): string {
   const e = encodeURIComponent;
-  if (r.view === "engage" && r.item) return `#/engage/${e(r.item.cellId)}/${e(r.item.actionId)}`;
-  if (r.view === "clarify" && r.cardId) return `#/inbox/${e(r.cardId)}`;
+  if (r.view === "inbox" && r.cardId) return `#/inbox/${e(r.cardId)}`;
   if (r.view === "agents") return `#/agents${r.cellId ? `/${e(r.cellId)}` : ""}${r.projectId ? `?project=${e(r.projectId)}` : ""}`;
-  return r.view==="clarify" || r.view==="engage" ? "#/inbox" : `#/${r.view}`;
+  return `#/${r.view}`;
 }
 
 const NavContext = createContext<(r: Route) => void>(() => undefined);

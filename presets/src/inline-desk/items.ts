@@ -22,7 +22,7 @@ import {
 import { projectLaunch, startProjectSync, type ProjectInit, type RepoRef } from "../project/launch";
 import { RESTORE_REASON, ROLES, type PresetsConfig } from "../shared/config";
 import { notifyOwner } from "../shared/notify";
-import { newAction, newActivity, primaryItem, type RawInput } from "../shared/records";
+import { newActivity, primaryItem, type RawInput } from "../shared/records";
 
 /** What the desk remembers about a proposal until the owner decides (`desk:proposal:<artifactId>`). */
 export interface ProposalItem {
@@ -144,6 +144,7 @@ export function createDeskBooks(cfg: PresetsConfig) {
       if (data?.kind !== "reminder" || !data.id || !data.text || env.id !== `gtd-reminder:${data.id}`) return;
       return {
         id: data.id, draft: {
+          source: { label: "定时提醒", envelopeId: env.id, at: env.createdAt },
           title: data.text, subjectKey: `reminder:${data.id}`, category: "action" as const, effort: data.effort ?? "15m",
           ...(data.remindAt !== undefined ? { dueAt: data.remindAt } : {}),
           options: [{ id: "done", label: "已办完", effect: "complete" as const, input: { mode: "optional" as const } }],
@@ -193,19 +194,6 @@ export async function settleDeskBatch(cfg: PresetsConfig, ctx: ToolContext): Pro
   const out: string[] = [];
   await ensureWeeklyReview(cfg, ports);
 
-  /** A reminder came due: a quick to-do for the owner and the reminder itself. Once per reminder. */
-  async function reminderDue(data: ReminderData, envelopeId?: string): Promise<void> {
-    const key = gtdKeys.action(data.id);
-    if (await ports.context.readState(self, key)) return;
-    const action = newAction(
-      { id: data.id, title: data.text, owner: "human", nextStep: data.text, effort: data.effort ?? "15m", dueAt: data.remindAt ?? now, source: { label: "定时提醒", ...(envelopeId ? { envelopeId } : {}), at: now } },
-      now,
-    );
-    await ports.context.commit(self, { statePatches: { [key]: action } });
-    await notifyOwner(ports, `⏰ 提醒：${data.text}`, `reminder:${data.id}`);
-    out.push(`提醒已到：${data.text}（已放进专注工作区，主人已收到提醒）`);
-  }
-
   /** A project of the desk finished: one line in the "后台已处理" drawer. Once per project. */
   async function projectFinished(p: CellResultPayload): Promise<void> {
     if (p.status !== "completed") return;
@@ -221,12 +209,7 @@ export async function settleDeskBatch(cfg: PresetsConfig, ctx: ToolContext): Pro
 
   /** True when the envelope needs nothing from the model. */
   async function settleOne(env: Envelope): Promise<boolean> {
-    if (isEnvelopeOfType(env, "timer.fired")) {
-      const data = (env.payload.data as { gtd?: ReminderData } | undefined)?.gtd;
-      if (data?.kind !== "reminder") return false;
-      await reminderDue(data, env.id);
-      return true;
-    } else if (isEnvelopeOfType(env, "approval.resolved")) {
+    if (isEnvelopeOfType(env, "approval.resolved")) {
       const p = env.payload as ApprovalResolvedPayload;
       if (p.action.type === "project.start") {
         if (p.status !== "approved") return true;

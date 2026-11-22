@@ -472,19 +472,6 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
       } catch (err) {
         return { output: `There is no item ${args.itemId} under the desk (${errorText(err)}).`, isError: true };
       }
-      if (!r.applied && r.reason === "closed") {
-        const arts = await ports.context.listArtifacts(args.itemId).catch(() => []);
-        const p = await ports.context.readState<ProjectRecord>(args.itemId, gtdKeys.project).catch(() => null);
-        const left = [
-          arts.length ? `its artifacts: ${arts.map((a) => `${a.artifactId} v${a.version}${a.content.title ? `「${a.content.title}」` : ""}`).join(", ")}` : "",
-          p?.proposal ? `its plan: ${p.proposal.outcome}; ${p.proposal.actions.map((a) => a.title).join("、")}` : "",
-          p?.summary ? `where it stood: ${p.summary}` : "",
-        ].filter(Boolean);
-        return {
-          output: `${args.itemId} is closed (an item from before projects could be parked), so it cannot be resumed. Start a new project with start_project and name in its brief what the old one left${left.length ? ` — ${left.join("; ")}` : ""}, so nothing is redone.`,
-          isError: true,
-        };
-      }
       if (!r.applied) return { output: `Not resumed: ${r.reason ?? "refused"}.`, isError: true };
       if (!ports.sendToCell) return { output: "Messages to items are not available in this environment.", isError: true };
       const s = await ports.sendToCell(`inbox:${args.itemId}`, { text: args.message, summary: "主人要继续推进", id: `${ctx.snapshot.runId}:${ctx.toolUseId}:resume` });

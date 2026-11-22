@@ -361,11 +361,11 @@ export function createReadModel(core: KernelCore): ReadModel {
     const blocks: string[] = [];
     for (const n of notes) {
       if (left <= 0) {
-        blocks.push(`## ${n.name}\n(not shown: the notes above already fill the space — read_resource("note://${n.name}"))`);
+        blocks.push(`## ${n.name}\n(not shown: the notes above already fill the space — read_resource("working_note://${n.name}"))`);
         continue;
       }
       const body = n.body.trim();
-      const shown = body.length > left ? `${body.slice(0, left)}\n… (cut here; the rest: read_resource("note://${n.name}"). Keep notes short — rewrite instead of appending.)` : body;
+      const shown = body.length > left ? `${body.slice(0, left)}\n… (cut here; the rest: read_resource("working_note://${n.name}"). Keep notes short — rewrite instead of appending.)` : body;
       left -= shown.length;
       blocks.push(`## ${n.name}\n${shown}`);
     }

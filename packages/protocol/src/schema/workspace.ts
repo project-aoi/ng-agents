@@ -3,12 +3,8 @@ import type { SchemaModule } from "./types";
 // Owner: @ng/workspace.
 export const workspaceSchema: SchemaModule = {
   owner: "@ng/workspace",
-  version: 4,
-  migrations: [
-    { version: 2, up: /* sql */ `ALTER TABLE jobs ADD COLUMN cancel_requested_at INTEGER;` },
-    { version: 3, up: /* sql */ `ALTER TABLE jobs ADD COLUMN timeout_ms INTEGER;` },
-    {version:4, up:"ALTER TABLE jobs ADD COLUMN process_identity TEXT;"},
-  ],
+  version: 1,
+  migrations: [],
   ddl: /* sql */ `
 CREATE TABLE IF NOT EXISTS workspaces (
   cell_id       TEXT PRIMARY KEY REFERENCES cells(id),

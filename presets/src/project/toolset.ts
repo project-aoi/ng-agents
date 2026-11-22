@@ -43,7 +43,7 @@ async function projectOf(ctx: ToolContext): Promise<ProjectRecord> {
   const p = await readProject(ctx.ports);
   if (p) return p;
   const spec = ctx.ports.self.spec;
-  return newProject({ title: spec.title ?? ctx.ports.self.cellId, ...(spec.cwd ? { cwd: spec.cwd } : {}) }, ctx.clock.now());
+  return newProject({ title: spec.title ?? ctx.ports.self.cellId }, ctx.clock.now());
 }
 
 async function save(ctx: ToolContext, patches: Record<string, unknown>): Promise<void> {
@@ -56,7 +56,7 @@ const checkInput = z
       .string()
       .min(1)
       .describe(
-        'a shell command run in the watcher\'s directory (the project\'s) whose exit status says yes or no, e.g. "gh pr view 142 --json state -q .state | grep -qx MERGED", "test -d /abs/path/to/dir", "glab ci status --branch feat/x | grep -q success"',
+        'a shell command run in the checker\'s directory (the project\'s) whose exit status says yes or no, e.g. "gh pr view 142 --json state -q .state | grep -qx MERGED", "test -d /abs/path/to/dir", "glab ci status --branch feat/x | grep -q success"',
       ),
     everySec: z.number().int().min(PROBE.minEverySec).optional().describe(`seconds between checks (default ${PROBE.everySec}, at least ${PROBE.minEverySec})`),
     until: z
@@ -66,10 +66,10 @@ const checkInput = z
     deadlineHours: z.number().positive().optional().describe("stop after this many hours and report failed (default: no deadline)"),
   })
   .describe(
-    'watcher only — a command that tests the condition. No model runs for such a watcher: the command runs now and then every everySec seconds, costing nothing while the answer is "not yet". You are woken once: when the condition holds (with what the command printed), when the deadline passes, or when the command cannot run at all twice in a row (not found, not executable, timed out). Use it whenever an exit status can say yes or no; leave it out when deciding needs reading and judgment.',
+    'checker only — a command that tests the condition. No model runs for such a checker: the command runs now and then every everySec seconds, costing nothing while the answer is "not yet". You are woken once: when the condition holds (with what the command printed), when the deadline passes, or when the command cannot run at all twice in a row (not found, not executable, timed out). Use it whenever an exit status can say yes or no; leave it out when deciding needs reading and judgment.',
   );
 
-/** What a model watcher is told about the schedule it was given, so it does not set reminders on top of it. */
+/** What a model checker is told about the schedule it was given, so it does not set reminders on top of it. */
 function scheduleNote(rules: NonNullable<CellSpec["schedules"]>): string {
   const lines: string[] = [];
   for (const r of rules) {
@@ -108,28 +108,27 @@ export function projectToolset(): Toolset {
         .string()
         .min(1)
         .describe("the goal; the directory; what the previous step left (branch, commits, uncommitted changes); material (paths, links, artifact id and version); the owner's preferences; how to verify; what to report"),
-      preset: z.enum(["worker", "checker","watcher"]).optional().describe('default "worker" ("checker" when check is given)'),
+      preset: z.enum(["worker", "checker"]).optional().describe('default "worker" ("checker" when check is given)'),
       cwd: z.string().optional().describe("absolute path of the directory it works in. Default: the project's (for a second writer in the same repository, give the path of a git worktree, or tell it in the instruction to create one)"),
       actionId: z.string().optional().describe("an action already on the books that this carries out (e.g. a planned step); default: a new action"),
       phase: z.number().int().min(1).optional().describe("phase of a staged project"),
       modelTier: z.enum(["fast", "strong"]).optional(),
       check: checkInput.optional(),
-      watches: z.array(watchInput).optional().describe("watcher: messages to route to it (e.g. the MR's thread); each one makes it look at once"),
+      watches: z.array(watchInput).optional().describe("checker: messages to route to it (e.g. the MR's thread); each one makes it look at once"),
       schedules: z
         .array(scheduleInput)
         .optional()
         .describe(
-          'watcher without check, rarely needed: a fixed rhythm to wake it on, as cron (e.g. {"cron": "*/10 * * * *"}), instead of the one reminder at a time it sets itself, fitted to what it saw. It is told so in its task and sets no reminders of its own. Usually leave it out. Not with check (the command keeps its own timer).',
+          'checker without check, rarely needed: a fixed rhythm to wake it on, as cron (e.g. {"cron": "*/10 * * * *"}), instead of the one reminder at a time it sets itself, fitted to what it saw. It is told so in its task and sets no reminders of its own. Usually leave it out. Not with check (the command keeps its own timer).',
         ),
     }),
     async run(args, ctx) {
       const check = args.check;
-      const preset = args.preset==="watcher" ? "checker" : args.preset ?? (check ? "checker" : "worker");
-      // One timer source per watcher (BUG-005): a check keeps its own, a model watcher either gets a fixed cron
+      const preset = args.preset ?? (check ? "checker" : "worker");
+      // One timer source per checker (BUG-005): a check keeps its own, a model checker either gets a fixed cron
       // rhythm or sets its own reminders.
-      if (check && preset !== "checker") return { output: 'Not started: check is for a watcher — give preset "checker" (or leave preset out).', isError: true };
-      if (check && args.schedules?.length) return { output: "Not started: a watcher with check keeps its own timer (check.everySec); leave schedules out.", isError: true };
-      const project = await readProject(ctx.ports);
+      if (check && preset !== "checker") return { output: 'Not started: check is for a checker — give preset "checker" (or leave preset out).', isError: true };
+      if (check && args.schedules?.length) return { output: "Not started: a checker with check keeps its own timer (check.everySec); leave schedules out.", isError: true };
       const actions = await readActions(ctx.ports);
       const existing = args.actionId !== undefined ? actions.find((a) => a.id === args.actionId) : undefined;
       const base: ProcessorSpec = preset === "checker" ? CHECKER_PROCESSOR : WORKER_PROCESSOR;
@@ -148,9 +147,9 @@ export function projectToolset(): Toolset {
           ? { ...base, modelTier: args.modelTier }
           : base;
       const spec: CellSpec = { preset, title: args.title, processor, meta: { gtd: { actionId } } };
-      // Default: where the project works — a worker to do the work there, a watcher so the repository, its remotes
+      // Default: where the project works — a worker to do the work there, a checker so the repository, its remotes
       // and the forge CLI's context are at hand. Whatever the project passes explicitly is what the child gets.
-      const cwd = args.cwd ?? (project?.cwd && project.cwd !== ctx.ports.self.spec.cwd ? project.cwd : undefined);
+      const cwd = args.cwd;
       if (cwd) spec.cwd = cwd;
       let addr: InboxAddr;
       let instruction = args.instruction;
@@ -171,7 +170,7 @@ export function projectToolset(): Toolset {
             { id: actionId, title: args.title, owner, cellId: childId, projectCellId: self(ctx), ...(args.phase ? { phase: args.phase } : {}), ...(owner === "waiting" ? { waiting: waitingFor(args.title) } : {}) },
             now,
           );
-      await save(ctx, { [gtdKeys.action(actionId)]: action });
+      ctx.ports.actionBooks!.write(action);
       const started = `Started ${preset} ${childId} for action ${actionId}「${args.title}」 (recorded as ${owner === "agent" ? "being handled by an agent" : "waiting"}).`;
       const where = cwd ?? ctx.ports.self.spec.cwd;
       const deadline = check?.deadlineHours !== undefined;
@@ -232,7 +231,7 @@ export function projectToolset(): Toolset {
         if (!cur) return { output: `There is no action ${args.id}; leave id out to create one.`, isError: true };
         action = patchAction(cur, { ...fields, ...(args.status ? { status: args.status } : {}), ...(args.status === "open" ? { completedAt: null } : {}) }, now);
       }
-      await save(ctx, { [gtdKeys.action(action.id)]: action });
+      ctx.ports.actionBooks!.write(action);
       const next =
         action.status !== "open"
           ? "It is closed."
@@ -261,9 +260,8 @@ export function projectToolset(): Toolset {
         ...(args.summary ? { summary: args.summary } : {}),
         ...(args.outcome ? { outcome: args.outcome } : {}),
         ...(args.title ? { title: args.title } : {}),
-        ...(cwd ? { cwd } : {}),
       };
-      if (Object.keys(patch).length === 0) return { output: "Nothing to update.", isError: true };
+      if (Object.keys(patch).length === 0 && !cwd) return { output: "Nothing to update.", isError: true };
       if (args.title || args.cwd) await ctx.ports.updateCell(self(ctx),{...(args.title ? {title:args.title} : {}),...(cwd ? {cwd} : {})});
       const next = patchProject(await projectOf(ctx), patch, now);
       await save(ctx, { [gtdKeys.project]: next, ...(args.summary ? { [CELL_STATUS_KEY]: statusLine(clip(args.summary, 200), now) } : {}) });
@@ -294,8 +292,8 @@ export function projectToolset(): Toolset {
       const patches: Record<string, unknown> = {};
       // The books follow what happened: a cancelled project's open actions are cancelled with it. For the other
       // outcomes they are left as the project left them and only reported back.
-      if (args.outcome === "cancelled") for (const a of open) patches[gtdKeys.action(a.id)] = patchAction(a, { status: "cancelled" }, now);
-      const record = patchProject(project, { lifecycle: args.outcome, summary: args.summary }, now) as ProjectRecord & { retro?: string };
+      if (args.outcome === "cancelled") for (const a of open.filter(record => record.owner !== "human")) patches[gtdKeys.action(a.id)] = patchAction(a, { status: "cancelled" }, now);
+      const record = patchProject(project, { lifecycle: args.outcome === "someday" ? "active" : args.outcome, summary: args.summary }, now) as ProjectRecord & { retro?: string };
       if (args.retro) record.retro = args.retro;
       patches[gtdKeys.project] = record;
       const label = args.outcome === "completed" ? "已完成" : args.outcome === "cancelled" ? "已停止" : "已放进以后再说";

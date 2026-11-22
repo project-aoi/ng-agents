@@ -3,7 +3,7 @@ import { CLI_SESSION_KEY } from "./loop";
 import type { CliSessionRecord } from "./types";
 
 export interface RoutingLoopOptions {
-  /** Executes registered code processors and injected test models. */
+  /** Executes locally assigned runs. */
   local: AgentLoop;
   /** Engine for llm cells without `processor.engine`; null = none available (such Runs fail with a clear error). */
   defaultEngine: AgentEngine | null;

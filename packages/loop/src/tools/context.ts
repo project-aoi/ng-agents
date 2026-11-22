@@ -370,8 +370,8 @@ const saveNote = defineTool({
     name: z.string().min(1),
     body: z.string().min(1),
     description: z.string().optional().describe("one line; defaults to the first line of body"),
-    kind: z.enum(["working_note", "reference", "note", "preference"]).optional(),
-    scope: z.enum(["cell", "global"]).optional().describe("default: note → cell, preference → global"),
+    kind: z.enum(["working_note", "reference", "preference"]).optional(),
+    scope: z.enum(["cell", "global"]).optional().describe("Preferences default to global scope. Working notes and references default to cell scope."),
     append: z.boolean().optional(),
     cwdPrefix: z
       .string()
@@ -384,7 +384,7 @@ const saveNote = defineTool({
       .describe('preference only: only cells of these roles see it — "worker", "project", "checker", "desk", "hub", "sensor" (a cell matches by its role or its preset name)'),
   }),
   async handler(args, ctx) {
-    const kind = args.kind === "note" ? "working_note" : args.kind ?? "working_note";
+    const kind = args.kind ?? "working_note";
     if (kind !== "preference" && (args.cwdPrefix !== undefined || args.roles !== undefined)) {
       return { output: `cwdPrefix and roles only limit a preference; a ${kind} cannot take them. Leave them out, or save with kind "preference".`, isError: true };
     }
@@ -434,7 +434,7 @@ const readResource = defineTool({
   name: "read_resource",
   kind: "kernel",
   description: [
-    "Read a stored resource by URI, in pages: res://… (full output that was truncated), skill://<name> (a skill's body), note://<name>, artifact://<id>[@version].",
+    "Read a stored resource by URI, in pages: res://… (full output that was truncated), skill://<name> (a skill's body), working_note://<name>, reference://<name>, preference://<name>, artifact://<id>[@version].",
     `A page is ${DEFAULT_RESOURCE_PAGE_CHARS} characters unless you pass limit (up to ${MAX_RESOURCE_PAGE_CHARS}, to read a large document in few calls); each page says whether more follows and from which offset.`,
   ].join(" "),
   input: z.object({

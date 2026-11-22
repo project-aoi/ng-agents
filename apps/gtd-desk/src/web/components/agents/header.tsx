@@ -89,7 +89,7 @@ export function NodeHeader(props: { head: CellTimelineDTO; onSelect(cellId: stri
         </p>
       )}
 
-      {(head.artifacts.length > 0 || n.pendingCardId || n.engageItem) && (
+      {(head.artifacts.length > 0 || n.pendingCardId || n.humanItemId) && (
         <div className="ag-assets">
           {head.artifacts.map((a) => (
             <button key={a.artifactId} type="button" className="btn sm report-btn" onClick={() => openReport(a)}>
@@ -97,12 +97,12 @@ export function NodeHeader(props: { head: CellTimelineDTO; onSelect(cellId: stri
             </button>
           ))}
           {n.pendingCardId && (
-            <button type="button" className="link-btn" onClick={() => navigate({ view: "clarify", cardId: n.pendingCardId! })}>
+            <button type="button" className="link-btn" onClick={() => navigate({ view: "inbox", cardId: n.pendingCardId! })}>
               去拍板 →
             </button>
           )}
-          {n.engageItem && (
-            <button type="button" className="link-btn" onClick={() => navigate({ view: "engage", item: n.engageItem! })}>
+          {n.humanItemId && (
+            <button type="button" className="link-btn" onClick={() => navigate({ view: "inbox", cardId: n.humanItemId! })}>
               去处理 →
             </button>
           )}

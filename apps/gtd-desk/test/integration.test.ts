@@ -4,7 +4,7 @@
 
 import { afterEach, describe, expect, it } from "vitest";
 import { gtdKeys, type ProjectRecord } from "@ng/protocol";
-import type { ActivityListDTO, ClarifyMutationResponse, ClarifyQueueDTO, EngageListDTO, EngageMutationResponse, ProjectMutationResponse, RadarDTO } from "../src/shared/api";
+import type { HumanItemDTO, ProjectMutationResponse, RadarDTO } from "../src/shared/api";
 import { bootRealDesk, cellMessages, cleanupAll, requestsOf, tool, type TestDesk } from "./helpers";
 
 afterEach(cleanupAll);
@@ -12,12 +12,19 @@ afterEach(cleanupAll);
 const deskCalls = (d: TestDesk) => d.script.requests.filter((r) => r.role === "desk").length;
 const texts = (d: TestDesk, cellId: string) => cellMessages(d.kernel, cellId).map((e) => (e.payload as { text: string }).text);
 
+const itemsOf = async (d: TestDesk) => (await d.get<{items: HumanItemDTO[]}>("/api/human-items")).items;
+async function approve(d: TestDesk, id: string) {
+  const item = (await itemsOf(d)).find(i => i.id === id)!;
+  return d.post(`/api/human-items/${id}/decide`, {
+    optionId: "system.execute", seenItemRevision: item.itemRevision, seenArtifactVersion: item.artifactVersion,
+  });
+}
+
 async function proposal(d: TestDesk, actions: Array<{ title: string; owner: "agent" | "human" | "waiting"; effort?: "15m" | "45m"; nextStep?: string }>): Promise<string> {
   d.script.add("desk", tool("propose_project", { title: "官网改版", outcome: "新版官网上线", actions }));
   await d.post("/api/capture", { text: "官网该改版了，帮我规划一下" });
   await d.kernel.idle();
-  const q = await d.get<ClarifyQueueDTO>("/api/clarify");
-  return q.cards.find((c) => c.cardType === "project_proposal")!.id;
+  return (await itemsOf(d)).find(item => item.action?.type === "project.start")!.id;
 }
 
 /** A project started by the desk (start_project); returns its id once its first run is over. */
@@ -31,10 +38,10 @@ async function deskProject(d: TestDesk, title: string): Promise<string> {
 describe("app × real presets", () => {
   it("“✓ 确认立项并让 Agent 开工” creates the project cell in the same request; the desk's model is not woken for it", async () => {
     const d = await bootRealDesk();
-    const cardId = await proposal(d, [{ title: "和市场部对齐风格", owner: "human", effort: "15m" }]);
+    const cardId = await proposal(d, [{ title: "盘点现有网页", owner: "agent", effort: "15m" }]);
     const calls = deskCalls(d);
-    const r = await d.post<ClarifyMutationResponse>(`/api/clarify/${cardId}/approve`, { seenVersion: 1, seenItemRevision: 1 });
-    expect(r).toMatchObject({ ok: true, outcome: "approved", message: "已确认立项，Agent 开始推进" });
+    const r = await approve(d, cardId);
+    expect(r).toMatchObject({ status: "approved" });
     // No idle(): the project cell exists when the response is out.
     const projects = d.kernel.listCells({ parentId: "desk" }).filter((c) => c.spec.meta?.["role"] === "project");
     expect(projects.map((c) => [c.title, c.preset])).toEqual([["官网改版", "project"]]);
@@ -43,25 +50,25 @@ describe("app × real presets", () => {
     const radar = await d.get<RadarDTO>("/api/radar");
     expect(radar.projects.map(p=>p.title)).toEqual(["官网改版"]);
     expect(d.kernel.humanItems.list()).toHaveLength(0);
-    expect(d.kernel.context.readStateSync<ProjectRecord>(projects[0]!.id,gtdKeys.project)?.proposal?.actions[0]?.title).toBe("和市场部对齐风格");
+    expect(d.kernel.context.readStateSync<ProjectRecord>(projects[0]!.id,gtdKeys.project)?.proposal?.actions[0]?.title).toBe("盘点现有网页");
   });
 
-  it("ticking off a project's human action in Engage wakes the project with the owner's words (its wait on the owner is answered); the project decides it is done", async () => {
+  it("ticking off a project's human action wakes the project with the owner's words (its wait on the owner is answered); the project decides it is done", async () => {
     const d = await bootRealDesk();
     const cardId = await proposal(d, [{ title: "和市场部对齐风格", owner: "human", effort: "15m", nextStep: "约市场部聊 15 分钟" }]);
     // The project's first run: it waits for the owner.
     d.script.add("project", tool("track_action",{title:"和市场部对齐风格",owner:"human",nextStep:"约市场部聊 15 分钟"}), tool("wait", { reason: "等主人和市场部对齐风格", waitingFor: "human" }));
-    await d.post(`/api/clarify/${cardId}/approve`, { seenVersion: 1, seenItemRevision: 1 });
+    await approve(d, cardId);
     await d.kernel.idle();
-    const [item] = (await d.get<EngageListDTO>("/api/engage")).items;
+    const [item] = (await itemsOf(d));
     expect(item).toMatchObject({ title: "和市场部对齐风格", project: { title: "官网改版" } });
     const projectId = item!.project!.id;
     expect(d.kernel.listWaits([projectId]).map((w) => w.waitingFor)).toEqual(["human"]);
 
     // What the project does when it hears it: everything it took on is done.
     d.script.add("project", tool("finish_project", { outcome: "completed", summary: "风格已对齐，新版官网方案定稿", retro: "none — 没有新的做事习惯" }));
-    const r = await d.post<EngageMutationResponse>(`/api/engage/${item!.cellId}/${item!.actionId}/done`, { note: "市场部同意用新配色",seenItemRevision:item!.itemRevision });
-    expect(r).toMatchObject({ ok: true, outcome: "done" });
+    const r = await d.post(`/api/human-items/${item!.id}/decide`, { optionId: item!.options[0]!.id,  note: "市场部同意用新配色",seenItemRevision:item!.itemRevision });
+    expect(r).toMatchObject({ status: "resolved" });
     expect(d.kernel.inbox.listMessagesSync({cellId:projectId,type:"approval.resolved"}).at(-1)?.envelope.payload).toMatchObject({note:"市场部同意用新配色"});
     await d.kernel.idle();
     expect(d.kernel.listWaits([projectId])).toEqual([]);
@@ -79,33 +86,33 @@ describe("app × real presets", () => {
     await d.kernel.idle();
     d.clock.advance(5 * 60_000);
     await d.kernel.idle();
-    const [item] = (await d.get<EngageListDTO>("/api/engage")).items;
-    expect(item).toMatchObject({ title: "给牙医打电话", project: null, cellId: "desk" });
-    await d.post(`/api/engage/${item!.cellId}/${item!.actionId}/done`, {seenItemRevision: 1});
-    expect(d.kernel.humanItems.get(item!.actionId)?.status).toBe("resolved");
+    const [item] = (await itemsOf(d));
+    expect(item).toMatchObject({ title: "给牙医打电话", project: null, cellId: null });
+    await d.post(`/api/human-items/${item!.id}/decide`, { optionId: item!.options[0]!.id, seenItemRevision: 1});
+    expect(d.kernel.humanItems.get(item!.id)?.status).toBe("resolved");
     expect(d.kernel.inbox.listMessagesSync({ type: "cell.message" })).toEqual([]);
   });
 
-  it("a project's worker blocked on the owner: its card is decided in Clarify, the action it carries is no to-do in Engage, Radar points at the card", async () => {
+  it("a project's worker blocked on the owner: its decision is the only inbox item and Radar points at the card", async () => {
     const d = await bootRealDesk();
     d.script.add("project", tool("dispatch", { title: "整理上线检查清单", instruction: "整理上线检查清单，用 markdown" }));
     d.script.add("worker", tool("request_approval", { kind: "escalation", title: "清单要不要包含回滚演练？", summary: "需要主人决定范围", escalation: { reason: "blocked", explanation: "回滚演练要停服 10 分钟，要不要写进清单？" } }));
     const projectId = await deskProject(d, "整理上线检查清单");
     await d.kernel.idle();
-    const card = (await d.get<ClarifyQueueDTO>("/api/clarify")).cards[0]!;
-    expect(card).toMatchObject({ cardType: "escalation", projectId, escalation: { reason: "blocked" } });
-    expect((await d.get<EngageListDTO>("/api/engage")).items).toEqual([]);
+    const card = (await itemsOf(d))[0]!;
+    expect(card).toMatchObject({ category: "decision", relatedProjectIds: [projectId], title: "清单要不要包含回滚演练？" });
+    expect((await itemsOf(d)).filter(item => item.category === "action")).toEqual([]);
     const [row] = (await d.get<RadarDTO>("/api/radar")).projects;
     expect(row).toMatchObject({ id: projectId, ball: { owner: "human", cardId: card.id }, stalled: false });
     expect(row!.workers.map((w) => w.title)).toEqual(["整理上线检查清单"]);
   });
 
-  it("“转给我来处理” on a project's card makes it the owner's action on the project's books; the project hears both the takeover and the check-off", async () => {
+  it("replying to a project decision wakes that project with the owner's words", async () => {
     const d = await bootRealDesk();
     d.script.add("project", tool("request_approval", { kind: "action", title: "第一阶段完成，开始第二阶段？", summary: "阶段确认", action: { name: "phase.next" } }));
     const projectId = await deskProject(d, "极简模式第一阶段");
-    const card = (await d.get<ClarifyQueueDTO>("/api/clarify")).cards[0]!;
-    expect(card.projectId).toBe(projectId);
+    const card = (await itemsOf(d))[0]!;
+    expect(card.project?.id).toBe(projectId);
     const [item] = d.kernel.humanItems.list();
     expect(item).toMatchObject({id:card.id,relatedProjectIds:[projectId]});
     await d.post(`/api/human-items/${card.id}/decide`, {optionId:"system.reply",seenItemRevision:item!.itemRevision,note:"自己和设计师过一遍第二阶段的范围"});
@@ -115,24 +122,24 @@ describe("app × real presets", () => {
     expect(d.kernel.getCell(projectId)!.status).toBe("active");
   });
 
-  it("a project moved to “以后再说” takes its actions out of Engage; activating the same cell brings them back and tells it", async () => {
+  it("a project moved to “以后再说” keeps its actions linked and identifies the project to resume", async () => {
     const d = await bootRealDesk();
     const cardId = await proposal(d, [
       { title: "和市场部对齐风格", owner: "human", effort: "15m" },
       { title: "拉一份现有页面清单", owner: "agent" },
     ]);
     d.script.add("project",tool("track_action",{title:"和市场部对齐风格",owner:"human",nextStep:"联系市场部"}));
-    await d.post(`/api/clarify/${cardId}/approve`, { seenVersion: 1, seenItemRevision: 1 });
+    await approve(d, cardId);
     await d.kernel.idle();
     const projectId = (await d.get<RadarDTO>("/api/radar")).projects[0]!.id;
-    expect((await d.get<EngageListDTO>("/api/engage")).items.map((i) => i.title)).toEqual(["和市场部对齐风格"]);
+    expect((await itemsOf(d)).map((i) => i.title)).toEqual(["和市场部对齐风格"]);
     expect((await d.post<ProjectMutationResponse>(`/api/projects/${projectId}/someday`)).outcome).toBe("someday");
     expect(d.kernel.getCell(projectId)!.status).toBe("paused");
-    expect((await d.get<EngageListDTO>("/api/engage")).items).toEqual([]);
+    expect(await itemsOf(d)).toMatchObject([{ title: "和市场部对齐风格", resumeTarget: { id: projectId }, project: { id: projectId, parked: true } }]);
     expect((await d.post<ProjectMutationResponse>(`/api/projects/${projectId}/activate`)).outcome).toBe("activated");
     expect(d.kernel.getCell(projectId)!.status).toBe("active");
     expect(d.kernel.context.readStateSync<ProjectRecord>(projectId, gtdKeys.project)!.lifecycle).toBe("active");
-    expect((await d.get<EngageListDTO>("/api/engage")).items.map((i) => i.title)).toEqual(["和市场部对齐风格"]);
+    expect((await itemsOf(d)).map((i) => i.title)).toEqual(["和市场部对齐风格"]);
     expect(texts(d, projectId)).toEqual([expect.stringContaining("主人点了启动")]);
   });
 

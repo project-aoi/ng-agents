@@ -78,11 +78,11 @@ describe("docs/03 §四 row 1 — a sensor is a source, not a task", () => {
     const proposal = (card.clarify as { proposal: ProjectProposal }).proposal;
     const edited: ProjectProposal = { ...proposal, actions: [...proposal.actions, { title: "确认埋点没有漏报", owner: "agent" }] };
     expect(h.kernel.context.commitSync("desk", { artifact: { artifactId: card.artifactId!, content: { format: "json", body: JSON.stringify(edited), data: edited }, updatedBy: "human", expectedVersion: 1 } })).toMatchObject({ ok: true });
-    expect(await h.kernel.resolveApproval(card.actionId, { decision: "approve", approverId: "owner", seenArtifactVersion: 1 })).toMatchObject({ status: "version_mismatch", currentVersion: 2 });
+    await expect(h.kernel.humanItems.decide(card.actionId, { optionId: "system.execute", seenItemRevision: h.kernel.humanItems.get(card.actionId)!.itemRevision, seenArtifactVersion: 1 }, "owner")).rejects.toMatchObject({code: "conflict"});
 
     // Approve v2 → the project starts with the edited plan, before (and without) any model call of the desk.
     const deskCalls = h.script.callsOf("desk").length;
-    expect(await h.kernel.resolveApproval(card.actionId, { decision: "approve", approverId: "owner", seenArtifactVersion: 2 })).toEqual({ status: "approved", actionId: card.actionId });
+    expect(await h.kernel.humanItems.decide(card.actionId, { optionId: "system.execute", seenItemRevision: h.kernel.humanItems.get(card.actionId)!.itemRevision, seenArtifactVersion: 2 }, "owner")).toEqual({ status: "approved" });
     await h.kernel.idle();
     expect(h.script.callsOf("desk")).toHaveLength(deskCalls);
 
@@ -150,7 +150,7 @@ describe("docs/03 §四 row 1 — a sensor is a source, not a task", () => {
 });
 
 describe("docs/03 §四 row 2 — personal zero-side-effect items: done at once, no card", () => {
-  it("a link for the reading list: note + activity + light notice, nothing in Clarify", async () => {
+  it("a link for the reading list: note + activity + light notice, no owner decision", async () => {
     const h = await boot();
     h.script.add(
       "desk",
@@ -188,7 +188,7 @@ describe("docs/03 §四 row 2 — personal zero-side-effect items: done at once,
       expect.objectContaining({ kind: "reminder_set", title: "已设好提醒：给牙医打电话约时间", detail: "11月20日周五 15:00", remindAt, restorable: false }),
     ]);
     expect(h.notices()).toEqual(["已设好 11月20日周五 15:00 的提醒：给牙医打电话约时间"]);
-    expect(h.actions("desk")).toEqual([]); // nothing in Engage before it fires
+    expect(h.actions("desk")).toEqual([]);
 
     // It fires: the desk's books turn it into a quick human action + the reminder itself; the model is not woken.
     const deskCalls = h.script.callsOf("desk").length;

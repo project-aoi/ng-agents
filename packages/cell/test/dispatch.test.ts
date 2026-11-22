@@ -1,12 +1,13 @@
+import type { ModelRequest } from "@ng/loop/testing";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   asClarifyCard,
   finalResultEnvelopeId,
   PAYLOAD,
   steerNoteText,
+  timerFrom,
   type CellResultPayload,
   type CodeProcessor,
-  type ModelRequest,
   type Registry,
 } from "@ng/protocol";
 import { boot, cleanupAll, HOUR, registerTestPresets, requestText, tool, waitFor, type Harness } from "./helpers";
@@ -61,6 +62,37 @@ describe("dispatcher", () => {
     const reqs = h.script.callsOf("desk");
     expect(userTexts(reqs[1]!)).toEqual(expect.arrayContaining(["msg-2", "msg-3", "msg-4", "msg-5"]));
     expect(h.kernel.inbox.listMessagesSync({ cellId: "desk" }).every((m) => m.status === "done")).toBe(true);
+  });
+
+  it("processes later reminders after a malformed reminder rolls back", async () => {
+    const failures: unknown[] = [];
+    const h = await boot({
+      start: false,
+      kernel: { onError: error => failures.push(error) },
+      setup(registry) {
+        registry.presets.register({
+          name: "inline",
+          description: "reminder inbox",
+          defaults: { processor: { kind: "llm" } },
+          personalReminder(env) {
+            return { id: env.id, draft: { title: env.id, subjectKey: env.id, category: "action",
+              options: [{ id: "done", label: "已办完", effect: env.id === "broken" ? "reply" : "complete" }] } };
+          },
+        });
+      },
+    });
+    for (const id of ["broken", "valid"]) {
+      h.kernel.inbox.enqueueSync("desk", {
+        id, from: timerFrom("desk"), principalId: "owner", kind: "event", type: PAYLOAD.timerFired,
+        payload: { label: id }, createdAt: h.clock.now(),
+      });
+    }
+    await h.kernel.start();
+    await h.kernel.idle();
+    expect(failures).toHaveLength(1);
+    expect(h.kernel.humanItems.get("broken")).toBeUndefined();
+    expect(h.kernel.humanItems.get("valid")).toMatchObject({ title: "valid", status: "pending" });
+    expect(h.kernel.hub.listNotificationsSync().map(n => n.content.body)).toEqual(["⏰ 提醒：valid"]);
   });
 
   it("a global cap bounds Runs across cells; everything still runs", async () => {
@@ -165,9 +197,9 @@ describe("dispatcher", () => {
 
   it("a timer set before a cancel never fires after it (epoch guard)", async () => {
     const h = await boot();
-    h.script.add("watcher", tool("set_reminder", { label: "follow up", inSeconds: 3600 }), { text: "set" });
+    h.script.add("hub", tool("set_reminder", { label: "follow up", inSeconds: 3600 }), { text: "set" });
     // a cell that lives on its timer (a one-shot one is closed, its timers with it, as soon as its Run completes)
-    h.kernel.spawnCell("desk", { id: "w", preset: "watcher", lifetime: "persistent" }, "go");
+    h.kernel.spawnCell("desk", { id: "w", preset: "hub", lifetime: "persistent" }, "go");
     await h.kernel.idle();
     const timer = h.kernel.inbox.listMessagesSync({ cellId: "w", type: PAYLOAD.timerFired })[0]!;
     expect(timer).toMatchObject({ status: "pending", expectedEpoch: 0 });
@@ -269,7 +301,7 @@ describe("leaf results (docs/05 guard 1: the kernel is the single sender)", () =
         registry.codeProcessors.register(emit);
       },
     });
-    h.kernel.spawnCell("desk", { id: "e", preset: "watcher", processor: { kind: "code", entry: emit.name } }, "go");
+    h.kernel.spawnCell("desk", { id: "e", preset: "checker", processor: { kind: "code", entry: emit.name } }, "go");
     await h.kernel.idle();
     expect(h.kernel.getCell("e")!.status).toBe("closed");
     const sent = () => h.kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.cellResult }).map((m) => [m.envelope.id, (m.envelope.payload as CellResultPayload).summary]);

@@ -3,18 +3,11 @@ import { afterEach, describe, expect, it } from "vitest";
 import { gtdKeys, PAYLOAD, type ActionRecord, type HandbackPayload, type ProjectRecord } from "@ng/protocol";
 import type {
   ActivityMutationResponse,
-  ApproveResponse,
   ArtifactSaveResponse,
   CaptureResponse,
-  ClarifyMutationResponse,
-  ClarifyQueueDTO,
-  EngageDetailDTO,
-  EngageListDTO,
-  EngageMutationResponse,
   HumanItemDTO,
   ProjectMutationResponse,
   RadarDTO,
-  StatusDTO,
 } from "../src/shared/api";
 import { RESTORE_REASON } from "../src/server/desk";
 import {
@@ -61,23 +54,22 @@ describe("capture", () => {
   });
 });
 
-describe("Clarify — the other buttons", () => {
+describe("review options", () => {
   it("snooze hides the card and it resurfaces when the clock passes the time", async () => {
     const d = await bootDesk();
     const { actionId } = makeReviewCard(d.kernel);
     const until = d.clock.now() + 3 * HOUR;
-    const r = await d.post<ClarifyMutationResponse>(`/api/clarify/${actionId}/snooze`, { until, seenItemRevision: 1 });
-    expect(r).toMatchObject({ outcome: "snoozed", card: null, view: { remaining: 0, snoozed: 1, inboxZero: true } });
-    expect(r.status.clarify).toEqual({ pending: 0, snoozed: 1 });
-
+    const item = d.kernel.humanItems.get(actionId)!;
+    const r = await d.post(`/api/human-items/${actionId}/decide`, {
+      optionId: "system.defer", until, seenItemRevision: item.itemRevision, seenArtifactVersion: item.artifactVersion,
+    });
+    expect(r).toMatchObject({ status: "snoozed" });
     d.clock.advance(3 * HOUR - 1);
     await d.kernel.idle();
-    expect((await d.get<ClarifyQueueDTO>("/api/clarify")).remaining).toBe(0);
+    expect((await d.get<{items: HumanItemDTO[]}>("/api/human-items")).items).toEqual([]);
     d.clock.advance(1);
     await d.kernel.idle();
-    const back = await d.get<ClarifyQueueDTO>("/api/clarify");
-    expect(back.cards.map((c) => c.id)).toEqual([actionId]);
-    expect(back.snoozed).toBe(0);
+    expect((await d.get<{items: HumanItemDTO[]}>("/api/human-items")).items).toMatchObject([{ id: actionId, status: "pending" }]);
   });
 
   it("defers a review from its current card options to tomorrow", async () => {
@@ -94,9 +86,12 @@ describe("Clarify — the other buttons", () => {
   it("revise wakes the owning cell with the instruction and marks the card as revising", async () => {
     const d = await bootDesk();
     const { actionId } = makeReviewCard(d.kernel);
-    const r = await d.post<ClarifyMutationResponse>(`/api/clarify/${actionId}/revise`, { instruction: "语气再正式一点", voice: true, seenItemRevision: 1 });
-    expect(r).toMatchObject({ outcome: "revising", card: { state: "revising" } });
-    expect(r.card!.sourceBar.statusText).toContain("正在按你的意见重拟");
+    const item = d.kernel.humanItems.get(actionId)!;
+    const r = await d.post(`/api/human-items/${actionId}/decide`, {
+      optionId: "system.revise", note: "语气再正式一点", seenItemRevision: item.itemRevision, seenArtifactVersion: item.artifactVersion,
+    });
+    expect(r).toMatchObject({ status: "revising" });
+    expect(d.kernel.humanItems.get(actionId)?.itemRevision).toBe(item.itemRevision + 1);
     await d.kernel.idle();
     const text = d.script.requests.filter((x) => x.cellId === "desk").map((x) => requestText(x.req)).join("\n");
     expect(text).toContain("语气再正式一点");
@@ -162,7 +157,7 @@ describe("Clarify — the other buttons", () => {
   });
 });
 
-describe("Engage", () => {
+describe("human actions", () => {
 
   it("defers and declines cards without reactivating their parked project", async () => {
     const d=await bootDesk();
@@ -174,69 +169,23 @@ describe("Engage", () => {
     expect(d.kernel.getCell(projectId)).toMatchObject({status:"paused",pauseReason:"parked"});
   });
 
-  it("reassignment and duplicate legacy identifiers keep the same action address within each cell", async () => {
+  it("completes personal actions and routes project replies to their issuing cell", async () => {
     const d = await bootDesk();
-    const id = "pick-up", key = gtdKeys.action(id);
-    const first = writeAction(d.kernel,"desk",{id,title:"收材料",owner:"human"});
-    d.kernel.spawnCell("desk",{id:"runner",preset:"worker"});
-    const other = writeAction(d.kernel,"runner",{id,title:"收材料",owner:"human"});
-    writeAction(d.kernel,"runner",{...other,owner:"agent"});
-    writeAction(d.kernel,"runner",other);
-    const pool = (await d.get<{items:HumanItemDTO[]}>("/api/human-items")).items;
-    const runner = pool.find(i => i.actionRefs.some(ref => ref.cellId === "runner" && ref.actionId === id));
-    expect(runner).toBeDefined();
-    expect(runner!.id).not.toBe(pool.find(i => i.actionRefs.some(ref => ref.cellId === "desk" && ref.actionId === id))?.id);
-    const queue = await d.get<EngageListDTO>("/api/engage");
-    const done = queue.items.find(i=>i.cellId==="runner")!.buttons.find(b=>b.id==="done")!.endpoint!;
-    expect(await d.post(done.path,done.body)).toMatchObject({ok:true});
-    expect(d.kernel.context.readStateSync("runner",key)).toMatchObject({status:"done"});
-    expect(d.kernel.context.readStateSync("desk",key)).toMatchObject({id:first.id,status:"open"});
-  });
-
-  it("quick check-off of a human action finishes it synchronously and closes the cell that existed only for it", async () => {
-    const d = await bootDesk();
-    const quick = writeAction(d.kernel, "desk", { title: "给牙医回电话", owner: "human", effort: "15m", nextStep: "打 010-1234" });
-    d.kernel.spawnCell("desk", { id: "follow-up", preset: "watcher", lifetime: "persistent", title: "盯牙医回电" });
-    const tracked = writeAction(d.kernel, "follow-up", { title: "签收快递", owner: "human", effort: "low_energy" });
-
-    const list = await d.get<EngageListDTO>("/api/engage");
-    expect(list.counts).toMatchObject({ all: 2, "15m": 1, low_energy: 1 });
-    expect((await d.get<EngageListDTO>("/api/engage?effort=15m")).items.map((i) => i.actionId)).toEqual([quick.id]);
-    const item = list.items.find((i) => i.actionId === quick.id)!;
-    expect(item).toMatchObject({ kind: "quick", effortLabel: "15m 碎片时间", nextStep: "打 010-1234" });
-    const done = item.buttons.find((b) => b.id === "done")!;
-    expect(done).toMatchObject({ primary: true, endpoint: { method: "POST", path: `/api/engage/desk/${quick.id}/done` } });
-
-    const r = await d.post<EngageMutationResponse>(done.endpoint!.path,done.endpoint!.body);
-    expect(r).toMatchObject({ outcome: "done", message: "已办完" });
-    expect(d.kernel.context.readStateSync<ActionRecord>("desk", gtdKeys.action(quick.id))).toMatchObject({ status: "done", completedAt: d.clock.now() });
-
-    const r2 = await d.post<EngageMutationResponse>(`/api/engage/follow-up/${tracked.id}/done`,{seenItemRevision:1});
-    expect(r2).toMatchObject({ outcome: "done", closedTasks: 0, view: { items: [] } });
-    expect(d.kernel.getCell("follow-up")!.status).toBe("active");
-    expect(d.kernel.getCell("desk")!.status).toBe("active");
-  });
-
-  it("the deep item shows the draft with decisions, parked additions and the context pack", async () => {
-    const d = await bootDesk();
-    const saved = d.kernel.context.commitSync("desk", {
-      artifact: {
-        artifactId: "art_plan",
-        content: { format: "markdown", body: "# 迁移方案\n\n> [!DECISION] 第 2.3 节：两个迁移方案二选一\n> A：停机迁移\n> B：双写迁移\n\n其余照旧" },
-        updatedBy: "agent",
-      },
-    });
-    expect(saved.ok).toBe(true);
-    const a = writeAction(d.kernel, "desk", { title: "定迁移方案", owner: "human", effort: "45m", artifactId: "art_plan", references: [{ label: "旧方案", uri: "res://desk/x" }] });
-    // the owner saves v2; a late agent update loses and is parked beside it
-    await d.req("PUT", "/api/artifacts/art_plan", { expectedVersion: 1, body: "# 迁移方案\n\n选 B" });
-    expect(agentRedraft(d.kernel, "art_plan", "# 迁移方案\n\n补充：供应商要求周末停机")).toMatchObject({ ok: false, parked: expect.anything() });
-
-    const detail = await d.get<EngageDetailDTO>(`/api/engage/desk/${a.id}`);
-    expect(detail.artifact).toMatchObject({ version: 2, updatedBy: "human", parked: [{ basedOnVersion: 0, body: "# 迁移方案\n\n补充：供应商要求周末停机" }] });
-    expect(detail.contextPack.references).toEqual([{ label: "旧方案", uri: "res://desk/x" }]);
-    const v1 = await d.get<{ decisions: unknown[] }>("/api/artifacts/art_plan");
-    expect(v1.decisions).toEqual([]);
+    const cellId = makeProject(d.kernel, "复核交付");
+    const personal = d.kernel.humanItems.create({ title: "给牙医回电话", subjectKey: "dentist", category: "action", effort: "15m",
+      options: [{ id: "done", label: "已办完", effect: "complete" }] }, null);
+    const tracked = d.kernel.humanItems.create({ title: "签收快递", subjectKey: "delivery", category: "action", relatedProjectIds: [cellId],
+      options: [{ id: "done", label: "已签收", effect: "reply" }] }, cellId);
+    const {items} = await d.get<{items: HumanItemDTO[]}>("/api/human-items");
+    expect(items.find(i => i.id === personal.id)).toMatchObject({effort: "15m", cellId: null});
+    expect(items.find(i => i.id === tracked.id)).toMatchObject({project: {id: cellId}});
+    for (const item of items) {
+      const reply = await d.post(`/api/human-items/${item.id}/decide`, { optionId: "done", seenItemRevision: item.itemRevision });
+      expect(reply).toMatchObject({status: "resolved"});
+    }
+    expect(d.kernel.inbox.listMessagesSync({type: PAYLOAD.approvalResolved}).map(m => m.cellId)).toEqual([cellId]);
+    expect((await d.get<{items: HumanItemDTO[]}>("/api/human-items")).items).toEqual([]);
+    expect(d.kernel.getCell(cellId)?.status).toBe("active");
   });
 
   it("artifact save with a stale expectedVersion returns the conflict with the current version and parked additions", async () => {
@@ -298,13 +247,13 @@ describe("Radar", () => {
     row = r.view.projects.find((x) => x.id === p)!;
     expect(row).toMatchObject({ stalled: false, ball: { owner: "human", text: "约设计师周三开会" } });
     expect(r.status.radar.stalledProjects).toBe(0);
-    expect((await d.get<EngageListDTO>("/api/engage")).items.map((i) => i.title)).toEqual(["约设计师周三开会"]);
+    expect((await d.get<{items: HumanItemDTO[]}>("/api/human-items")).items.map((i) => i.title)).toEqual(["约设计师周三开会"]);
   });
 
   it("a waiting watch keeps a project from being stalled; someday pauses it and activate resumes it", async () => {
     const d = await bootDesk();
     const p = makeProject(d.kernel, "供应商比价");
-    d.kernel.spawnCell(p, { id: "watch-c", preset: "watcher", title: "等 C 报价", watches: [{ threadOrFilter: { thread: "memory:quote-c" } }] });
+    d.kernel.spawnCell(p, { id: "watch-c", preset: "checker", title: "等 C 报价", watches: [{ threadOrFilter: { thread: "memory:quote-c" } }] });
     let row = (await d.get<RadarDTO>("/api/radar")).projects.find((x) => x.id === p)!;
     expect(row).toMatchObject({ stalled: false, waitingOn: 1, ball: { owner: "waiting" } });
 
@@ -320,7 +269,7 @@ describe("Radar", () => {
   });
 });
 
-describe("activity: move back to Clarify", () => {
+describe("activity restore", () => {
   it("re-delivers a silently archived notification to the desk as a handback that asks for a card", async () => {
     const d = await bootDesk();
     const env = inboundEnvelope(d.kernel, "【通知】周五全员会改到下午 4 点", "hr");

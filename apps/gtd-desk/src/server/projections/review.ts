@@ -1,6 +1,5 @@
 import type { WeeklyReviewDTO } from "../../shared/api";
 import {
-  linkedApprovalId,
   projectOfAction,
   readActions,
   readProjects,

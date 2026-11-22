@@ -27,10 +27,10 @@ export async function readProject(ports: RunPorts): Promise<ProjectRecord | null
 }
 
 export async function readActions(ports: RunPorts): Promise<ActionRecord[]> {
-  return (await ports.context.listState(ports.self.cellId, gtdKeys.actionPrefix)).map((e) => e.value as ActionRecord).filter((a) => a && typeof a === "object");
+  return ports.actionBooks!.list();
 }
 
-const WAITING_PRESETS = new Set(["checker", "watcher", "sensor"]);
+const WAITING_PRESETS = new Set(["checker", "sensor"]);
 
 export function waitingFor(description: string, parties: WaitingSet["parties"] = [], extra: Partial<WaitingSet> = {}): WaitingSet {
   return { description, parties, join: "all", ...extra };
@@ -69,7 +69,6 @@ function seed(batch: readonly Envelope[], self: string, clock: Clock): { project
       title: s.title,
       ...(s.outcome ? { outcome: s.outcome } : {}),
       ...(s.source ? { source: s.source } : {}),
-      ...(s.cwd ? { cwd: s.cwd } : {}),
       ...(s.proposal ? { proposal: s.proposal } : {}),
     },
     now,
@@ -101,7 +100,8 @@ export async function prepareProjectRun({ snapshot, ports, clock }: PrepareRunIn
   const actions = new Map((await readActions(ports)).map((a) => [a.id, a]));
   const set = (a: ActionRecord) => {
     actions.set(a.id, a);
-    patches[gtdKeys.action(a.id)] = a;
+    if (a.owner === "human") ports.actionBooks!.write(a);
+    else patches[gtdKeys.action(a.id)] = a;
   };
 
   // The task message carries the seed. The record may already be there (a project parked straight from a proposal has

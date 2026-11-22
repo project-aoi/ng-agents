@@ -9,7 +9,7 @@ import type {
 } from "@ng/protocol";
 import type { RawInput } from "./records";
 
-// Builders for the three Clarify card types (docs/04 §2.2). A card is the `card` Deliverable of a deferred action;
+// Builders for project proposals and escalations. A card is the `card` Deliverable of a deferred action;
 // its `data` is the ClarifyCard the UI renders block by block.
 
 export interface CardBase {

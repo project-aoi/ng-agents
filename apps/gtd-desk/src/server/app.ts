@@ -7,10 +7,9 @@ import type { ModelSwitch } from "./models";
 import { Hono, type Context } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { streamSSE } from "hono/streaming";
-import type { ActivityKind, ApiError, DeskEvent, Effort } from "../shared/api";
+import type { ActivityKind, ApiError, DeskEvent } from "../shared/api";
 import { DeskError, type Desk } from "./desk";
 import type { EventHub } from "./events";
-import { isEffort } from "./projections/engage";
 import { mountAgentApi, type AgentControlPlane } from "../agent/routes";
 import { agentAuthFor, bearerOf, crossSiteReason, hostnameOf, tokenMatches, type SecurityPolicy } from "./security";
 
@@ -148,34 +147,10 @@ export function createDeskApp(deps: DeskAppDeps): Hono {
   app.post("/api/human-activity/:id/undo", async c => c.json(await desk.undoHumanDecision(c.req.param("id"),ownerActor)));
   app.post("/api/projects/:id/reopen", async c => c.json(await desk.reopenProject(c.req.param("id"),ownerActor)));
 
-  // ---------- 📥 Clarify ----------
-  app.get("/api/clarify", (c) => c.json(desk.clarify()));
-  app.get("/api/clarify/:cardId", (c) => {
-    const card = desk.clarifyCard(c.req.param("cardId"));
-    if (!card) throw new DeskError(404, "not_found", "这张卡不在待确认里");
-    return c.json(card);
+  app.put("/api/human-items/:id/plan", async (c) => {
+    const result = await desk.savePlan(c.req.param("id"), await body(c), ownerActor);
+    return c.json(result, result.ok ? 200 : 409);
   });
-  app.post("/api/clarify/:cardId/approve", async (c) => c.json(await desk.approve(c.req.param("cardId"), await body(c), ownerActor)));
-  app.post("/api/clarify/:cardId/revise", async (c) => c.json(await desk.revise(c.req.param("cardId"), await body(c), ownerActor)));
-  app.post("/api/clarify/:cardId/snooze", async (c) => c.json(await desk.snooze(c.req.param("cardId"), await body(c), ownerActor)));
-  app.post("/api/clarify/:cardId/someday", async (c) => c.json(await desk.someday(c.req.param("cardId"), await body(c), ownerActor)));
-  app.put("/api/clarify/:cardId/plan", async (c) => {
-    const r = await desk.savePlan(c.req.param("cardId"), await body(c),ownerActor);
-    return c.json(r, r.outcome === "conflict" ? 409 : 200);
-  });
-  app.post("/api/clarify/:cardId/extend", async (c) => c.json(await desk.extend(c.req.param("cardId"), await body(c), ownerActor)));
-  app.post("/api/clarify/:cardId/resolve-offline", async (c) => c.json(await desk.resolveOffline(c.req.param("cardId"), await body(c), ownerActor)));
-  app.post("/api/clarify/:cardId/dismiss", async (c) => c.json(await desk.dismiss(c.req.param("cardId"), await body(c), ownerActor)));
-  app.post("/api/clarify/:cardId/deny", async (c) => c.json(await desk.deny(c.req.param("cardId"), await body(c), ownerActor)));
-
-  // ---------- 🎯 Engage ----------
-  app.get("/api/engage", (c) => {
-    const effort = c.req.query("effort");
-    if (effort !== undefined && effort !== "all" && !isEffort(effort)) throw new DeskError(400, "invalid_argument", "effort 只能是 15m / 45m / low_energy");
-    return c.json(desk.engage((effort as Effort | "all" | undefined) ?? "all"));
-  });
-  app.get("/api/engage/:cellId/:actionId", (c) => c.json(desk.engageDetail(c.req.param("cellId"), c.req.param("actionId"))));
-  app.post("/api/engage/:cellId/:actionId/done", async (c) => c.json(await desk.done(c.req.param("cellId"), c.req.param("actionId"), await body(c), ownerActor)));
 
   // ---------- drafts ----------
   app.get("/api/artifacts/:artifactId", (c) => c.json(desk.artifact(c.req.param("artifactId"))));

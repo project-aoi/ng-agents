@@ -254,10 +254,6 @@ export function createGate(opts: GateOptions): GateService {
       return child;
     },
 
-    async authorize(action, meta) {
-      return gate.authorizeSync(action, meta);
-    },
-
     authorizeSync(action, meta) {
       const deny = (feedback: string): AuthorizeResult => ({ type: "deny", feedback });
       const shape = actionShapeFeedback(action);
@@ -304,10 +300,6 @@ export function createGate(opts: GateOptions): GateService {
         return { type: "allow" };
       });
     },
-    async approve(actionId, approverId, seenArtifactVersion, approveOpts) {
-      return gate.approveSync(actionId, approverId, seenArtifactVersion, approveOpts);
-    },
-
     approveSync(actionId, approverId, seenArtifactVersion, approveOpts = {}): ApproveResult {
       const decider = assertOwnerOrAgent(approverId, "approving a card");
       return withTx(db, (): ApproveResult => {
@@ -369,10 +361,6 @@ export function createGate(opts: GateOptions): GateService {
         emitApproval(row, "approved");
         return "approved";
       });
-    },
-
-    async revoke(cellId) {
-      gate.revokeSync(cellId);
     },
 
     revokeSync(cellId) {
@@ -516,14 +504,6 @@ export function createGate(opts: GateOptions): GateService {
       });
     },
 
-    cancelForCellSync(cellId, reason) {
-      return withTx(db, () => {
-        const rows = all<ApprovalRow>(db, `${approvalSelect} WHERE disposition='pending' AND cell_id = ?`, [cellId]);
-        for (const row of rows) resolveRow(row, "cancelled", reason);
-        return rows.length;
-      });
-    },
-
     recordOutcomeSync(actionId, status, outcome) {
       withTx(db, () => {
         const row = approvalRow(actionId);
@@ -540,24 +520,6 @@ export function createGate(opts: GateOptions): GateService {
       });
     },
 
-    rebindSync(actionId, version) {
-      return withTx(db, () => {
-        const row = approvalRow(actionId);
-        if (!row || row.status !== "pending") return "not_pending";
-        if (row.artifact_id === null) throw new NgError("invalid_argument", `approval "${actionId}" is not bound to a draft`);
-        const current = artifacts.currentVersion(row.artifact_id);
-        if (current === undefined || !Number.isInteger(version) || version < 1 || version > current) {
-          throw new NgError("invalid_argument", `draft "${row.artifact_id}" has no version ${String(version)}`);
-        }
-        run(db, "UPDATE human_items SET bound_version = ?, item_revision = item_revision + 1, updated_at = ? WHERE action_id = ?", [
-          version,
-          clock.now(),
-          actionId,
-        ]);
-        emitApproval(row, "pending");
-        return "rebound";
-      });
-    },
     authorizeControlSync(cellId, principalId, action) {
       if (!CONTROL_ACTIONS.includes(action)) return { ok: false, reason: `unknown control action ${JSON.stringify(action)}` };
       const target = cells.get(cellId);

@@ -7,7 +7,7 @@ export const PROMPTS = {
   sensor: "gtd.sensor",
   /** docs/05: the persistent project coordinator. */
   project: "gtd.project",
-  /** docs/05: the `watcher` preset's default — a light one-shot checker of one outside condition. */
+  /** docs/05: the `checker` preset's default — a light one-shot checker of one outside condition. */
   checker: "gtd.checker",
   /** docs/05: the persistent router of one stream of direct messages. */
   hub: "gtd.hub",
@@ -23,21 +23,10 @@ export const TOOLSETS = {
 export const PROCESSORS = {
   /** Sensor that runs a script through its workspace (args.script). */
   sensorScript: "gtd.sensor_script",
-  /** A watcher dispatched with a check command (probe.ts): runs it on a timer, zero tokens until it reports. */
+  /** A checker dispatched with a check command (probe.ts): runs it on a timer, zero tokens until it reports. */
   checkProbe: "gtd.check_probe",
 } as const;
 
-/**
- * Names that cells created before docs/05 may still carry in their stored specs. They stay registered (as stand-ins
- * that wind such a cell down) so an old database never fails to load; nothing new is created with them.
- */
-export const LEGACY = {
-  /** The zero-token item root that ran every project before docs/05. */
-  joinAll: "gtd.join_all",
-  joinAny: "gtd.join_any",
-  /** The redraft helper of the old item root (prompt and toolset share the name). */
-  editor: "gtd.editor",
-} as const;
 
 /** `spec.meta.role` of every cell the presets create (handy for routing a scripted model by role). */
 export const ROLES = {
@@ -45,7 +34,7 @@ export const ROLES = {
   project: "project",
   hub: "hub",
   worker: "worker",
-  /** The one-shot checker (preset `watcher`'s default). */
+  /** The one-shot checker (preset `checker`'s default). */
   checker: "checker",
   sensor: "sensor",
 } as const;
@@ -54,7 +43,7 @@ export const STD = STANDARD_TOOLSETS;
 
 /** Internal (non-GTD) state keys. GTD records use `gtdKeys` from @ng/protocol. */
 export const KEYS = {
-  /** In a watcher with a check command: ProbeState. */
+  /** In a checker with a check command: ProbeState. */
   probe: "probe:state",
   /** Weekly-review suggestions the app lists (shapes owned by apps/gtd-desk). */
   skillSuggestion: (slug: string) => `desk:suggestion:skill:${slug}`,
@@ -62,7 +51,7 @@ export const KEYS = {
 } as const;
 
 /**
- * `handback.reason` of an item the owner moved back from the archive to Clarify ("移回待确认"). Same text the app
+ * `handback.reason` of an item the owner restored from the archive ("移回待确认"). Same text the app
  * sends (apps/gtd-desk/src/server/desk.ts RESTORE_REASON); such an item must get a card, never be archived again.
  */
 export const RESTORE_REASON = "主人把这条从归档记录里移回了待确认：请为它准备一张待确认卡片，不要再静默归档。";

@@ -1,14 +1,10 @@
-// docs/05 §3.1 — the project lifecycle as Radar drives it: a project is one persistent cell; parking it is a pause,
-// bringing it back resumes the same cell with its records, reports and history; closing never touches a directory;
-// a parked item from before docs/05 (its cell closed) is migrated, never rebuilt from a deleted record.
-
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { LEGACY, startProjectSync } from "@ng/presets";
-import { gtdKeys, type ActionRecord, type ProjectRecord } from "@ng/protocol";
+import { startProjectSync } from "@ng/presets";
+import { gtdKeys, type ProjectRecord } from "@ng/protocol";
 import type { ProjectMutationResponse, RadarDTO, SourcesDTO } from "../src/shared/api";
-import { bootRealDesk, cellMessages, cleanupAll, requestsOf, tempDir, tool, writeAction, type TestDesk } from "./helpers";
+import { bootRealDesk, cellMessages, cleanupAll, requestsOf, tempDir, tool, type TestDesk } from "./helpers";
 
 afterEach(cleanupAll);
 
@@ -35,15 +31,15 @@ describe("someday and back", () => {
     expect(s).toMatchObject({ ok: true, outcome: "someday" });
     expect(s.view.someday.map((p) => p.id)).toEqual([projectId]);
     expect(d.kernel.getCell(projectId)!.status).toBe("paused");
-    expect(record(d, projectId).lifecycle).toBe("someday");
+    expect(d.kernel.getCell(projectId)?.pauseReason).toBe("parked");
     // its open action stays on its books (parked, not cancelled)
-    expect(d.kernel.context.listStateSync(projectId, gtdKeys.actionPrefix).map((e) => (e.value as ActionRecord).status)).toEqual(["open"]);
+    expect(d.kernel.humanItems.list().filter(item => item.cellId === projectId)).toMatchObject([{title: "看一眼报告", status: "pending"}]);
     expect(d.kernel.context.getArtifactSync("art_minimal")).not.toBeNull();
 
     d.script.add("project", tool("update_project", { summary: "按报告开始做第一阶段" }));
     const a = await d.post<ProjectMutationResponse>(`/api/projects/${projectId}/activate`);
     expect(a).toMatchObject({ ok: true, outcome: "activated" });
-    expect(a.projectId).toBeUndefined();
+
     expect(a.view.projects.map((p) => p.id)).toEqual([projectId]);
     expect(d.kernel.getCell(projectId)).toMatchObject({ status: "active", epoch });
     expect(d.kernel.listCells({ parentId: "desk" }).filter((c) => c.spec.meta?.["role"] === "project").map((c) => c.id)).toEqual([projectId]);
@@ -57,58 +53,6 @@ describe("someday and back", () => {
     expect(d.kernel.context.getArtifactSync("art_minimal")).toMatchObject({ version: 1, content: { body: "## 结论\n先做极简档" } });
   });
 
-  it("a parked item from before docs/05 (its cell closed) is migrated: a new project gets its plan and names its reports; the old record ends, it is not deleted", async () => {
-    const d = await bootRealDesk();
-    // Pre-docs/05 data: a closed holder cell with a report and a someday record (written after the close, as the old
-    // app did — today's kernel would settle a record it finds on close).
-    d.kernel.spawnCell("desk", { id: "proj_legacy", preset: "worker", title: "报表导出性能优化", meta: { projectCellId: "proj_legacy" } });
-    d.kernel.context.commitSync("proj_legacy", { artifact: { artifactId: "art_legacy", content: { format: "markdown", title: "慢查询分析", body: "瓶颈在一次性加载全部明细" }, updatedBy: "agent" } });
-    await d.kernel.closeCell("proj_legacy", "cancelled");
-    const t = d.clock.now();
-    const proposal = { title: "报表导出性能优化", outcome: "1 万行导出 10 秒内完成", actions: [{ title: "分析导出慢查询", owner: "agent" as const }, { title: "和王敏确认上限", owner: "human" as const }] };
-    d.kernel.context.commitSync("proj_legacy", { statePatches: { [gtdKeys.project]: { title: proposal.title, outcome: proposal.outcome, lifecycle: "someday", proposal, createdAt: t, updatedAt: t } satisfies ProjectRecord } });
-    let radar = await d.get<RadarDTO>("/api/radar");
-    expect(radar.someday.map((p) => p.id)).toEqual(["proj_legacy"]);
-
-    const a = await d.post<ProjectMutationResponse>("/api/projects/proj_legacy/activate");
-    expect(a).toMatchObject({ ok: true, outcome: "migrated", projectId: expect.stringMatching(/^proj_/) });
-    const next = a.projectId!;
-    expect(next).not.toBe("proj_legacy");
-    expect(d.kernel.getCell(next)).toMatchObject({ preset: "project", status: "active", parentId: "desk" });
-    // the old record says where it went; it is still there
-    expect(record(d, "proj_legacy")).toMatchObject({ lifecycle: "cancelled", migratedTo: next, proposal: { title: "报表导出性能优化" } });
-    radar = a.view;
-    expect(radar.someday).toEqual([]);
-    await d.kernel.idle();
-    expect(record(d, next)).toMatchObject({ lifecycle: "active", title: "报表导出性能优化", outcome: "1 万行导出 10 秒内完成", proposal: { actions: [{}, {}] } });
-    // its brief names the old plan and the report by id, to be read instead of redone
-    const brief = requestsOf(d.script, next)[0]!;
-    expect(brief).toContain("art_legacy");
-    expect(brief).toContain("慢查询分析");
-    expect(brief).toContain("和王敏确认上限");
-    expect((await d.get<RadarDTO>("/api/radar")).projects.map((p) => p.id)).toEqual([next]);
-  });
-});
-
-describe("someday from before docs/05: the old item root", () => {
-  it("a parked item root of the old zero-token coordinator is not resumed (it would only wind itself down): it is closed and migrated with its workers' reports", async () => {
-    const d = await bootRealDesk();
-    d.kernel.spawnCell("desk", { id: "proj_old", title: "竞品权限模型", processor: { kind: "code", entry: LEGACY.joinAll }, meta: { projectCellId: "proj_old" } });
-    d.kernel.spawnCell("proj_old", { id: "slot_a", preset: "worker", title: "账无忧" });
-    d.kernel.context.commitSync("slot_a", { artifact: { artifactId: "art_slot_a", content: { format: "markdown", title: "账无忧的权限模型", body: "角色 + 数据范围" }, updatedBy: "agent" } });
-    d.kernel.control("proj_old", { action: "pause" });
-    const t = d.clock.now();
-    d.kernel.context.commitSync("proj_old", { statePatches: { [gtdKeys.project]: { title: "竞品权限模型", outcome: "对比 6 家", lifecycle: "someday", createdAt: t, updatedAt: t } satisfies ProjectRecord } });
-    const a = await d.post<ProjectMutationResponse>("/api/projects/proj_old/activate");
-    expect(a).toMatchObject({ ok: true, outcome: "migrated" });
-    await d.kernel.idle();
-    expect(d.kernel.getCell("proj_old")!.status).toBe("closed");
-    expect(record(d, "proj_old")).toMatchObject({ lifecycle: "cancelled", migratedTo: a.projectId });
-    expect(d.kernel.context.getArtifactSync("art_slot_a")).not.toBeNull();
-    expect(requestsOf(d.script, a.projectId!)[0]).toContain("art_slot_a");
-    // the old root never ran: nobody was woken just to wind it down
-    expect(d.script.requests.filter((r) => r.cellId === "proj_old")).toEqual([]);
-  });
 });
 
 describe("closing and the directory", () => {
@@ -121,7 +65,7 @@ describe("closing and the directory", () => {
     d.script.add("worker", tool("wait", { reason: "等 CI" }));
     const { projectId } = startProjectSync(d.kernel, { title: "改 a", outcome: "a = 2", brief: "改 a", cwd: repo });
     await d.kernel.idle();
-    const human = writeAction(d.kernel, projectId, { title: "看改动", owner: "human", nextStep: "看一眼" });
+    const human = d.kernel.humanItems.create({ title: "看改动", subjectKey: "project-review", category: "action", options: [{ id: "done", label: "看过了", effect: "reply" }] }, projectId);
     const worker = d.kernel.listCells({ parentId: projectId })[0]!;
     expect(worker.spec.cwd ?? d.kernel.getCell(projectId)!.spec.cwd).toBe(repo);
 
@@ -130,7 +74,7 @@ describe("closing and the directory", () => {
     await d.kernel.idle();
     expect([projectId, worker.id].map((id) => d.kernel.getCell(id)!.status)).toEqual(["closed", "closed"]);
     expect(record(d, projectId).lifecycle).toBe("cancelled");
-    expect(d.kernel.context.readStateSync<ActionRecord>(projectId, gtdKeys.action(human.id))!.status).toBe("cancelled");
+    expect(d.kernel.humanItems.get(human.id)?.status).toBe("cancelled");
     expect(existsSync(repo)).toBe(true);
     expect(readFileSync(join(repo, "src", "a.ts"), "utf8")).toBe("export const a = 1;\n");
     // a finished project cannot be cancelled again

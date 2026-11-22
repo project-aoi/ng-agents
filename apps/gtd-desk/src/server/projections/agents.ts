@@ -48,7 +48,7 @@ import type {
   TopologyDTO,
   TopologyNodeDTO,
 } from "../../shared/api";
-import { actionKey, approvalProjectId, cardBackedActions, projectOfAction, readActions, readProjects, type DeskKernel, type ProjectionInput } from "./common";
+import { approvalProjectId, projectOfAction, readActions, readProjects, type DeskKernel, type ProjectionInput } from "./common";
 import { button, channelLabelOfAddress, enc, post } from "./format";
 import { whenText } from "./time";
 
@@ -191,10 +191,9 @@ export function agentsView(input: ProjectionInput, focus?: readonly string[]): A
 
   const human = new Map<string, { cellId: string; actionId: string; title: string }>();
   const actions = readActions(kernel);
-  const onCard = cardBackedActions(kernel, actions);
   const projectIds = new Set(projects.keys());
   for (const a of actions) {
-    if (a.record.status !== "open" || a.record.owner !== "human" || onCard.has(actionKey(a))) continue;
+    if (a.record.status !== "open" || a.record.owner !== "human") continue;
     const ref = { cellId: a.cellId, actionId: a.record.id, title: a.record.title };
     for (const id of [a.cellId, a.record.cellId, projectOfAction(kernel, a, projectIds)]) if (id && !human.has(id)) human.set(id, ref);
   }
@@ -216,7 +215,7 @@ function roleOf(v: AgentsView, c: CellRecord): { roleLabel: string; layer: 0 | 1
   if (v.projects.has(c.id) || c.preset === "project") return { roleLabel: "项目协调", layer: 1 };
   if (c.preset === "hub" || role === "hub") return { roleLabel: "领域中枢", layer: 1 };
   if (c.preset === "sensor" || role === "sensor") return { roleLabel: "信源巡检", layer: 0 };
-  if (c.preset === "checker" || c.preset === "watcher" || role === "watcher" || role === "checker") return { roleLabel: "外部盯梢", layer: 2 };
+  if (c.preset === "checker" || role === "checker") return { roleLabel: "外部盯梢", layer: 2 };
   if (isLeafCell(c)) return { roleLabel: "执行分身", layer: 2 };
   return { roleLabel: "分身", layer: 1 };
 }
@@ -420,7 +419,7 @@ export function nodeOf(v: AgentsView, c: CellRecord): TopologyNodeDTO {
     unpulledCount: leaf ? unpulledOf(kernel, c).count : 0,
     hadDirectUserChat: (chat?.total ?? 0) > 0,
     pendingCardId: c.status === "closed" ? null : (card?.id ?? null),
-    engageItem: human ? { cellId: human.cellId, actionId: human.actionId } : null,
+    humanItemId: human?.actionId ?? null,
     archivedChildren: (v.children.get(c.id) ?? []).filter((x) => x.status === "closed").length,
     updatedAt: c.lastRunAt ?? c.updatedAt,
   };

@@ -8,7 +8,7 @@ import { createContextStore } from "@ng/context";
 import { createGate } from "@ng/gate";
 import { createInbox } from "@ng/inbox";
 import {
-  createAgentLoop,
+  createCodeLoop,
   createCliAgentLoop,
   createRoutingLoop,
   reapOrphanedCliProcesses,
@@ -61,7 +61,7 @@ function isSubscribable(clock: Clock): clock is SubscribableClock {
  * cell, a global cap, control that takes effect immediately), ingress routing, approval execution, escalations and
  * the close cascade. Everything is built with defaults from a few options:
  *
- *   const kernel = createKernel({ dataDir, model });
+ *   const kernel = createKernel({ dataDir, agentBackend: "auto" });
  *   registerPresets(kernel.registry);
  *   kernel.ensureRootCell({ id: "desk", preset: "inline", processor: … });
  *   await kernel.start();
@@ -72,12 +72,12 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
   mkdirSync(dataDir, { recursive: true });
   // Resolve the backend before opening the workbench database.
   let agentBackend: AgentEngine | null = null;
-  if (!opts.loop && (opts.agentBackend || !opts.model)) {
+  if (opts.agentBackend || !opts.loop) {
     const setting = opts.agentBackend ?? "auto";
     const bins = Object.fromEntries(Object.entries(opts.cli ?? {}).flatMap(([e, o]) => (o?.bin ? [[e, o.bin]] : [])));
     agentBackend = resolveAgentBackend(setting, { bins });
     if (agentBackend === null) {
-      throw new NgError("invalid_argument", "createKernel needs a model, a ready-made loop, or an installed CLI agent (claude, codex or agy)");
+      throw new NgError("invalid_argument", "createKernel requires an installed CLI agent (claude, codex or agy)");
     }
   }
   const onError =
@@ -170,16 +170,14 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
 
   /** Running CLI agent processes are on record here, so a restart can stop the ones a crashed kernel left behind. */
   const cliProcDir = join(dataDir, "cli-procs");
-  const loop: AgentLoop =
-    opts.loop ??
-    createRoutingLoop({
-      local: createAgentLoop({ ...(opts.model ? { model: opts.model } : {}), registry, clock, ...opts.loopOptions }),
-      defaultEngine: agentBackend,
-      cliLoop: (engine) => {
-        const settings = modelSettingsOf(engine);
-        return createCliAgentLoop({ procDir: cliProcDir, ...opts.cli?.[engine], ...(settings ? { resolveModel: (tier) => settings.resolve(tier) } : {}), engine, registry, clock });
-      },
-    });
+  const loop: AgentLoop = createRoutingLoop({
+    local: opts.loop ?? createCodeLoop(registry, clock),
+    defaultEngine: agentBackend,
+    cliLoop: (engine) => {
+      const settings = modelSettingsOf(engine);
+      return createCliAgentLoop({ procDir: cliProcDir, ...opts.cli?.[engine], ...(settings ? { resolveModel: (tier) => settings.resolve(tier) } : {}), engine, registry, clock });
+    },
+  });
 
   // ---------- background work tracking (for idle()) ----------
   const tasks = new Set<Promise<unknown>>();
@@ -293,7 +291,6 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
   let unsubscribeClock: (() => void) | undefined;
 
   async function startRuntime() {
-    for (const preset of registry.presets.list()) if (preset.stateDomain) context.installStateDomain(preset.stateDomain(db, clock));
     // Refresh already-materialized persistent prefixes in parent order after a new release or an offline skill edit.
     for (const c of cells.list({status:["active","paused"]}).sort((a,b)=>a.depth-b.depth)) context.refreshPrefixSync(c.id);
     // Ask the backend CLI for its models now, so the first Run does not have to wait for the list.
@@ -418,7 +415,6 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
 
     ingest: (raw, channelId) => ingest(core, raw, channelId),
     reopenProject: core.lifecycle.reopenProject,
-    resolveApproval: (actionId, decision) => core.humanItems.resolve(actionId, decision),
     getCell: (cellId) => cells.get(cellId),
     listCells: (filter) => cells.list(filter),
     rosterFor: (cellId) => core.readModel.rosterFor(cellId),

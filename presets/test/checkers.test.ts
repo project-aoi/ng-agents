@@ -1,6 +1,7 @@
+import type { ModelRequest } from "@ng/loop/testing";
 import { afterEach, describe, expect, it } from "vitest";
-import { PAYLOAD, type ModelRequest } from "@ng/protocol";
-import { LEGACY, startProjectSync } from "../src";
+import { PAYLOAD } from "@ng/protocol";
+import { startProjectSync } from "../src";
 import { boot, childrenOf, cleanupAll, continuesRun, requestText, tool } from "./helpers";
 
 afterEach(cleanupAll);
@@ -10,12 +11,12 @@ function lastUserText(req: ModelRequest): string {
   return (last?.content ?? []).map((b) => (b.type === "text" ? b.text : "")).join("\n");
 }
 
-describe("the default watcher: a one-shot checker that watches on its own", () => {
+describe("the default checker: a one-shot checker that watches on its own", () => {
   it("looks, sets its own watch, sleeps; the event wakes it; it reports once and closes", async () => {
     const h = await boot();
     h.script.add(
       "project",
-      tool("dispatch", { preset: "watcher", title: "等 MR !5 合入", instruction: "检查 MR !5 是否合入；MR 的通知在 memory:mr-5 线程。" }),
+      tool("dispatch", { preset: "checker", title: "等 MR !5 合入", instruction: "检查 MR !5 是否合入；MR 的通知在 memory:mr-5 线程。" }),
       {},
     );
     h.script.add(
@@ -82,30 +83,3 @@ describe("a source filtered by a small model", () => {
   });
 });
 
-describe("cells from before docs/05", () => {
-  it("an old item root winds itself down as cancelled with a plain explanation; an old redraft helper does nothing", async () => {
-    const h = await boot();
-    // As an old database has it: an item root stored as a persistent "worker" with the depth it was given then (the
-    // worker preset is a leaf now; stored bounds are not recomputed).
-    h.kernel.spawnCell("desk", { id: "prj_old", preset: "worker", lifetime: "persistent", title: "旧事项", processor: { kind: "code", entry: LEGACY.joinAll }, bounds: { maxDepth: 2 } });
-    // Restore the original persisted bounds, as in an installation upgraded from the earlier schema.
-    h.kernel.db.prepare("UPDATE cells SET bounds=json_set(bounds,'$.maxDepth',2) WHERE id='prj_old'").run();
-    h.kernel.spawnCell("prj_old", { id: "prj_old-edit1", preset: "inline", title: "按意见改稿", processor: { kind: "llm", prompt: LEGACY.editor, toolsets: [LEGACY.editor, "kernel.context"] }, meta: { role: "editor" } });
-    h.script.add("editor", (req) => {
-      expect(req.tools.map((t) => t.name)).not.toContain("submit_draft");
-      return {};
-    });
-    h.script.add("desk", (req) => {
-      expect(requestText(req)).toContain("这个事项是旧版本创建的，已无法继续；请重新发起。");
-      return tool("wait", { reason: "ok" });
-    });
-    h.kernel.sendToCell("prj_old-edit1", { text: "改一下" });
-    h.kernel.sendToCell("prj_old", { text: "继续" });
-    await h.kernel.idle();
-    expect(h.kernel.getCell("prj_old")).toMatchObject({ status: "closed", closeReason: "cancelled" });
-    expect(h.kernel.getCell("prj_old-edit1")?.status).toBe("closed");
-    expect(h.kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.cellResult }).map((m) => m.envelope.payload)).toEqual([
-      expect.objectContaining({ childCellId: "prj_old", status: "cancelled", summary: "这个事项是旧版本创建的，已无法继续；请重新发起。" }),
-    ]);
-  });
-});

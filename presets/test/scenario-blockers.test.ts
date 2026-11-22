@@ -1,5 +1,6 @@
+import type { ModelRequest } from "@ng/loop/testing";
 import { afterEach, describe, expect, it } from "vitest";
-import { PAYLOAD, type ModelRequest } from "@ng/protocol";
+import { PAYLOAD } from "@ng/protocol";
 import { startProjectSync } from "../src";
 import { boot, childrenOf, cleanupAll, continuesRun, gitRepo, lastToolResult, requestText, systemOf, tool, type Harness } from "./helpers";
 

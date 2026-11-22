@@ -12,8 +12,8 @@ import { toFailure, useNavigate, useNow, useResource, useToast, useViewKeys } fr
 
 const pool = () => request<{ items: Item[] }>("GET", "/api/human-items");
 
-export function HumanInbox({ cardId, actionRef }: { cardId?: string | undefined; actionRef?: Item["actionRefs"][number] | undefined }) {
-  const res = useResource("human-inbox", pool, ["clarify", "engage", "radar", "status"]);
+export function HumanInbox({ cardId }: { cardId?: string | undefined }) {
+  const res = useResource("human-inbox", pool, ["inbox", "radar", "status"]);
   const navigate = useNavigate();
   const [filter, setFilter] = useState("all");
   const [editing, setEditing] = useState<string | null>(null);
@@ -21,14 +21,13 @@ export function HumanInbox({ cardId, actionRef }: { cardId?: string | undefined;
     .filter((i) => filter === "all" || i.category === filter)
     .sort((a, b) => b.category.localeCompare(a.category) || (a.dueAt ?? Infinity) - (b.dueAt ?? Infinity));
   const [editingChoice, setEditingChoice] = useState<Item | null>(null);
-  const linked = actionRef && items.find(i => i.actionRefs.some(ref => ref.cellId === actionRef.cellId && ref.actionId === actionRef.actionId));
-  const item = editingChoice ?? linked ?? items.find(i => i.id === (cardId ?? actionRef?.actionId)) ?? items[0];
-  useEffect(() => setEditingChoice(null), [cardId, actionRef?.cellId, actionRef?.actionId]);
+  const item = editingChoice ?? items.find(i => i.id === cardId) ?? items[0];
+  useEffect(() => setEditingChoice(null), [cardId]);
   const focused = !!item && editing === item.id;
   const choose = (id: string) => {
     setEditing(null);
     setEditingChoice(null);
-    navigate({ view: "clarify", cardId: id });
+    navigate({ view: "inbox", cardId: id });
   };
   useViewKeys((e) => {
     if (e.key === "Escape" && focused) {
@@ -338,8 +337,7 @@ function Detail({
                 <PlanEditor
                   item={item}
                   onClose={toggle}
-                  onSaved={(r) => {
-                    if (r.card?.draft) draft?.accept(r.card.draft);
+                  onSaved={() => {
                     pin(null);
                     toggle();
                     refresh();

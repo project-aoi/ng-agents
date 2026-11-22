@@ -64,7 +64,6 @@ describe("docs/05 scenario 1 — part of the work waits for the owner; the repor
 
     // The owner gets the code and ticks the action off in the app: the app writes the record and tells the project.
     mkdirSync(doubao, { recursive: true });
-    const t = h.clock.now();
     h.script.add(
       "project",
       (req) => {
@@ -90,8 +89,8 @@ describe("docs/05 scenario 1 — part of the work waits for the owner; the repor
         return tool("report_to_parent", { kind: "result", text: `Doubao work 部分已补进报告 ${report} v2。`, artifactId: report });
       },
     );
-    h.kernel.context.commitSync(project!, { statePatches: { [gtdKeys.action(human.id)]: { ...human, status: "done", completedAt: t, updatedAt: t } satisfies ActionRecord } });
-    expect(notifyProjectOfOwnerChangeSync(h.kernel, project!, `主人已勾掉「${human.title}」：Doubao work 的代码已就绪，在 ${doubao}`)).toMatchObject({ status: "delivered" });
+    const item = h.kernel.humanItems.get(human.id)!;
+    await h.kernel.humanItems.decide(item.id, { optionId: "done", seenItemRevision: item.itemRevision, note: `Doubao work 的代码已就绪，在 ${doubao}` }, "owner");
     await h.kernel.idle();
 
     expect(h.kernel.listWaits([project!])).toEqual([]); // the owner answered

@@ -10,11 +10,7 @@ import type {
   CaptureRequest,
   CaptureResponse,
   CellTimelineDTO,
-  ClarifyQueueDTO,
   CreateSourceRequest,
-  Effort,
-  EngageDetailDTO,
-  EngageListDTO,
   HttpMethod,
   ModelsDTO,
   RadarDTO,
@@ -148,10 +144,7 @@ export const api = {
   models: (refresh = false) => request<ModelsDTO>("GET", refresh ? "/api/models?refresh=1" : "/api/models"),
   setModel: (req: SetModelRequest) => request<ModelsDTO>("PUT", "/api/models", req),
 
-  clarify: () => request<ClarifyQueueDTO>("GET", "/api/clarify"),
 
-  engage: (effort: Effort | "all") => request<EngageListDTO>("GET", effort === "all" ? "/api/engage" : `/api/engage?effort=${enc(effort)}`),
-  engageDetail: (cellId: string, actionId: string) => request<EngageDetailDTO>("GET", `/api/engage/${enc(cellId)}/${enc(actionId)}`),
 
   artifact: (artifactId: string) => request<ArtifactDTO>("GET", `/api/artifacts/${enc(artifactId)}`),
   saveArtifact: (save: ArtifactDTO["save"], req: ArtifactSaveRequest) => request<ArtifactSaveResponse>(save.method, save.path, req),

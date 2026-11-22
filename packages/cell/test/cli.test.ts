@@ -110,13 +110,13 @@ describe("kernel with CLI engines", () => {
     expect(claude.prompts()[2]).not.toContain("unique-parent-start");
   });
 
-  it("needs a model, a loop or an installed CLI; a CLI default backend makes the model optional", async () => {
+  it("requires an installed default CLI and runs unbound LLM cells with it", async () => {
     const fakes = tempDir("fake-cli");
     const agy = installFakeCli(fakes, "agy", [{ actions: [{ mcp: "set_state", args: { patches: { via: "agy" } } }] }]);
     const missing = `${fakes}/not-installed`;
     expect(() => createKernel({ agentBackend: "auto", cli: { claude: { bin: missing }, codex: { bin: missing }, agy: { bin: missing } } })).toThrow(/installed CLI agent/);
 
-    const h = await boot({ kernel: { model: undefined, agentBackend: "auto", cli: { claude: { bin: missing }, codex: { bin: missing }, agy: cliOpts(agy) } } });
+    const h = await boot({ kernel: { loop: undefined, agentBackend: "auto", cli: { claude: { bin: missing }, codex: { bin: missing }, agy: cliOpts(agy) } } });
     expect(h.kernel.agentBackend).toBe("agy");
     h.kernel.createRootCell({ id: "plain", processor: { kind: "llm", toolsets: [TOOLSETS.context] } });
     message(h, "plain", "hi");

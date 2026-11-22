@@ -27,7 +27,7 @@ import type { ProjectRowDTO, SendCellMessageRequest, TimelineItemDTO } from "../
 import type { Delivery } from "../server/agents";
 import { DeskError, type Desk, type DeskActor, type ProjectOp } from "../server/desk";
 import { isLeafCell, unpulledOf } from "../server/projections/agents";
-import { inputOf, linkedApprovalId, projectOfAction, readActions, readProjects, type DeskSettings, type Located } from "../server/projections/common";
+import { inputOf, projectOfAction, readActions, readProjects, type DeskSettings, type Located } from "../server/projections/common";
 import { AGENT_TOOLS, type AgentToolDoc } from "./guide";
 import type { AgentControlPlane, AgentToolResult } from "./routes";
 
@@ -164,8 +164,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
   // ---------- shared readers ----------
 
   function projectRecordOf(id: string): ProjectRecord | null {
-    const v = context.readStateSync<ProjectRecord>(id, gtdKeys.project);
-    return v && typeof v === "object" && typeof v.title === "string" ? v : null;
+    return readProjects(kernel).find(p => p.cellId === id)?.record ?? null;
   }
 
   const noProject = (id: string) =>
@@ -186,10 +185,6 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
   function projectActionsOf(projectId: string): Array<Located<ActionRecord>> {
     const projectCells = new Set(readProjects(kernel).map((p) => p.cellId));
     return readActions(kernel).filter((a) => projectOfAction(kernel, a, projectCells) === projectId);
-  }
-
-  function ownerOnlyOf(rec: ApprovalRecord): string | null {
-    return ownerOnlyApproval(rec.action);
   }
 
   function cardLine(item: ReturnType<typeof desk.listHumanItems>[number]) {
@@ -331,12 +326,12 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
 
   const handlers: Record<string, Handler> = {
     workbench_overview(args) {
-      const clarify = cardQueue();
+      const queue = cardQueue();
       const radar = desk.radar();
-      const human = clarify.items.filter(i=>i.category === "action").map(i=>({
+      const human = queue.items.filter(i=>i.category === "action").map(i=>({
         line:cardLine(i).line, data:{...i, nextStep:i.description, projectId:i.project?.id ?? null, overdue:i.dueAt != null && i.dueAt<now()}
       }));
-      const cards = clarify.cards.map(cardLine);
+      const cards = queue.cards.map(cardLine);
       const running = runningLines();
       const ws = workspaceLines();
       const parts = [
@@ -361,7 +356,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         );
         finished = recent.map((p) => ({ id: p.cellId, title: p.record.title, lifecycle: p.record.lifecycle, at: p.record.completedAt ?? p.record.updatedAt, summary: p.record.summary ?? null }));
       }
-      if (clarify.snoozed > 0) parts.push(`另有 ${clarify.snoozed} 张卡被推迟，到点会回到待确认。`);
+      if (queue.snoozed > 0) parts.push(`另有 ${queue.snoozed} 张卡被推迟，到点会回到待确认。`);
       return ok(`工作台概览（${isoMin(now())}）\n\n${parts.join("\n\n")}`, {
         generatedAt: now(),
         humanActions: human.map((h) => h.data),
@@ -370,7 +365,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         parked: radar.someday.map(projectData),
         running: running.data,
         workspaces: ws.data,
-        snoozedCards: clarify.snoozed,
+        snoozedCards: queue.snoozed,
         ...(finished ? { finished } : {}),
       });
     },
@@ -539,7 +534,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         `状态：${state}${row?.stalled || record.stalledSince ? `；⚠ 停滞（自 ${isoMin(record.stalledSince)}）` : ""}`,
         `目标：${record.outcome ?? "—"}`,
         `摘要：${record.summary ?? "—"}`,
-        `目录：${record.cwd ?? cell?.spec.cwd ?? "—"}`,
+        `目录：${cell?.spec.cwd ?? "—"}`,
         `来源：${record.source?.label ?? "—"}；创建 ${isoMin(record.createdAt)}；更新 ${isoMin(record.updatedAt)}`,
         ...(row?.ball ? [`球在：${OWNER_TEXT[row.ball.owner]} · ${oneLine(row.ball.text, 120)}`] : []),
         ...(ownWaits.length ? [`项目本身在等：${ownWaits.join("；")}`] : []),
@@ -561,14 +556,14 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         cellStatus: cell?.status ?? null,
         outcome: record.outcome ?? null,
         summary: record.summary ?? null,
-        cwd: record.cwd ?? cell?.spec.cwd ?? null,
+        cwd: cell?.spec.cwd ?? null,
         stalled: Boolean(row?.stalled),
         stalledSince: record.stalledSince ?? null,
         ball: row?.ball ? { owner: row.ball.owner, text: row.ball.text } : null,
         actions: actions.map(({ record, cellId }) => {
-          const linked = linkedApprovalId(record);
+          const item = record.owner === "human" ? kernel.humanItems.get(record.id) : undefined;
           return { id: record.id, cellId, title: record.title, owner: record.owner, status: record.status, nextStep: record.nextStep ?? null,
-            carriedBy: record.cellId ?? null, ...(linked ? { itemRevision: kernel.gate.getApprovalSync(linked)?.itemRevision } : {}) };
+            carriedBy: record.cellId ?? null, ...(item ? { itemRevision: item.itemRevision } : {}) };
         }),
         cells: below.map((c) => ({ id: c.id, title: c.title, preset: c.preset, status: c.status, state: cellStateText(c), running: running.has(c.id), waitingFor: waits.filter((w) => w.cellId === c.id).map((w) => w.waitingFor), statusLine: statusLineOf(c.id) })),
         unpulled: unpulled.map((u) => ({ cellId: u.cellId, count: u.count })),
@@ -598,8 +593,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const id = str(args["id"])!;
       if (!projectRecordOf(id)) return noProject(id);
       const r = await desk.projectOp(id, args["state"] as ProjectOp, as(principalId, str(args["note"])));
-      const extra = r.outcome === "migrated" && r.projectId ? ` The parked item came from an older version and could not be resumed: it continues as the new project ${r.projectId} (its plan and reports were handed over).` : "";
-      return r.ok ? ok(`${r.message}${extra}`, { outcome: r.outcome, ...(r.projectId ? { projectId: r.projectId } : {}) }) : fail(`Not applied: ${r.message}`, { outcome: r.outcome });
+      return r.ok ? ok(r.message, { outcome: r.outcome }) : fail(`Not applied: ${r.message}`, { outcome: r.outcome });
     },
 
     async add_action(args, principalId) {
@@ -637,54 +631,6 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
     async undo_human_decision(args,principalId) {
       const result = await desk.undoHumanDecision(str(args.activityId)!,as(principalId));
       return ok(result.message,result);
-    },
-
-    list_cards() {
-      const clarify = cardQueue();
-      const cards = clarify.cards.map(cardLine);
-      const text = `${section("待确认卡片", cards.map((c) => c.line))}${clarify.snoozed ? `\n另有 ${clarify.snoozed} 张卡被推迟。` : ""}\nCards marked ownerOnly require the owner for execution in the workbench UI.`;
-      return ok(text, { cards: cards.map((c) => c.data), snoozed: clarify.snoozed });
-    },
-
-    async decide_card(args, principalId) {
-      const id = str(args["id"])!;
-      const decision = args["decision"] as "approve" | "deny" | "continue" | "snooze" | "dismiss";
-      const note = str(args["note"]);
-      const seenVersion = typeof args["seenVersion"] === "number" ? args["seenVersion"] : undefined;
-      const rev = { seenItemRevision: args["seenItemRevision"] as number };
-      const rec = gate.getApprovalSync(id);
-      if (!rec) {
-        const item = kernel.humanItems.get(id);
-        if (!item) return fail(`There is no card "${id}". Card ids come from list_cards / workbench_overview.`);
-        const options = item.options.filter(o => decision === "snooze" ? o.effect === "defer" :
-          decision === "deny" || decision === "dismiss" ? o.effect === "terminate" && o.terminateMode !== "cancel_task" :
-          o.effect === "complete" || o.effect === "reply");
-        if (options.length !== 1) return fail(`Choose the exact option with decide_human_item: ${JSON.stringify(item.options)}`);
-        const result = await desk.decideHumanItem(id, { ...rev,optionId:options[0]!.id,
-          ...(note ? {note} : {}), ...(seenVersion === undefined ? {} : {seenArtifactVersion:seenVersion}),
-          ...(decision === "snooze" ? {until:now() + (typeof args.minutes === "number" && args.minutes>0 ? args.minutes : 120)*60_000} : {})
-        },as(principalId));
-        return ok(JSON.stringify(result),result);
-      }
-      if (rec.status !== "pending") return fail(`Card ${id} is no longer pending (${rec.status}); nothing to decide.`, { status: rec.status });
-      const why = ownerOnlyOf(rec);
-      if (why && (decision === "approve" || decision === "continue")) return fail(ownerOnlyText(id, why), { ownerOnly: true, reason: why });
-      const actor = as(principalId, note);
-      const title = rec.card.title ?? rec.action.summary;
-      try {
-        const common = {...rev, ...(note ? {note} : {})};
-        const until = now()+Math.round((typeof args.minutes==="number" && args.minutes>0 ? args.minutes : 120)*60_000);
-        const result = await (decision==="approve" ? desk.approve(id,{...rev,...(seenVersion!==undefined ? {seenVersion} : {})},actor)
-          : decision==="continue" ? desk.extend(id,common,actor) : decision==="deny" ? desk.deny(id,common,actor)
-          : decision==="snooze" ? desk.snooze(id,{...rev,until},actor) : desk.dismiss(id,common,actor));
-        const data = {outcome:result.outcome, ...("currentVersion" in result && result.currentVersion!==undefined ? {currentVersion:result.currentVersion} : {}),
-          ...(result.currentRevision!==undefined ? {currentRevision:result.currentRevision} : {}), ...(decision==="snooze" ? {until} : {})};
-        const verbs = {approve:"Approved",continue:"Continued",deny:"Denied",snooze:"Snoozed",dismiss:"Took down"};
-        return result.ok ? ok(`${verbs[decision]}「${title}」：${result.message}`,data) : fail(result.message,data);
-      } catch (err) {
-        if (isNgError(err, "bounds_violation")) return fail(ownerOnlyText(id, why ?? err.message), { ownerOnly: true, reason: err.message });
-        throw err;
-      }
     },
 
     read_artifact(args) {

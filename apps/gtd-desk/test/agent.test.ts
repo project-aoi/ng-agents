@@ -57,11 +57,11 @@ describe("auth: a separate credential and a separate identity", () => {
     expect((await d.req("GET", "/api/agent/tools")).status).toBe(401);
     expect((await d.req("GET", "/api/agent/tools", undefined, { authorization: `Bearer ${AGENT_TOKEN}` })).status).toBe(200);
     // the agent's credential is not the owner's: the rest of the API stays closed to it
-    for (const path of ["/api/clarify", "/api/status", "/api/radar"]) {
+    for (const path of ["/api/human-items", "/api/status", "/api/radar"]) {
       expect((await d.req("GET", path, undefined, { authorization: `Bearer ${AGENT_TOKEN}` })).status, path).toBe(401);
     }
     expect((await d.req("POST", "/api/capture", { text: "x" }, { authorization: `Bearer ${AGENT_TOKEN}` })).status).toBe(401);
-    expect((await d.req("GET", "/api/clarify", undefined, { authorization: `Bearer ${OWNER_TOKEN}` })).status).toBe(200);
+    expect((await d.req("GET", "/api/human-items", undefined, { authorization: `Bearer ${OWNER_TOKEN}` })).status).toBe(200);
   });
 
   it("token-less on a loopback bind without any token: agent:local, never the owner", async () => {
@@ -114,14 +114,14 @@ describe("tools", () => {
     const created = await ok(d, "create_project", { title: "Harness 对比", outcome: "一份对比报告", brief: "trae 本地有代码，Doubao 的要找张三要", cwd: repo });
     const { projectId } = created.data as { projectId: string };
     expect(created.text).toContain(`Started project ${projectId}「Harness 对比」`);
-    expect(d.kernel.getCell(projectId)).toMatchObject({ preset: "project", principalId: "agent:main", parentId: "desk" });
+    expect(d.kernel.getCell(projectId)).toMatchObject({ preset: "project", principalId: "agent:main", parentId: "desk", spec: {cwd:repo} });
     await d.kernel.idle();
-    expect(d.kernel.context.readStateSync<ProjectRecord>(projectId, gtdKeys.project)).toMatchObject({ title: "Harness 对比", cwd: repo, source: { label: "主 Agent", principalId: "agent:main" } });
+    expect(d.kernel.context.readStateSync<ProjectRecord>(projectId, gtdKeys.project)).toMatchObject({ title: "Harness 对比", source: { label: "主 Agent", principalId: "agent:main" } });
 
     const card = d.kernel.humanItems.create({title:"选择交付范围", subjectKey:"scope",
       options:[{id:"reply", label:"回复", effect:"reply"}]}, projectId);
     const got = await ok(d, "get_project", { id: projectId });
-    for (const result of [got, await ok(d, "list_cards"), await ok(d, "get_cell", {id:projectId})]) {
+    for (const result of [got, await ok(d, "get_cell", {id:projectId})]) {
       expect((result.data as {cards:{id:string}[]}).cards.map(c => c.id)).toEqual([card.id]);
     }
     const action = (got.data as { actions: Array<{ id: string; owner: string; status: string }> }).actions[0]!;
@@ -146,7 +146,7 @@ describe("tools", () => {
     const item = options.items.find(i => i.id === action.id)!;
     const args = {id:item.id,optionId:"done",seenItemRevision:item.itemRevision,note:"代码在 ~/code/doubao"};
     expect((await ok(d, "decide_human_item", args)).data).toMatchObject({status:"resolved"});
-    expect(d.kernel.context.readStateSync<ActionRecord>(projectId, gtdKeys.action(action.id))).toMatchObject({status:"done"});
+    expect(d.kernel.humanItems.get(action.id)).toMatchObject({status:"resolved"});
     expect(d.kernel.inbox.listMessagesSync({cellId:projectId,type:"approval.resolved"}).at(-1)?.envelope).toMatchObject({
       principalId:"agent:main",delivery:"wakeup",payload:{note:args.note},
     });
@@ -173,7 +173,7 @@ describe("tools", () => {
     expect(d.kernel.getCell(projectId)!.status).toBe("paused");
     expect((await ok(d, "set_project_state", { id: projectId, state: "resume" })).data).toMatchObject({ outcome: "resumed" });
     expect((await ok(d, "set_project_state", { id: projectId, state: "someday" })).data).toMatchObject({ outcome: "someday" });
-    expect(d.kernel.context.readStateSync<ProjectRecord>(projectId, gtdKeys.project)!.lifecycle).toBe("someday");
+    expect(d.kernel.getCell(projectId)!.pauseReason).toBe("parked");
     // a message to a parked project is kept for when it is activated
     expect((await ok(d, "message_project", { id: projectId, text: "范围缩小到第一阶段" })).text).toContain('parked ("someday")');
     expect((await refused(d, "set_project_state", { id: projectId, state: "resume" })).text).toContain("以后再说");
@@ -225,11 +225,11 @@ describe("tools", () => {
     const bare = await ok(d, "add_action", { projectId, title: "约老板", owner: "human" });
     expect(bare.text).toContain("the owner's to-do");
     const bareId = (bare.data as { actionId: string }).actionId;
-    expect(d.kernel.context.readStateSync<ActionRecord>(projectId, gtdKeys.action(bareId))).toMatchObject({ owner: "human", title: "约老板", nextStep: "约老板", status: "open" });
+    expect(d.kernel.humanItems.get(bareId)).toMatchObject({ category:"action", title: "约老板", description: "约老板", status: "pending" });
     expect(texts(d, projectId).at(-1)).toMatchObject({ principalId: "agent:main", text: expect.stringContaining("约老板") });
     const r = await ok(d, "add_action", { projectId, title: "约老板过一遍", owner: "human", nextStep: "发日历邀请，周四下午" });
     const actionId = (r.data as { actionId: string }).actionId;
-    expect(d.kernel.context.readStateSync<ActionRecord>(projectId, gtdKeys.action(actionId))).toMatchObject({ owner: "human", nextStep: "发日历邀请，周四下午", status: "open" });
+    expect(d.kernel.humanItems.get(actionId)).toMatchObject({ category:"action", description: "发日历邀请，周四下午", status: "pending" });
     expect(texts(d, projectId).at(-1)).toMatchObject({ principalId: "agent:main", text: expect.stringContaining("约老板过一遍") });
     await ok(d, "add_action", { projectId, title: "等财务出数", owner: "waiting" });
     const got = await ok(d, "get_project", { id: projectId });
@@ -243,23 +243,20 @@ describe("tools", () => {
     d.script.add("desk", tool("propose_project", { title: "官网改版", outcome: "新版官网上线", actions: [{ title: "出设计稿", owner: "agent" }] }));
     await d.post("/api/capture", { text: "官网该改版了" });
     await d.kernel.idle();
-    const proposal = (await d.get<{ cards: Array<{ id: string; cardType: string; itemRevision: number }> }>("/api/clarify")).cards.find((x) => x.cardType === "project_proposal")!;
-    const listed2 = await ok(d, "list_cards");
-    const proposalListed = (listed2.data as { cards: Array<{ id: string; ownerOnly: boolean; artifactVersion: number | null; humanEdited: boolean; itemRevision: number }> }).cards.find(
-      (c) => c.id === proposal.id,
-    )!;
-    expect(proposalListed).toMatchObject({ ownerOnly: true, artifactVersion: 1, humanEdited: false, itemRevision: proposal.itemRevision });
-    expect((await refused(d, "decide_card", { id: proposal.id, decision: "approve", seenVersion: 1, note: "主人说可以", seenItemRevision: 1 })).text).toContain("only the owner can approve card");
+    const listed = (await ok(d, "list_human_items")).data as { items: import("../src/shared/api").HumanItemDTO[] };
+    const proposal = listed.items.find(i => i.proposal?.title === "官网改版")!;
+    expect(proposal).toMatchObject({ ownerOnly: true, artifactVersion: 1, humanEdited: false });
+    expect((await refused(d, "decide_human_item", { id: proposal.id, optionId: "system.execute", seenVersion: 1, note: "主人说可以", seenItemRevision: proposal.itemRevision })).text).toMatch(/主人/);
     expect(d.kernel.gate.getApprovalSync(proposal.id)!.status).toBe("pending");
     await expect(d.kernel.humanItems.decide(proposal.id, {optionId:"system.someday",
       seenArtifactVersion:1, seenItemRevision:proposal.itemRevision}, "owner")).rejects.toThrow(/以后再说/);
     expect(d.kernel.listCells({ parentId: "desk" }).some(x => x.title === "官网改版")).toBe(false);
     // The owner can approve it via the web UI.
-    expect((await d.post<{ ok: boolean }>(`/api/clarify/${proposal.id}/approve`, { seenVersion: 1, seenItemRevision: proposal.itemRevision })).ok).toBe(true);
+    expect(await d.post(`/api/human-items/${proposal.id}/decide`, { optionId: "system.execute", seenArtifactVersion: 1, seenItemRevision: proposal.itemRevision })).toMatchObject({status:"approved"});
     expect(d.kernel.gate.getApprovalSync(proposal.id)).toMatchObject({ status: "approved", approverId: "owner" });
     expect(d.kernel.listCells({ parentId: "desk" }).some((x) => x.title === "官网改版" && x.preset === "project")).toBe(true);
-    expect((await refused(d, "decide_card", { id: proposal.id, decision: "deny", seenItemRevision: 1 })).text).toContain("no longer pending");
-    expect((await refused(d, "decide_card", { id: "act_nope", decision: "deny", seenItemRevision: 1 })).text).toContain('There is no card "act_nope"');
+    expect((await refused(d, "decide_human_item", { id: proposal.id, optionId: "system.execute", seenItemRevision: 1 })).isError).toBe(true);
+    expect((await refused(d, "decide_human_item", { id: "missing", optionId: "done", seenItemRevision: 1 })).text).toContain("找不到");
 
     // An ordinary non-ownerOnly card with a draft: MCP must forward caller-held seenVersion (never live DB read).
     const artId = "art_merge_1";
@@ -276,16 +273,14 @@ describe("tools", () => {
         artifact: { artifactId: artId, content: { format: "text", body: "方案 v2（人改过）" }, updatedBy: "human", expectedVersion: 1 },
       }),
     ).toMatchObject({ ok: true, artifactVersion: 2 });
-    // Calling decide_card without seenVersion or with stale seenVersion=1 must be rejected!
-    expect((await refused(d, "decide_card", { id: customCard.actionId, decision: "approve", seenItemRevision: 1 })).data).toMatchObject({ outcome: "version_mismatch", currentVersion: 2 });
-    expect((await refused(d, "decide_card", { id: customCard.actionId, decision: "approve", seenVersion: 1, seenItemRevision: 2 })).data).toMatchObject({ outcome: "version_mismatch", currentVersion: 2 });
-    // Passing the actual v2 (and matching itemRevision) succeeds!
-    const customListed = ((await ok(d, "list_cards")).data as { cards: Array<{ id: string; artifactVersion: number; humanEdited: boolean; itemRevision: number }> }).cards.find(
-      (c) => c.id === customCard.actionId,
-    )!;
-    expect(customListed).toMatchObject({ artifactVersion: 2, humanEdited: true });
-    expect((await ok(d, "decide_card", { id: customCard.actionId, decision: "approve", seenVersion: 2, seenItemRevision: customListed.itemRevision })).text).toContain("Approved");
-    expect(d.kernel.gate.getApprovalSync(customCard.actionId)).toMatchObject({ status: "approved", approverId: "agent:main" });
+    const current = d.server.desk.listHumanItems().find(i => i.id === customCard.actionId)!;
+    expect(current).toMatchObject({ artifactVersion: 2, humanEdited: true });
+    const choice = { id: current.id, optionId: "system.reply", seenItemRevision: current.itemRevision };
+    await refused(d, "decide_human_item", choice);
+    await refused(d, "decide_human_item", { ...choice, seenVersion: 1 });
+    expect(d.kernel.humanItems.get(current.id)?.status).toBe("pending");
+    expect((await ok(d, "decide_human_item", { ...choice, seenVersion: 2 })).data).toMatchObject({status:"resolved"});
+    expect(d.kernel.gate.getApprovalSync(current.id)).toMatchObject({ approverId: "agent:main" });
 
 
   });
@@ -305,7 +300,7 @@ describe("tools", () => {
 
   it("routes authenticated capture through watches, and retries the same client id once", async () => {
     const d = await bootDesk({agentTokens:{main:AGENT_TOKEN}});
-    d.kernel.spawnCell("desk", {id:"sub",preset:"watcher",lifetime:"persistent",watches:[{threadOrFilter:{type:"user.message",principalId:"agent:main"}}]});
+    d.kernel.spawnCell("desk", {id:"sub",preset:"checker",lifetime:"persistent",watches:[{threadOrFilter:{type:"user.message",principalId:"agent:main"}}]});
     const args={text:"路由给订阅者",clientId:"mcp-retry-1"};
     await ok(d,"capture",args);
     await ok(d,"capture",args);
@@ -421,8 +416,7 @@ describe("tools", () => {
     expect(d.kernel.context.readStateSync<{ lifecycle: string }>(projectId, "gtd:project")?.lifecycle).toBe("cancelled");
 
     // BUG-020: DeskActor principalId is strictly required (never falls back silently to owner).
-    await expect(d.server.desk.approve("act_x", { seenItemRevision: 1 }, { principalId: "" })).rejects.toThrow(/principalId/);
-    await expect(d.server.desk.deny("act_x", { seenItemRevision: 1 }, { principalId: "   " })).rejects.toThrow(/principalId/);
+    await expect(d.server.desk.decideHumanItem("missing", {optionId:"done",seenItemRevision:1}, {principalId:""})).rejects.toThrow(/principalId/);
     await expect(d.server.desk.projectOp(projectId, "pause", { principalId: "" })).rejects.toThrow(/principalId/);
     await expect(d.server.desk.cellControl(projectId, { action: "pause" }, { principalId: "" })).rejects.toThrow(/principalId/);
     expect(() => d.server.desk.sendCellMessage("desk", { text: "hi", clientId: "c1" }, { principalId: "" })).toThrow(/principalId/);
@@ -430,7 +424,7 @@ describe("tools", () => {
     // spawn_cell takes any registered preset (no enum in its schema); the kernel answers for one that is not registered
     const presetSchema = (AGENT_TOOLS.find((t) => t.name === "spawn_cell")!.inputSchema as { properties: Record<string, { enum?: unknown }> }).properties["preset"]!;
     expect(presetSchema.enum).toBeUndefined();
-    const watcher = await ok(d, "spawn_cell", { preset: "watcher", title: "盯 CI", instruction: "CI 绿了告诉我" });
+    const watcher = await ok(d, "spawn_cell", { preset: "checker", title: "盯 CI", instruction: "CI 绿了告诉我" });
     expect(d.kernel.getCell((watcher.data as { cellId: string }).cellId)).toMatchObject({ preset: "checker", parentId: "desk" });
     expect(await refused(d, "spawn_cell", { preset: "nope", title: "x", instruction: "y" })).toMatchObject({ text: 'Not done: unknown preset "nope"', data: { code: "invalid_argument" } });
   });
@@ -558,6 +552,5 @@ describe("agent tools: near-miss argument names", () => {
     expect(normalizeArgs(doc("set_project_state"), { id: "proj_1", op: "pause" })).toEqual({ id: "proj_1", state: "pause" });
     // Correct calls and genuinely unknown arguments are left exactly as given (validation still reports the latter).
     expect(normalizeArgs(doc("control_cell"), { id: "c1", action: "message", text: "hi" })).toEqual({ id: "c1", action: "message", text: "hi" });
-    expect(normalizeArgs(doc("decide_card"), { id: "a1", decision: "deny", note: "no", bogus: 1 })).toEqual({ id: "a1", decision: "deny", note: "no", bogus: 1 });
   });
 });

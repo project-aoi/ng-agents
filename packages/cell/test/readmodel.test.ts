@@ -24,7 +24,7 @@ describe("read models", () => {
     // a leaf given spawn depth on purpose (a worker has none by default)
     h.kernel.spawnCell("desk", { id: "proj", preset: "inline", lifetime:"wakeable", title: "官网改版", processor: { kind: "code", entry: "test.idle" }, meta: { projectCellId: "proj" }, bounds: { maxDepth: 1 } });
     h.kernel.spawnCell("proj", { id: "build", preset: "worker", title: "跑测试", processor: { kind: "code", entry: "test.long_job" } }, "go");
-    h.kernel.spawnCell("proj", { id: "wait", preset: "watcher", title: "等报价", processor: { kind: "code", entry: "test.idle" }, watches: [{ threadOrFilter: { thread: "memory:q" } }], schedules: [{ deliverAt: T0 + DAY }] });
+    h.kernel.spawnCell("proj", { id: "wait", preset: "checker", title: "等报价", processor: { kind: "code", entry: "test.idle" }, watches: [{ threadOrFilter: { thread: "memory:q" } }], schedules: [{ deliverAt: T0 + DAY }] });
     h.kernel.context.commitSync("wait", { statePatches: { [CELL_STATUS_KEY]: { text: "已回", at: T0, progress: { done: 2, total: 3, label: "家" } } } });
     await h.kernel.idle();
     await waitFor(() => h.kernel.workspace.listJobsSync({ state: ["running"] }).length === 1, 10_000, "job");
@@ -56,7 +56,7 @@ describe("read models", () => {
     expect(h.kernel.stats()).toMatchObject({ backgroundCells: 3, runningJobs: 1, busyCells: 1, waitingCells: 1, runningRuns: 0, pendingApprovals: 0 });
 
     // the desk's next Run sees its in-flight child (the project) in the volatile tail
-    h.kernel.spawnCell("desk", { id: "note", preset: "watcher", title: "提醒", processor: { kind: "code", entry: "test.idle" } });
+    h.kernel.spawnCell("desk", { id: "note", preset: "checker", title: "提醒", processor: { kind: "code", entry: "test.idle" } });
     h.script.add("desk", (req) => {
       const tail = JSON.stringify(req.messages);
       expect(tail).toContain("in-flight child cells");

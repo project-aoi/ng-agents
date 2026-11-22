@@ -11,7 +11,7 @@ import {
   type RadarDTO,
   type WaitingDTO,
 } from "../../shared/api";
-import { actionKey, approvalProjectId, cardBackedActions, projectOfAction, readActions, readProjects, type DeskKernel, type Located, type ProjectionInput } from "./common";
+import { approvalProjectId, projectOfAction, readActions, readProjects, type DeskKernel, type Located, type ProjectionInput } from "./common";
 import { button, enc, ownerLabel, post, progressDTO, waitingDeadline, waitingDTO } from "./format";
 import { projectReview } from "./review";
 import { weekStart, whenText } from "./time";
@@ -195,7 +195,6 @@ export function radarProjects(input: ProjectionInput): Omit<RadarDTO, "review"> 
     if (list) list.push(a);
     else actionsByProject.set(pid, [a]);
   }
-  const onCard = cardBackedActions(kernel, [...actionsByProject.values()].flat());
   const visibleCards = new Map<string, { id: string; title: string }>();
   for (const rec of kernel.gate.listPendingSync({ includeSnoozed: true })) {
     const pid = approvalProjectId(kernel, rec);
@@ -243,13 +242,12 @@ export function radarProjects(input: ProjectionInput): Omit<RadarDTO, "review"> 
     const card = visibleCards.get(p.cellId) ?? null;
 
     let ball: ProjectRowDTO["ball"] = null;
-    // An action whose owner part is a pending card points at that card, not at Engage.
-    const todos = open.filter((a) => !onCard.has(actionKey(a)));
-    const top = topBallOwner(todos.map((a) => a.record));
-    const first = (owner: BallOwner) => openActions.find((a) => a.owner === owner && !onCard.has(`${a.cellId}\u0000${a.actionId}`));
+    // A decision about an action supplies its own link.
+    const top = topBallOwner(open.map((a) => a.record));
+    const first = (owner: BallOwner) => openActions.find((a) => a.owner === owner);
     if (top === "human") {
       const a = first("human")!;
-      ball = { owner: "human", label: BALL_LABEL.human, text: a.text, engage: { cellId: a.cellId, actionId: a.actionId } };
+      ball = { owner: "human", label: BALL_LABEL.human, text: a.text, cardId: a.actionId };
     } else if (card) {
       ball = { owner: "human", label: BALL_LABEL.human, text: `有一张卡等你确认：${card.title}`, cardId: card.id };
     } else if (top === "agent") {
@@ -267,7 +265,7 @@ export function radarProjects(input: ProjectionInput): Omit<RadarDTO, "review"> 
       title: r.title,
       outcome: r.outcome ?? null,
       summary: typeof r.summary === "string" && r.summary ? r.summary : null,
-      cwd: typeof r.cwd === "string" && r.cwd ? r.cwd : (cell?.spec.cwd ?? null),
+      cwd: cell?.spec.cwd ?? null,
       lifecycle: r.lifecycle,
       paused,
       ball,

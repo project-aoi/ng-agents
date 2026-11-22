@@ -71,12 +71,12 @@ describe("authorizeControlSync (the Inbox control bypass)", () => {
 
 describe("revoke", () => {
 
-  it("is idempotent, a no-op for unknown cells, and the async form delegates", async () => {
+  it("is idempotent and ignores unknown cells", () => {
     const f = tree();
     f.gate.revokeSync("proj");
     f.gate.revokeSync("proj");
     f.gate.revokeSync("ghost");
-    await f.gate.revoke("sib");
+    f.gate.revokeSync("sib");
     expectType(f.gate.authorizeSync(exec("read"), meta("sib")), "deny");
     expectType(f.gate.authorizeSync(exec("review"), meta("desk")), "allow");
   });

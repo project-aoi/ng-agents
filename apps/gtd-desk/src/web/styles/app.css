@@ -1617,15 +1617,6 @@ textarea:focus-visible {
 
 /* ==================== Clarify ==================== */
 
-.clarify-meta {
-  display: flex;
-  justify-content: flex-end;
-  align-items: baseline;
-  gap: var(--sp-2);
-  margin-bottom: var(--sp-3);
-  color: var(--text-2);
-  font-size: var(--fs-sm);
-}
 
 .remaining strong {
   color: var(--text);

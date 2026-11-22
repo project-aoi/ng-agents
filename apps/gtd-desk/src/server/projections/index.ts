@@ -3,8 +3,6 @@
 
 export { DEFAULT_SETTINGS, inputOf, SENSOR_SUGGESTION_PREFIX, SKILL_SUGGESTION_PREFIX } from "./common";
 export type { DeskKernel, DeskSettings, ProjectionInput, SensorSuggestion, SkillSuggestion } from "./common";
-export { clarifyCardById, projectClarify } from "./clarify";
-export { projectEngage, projectEngageDetail } from "./engage";
 export { projectRadar, radarProjects, STALLED_TEXT } from "./radar";
 export { projectReview } from "./review";
 export { notifications, projectStatus } from "./status";

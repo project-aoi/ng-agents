@@ -135,13 +135,8 @@ function ProjectRow({ row, now, onRun }: { row: ProjectRowDTO; now: number; onRu
         <div className="ball-line">
           <BallChip owner={ball.owner} label={ball.label} />
           <span className="ball-text">{ball.text}</span>
-          {ball.engage && (
-            <button type="button" className="link-btn" onClick={() => navigate({ view: "engage", item: ball.engage! })}>
-              去处理 →
-            </button>
-          )}
-          {!ball.engage && ball.cardId && (
-            <button type="button" className="link-btn" onClick={() => navigate({ view: "clarify", cardId: ball.cardId! })}>
+          {ball.cardId && (
+            <button type="button" className="link-btn" onClick={() => navigate({ view: "inbox", cardId: ball.cardId! })}>
               去确认 →
             </button>
           )}
@@ -210,7 +205,7 @@ function ProjectRow({ row, now, onRun }: { row: ProjectRowDTO; now: number; onRu
               <BallChip owner={a.owner} label={a.ownerLabel} />
               <span className="pa-text">
                 {a.owner === "human" ? (
-                  <button type="button" className="link-btn" onClick={() => navigate({ view: "engage", item: { cellId: a.cellId, actionId: a.actionId } })}>
+                  <button type="button" className="link-btn" onClick={() => navigate({ view: "inbox", cardId: a.actionId })}>
                     {a.text}
                   </button>
                 ) : (
@@ -334,7 +329,7 @@ function WeeklyReview({ review, now, completedProjects, onRun }: { review: Weekl
 
       <p className="muted small review-foot">
         周回顾在 {whenText(review.nextReviewAt, now)} 自动准备好。
-        <button type="button" className="link-btn" onClick={() => navigate({ view: "clarify" })}>
+        <button type="button" className="link-btn" onClick={() => navigate({ view: "inbox" })}>
           去待我处理 →
         </button>
       </p>

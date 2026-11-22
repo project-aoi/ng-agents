@@ -12,12 +12,11 @@
 //   415 = a write without a JSON body, 404 = unknown id, 409 = the item is no longer in a state that allows this,
 //   400 = malformed input. Exceptions that carry a full result body instead: approve and the Agents view's cell
 //   messages / control / trigger (always 200, the outcome — not_found included — is in the body), and the two
-//   version-protected saves (409 with ArtifactSaveResponse / ClarifyMutationResponse).
+//   version-protected saves (409 with ArtifactSaveResponse / PlanSaveResponse).
 
 import type { HumanItem, ProjectProposal, ClarifyCard } from "@ng/protocol";
 
 export interface HumanItemDTO extends HumanItem {
-  actionRefs: Array<{cellId:string; actionId:string}>;
   resumeTarget: {id:string; title:string} | null;
   proposal: ProjectProposal | null;
   projects: Array<{id:string; title:string}>;
@@ -32,7 +31,7 @@ export interface HumanItemDTO extends HumanItem {
 /** 🔵 我来处理 · 🟢 Agent 处理中 · 🟡 等待外部 (the action's title says what is awaited) */
 export type BallOwner = "human" | "agent" | "waiting";
 export type Effort = "15m" | "45m" | "low_energy";
-export type ViewName = "clarify" | "engage" | "radar" | "agents" | "review" | "status" | "sources" | "activity";
+export type ViewName = "inbox" | "radar" | "agents" | "review" | "status" | "sources" | "activity";
 export type HttpMethod = "GET" | "POST" | "PUT" | "DELETE";
 
 export const BALL_LABEL: Readonly<Record<BallOwner, string>> = {
@@ -65,7 +64,6 @@ export interface ButtonDTO {
   endpoint?: { method: HttpMethod; path: string; body?: Record<string, unknown> };
   input?: { field: string; kind: "instruction" | "text" | "datetime"; placeholder: string };
   /** Client-only behaviour when there is no endpoint. */
-  client?: "skip" | "open_plan_editor" | "open_editor" | "open_engage";
   /** One line shown under/next to the button, e.g. "到 今天 14:00 回到待确认". */
   hint?: string;
   /** Ask for confirmation first (destructive actions). */
@@ -202,13 +200,13 @@ export interface ModelsDTO {
 export type SetModelRequest = { tier: ModelTierDTO; mode: "auto" } | { tier: ModelTierDTO; mode: "fixed"; model: string; effort?: string };
 
 export interface StatusDTO {
-  humanPending?:number;
+  humanPending: number;
+  humanSnoozed: number;
   generatedAt: number;
   backend: string;
   /** The model the main agents run on right now, e.g. "Opus 5.5 · xhigh" (CLI backends, once the CLI has listed its models). */
   model?: string;
   auth: { tokenRequired: boolean };
-  clarify: { pending: number; snoozed: number };
   background: {
     /** Background clones doing something right now (a run or a long command). */
     running: number;
@@ -225,12 +223,11 @@ export interface StatusDTO {
   radar: { activeProjects: number; stalledProjects: number; somedayProjects: number; nextReviewAt: number };
   /** Ready-made status-line text per view (docs/04 §一 右上角状态提示). */
   statusLine: {
-    clarify: string;
+    inbox: string;
     radar: string;
     /** "2 个分身在跑 · 3 个待命可唤醒" */
     agents?: string;
   };
-  /** Newest first: light notices to the owner (delivered) and the ones held back during focus. */
   notifications: NotificationDTO[];
 }
 
@@ -253,97 +250,6 @@ export interface CaptureResponse {
   status: StatusDTO;
 }
 
-// ==================== 📥 Clarify (GET /api/clarify) ====================
-
-export type ClarifyCardType = "project_proposal" | "escalation" | "generic";
-
-/**
- * pending        waiting for the owner
- * revising       the owner asked for changes; a new draft version is being prepared
- */
-export type ClarifyCardState = "pending" | "revising";
-
-export interface ProposalDTO {
-  title: string;
-  outcome: string;
-  background?: string;
-  actions: Array<{ title: string; owner: BallOwner; ownerLabel: string; effort?: Effort; effortLabel?: string; nextStep?: string }>;
-}
-
-export interface ClarifyCardDTO {
-  /** Card id (use it in every /api/clarify/:cardId/… path). */
-  id: string;
-  cardType: ClarifyCardType;
-  state: ClarifyCardState;
-  title: string;
-  /** The project this card belongs to, if any (Radar row id). */
-  projectId: string | null;
-  createdAt: number;
-  updatedAt: number;
-  /** Monotonic card revision checked on every decision to reject stale concurrent clicks / MCP calls. */
-  itemRevision: number;
-
-  /** Block 1 — source & status bar: "工作台 · 12 分钟前" + "已备好初稿 v2 · 等待确认". */
-  sourceBar: {
-    source: SourceInfoDTO;
-    statusText: string;
-    /** Current draft version, if the card has a draft. */
-    version: number | null;
-    /** True when the draft changed after the card was prepared ("草稿已更新，请重看"). */
-    draftUpdated: boolean;
-  };
-  /** Block 2 — raw input (grey box). */
-  rawInput: { text: string; kind: "message" | "voice_transcript" | "monitor_summary" | "system" };
-  /** Block 3 — what the agent checked, plus the draft / plan / blocker. */
-  prep: { summary: string; checked: ReferenceDTO[] };
-  /** response: the reply draft · escalation (waiting_timeout): the nudge draft · project_proposal: the plan document. */
-  draft: ArtifactDTO | null;
-  /** project_proposal: the plan as it stands now (including the owner's edits). */
-  proposal: ProposalDTO | null;
-  escalation: {
-    reason: "waiting_timeout" | "retry_limit" | "blocked";
-    reasonLabel: string;
-    explanation: string;
-    waiting: WaitingDTO | null;
-  } | null;
-
-  /** Block 4 — the fixed button row (1 primary + 2 adjust/defer + 下一张) and the secondary actions. */
-  buttons: ButtonDTO[];
-}
-
-export interface ClarifyQueueDTO {
-  generatedAt: number;
-  /** "剩余 N 张" */
-  remaining: number;
-  /** Show the first; "下一张 →" cycles client-side. Ordered oldest first, verification-needed cards first. */
-  cards: ClarifyCardDTO[];
-  /** Cards postponed and not yet back. */
-  snoozed: number;
-  /** Nothing left to confirm ("收件箱已清空（Inbox Zero）"); background work is reported separately in `background`. */
-  inboxZero: boolean;
-  background: { running: number; jobs: number; waiting: number; text: string };
-}
-
-/** POST /api/clarify/:cardId/approve */
-export interface ApproveRequest {
-  /** The draft version the owner was looking at (`card.sourceBar.version`); omit for cards without a draft. */
-  seenVersion?: number | null;
-  /** The card revision the caller saw (`card.itemRevision`); when provided, stale decisions are rejected. */
-  seenItemRevision: number;
-}
-
-/**
- * sent              delivered (card leaves the queue)
- * approved          confirmed; the agent carries it out (project start, merge, …)
- * failed            sending failed, nothing delivered; approving again retries
- * unknown           "发送结果未知，请核实" — the card stays; verify it, it is never re-sent automatically
- * version_mismatch  "草稿已更新，请重看" — `currentVersion` is what to show; approving that version works
- * revision_mismatch "这张卡刚刚变动过，请刷新后再确认" — `currentRevision` is what to show
- * already_cancelled the task was stopped or the card withdrawn
- * not_found         no such card
- */
-export type ApproveOutcome = "approved" | "version_mismatch" | "revision_mismatch" | "already_cancelled" | "not_found";
-
 export interface MutationResult<V, O extends string = string> {
   ok: boolean;
   outcome: O;
@@ -353,42 +259,6 @@ export interface MutationResult<V, O extends string = string> {
   status: StatusDTO;
 }
 
-export interface ApproveResponse extends MutationResult<ClarifyQueueDTO, ApproveOutcome> {
-  currentVersion?: number | null;
-  currentRevision?: number;
-  error?: string;
-  /** The card after the click (null when it left the queue). */
-  card: ClarifyCardDTO | null;
-}
-
-/** POST /api/clarify/:cardId/revise — "🎙 按住口述修改意见" */
-export interface ReviseRequest {
-  instruction: string;
-  voice?: boolean;
-  seenItemRevision: number;
-}
-
-/** POST /api/clarify/:cardId/snooze — "⏱ 推迟到下午"; `until` defaults to the next afternoon slot. */
-export interface SnoozeRequest {
-  until?: number;
-  seenItemRevision: number;
-}
-
-/** POST /api/clarify/:cardId/extend — "⏱ 再等 1 天" (`until` defaults to +1 day) / "⏱ 追加额度继续" (`raise` defaults to +50%). */
-export interface ExtendRequest {
-  until?: number;
-  note?: string;
-  seenItemRevision: number;
-}
-
-/** POST /api/clarify/:cardId/resolve-offline · /dismiss · /deny · /someday · /abandon */
-export interface NoteRequest {
-  seenVersion?: number;
-  note?: string;
-  seenItemRevision: number;
-}
-
-/** PUT /api/clarify/:cardId/plan — "✎ 手动改一下安排", saved with version protection. */
 export interface PlanSaveRequest {
   expectedVersion: number;
   proposal: {
@@ -399,98 +269,9 @@ export interface PlanSaveRequest {
   };
 }
 
-export type ClarifyOutcome =
-  | "revising"
-  | "snoozed"
-  | "someday"
-  | "continued"
-  | "resolved_offline"
-  | "dismissed"
-  | "denied"
-  | "saved"
-  | "conflict"
-  | "revision_mismatch"
-  | "not_pending"
-  | "not_found";
-
-export interface ClarifyMutationResponse extends MutationResult<ClarifyQueueDTO, ClarifyOutcome> {
-  card: ClarifyCardDTO | null;
-  projectId?: string;
-  /** plan save conflict: the plan document as it is now. */
-  current?: ArtifactDTO;
-  /** revision_mismatch: the card's current itemRevision. */
-  currentRevision?: number;
-}
-
-// ==================== 🎯 Engage (GET /api/engage?effort=15m|45m|low_energy) ====================
-
-export interface EngageItemDTO {
-  itemRevision?: number; // linked approval, if present
-  /** Use both in /api/engage/:cellId/:actionId paths. */
-  cellId: string;
-  actionId: string;
-  title: string;
-  nextStep: string | null;
-  effort: Effort | null;
-  effortLabel: string | null;
-  dueAt: number | null;
-  overdue: boolean;
-  project: { id: string; title: string } | null;
-  source: SourceInfoDTO | null;
-  /** quick = one-click "✓ 已办完"; deep = opens the 8/4 editor. */
-  kind: "quick" | "deep";
-  artifact: { artifactId: string; version: number; title?: string; updatedBy: "agent" | "human" } | null;
-  createdAt: number;
-  buttons: ButtonDTO[];
-}
-
-export interface EngageListDTO {
-  generatedAt: number;
-  filter: Effort | "all";
-  counts: Record<Effort | "all", number>;
-  items: EngageItemDTO[];
-}
-
-/** GET /api/engage/:cellId/:actionId — the 8/4 workspace. */
-export interface EngageDetailDTO {
-  generatedAt: number;
-  item: EngageItemDTO;
-  /** Left 8/12: the draft (null for items without one). */
-  artifact: ArtifactDTO | null;
-  /** Right 4/12: the context pack. */
-  contextPack: {
-    references: ReferenceDTO[];
-    /** Checklists (SKILL.md) that apply here (name + one-line description). */
-    skills: Array<{ name: string; description: string }>;
-    /** The original message this came from. */
-    rawInput: { text: string; source: SourceInfoDTO } | null;
-    /** What the agent noted while preparing it. */
-    prepSummary: string | null;
-  };
-}
-
-/** POST /api/engage/:cellId/:actionId/done — "✓ 已办完" */
-export interface DoneRequest {
-  seenVersion?: number;
-  seenItemRevision?: number; // required when the action is linked to an approval
-  note?: string;
-}
-
-/** POST /api/engage/:cellId/:actionId/send — "定稿发送" */
-export interface EngageSendRequest {
-  seenVersion: number;
-  seenItemRevision: number;
-}
-
-export type EngageOutcome = "done" | "already_done" | ApproveOutcome;
-
-export interface EngageMutationResponse extends MutationResult<EngageListDTO, EngageOutcome> {
-  /** Background tasks stopped because the item is finished. */
-  closedTasks?: number;
-  currentVersion?: number | null;
-  currentRevision?: number;
-  error?: string;
-}
+export type PlanSaveResponse =
+  | { ok: true; outcome: "saved"; message: string }
+  | { ok: false; outcome: "conflict"; message: string; current: ArtifactDTO };
 
 // ==================== drafts (GET/PUT /api/artifacts/:artifactId) ====================
 
@@ -553,7 +334,7 @@ export interface ProjectRowDTO {
   lifecycle: "active" | "completed" | "cancelled" | "someday";
   paused: boolean;
   /** The single ball label the row shows (🔵 > 🟢 > 🟡); null when nothing is open. */
-  ball: { owner: BallOwner; label: string; text: string; engage?: { cellId: string; actionId: string }; cardId?: string } | null;
+  ball: { owner: BallOwner; label: string; text: string; cardId?: string } | null;
   /** Aggregated progress ("11/15", "已回 2/3"). */
   progress: ProgressDTO | null;
   waiting: WaitingDTO | null;
@@ -590,15 +371,9 @@ export interface RadarDTO {
   review: WeeklyReviewDTO;
 }
 
-/**
- * activated: the same project continues (its records, reports and history are kept). migrated: a parked item from an
- * older version could not be resumed, so a new project was started from its plan and reports (`projectId`).
- */
-export type ProjectOutcome = "paused" | "resumed" | "cancelled" | "completed" | "someday" | "activated" | "migrated" | "action_added" | "not_applied";
+export type ProjectOutcome = "paused" | "resumed" | "cancelled" | "completed" | "someday" | "activated" | "action_added" | "not_applied";
 
 export interface ProjectMutationResponse extends MutationResult<RadarDTO, ProjectOutcome> {
-  /** migrated: the project that continues the parked one. */
-  projectId?: string;
   /** action_added: the new action. */
   actionId?: string;
 }
@@ -636,7 +411,7 @@ export interface TopologyNodeDTO {
   parentId: string | null;
   /** The project it belongs to (itself, for a project node); null for the desk, sources and hubs. */
   projectId: string | null;
-  preset: "inline" | "worker" | "checker" | "watcher" | "sensor" | "project" | "hub" | null;
+  preset: "inline" | "worker" | "checker" | "sensor" | "project" | "hub" | null;
   /** "总助理" | "项目协调" | "执行分身" | "外部盯梢" | "信源巡检" | "领域中枢" */
   roleLabel: string;
   title: string;
@@ -663,11 +438,8 @@ export interface TopologyNodeDTO {
   unpulledCount: number;
   /** The owner has spoken to it directly at some point. */
   hadDirectUserChat: boolean;
-  /** Tokens charged to it and everything below it, and the limit that applies to it (null: unlimited). */
-  /** A card of its waits in Clarify → `#/clarify/:cardId`. */
   pendingCardId: string | null;
-  /** An action of the owner's belongs to it → `#/engage/:cellId/:actionId`. */
-  engageItem: { cellId: string; actionId: string } | null;
+  humanItemId: string | null;
   /** Closed children folded into this node ("已归档 (N)"); they are listed as nodes only with includeArchived=1. */
   archivedChildren: number;
   updatedAt: number | null;
