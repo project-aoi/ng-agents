@@ -9,6 +9,7 @@ import {
   type Effort,
   type ItemSource,
   type ProjectProposal,
+  type RunnerOverride,
 } from "@ng/protocol";
 import { ROLES } from "../shared/config";
 import { PROJECT_PROCESSOR } from "../shared/processors";
@@ -58,6 +59,7 @@ export interface ProjectInit {
   rawInput?: string;
   /** Continue from the starting cell's conversation (fork_prefix). */
   continueConversation?: boolean;
+  runnerOverride?: RunnerOverride;
 }
 
 /** `gtd:project` as the project's first run writes it. */
@@ -147,7 +149,7 @@ export function projectLaunch(init: ProjectInit, clock: Clock): ProjectLaunch {
     id: projectId,
     preset: "project",
     title: init.title,
-    processor: PROJECT_PROCESSOR,
+    processor: { ...PROJECT_PROCESSOR, ...(init.runnerOverride ?? init.proposal?.runnerOverride) },
     meta: { role: ROLES.project, projectCellId: projectId },
   };
   if (init.cwd) spec.cwd = init.cwd;

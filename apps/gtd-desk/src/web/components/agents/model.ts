@@ -288,9 +288,10 @@ export function dirBase(path: string): string {
 }
 
 /** "codex · strong", "零算力脚本"; null when nothing is known. */
-export function engineText(node: Pick<TopologyNodeDTO, "processorType" | "engine" | "modelTier">): string | null {
+export function engineText(node: Pick<TopologyNodeDTO, "processorType" | "engine" | "modelTier" | "modelOverride">): string | null {
   if (node.processorType === "code") return "零算力脚本";
-  const parts = [node.engine, node.modelTier === "strong" ? "高能力" : node.modelTier === "fast" ? "快速" : null].filter((x): x is string => Boolean(x));
+  const tier = node.modelTier === "strong" ? "高能力" : node.modelTier === "fast" ? "快速" : null;
+  const parts = [node.engine, node.modelOverride?.model ?? tier, node.modelOverride?.effort].filter((x): x is string => Boolean(x));
   return parts.length ? parts.join(" · ") : null;
 }
 

@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { NgError, type CliEngine, type Clock, type ModelTier } from "@ng/protocol";
+import { NgError, type CliEngine, type Clock, type ModelTier, type RunnerOverride, type RunnerSelection } from "@ng/protocol";
 import { fastRecommendation, listCliModels, preferredEffort, type CliModelCatalog, type CliModelChoice, type CliModelInfo } from "@ng/loop";
 
 /**
@@ -59,6 +59,13 @@ export interface ModelSettingsOptions {
 const TIERS: readonly ModelTier[] = ["strong", "fast"];
 const FILE = "models.json";
 
+function writeSettings(dataDir: string, file: string, value: unknown): void {
+  mkdirSync(dataDir, { recursive: true });
+  const tmp = join(dataDir, `${file}.tmp`);
+  writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`);
+  renameSync(tmp, join(dataDir, file));
+}
+
 type Stored = Partial<Record<CliEngine, Partial<Record<ModelTier, ModelSelection>>>>;
 
 function readStored(dataDir: string): Stored {
@@ -94,15 +101,6 @@ export function createModelSettings(opts: ModelSettingsOptions): ModelSettings {
   const saved = readStored(dataDir)[engine] ?? {};
   for (const tier of TIERS) {
     selection[tier] = validSelection(saved[tier]) ?? (opts.initial?.[tier] ? { mode: "fixed", model: opts.initial[tier]! } : { mode: "auto" });
-  }
-
-  function persist(): void {
-    const all = readStored(dataDir);
-    all[engine] = { ...selection };
-    if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
-    const tmp = join(dataDir, `${FILE}.tmp`);
-    writeFileSync(tmp, `${JSON.stringify(all, null, 2)}\n`);
-    renameSync(tmp, join(dataDir, FILE));
   }
 
   function refresh(): Promise<CliModelCatalog> {
@@ -166,8 +164,8 @@ export function createModelSettings(opts: ModelSettingsOptions): ModelSettings {
           throw new NgError("invalid_argument", `${m.label} does not offer effort "${next.effort}" (it offers: ${m.efforts.join(", ") || "none"})`);
         }
       }
+      writeSettings(dataDir, FILE, { ...readStored(dataDir), [engine]: { ...selection, [tier]: next } });
       selection[tier] = next;
-      persist();
     },
     async resolve(tier) {
       const sel = selection[tier] ?? selection.strong;
@@ -182,6 +180,72 @@ export function createModelSettings(opts: ModelSettingsOptions): ModelSettings {
     },
     warm() {
       if (catalog === null) void refresh().catch(() => undefined);
+    },
+  };
+}
+
+export function createRunnerSettings(opts: {
+  dataDir: string;
+  runners: readonly CliEngine[];
+  initial: CliEngine | null;
+  modelSettings(engine: CliEngine): ModelSettings | null;
+}) {
+  const { dataDir, runners, modelSettings } = opts;
+  const file = "default-runner.json";
+  let current = opts.initial;
+  try {
+    const saved: unknown = JSON.parse(readFileSync(join(dataDir, file), "utf8"));
+    current = runners.find((runner) => runner === saved) ?? current;
+  } catch {
+    // An absent or unreadable selection uses the host's default.
+  }
+
+  function enabled(value: string): CliEngine {
+    const runner = runners.find((candidate) => candidate === value);
+    if (!runner) throw new NgError("invalid_argument", `Runner「${value}」未启用。可选：${runners.join(", ") || "无"}`);
+    return runner;
+  }
+
+  async function catalog(engine: CliEngine) {
+    const settings = modelSettings(engine);
+    await settings?.resolve("strong");
+    return settings?.view().catalog;
+  }
+
+  return {
+    get current() { return current; },
+    select(runner: string) {
+      const next = enabled(runner);
+      if (next === current) return;
+      writeSettings(dataDir, file, next);
+      current = next;
+    },
+    async describe(): Promise<string> {
+      if (runners.length === 0) return "No CLI runner overrides are available. Leave runner, model and effort unset.";
+      const lists = await Promise.all(runners.map(async (engine) => {
+        const models = (await catalog(engine))?.models ?? [];
+        const choices = models.map(({ id, efforts }) => `${JSON.stringify(id)}${efforts.length ? ` (effort: ${efforts.map((effort) => JSON.stringify(effort)).join(", ")})` : ""}`);
+        return `- ${engine}: ${choices.join("; ") || "model list unavailable, omit model and effort"}`;
+      }));
+      return [
+        `Optional runner overrides for model-backed cells. Default runner: ${current}. Omit all fields to follow the workbench defaults. A model override fixes the runner for this cell. Specify model to use effort.`,
+        ...lists,
+      ].join("\n");
+    },
+    async resolve({ runner, model, effort }: RunnerSelection): Promise<RunnerOverride> {
+      const engine = runner === undefined ? current : enabled(runner);
+      if (!engine) throw new NgError("unsupported", "No CLI runner is available.");
+      if (effort && !model) throw new NgError("invalid_argument", "Specify a model when choosing effort.");
+      if (!model) return { engine };
+      const list = await catalog(engine);
+      if (!list?.models.length) throw new NgError("invalid_argument", `The model list for ${engine} is unavailable. Omit model and effort to use its configured defaults.`);
+      const info = list.models.find((m) => m.id === model);
+      if (!info) throw new NgError("invalid_argument", `Runner ${engine} does not list model "${model}".`);
+      if (effort && !info.efforts.includes(effort)) {
+        throw new NgError("invalid_argument", `${model} on ${engine} does not offer effort "${effort}" (available: ${info.efforts.join(", ") || "none"}).`);
+      }
+      const chosen = effort ?? preferredEffort(info.efforts);
+      return { engine, model, ...(chosen ? { effort: chosen } : {}) };
     },
   };
 }

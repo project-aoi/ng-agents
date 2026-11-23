@@ -192,11 +192,13 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
     const tier = processor.modelTier ?? opts.defaultTier ?? "strong";
     // The owner's switch first; a failure to read it must not stop the Run (the static setting or the CLI's own
     // default model still works).
-    let chosen: CliModelChoice | undefined;
-    try {
-      chosen = await opts.resolveModel?.(tier);
-    } catch {
-      chosen = undefined;
+    let chosen: CliModelChoice | undefined = processor.model ? { model: processor.model, effort: processor.effort } : undefined;
+    if (!chosen) {
+      try {
+        chosen = await opts.resolveModel?.(tier);
+      } catch {
+        chosen = undefined;
+      }
     }
     const launch = chosen ? launchChoice(engine, chosen) : { model: models[tier] ? models[tier] : undefined, effort: undefined };
     const effort = launch.effort;
@@ -418,9 +420,17 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
 
     let bridge: ToolBridge | null = null;
     try {
+      const runnerOptions = tools.some((t) => t.runnerOptions) && ports.describeRunnerOptions
+        ? await raceAbort(ports.describeRunnerOptions(), signal)
+        : "";
+      signal.throwIfAborted();
       bridge = await startToolBridge({
         serverName: CLI_MCP_SERVER,
-        tools: tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })),
+        tools: tools.map((t) => ({
+          name: t.name,
+          description: t.runnerOptions && runnerOptions ? `${t.description}\n\n${runnerOptions}` : t.description,
+          inputSchema: t.inputSchema,
+        })),
         call: callTool,
         ...(opts.nodePath ? { nodePath: opts.nodePath } : {}),
       });

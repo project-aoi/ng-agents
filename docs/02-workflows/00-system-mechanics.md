@@ -16,6 +16,8 @@
 
 **`INV-SYS-07`**　待命分身保留会话，不占执行槽、不阻挡结项。项目结项时将其一并归档。
 
+**`INV-SYS-08`**　模型节点在回合启动时读取全局 runner 和模型档位。创建节点时可指定已启用的 runner、该 runner 提供的模型和推理强度，工具说明从实际模型目录生成选项。节点的显式选择随节点保存。配置变化后，会话仅在 runner、模型和推理强度仍匹配时续接。脚本探针按原定脚本执行。
+
 ## 回归入口
 
-[dispatch.test.ts](../../packages/cell/test/dispatch.test.ts)、[docs05-anchors.test.ts](../../packages/cell/test/docs05-anchors.test.ts)、[wakeable.test.ts](../../packages/cell/test/wakeable.test.ts)。
+[dispatch.test.ts](../../packages/cell/test/dispatch.test.ts)、[docs05-anchors.test.ts](../../packages/cell/test/docs05-anchors.test.ts)、[wakeable.test.ts](../../packages/cell/test/wakeable.test.ts)、[models.test.ts](../../apps/gtd-desk/test/models.test.ts)。

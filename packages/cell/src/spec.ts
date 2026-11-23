@@ -74,13 +74,20 @@ export function resolveSpec(registry: Registry, input: CellSpecInput, parent: Ce
 }
 
 /** Fail at spawn/update time rather than as a dead letter on the first Run. */
-export function validateSpec(registry: Registry, spec: CellSpec): void {
+export function validateSpec(registry: Registry, spec: CellSpec, cliRunners?: readonly string[]): void {
   const p = spec.processor;
   if (!p || (p.kind !== "llm" && p.kind !== "code")) throw new NgError("invalid_argument", "spec.processor.kind must be llm or code");
   if (p.kind === "llm") {
     if (p.prompt !== undefined && !registry.prompts.has(p.prompt)) throw new NgError("not_found", `prompt "${p.prompt}" is not registered`);
     if (p.engine !== undefined && !(CLI_ENGINES as readonly string[]).includes(p.engine)) {
       throw new NgError("invalid_argument", `unknown processor.engine "${String(p.engine)}" (expected ${CLI_ENGINES.join(" | ")})`);
+    }
+    if (p.engine !== undefined && cliRunners && !cliRunners.includes(p.engine)) throw new NgError("invalid_argument", `runner "${p.engine}" is not enabled`);
+    if (p.model !== undefined && (!p.engine || typeof p.model !== "string" || !p.model.trim())) {
+      throw new NgError("invalid_argument", "A processor model requires a runner and a nonempty model ID.");
+    }
+    if (p.effort !== undefined && (!p.model || typeof p.effort !== "string" || !p.effort.trim())) {
+      throw new NgError("invalid_argument", "Processor effort requires a model and a nonempty effort ID.");
     }
     registry.resolveTools(p.toolsets ?? []);
   } else {

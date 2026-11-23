@@ -91,7 +91,8 @@ function mcpClient(server) {
     const init = await request("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: `fake-${engine}`, version: "0" } });
     child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
     const list = await request("tools/list", {});
-    log({ type: "mcp_ready", protocolVersion: init.result?.protocolVersion, tools: (list.result?.tools ?? []).map((t) => t.name) });
+    const tools = list.result?.tools ?? [];
+    log({ type: "mcp_ready", protocolVersion: init.result?.protocolVersion, tools: tools.map((t) => t.name), descriptions: Object.fromEntries(tools.map((t) => [t.name, t.description])) });
     return list.result?.tools ?? [];
   })();
   return {

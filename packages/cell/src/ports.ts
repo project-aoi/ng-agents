@@ -251,6 +251,8 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
     self,
     workspace,
     context: ctx,
+    describeRunnerOptions: core.describeRunnerOptions,
+    resolveRunnerSelection: core.resolveRunnerSelection,
 
     async notifyOwner(content, idempotencyKey) {
       assertLive("notifyOwner");

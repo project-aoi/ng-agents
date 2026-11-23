@@ -36,7 +36,7 @@ export interface HumanItemDTO extends HumanItem {
 /** 🔵 我来处理 · 🟢 Agent 处理中 · 🟡 等待外部 (the action's title says what is awaited) */
 export type BallOwner = "human" | "agent" | "waiting";
 export type Effort = "15m" | "45m" | "low_energy";
-export type ViewName = "inbox" | "radar" | "agents" | "review" | "status" | "sources" | "activity";
+export type ViewName = "inbox" | "radar" | "agents" | "review" | "status" | "sources" | "activity" | "models";
 export type HttpMethod = "GET" | "POST" | "PUT" | "DELETE";
 
 export const BALL_LABEL: Readonly<Record<BallOwner, string>> = {
@@ -183,11 +183,13 @@ export interface ModelChoiceDTO {
  */
 export type ModelSelectionDTO = { mode: "auto" } | { mode: "fixed"; model: string; effort?: string };
 export type ModelTierDTO = "strong" | "fast";
+export type RunnerDTO = "claude" | "codex" | "agy";
 
 /** GET /api/models (`?refresh=1` asks the CLI again) and the answer of PUT /api/models. */
 export interface ModelsDTO {
   available: boolean;
-  engine: "claude" | "codex" | "agy" | null;
+  engine: RunnerDTO | null;
+  runners: readonly RunnerDTO[];
   /** As the CLI lists them, its first choice first. Never hard-coded. */
   models: ModelInfoDTO[];
   recommended: ModelChoiceDTO | null;
@@ -202,7 +204,8 @@ export interface ModelsDTO {
   effective: Record<ModelTierDTO, ModelChoiceDTO | null>;
 }
 /** PUT /api/models */
-export type SetModelRequest = { tier: ModelTierDTO; mode: "auto" } | { tier: ModelTierDTO; mode: "fixed"; model: string; effort?: string };
+export type SetModelRequest = { tier: ModelTierDTO; engine?: RunnerDTO } & ({ mode: "auto" } | { mode: "fixed"; model: string; effort?: string });
+export type SetRunnerRequest = { runner: RunnerDTO };
 
 export interface StatusDTO {
   humanPending: number;
@@ -432,6 +435,8 @@ export interface TopologyNodeDTO {
   canChat: boolean;
   /** "claude" | "codex" | "agy" | "api"; null for a script. */
   engine: string | null;
+  /** An explicit model and effort chosen at launch. */
+  modelOverride?: { model: string; effort?: string };
   modelTier: "strong" | "fast" | null;
   cwd: string | null;
   /** The work tree its directory belongs to (same value on every cell sharing it); null when it has no directory. */

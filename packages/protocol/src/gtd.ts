@@ -1,4 +1,5 @@
 import type { CellSpec } from "./contract/cell";
+import { isRunnerOverride, type RunnerOverride } from "./contract/loop";
 
 // Wire contracts shared by the workbench, its presets and the kernel.
 
@@ -139,6 +140,7 @@ export interface ProjectProposal {
   outcome: string;
   background?: string;
   actions: ProposedProjectAction[];
+  runnerOverride?: RunnerOverride;
   /** Optional spec for the project root cell (preset, processor, bounds request); the kernel fills the rest. */
   rootSpec?: Partial<CellSpec>;
 }
@@ -153,6 +155,7 @@ export function isProjectProposal(value: unknown): value is ProjectProposal {
       (a.effort === undefined || ["15m", "45m", "low_energy"].includes(a.effort)) && (a.nextStep===undefined || typeof a.nextStep==="string")) &&
     (p.cwd===undefined || text(p.cwd)) && (p.background===undefined || typeof p.background==="string") &&
     (p.phases===undefined || Array.isArray(p.phases) && p.phases.every(text)) &&
+    (p.runnerOverride === undefined || isRunnerOverride(p.runnerOverride)) &&
     (p.repos===undefined || Array.isArray(p.repos) && p.repos.every(r=>r && text(r.name) && text(r.cwd) && (r.defaultBranch===undefined || text(r.defaultBranch))));
 }
 

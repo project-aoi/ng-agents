@@ -31,6 +31,8 @@ import type {
   Progress,
   Registry,
   RunOutcome,
+  RunnerOverride,
+  RunnerSelection,
   SendToCellResult,
   WorkspaceOccupancy,
 } from "@ng/protocol";
@@ -58,6 +60,8 @@ export interface KernelOptions {
   loop?: AgentLoop;
   /** The installed CLI to use when the processor does not select its own engine. */
   agentBackend?: AgentBackendSetting;
+  /** Limits which runners can be selected or launched. The host checks their binaries before boot. */
+  cliRunners?: readonly CliEngine[];
   /** Per-CLI loop settings (binary, tier models, env pass-through, timeouts, ...). */
   cli?: Partial<Record<CliEngine, Omit<CliAgentLoopOptions, "engine" | "registry" | "clock" | "processRegistry">>>;
   /**
@@ -225,6 +229,10 @@ export interface Kernel {
   readonly loop: AgentLoop;
   /** Engine of llm cells without `processor.engine` (null: none available — such Runs fail with a clear error). */
   readonly agentBackend: AgentEngine | null;
+  readonly cliRunners: readonly CliEngine[];
+  setDefaultRunner(runner: string): void;
+  describeRunnerOptions(): Promise<string>;
+  resolveRunnerSelection(selection: RunnerSelection): Promise<RunnerOverride>;
   /**
    * The model switch of a CLI engine (default: the backend engine); null when the switch is off (`modelSwitch`) or
    * the engine is not a CLI.

@@ -10,10 +10,13 @@ import type { Lifecycle } from "./lifecycle";
 import type { ReadModel } from "./readmodel";
 import type { StallMonitor } from "./stall";
 import type { Waits } from "./waits";
+import type { Kernel } from "./types";
 
 /** Everything the kernel's modules share. Built once by createKernel; modules are attached after construction. */
 export interface KernelCore {
-  defaultEngine: import("@ng/protocol").AgentEngine | null;
+  cliRunners?: Kernel["cliRunners"];
+  describeRunnerOptions: Kernel["describeRunnerOptions"];
+  resolveRunnerSelection: Kernel["resolveRunnerSelection"];
   db: Db;
   bus: Bus;
   clock: Clock;

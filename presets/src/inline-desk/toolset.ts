@@ -3,9 +3,11 @@ import { z } from "zod";
 import { gtdKeys } from "../shared/keys";
 import type { ActivityRecord, ProjectRecord } from "../shared/product-records";
 import {
+  childRunnerOverride,
   defineTool,
   isNgError,
   newId,
+  runnerSelectionInput,
   subjectKeys,
   type CellSpec,
   type ProcessorSpec,
@@ -64,11 +66,12 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
   const owner = "channel:ui:owner";
 
   /** Every desk tool first applies the wake-up's deterministic follow-ups, whichever tool the model picked. */
-  function tool<S extends z.ZodType>(def: { name: string; description: string; input: S; run(args: z.output<S>, ctx: ToolContext, settled: string[]): Promise<ToolResult | string> }): ToolDef {
+  function tool<S extends z.ZodType>(def: { name: string; description: string; input: S; runnerOptions?: true; run(args: z.output<S>, ctx: ToolContext, settled: string[]): Promise<ToolResult | string> }): ToolDef {
     return defineTool({
       name: def.name,
       kind: "kernel",
       description: def.description,
+      runnerOptions: def.runnerOptions,
       input: def.input,
       async handler(args, ctx) {
         const settled = await settleDesk(cfg, ctx);
@@ -290,6 +293,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
 
   const startProject = tool({
     name: "start_project",
+    runnerOptions: true,
     description: [
       "Start a project for anything that takes more than a quick lookup (a task, a todo, a code change, research, an idea). A persistent project cell plans it, keeps its records and its report, and hands every piece of heavy work to workers; it starts at once and the owner gets a short notice.",
       "Put everything it needs into brief: the owner's exact words, constraints, links, what to deliver. cwd is the absolute path of the repository on this machine — ask the owner when you do not know it.",
@@ -305,6 +309,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
       phases: z.array(z.string().min(1)).optional().describe("staged work: phases in order; the project runs one at a time, each after the owner's go-ahead"),
       plan: planInput.optional(),
       continueConversation: z.boolean().optional().describe("the project continues from this conversation (it sees what you just discussed)"),
+      ...runnerSelectionInput,
     }),
     async run(args, ctx) {
       const env = currentItem(ctx);
@@ -324,6 +329,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
       };
       let r: { projectId: string; started: boolean };
       try {
+        init.runnerOverride = await childRunnerOverride(ctx.ports, args);
         r = await launchProject(ctx.ports, init, ctx.clock);
       } catch (err) {
         if (isCwdError(err)) return cwdRefusal(err);
@@ -337,6 +343,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
 
   const proposeProject = tool({
     name: "propose_project",
+    runnerOptions: true,
     description: [
       "Propose a project whose plan needs the owner's sign-off first (large, costly, or built on assumptions): one proposal card where the owner can edit the plan, approve it, or park it for later.",
       "On approval the project starts with the plan they approved automatically (apply_updates shows it). When revising an existing proposal after approval.revise, pass its original subjectKey so this updates the existing card instead of creating a duplicate.",
@@ -351,12 +358,14 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
       repos: z.array(repoInput).optional(),
       phases: z.array(z.string().min(1)).optional(),
       subjectKey: z.string().min(1).optional().describe("when redrafting a pending proposal after approval.revise, reuse the original subjectKey to replace the existing card"),
+      ...runnerSelectionInput,
     }),
     async run(args, ctx) {
       const { ports } = ctx;
       const t = now(ctx);
       const env = currentItem(ctx);
       const subjectKey = args.subjectKey?.trim() || (env ? subjectKeys.inbound(env.id) : subjectKeys.cell(self(ctx)));
+      const runnerOverride = await childRunnerOverride(ports, args);
       const proposal: ProjectProposal = {
         title: args.title,
         outcome: args.outcome,
@@ -364,6 +373,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
         ...(args.cwd ? { cwd: args.cwd } : {}),
         ...(args.repos ? { repos: args.repos } : {}),
         ...(args.phases ? { phases: args.phases } : {}),
+        ...(runnerOverride ? { runnerOverride } : {}),
         actions: args.actions.map((a) => ({ title: a.title, owner: a.owner, ...(a.effort ? { effort: a.effort } : {}), ...(a.nextStep ? { nextStep: a.nextStep } : {}) })),
       };
       const artifactId = newId("art", ctx.clock);
@@ -483,6 +493,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
 
   const addHub = tool({
     name: "add_hub",
+    runnerOptions: true,
     description: [
       "Add a hub: a persistent front door for one stream of direct messages (code review requests, incident pings, task requests for a set of repositories).",
       "Messages matching watch go straight to it instead of the desk, batched over coalesceMinutes; it sends each topic to a worker in the right repository and forwards follow-ups. Off-topic messages come back to you.",
@@ -493,6 +504,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
       rules: z.string().min(1).describe("what belongs to it and how each kind of request is handled (review, investigate, fix), in plain words"),
       watch: z.object({ thread: z.string().optional().describe('workbench topic thread (must start with "ui:", e.g. "ui:reviews")'), filter: watchFilterInput.optional() }),
       coalesceMinutes: z.number().min(0).max(60).optional().describe("batching window (default 2)"),
+      ...runnerSelectionInput,
     }),
     async run(args, ctx) {
       if (!args.watch.thread && !args.watch.filter) return { output: "watch needs a thread or a filter (otherwise nothing reaches the hub).", isError: true };
@@ -515,6 +527,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
         args.rules,
       ].join("\n");
       try {
+        spec.processor = { ...HUB_PROCESSOR, ...await childRunnerOverride(ctx.ports, args) };
         await ctx.ports.spawnCell(spec, { instruction, input: { repos, rules: args.rules } });
       } catch (err) {
         return { output: `Not added: ${errorText(err)}`, isError: true };
@@ -526,6 +539,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
 
   const addSource = tool({
     name: "add_source",
+    runnerOptions: true,
     description: [
       "Add a source that runs on a schedule or a workbench capture topic (ui:<topic>), for example a weekly metrics check.",
       "It stays silent when nothing is found and posts to you only on a hit. mode observe = only keep observation notes, never create items (for a source the owner does not trust yet).",
@@ -540,6 +554,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
       check: z.string().optional(),
       script: z.string().trim().min(1).optional().describe("path to a local script (~ allowed); exit 0 + empty stdout = no hit, non-empty stdout = hit, non-zero = error"),
       mode: z.enum(["active", "observe"]).optional(),
+      ...runnerSelectionInput,
     }),
     async run(args, ctx) {
       if (!args.cron && !args.watchThread) return { output: "Give cron or watchThread.", isError: true };
@@ -556,7 +571,8 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
         mode: args.mode ?? "active",
         processor: processor.kind,
       };
-      const spec = createSensorSpec(newId("src",ctx.clock),source,processor,args.watchThread);
+      const runner = await childRunnerOverride(ctx.ports, args, processor.kind);
+      const spec = createSensorSpec(newId("src", ctx.clock), source, { ...processor, ...runner }, args.watchThread);
       const addr = await ctx.ports.spawnCell(spec, { instruction: args.description ?? args.title });
       await notifyOwner(ctx.ports, `已添加信源：${args.title}${args.mode === "observe" ? "（观察模式，只记笔记不出卡）" : ""}`, `source:${spec.id}`);
       return `Source added (${addr}). It stays silent unless it finds something.`;

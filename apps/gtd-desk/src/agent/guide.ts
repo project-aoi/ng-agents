@@ -1,3 +1,5 @@
+import { runnerSelectionProperties } from "@ng/protocol";
+
 // docs/05 principle 1 — the second entrance. An external "main agent" (Claude Code, Codex CLI, Antigravity… whatever
 // the owner chats with) drives the workbench through these tools, with its own `agent:<id>` identity: it may
 // orchestrate like the owner, but it is never the owner. This file is the whole of what such an agent is told —
@@ -80,6 +82,7 @@ export const AGENT_TOOLS: readonly AgentToolDoc[] = [
         cwd: str("absolute path of the directory/repository the work happens in (must exist). Omit only for work that needs no local files (pure research)"),
         mode: { type: "string", enum: ["now", "research_then_park"], description: 'now (default): do it. research_then_park: an idea for later — research what it should look like, save a report, then park as "someday"' },
         phases: { type: "array", items: { type: "string" }, description: "for a large job: the stages in order. The project runs one stage at a time and asks the owner before starting the next" },
+        ...runnerSelectionProperties,
       },
       ["title", "outcome", "brief"],
     ),
@@ -254,6 +257,7 @@ export const AGENT_TOOLS: readonly AgentToolDoc[] = [
         instruction: str("the complete task: goal, materials, how to verify, what to report"),
         cwd: str("absolute path of the directory it works in"),
         parentId: str("cell to attach it to (default: the desk)"),
+        ...runnerSelectionProperties,
       },
       ["preset", "title", "instruction"],
     ),

@@ -20,6 +20,7 @@ import type {
   SendCellMessageResponse,
   SourcesDTO,
   SetModelRequest,
+  SetRunnerRequest,
   SourcesMutationResponse,
   StatusDTO,
   TopologyDTO,
@@ -144,7 +145,7 @@ export const api = {
   capture: (req: CaptureRequest) => request<CaptureResponse>("POST", "/api/capture", req),
   /** The CLI agent's models; `refresh` asks the CLI again instead of using the cached list. */
   models: (refresh = false) => request<ModelsDTO>("GET", refresh ? "/api/models?refresh=1" : "/api/models"),
-  setModel: (req: SetModelRequest) => request<ModelsDTO>("PUT", "/api/models", req),
+  setModel: (req: SetModelRequest | SetRunnerRequest) => request<ModelsDTO>("PUT", "/api/models", req),
 
 
 

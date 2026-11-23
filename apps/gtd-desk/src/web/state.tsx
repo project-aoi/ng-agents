@@ -25,7 +25,7 @@ export function useStatus(): StatusApi {
 
 type Ticks = Readonly<Record<ViewName, number>>;
 
-const ZERO: Ticks = { inbox: 0, radar: 0, agents: 0, review: 0, status: 0, sources: 0, activity: 0 };
+const ZERO: Ticks = { inbox: 0, radar: 0, agents: 0, review: 0, status: 0, sources: 0, activity: 0, models: 0 };
 
 interface RefreshApi {
   ticks: Ticks;

@@ -41,7 +41,7 @@ import { isProjectRoot, type KernelCore } from "./core";
 import { createDispatcher } from "./dispatcher";
 import { createEscalations } from "./escalations";
 import { createLifecycle } from "./lifecycle";
-import { createModelSettings, type ModelSettings } from "./models";
+import { createModelSettings, createRunnerSettings, type ModelSettings } from "./models";
 import { createReadModel } from "./readmodel";
 import { inspectCell } from "./inspect";
 import { ccDirectChat, directMessage, isPersonPrincipal, sendCellMessage } from "./messages";
@@ -171,13 +171,16 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     }
     return s;
   };
+  const cliRunners = agentBackend ? (opts.cliRunners ?? [agentBackend]) : [];
+  const runnerSettings = createRunnerSettings({ dataDir, runners: cliRunners, initial: agentBackend, modelSettings: modelSettingsOf });
 
   /** Running CLI agent processes are on record here, so a restart can stop the ones a crashed kernel left behind. */
   const cliOwner = createCliOwner();
   const cliProcDir = join(dataDir, "cli-procs");
   const loop: AgentLoop = createRoutingLoop({
     local: opts.loop ?? createCodeLoop(registry, clock),
-    defaultEngine: agentBackend,
+    defaultEngine: () => runnerSettings.current,
+    allowedEngines: opts.cliRunners,
     cliLoop: (engine) => {
       const settings = modelSettingsOf(engine);
       return createCliAgentLoop({ ...opts.cli?.[engine], processRegistry: { dir: cliProcDir, ownerInstanceId: cliOwner.ownerInstanceId }, ...(settings ? { resolveModel: (tier) => settings.resolve(tier) } : {}), engine, registry, clock });
@@ -194,7 +197,9 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
   };
 
   const core: KernelCore = {
-    defaultEngine:agentBackend,
+    cliRunners: opts.cliRunners,
+    describeRunnerOptions: runnerSettings.describe,
+    resolveRunnerSelection: runnerSettings.resolve,
     db,
     bus,
     clock,
@@ -298,8 +303,7 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
   async function startRuntime() {
     // Refresh already-materialized persistent prefixes in parent order after a new release or an offline skill edit.
     for (const c of cells.list({status:["active","paused"]}).sort((a,b)=>a.depth-b.depth)) context.refreshPrefixSync(c.id);
-    // Ask the backend CLI for its models now, so the first Run does not have to wait for the list.
-    if (agentBackend) modelSettingsOf(agentBackend)?.warm();
+    for (const runner of cliRunners) modelSettingsOf(runner)?.warm();
     // A previous process's in-flight Runs died with it; their batches go back to the queue (one attempt each).
     inbox.recoverClaimsSync({ ownerAlive: isCliOwnerAlive, reason: "recovered at startup: the previous kernel stopped during this run" });
     try {
@@ -367,9 +371,13 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     workspace,
     hub,
     loop,
-    agentBackend,
+    get agentBackend() { return runnerSettings.current; },
+    cliRunners,
+    setDefaultRunner: runnerSettings.select,
+    describeRunnerOptions: runnerSettings.describe,
+    resolveRunnerSelection: runnerSettings.resolve,
     modelSettings(engine) {
-      const e = engine ?? (agentBackend ? agentBackend : null);
+      const e = engine ?? runnerSettings.current;
       return e ? modelSettingsOf(e) : null;
     },
     dataDir,

@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState, type FocusEvent as ReactFocusEvent, type KeyboardEvent as ReactKeyboardEvent } from "react";
-import { relativeTimeZh, type ModelChoiceDTO, type ModelSelectionDTO, type ModelsDTO, type ModelTierDTO, type SetModelRequest, type StatusDTO } from "../../shared/api";
+import { relativeTimeZh, type ModelChoiceDTO, type ModelSelectionDTO, type ModelsDTO, type ModelTierDTO, type RunnerDTO, type SetModelRequest, type SetRunnerRequest, type StatusDTO } from "../../shared/api";
 import { api } from "../api";
 import { toFailure, useNow, useRefresh, useResource } from "../state";
 import { whenText } from "../text";
@@ -17,6 +17,7 @@ const TIERS: Array<{ key: ModelTierDTO; label: string }> = [
 /** Select values that are not a model id / an effort the CLI listed. */
 const AUTO = "";
 const DEFAULT_EFFORT = "";
+const RUNNER_NAMES: Record<RunnerDTO, string> = { claude: "Claude Code", codex: "Codex", agy: "Antigravity" };
 
 /** "Opus 5.5 · xhigh" */
 function choiceText(c: ModelChoiceDTO | null): string | null {
@@ -72,10 +73,10 @@ export function ModelSwitch({ status }: { status: StatusDTO }) {
   );
 }
 
-type Busy = ModelTierDTO | "refresh";
+type Busy = ModelTierDTO | "runner" | "refresh";
 
 function ModelPanel({ id }: { id: string }) {
-  const res = useResource<ModelsDTO>("models", () => api.models(), []);
+  const res = useResource<ModelsDTO>("models", () => api.models(), ["models"]);
   const { bump } = useRefresh();
   const now = useNow();
   const [busy, setBusy] = useState<Busy | null>(null);
@@ -85,17 +86,18 @@ function ModelPanel({ id }: { id: string }) {
   const panel = useRef<HTMLDivElement>(null);
   useEffect(() => panel.current?.focus(), []);
 
-  const save = async (req: SetModelRequest) => {
+  const save = async (req: SetModelRequest | SetRunnerRequest) => {
     if (busy) return;
-    const { tier, ...selection } = req;
-    setBusy(tier);
-    setPending({ tier, selection });
+    const where = "runner" in req ? "runner" : req.tier;
+    setBusy(where);
+    if ("tier" in req) setPending({ tier: req.tier, selection: req });
     setFailure(null);
     try {
-      res.set(await api.setModel(req));
-      bump(["status"]); // the top bar shows the main model
+      const engine = res.data?.engine;
+      res.set(await api.setModel("tier" in req && engine ? { ...req, engine } : req));
+      bump(["status", "agents"]);
     } catch (err) {
-      setFailure({ where: tier, message: toFailure(err).message });
+      setFailure({ where, message: toFailure(err).message });
     } finally {
       setBusy(null);
       setPending(null);
@@ -120,9 +122,9 @@ function ModelPanel({ id }: { id: string }) {
   return (
     <div className="model-panel" id={id} role="dialog" aria-label="模型" ref={panel} tabIndex={-1}>
       <div className="mp-head">
-        <h2>模型</h2>
+        <h2>默认 Runner 和模型</h2>
         {m?.available && (
-          <button type="button" className="btn sm" aria-busy={busy === "refresh"} onClick={() => void refresh()} title="重新向 CLI 询问可用的模型">
+          <button type="button" className="btn sm" disabled={busy !== null} aria-busy={busy === "refresh"} onClick={() => void refresh()} title="重新向 CLI 询问可用的模型">
             {busy === "refresh" && <Spinner />}刷新列表
           </button>
         )}
@@ -137,6 +139,20 @@ function ModelPanel({ id }: { id: string }) {
         <p className="mp-none">当前的 Agent 不是由 CLI Agent 运行的，没有可切换的模型。</p>
       ) : (
         <>
+          <label className="field">
+            <span>默认 Runner {busy === "runner" && <Spinner label="正在切换" />}</span>
+            <select
+              value={m.engine ?? ""}
+              disabled={busy !== null || m.runners.length < 2}
+              onChange={(e) => {
+                const runner = m.runners.find((option) => option === e.target.value);
+                if (runner) void save({ runner });
+              }}
+            >
+              {m.runners.map((runner) => <option key={runner} value={runner}>{RUNNER_NAMES[runner]}</option>)}
+            </select>
+          </label>
+          {failure?.where === "runner" && <p className="mp-error" role="alert">{failure.message}</p>}
           <p className="mp-meta" title={m.fetchedAt ? whenText(m.fetchedAt, now) : undefined}>
             {m.engine} 列出的模型 · {m.fetchedAt ? `${relativeTimeZh(m.fetchedAt, now)}更新` : "还没拿到列表"}
           </p>
@@ -159,6 +175,7 @@ function ModelPanel({ id }: { id: string }) {
               m={m}
               selection={pending?.tier === t.key ? pending.selection : m.selection[t.key]}
               busy={busy === t.key}
+              disabled={busy !== null}
               error={failure?.where === t.key ? failure.message : null}
               onSave={(req) => void save(req)}
             />
@@ -176,6 +193,7 @@ function TierSettings(props: {
   m: ModelsDTO;
   selection: ModelSelectionDTO;
   busy: boolean;
+  disabled: boolean;
   error: string | null;
   onSave(req: SetModelRequest): void;
 }) {
@@ -210,6 +228,7 @@ function TierSettings(props: {
           <span>模型</span>
           <select
             value={fixed ? fixed.model : AUTO}
+            disabled={props.disabled}
             onChange={(e) => {
               const v = e.target.value;
               props.onSave(v === AUTO ? { tier, mode: "auto" } : { tier, mode: "fixed", model: v });
@@ -232,6 +251,7 @@ function TierSettings(props: {
             <span>推理强度</span>
             <select
               value={fixed.effort ?? DEFAULT_EFFORT}
+              disabled={props.disabled}
               onChange={(e) => {
                 const effort = e.target.value;
                 props.onSave({ tier, mode: "fixed", model: fixed.model, ...(effort !== DEFAULT_EFFORT ? { effort } : {}) });

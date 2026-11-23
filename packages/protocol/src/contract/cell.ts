@@ -129,6 +129,8 @@ export interface ActionBooks {
 }
 
 export interface RunPorts extends CellPorts {
+  describeRunnerOptions?(): Promise<string>;
+  resolveRunnerSelection?(selection: import("./loop").RunnerSelection): Promise<import("./loop").RunnerOverride | undefined>;
   actionBooks?: ActionBooks;
   isDirectChild(id: string): boolean;
   createHumanItem?(draft: HumanItemDraft): { id: string; itemRevision: number };

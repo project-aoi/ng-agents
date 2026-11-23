@@ -1,8 +1,10 @@
 import { z } from "zod";
 import {
   cellIdOf,
+  childRunnerOverride,
   defineTool,
   isAddress,
+  runnerSelectionInput,
   TOOL_KINDS,
 
   type Address,
@@ -98,6 +100,7 @@ export function cellsToolset(registry: Registry): Toolset {
   const spawnCell = defineTool({
     name: "spawn_cell",
     kind: "kernel",
+    runnerOptions: true,
     availableFor: canSpawn,
     description: [
       "Start a child cell for work that should not block you. It runs in the background and reports to your inbox (cell.result / cell.progress); your in-flight cells are listed at the start of every wake-up message.",
@@ -112,6 +115,7 @@ export function cellsToolset(registry: Registry): Toolset {
       cwd: z.string().optional().describe("absolute path of the directory it works in; default: yours"),
       contextMode: z.enum(["isolated", "fork_prefix"]).optional(),
       modelTier: z.enum(["fast", "strong"]).optional(),
+      ...runnerSelectionInput,
       allowedTools: z.array(z.enum(TOOL_KINDS)).optional().describe("workspace tools the child's model may see"),
       toolsets: z.array(z.string()).optional().describe("replaces the preset's toolsets"),
       code: z
@@ -140,7 +144,8 @@ export function cellsToolset(registry: Registry): Toolset {
           ...(args.toolsets ? { toolsets: args.toolsets } : {}),
         };
       }
-      const spec: CellSpec = { preset: args.preset, title: args.title, processor };
+      const runner = await childRunnerOverride(ctx.ports, args, processor.kind);
+      const spec: CellSpec = { preset: args.preset, title: args.title, processor: { ...processor, ...runner } };
       if (args.cwd) spec.cwd = args.cwd;
       if (args.contextMode) spec.contextMode = args.contextMode;
       if (args.bounds) spec.bounds = toBounds(args.bounds);

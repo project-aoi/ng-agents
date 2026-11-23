@@ -20,6 +20,7 @@ export interface BusTopics {
   "approval.changed": { actionId: string; cellId: string; subjectKey: string; status: ApprovalStatus };
   "owner.notified": LocalNotification;
   "cell.changed": { cellId: string; change: "created" | "updated" | "status" | "epoch"; status?: CellStatus; epoch?: number };
+  "runner.settings.changed": Record<string, never>;
   "job.changed": { jobId: string; cellId: string; state: JobState };
   "run.started": { cellId: string; runId: string; epoch: number };
   "run.finished": { cellId: string; runId: string; epoch: number; outcome: RunOutcome | "error"; error?: string };

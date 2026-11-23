@@ -4,7 +4,7 @@ import { CELL_DIRECT_CHAT_KEY, CELL_TURN_KEY, type BusTopic, type BusTopics } fr
 import type { DeskEvent, NotificationDTO, ViewName } from "../shared/api";
 import { SENSOR_SUGGESTION_PREFIX, SKILL_SUGGESTION_PREFIX } from "./projections/common";
 
-const ALL: readonly ViewName[] = ["inbox", "radar", "agents", "review", "status", "sources", "activity"];
+const ALL: readonly ViewName[] = ["inbox", "radar", "agents", "review", "status", "sources", "activity", "models"];
 
 function stateViews(keys: readonly string[]): ViewName[] {
   const v = new Set<ViewName>();
@@ -30,6 +30,8 @@ export function viewsForBusEvent<K extends BusTopic>(topic: K, data: BusTopics[K
       return ["inbox", "radar", "agents"];
     case "state.changed":
       return stateViews((data as BusTopics["state.changed"]).keys);
+    case "runner.settings.changed":
+      return ["status", "agents", "models"];
     case "cell.changed":
     case "inbox.control":
       return ["radar", "agents", "status", "sources", "inbox", "review"];

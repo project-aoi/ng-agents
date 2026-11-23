@@ -19,11 +19,11 @@ export interface AgentControlPlane {
   /** Run one tool as `principalId`. Unknown tools and invalid arguments come back as `isError` results, not throws. */
   call(name: string, args: Record<string, unknown>, principalId: `agent:${string}`): Promise<AgentToolResult>;
   /** The tools this control plane implements (default: all of AGENT_TOOLS). */
-  tools?(): readonly AgentToolDoc[];
+  tools?(): readonly AgentToolDoc[] | Promise<readonly AgentToolDoc[]>;
 }
 
 export function mountAgentApi(app: Hono, plane: AgentControlPlane, principalOf: (c: Context) => `agent:${string}` | null): void {
-  app.get("/api/agent/tools", (c) => c.json({ server: AGENT_SERVER_NAME, instructions: AGENT_INSTRUCTIONS, tools: plane.tools?.() ?? AGENT_TOOLS }));
+  app.get("/api/agent/tools", async (c) => c.json({ server: AGENT_SERVER_NAME, instructions: AGENT_INSTRUCTIONS, tools: await (plane.tools?.() ?? AGENT_TOOLS) }));
   app.post("/api/agent/tools/:name", async (c) => {
     const principalId = principalOf(c);
     if (!principalId) return c.json({ error: { code: "unauthorized", message: "no agent identity" } }, 401);

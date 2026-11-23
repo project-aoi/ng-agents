@@ -342,8 +342,8 @@ function reopenable(v: AgentsView, c: CellRecord): boolean {
 export function nodeOf(v: AgentsView, c: CellRecord): TopologyNodeDTO {
   const { kernel } = v.input;
   const { roleLabel, layer } = roleOf(v, c);
-  const llm = c.spec.processor.kind === "llm";
-  const processor = c.spec.processor as { kind: string; engine?: string; modelTier?: "strong" | "fast" };
+  const processor = c.spec.processor;
+  const llm = processor.kind === "llm";
   const s = stateOf(v, c);
   const cwd = c.spec.cwd ?? null;
   const leaf = isLeafCell(c);
@@ -364,6 +364,7 @@ export function nodeOf(v: AgentsView, c: CellRecord): TopologyNodeDTO {
     processorType: llm ? "llm" : "code",
     canChat: llm && (c.status !== "closed" || reopenable(v, c)),
     engine: llm ? (processor.engine ?? kernel.agentBackend ?? null) : null,
+    ...(llm && processor.model ? { modelOverride: { model: processor.model, effort: processor.effort } } : {}),
     modelTier: llm ? (processor.modelTier ?? "strong") : null,
     cwd,
     gitRoot: safeWorkTree(cwd),

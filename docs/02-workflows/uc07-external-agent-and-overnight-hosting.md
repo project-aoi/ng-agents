@@ -8,8 +8,10 @@
 
 **`INV-UC07-02`**　外部助手用 `create_project` 直接交办，主台分身用 `start_project`。需要主人确认时生成 `project.start` 卡，由主人批准执行。工作台、宿主启动程序与外部助手均显式传入身份，缺少身份的内核写入会被拒绝。
 
+**`INV-UC07-03`**　外部助手的 `create_project` 和 `spawn_cell` 与内置立项、派工工具共用宿主启用的 runner 列表和模型目录。拒绝无效的选择，保留原有交办和审批权限。
+
 **`INV-UC07-05`**　唤醒时保护仍存活的运行。回收旧进程完成后才允许同一分身启动新命令行。身份暂时不可读时保留登记。后台脚本退出后，恢复流程核对仍存活的同组子进程，再发布任务结果。
 
 ## 回归入口
 
-[agent.test.ts](../../apps/gtd-desk/test/agent.test.ts)、[restart.test.ts](../../packages/cell/test/restart.test.ts)、[cli-orphans.test.ts](../../packages/loop/test/cli-orphans.test.ts)。
+[agent.test.ts](../../apps/gtd-desk/test/agent.test.ts)、[models.test.ts](../../apps/gtd-desk/test/models.test.ts)、[restart.test.ts](../../packages/cell/test/restart.test.ts)、[cli-orphans.test.ts](../../packages/loop/test/cli-orphans.test.ts)。

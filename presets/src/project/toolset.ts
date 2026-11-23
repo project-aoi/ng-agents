@@ -5,9 +5,11 @@ import type { ProjectRecord } from "../shared/product-records";
 import {
   CELL_STATUS_KEY,
   cellIdOf,
+  childRunnerOverride,
   defineTool,
   isNgError,
   newId,
+  runnerSelectionInput,
   type ActionRecord,
   type BallOwner,
   type CellSpec,
@@ -90,13 +92,14 @@ function spawnRefusal(err: unknown): ToolResult {
 }
 
 export function projectToolset(): Toolset {
-  function tool<S extends z.ZodType>(def: { name: string; description: string; input: S; run(args: z.output<S>, ctx: ToolContext): Promise<ToolResult | string> }): ToolDef {
-    return defineTool({ name: def.name, kind: "kernel", description: def.description, input: def.input, availableFor: hasParent, handler: (args, ctx) => def.run(args, ctx) });
+  function tool<S extends z.ZodType>(def: { name: string; description: string; input: S; runnerOptions?: true; run(args: z.output<S>, ctx: ToolContext): Promise<ToolResult | string> }): ToolDef {
+    return defineTool({ name: def.name, kind: "kernel", description: def.description, input: def.input, runnerOptions: def.runnerOptions, availableFor: hasParent, handler: (args, ctx) => def.run(args, ctx) });
   }
   const self = (ctx: ToolContext) => ctx.ports.self.cellId;
 
   const dispatch = tool({
     name: "dispatch",
+    runnerOptions: true,
     description: [
       "Hand one piece of work to a new child and put it on the books in the same step.",
       'preset "worker" (default): reads or changes code, runs tests, researches. You are woken when its turn is over; it then rests and a send_message to it continues it with everything it knows. preset "checker": a light checker of one outside condition (an MR merged, CI green, a path exists); it looks now, keeps checking, reports when the condition holds and is then closed — with check, a command does the checking and no model runs until it reports.',
@@ -113,6 +116,7 @@ export function projectToolset(): Toolset {
       actionId: z.string().optional().describe("an action already on the books that this carries out (e.g. a planned step); default: a new action"),
       phase: z.number().int().min(1).optional().describe("phase of a staged project"),
       modelTier: z.enum(["fast", "strong"]).optional(),
+      ...runnerSelectionInput,
       check: checkInput.optional(),
       watches: z.array(watchInput).optional().describe("checker: optional workbench message filters that wake it to check the current condition"),
       schedules: z
@@ -154,6 +158,8 @@ export function projectToolset(): Toolset {
       let addr: InboxAddr;
       let instruction = args.instruction;
       try {
+        const runner = await childRunnerOverride(ctx.ports, args, processor.kind);
+        if (runner) spec.processor = { ...processor, ...runner };
         if (args.watches?.length) spec.watches = args.watches.map((w) => toWatch(w));
         if (args.schedules?.length) spec.schedules = args.schedules.map(toSchedule);
         const note = preset === "checker" && !check && spec.schedules ? scheduleNote(spec.schedules) : "";

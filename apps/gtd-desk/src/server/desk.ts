@@ -1,5 +1,5 @@
 import { createModelSwitch } from "./models";
-import type { SetModelRequest } from "../shared/api";
+import type { SetModelRequest, SetRunnerRequest } from "../shared/api";
 import { ownerOnlyApproval } from "@ng/gate";
 import type { HumanDecision, HumanItem, CardOption } from "@ng/protocol";
 import { isProjectRoot, type Kernel } from "@ng/cell";
@@ -152,7 +152,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
   const status = (): StatusDTO => {
     restamp();
     const model = models.label();
-    return { ...projectStatus(input()), ...(model ? {model} : {}) };
+    return { ...projectStatus(input()), backend: kernel.agentBackend ?? settings.backend, ...(model ? {model} : {}) };
   };
   const radar = (): RadarDTO => {
     restamp();
@@ -794,9 +794,11 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
   return {
     ownerPrincipal: owner,
     models: (refresh: boolean) => models.view({ refresh }),
-    setModel(req: SetModelRequest, actor: DeskActor) {
+    async setModel(req: SetModelRequest | SetRunnerRequest, actor: DeskActor) {
       principalOf(actor);
-      return models.set(req);
+      const result = await models.set(req);
+      kernel.bus.emit("runner.settings.changed", {});
+      return result;
     },
     status,
     topology: agents.topology,

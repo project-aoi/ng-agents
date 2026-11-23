@@ -240,7 +240,7 @@ export function createLifecycle(core: KernelCore): Lifecycle {
       const id = spec.id ?? newId("cell", clock);
       if (cells.get(id)) throw new NgError("duplicate", `cell "${id}" already exists`);
       const { spec: resolved } = resolveSpec(registry, spec, null);
-      validateSpec(registry, resolved);
+      validateSpec(registry, resolved, core.cliRunners);
       if (resolved.cwd !== undefined) assertDirectory(resolved.cwd, "cwd");
       const bounds = rootBounds(opts.bounds);
       if (isLeafLifetime(resolved.lifetime)) bounds.maxDepth = 0;
@@ -281,7 +281,7 @@ export function createLifecycle(core: KernelCore): Lifecycle {
 
       const { spec: resolved, boundsRequest } = resolveSpec(registry, spec, parent);
       if (resolved.preset && registry.presets.get(resolved.preset)?.rootOnly) throw new NgError("bounds_violation", "这个角色只允许作为根任务");
-      validateSpec(registry, resolved);
+      validateSpec(registry, resolved, core.cliRunners);
       if (parent.bounds.maxDepth < 1) {
         throw new NgError("bounds_violation", `cell "${parent.id}" may not spawn children (maxDepth 0); do the work itself or report to its parent`);
       }
@@ -365,7 +365,7 @@ export function createLifecycle(core: KernelCore): Lifecycle {
       }
       if (given.watches !== undefined) next.watches = given.watches;
       if (given.schedules !== undefined) next.schedules = given.schedules;
-      validateSpec(registry, next);
+      validateSpec(registry, next, core.cliRunners);
 
       let bounds = cell.bounds;
       if (given.bounds !== undefined) {

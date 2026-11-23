@@ -2,11 +2,12 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createModelSettings } from "@ng/cell";
-import type { CliModelCatalog, CliModelInfo } from "@ng/loop";
+import { CLI_SESSION_KEY, type CliModelCatalog, type CliModelInfo, type CliSessionRecord } from "@ng/loop";
+import { installFakeCli } from "@ng/loop/testing";
 import { ManualClock, NgError, type CliEngine } from "@ng/protocol";
-import type { ApiError, ModelsDTO, StatusDTO } from "../src/shared/api";
+import type { ApiError, ModelsDTO, StatusDTO, TopologyDTO } from "../src/shared/api";
 import { createModelSwitch } from "../src/server/models";
-import { bootDesk, cleanupAll, MIN, T0, tempDir } from "./helpers";
+import { bootDesk, bootRealDesk, cleanupAll, MIN, T0, tempDir } from "./helpers";
 
 // The owner's model switch over HTTP (/api/models, and the model in /api/status). The catalogue is injected through
 // the kernel's `modelSwitch.fetch`: no CLI is run (the configured binary does not exist).
@@ -64,6 +65,7 @@ describe("GET/PUT /api/models on a CLI backend", () => {
     expect(m).toEqual({
       available: true,
       engine: "claude",
+      runners: ["claude"],
       models: [OPUS, SONNET, HAIKU],
       recommended: { model: "opus", label: "Opus 5.5", effort: "xhigh" },
       // the fast tier's auto choice is the light model the CLI lists, not the flagship at its top effort
@@ -183,6 +185,7 @@ describe("without a CLI backend", () => {
     expect(await d.get<ModelsDTO>("/api/models")).toEqual({
       available: false,
       engine: null,
+      runners: [],
       models: [],
       recommended: null,
       fetchedAt: null,
@@ -198,12 +201,96 @@ describe("without a CLI backend", () => {
   });
 });
 
+describe("runner selection", () => {
+  it("advertises real options to launch tools and routes the desk, project and worker with their chosen models", async () => {
+    const dataDir = tempDir("runners-data");
+    const bins = tempDir("runners-bin");
+    const claude = installFakeCli(bins, "claude", [
+      { actions: [
+        { mcp: "start_project", args: { title: "查一下", outcome: "核对记录", brief: "核对记录", runner: "codex", model: "codex-test", effort: "low" } },
+        { text: "已立项" },
+      ] },
+      { actions: [{ text: "已核对" }] },
+      { actions: [{ text: "补充已核对" }] },
+    ]);
+    const codex = installFakeCli(bins, "codex", [
+      { actions: [
+        { mcp: "dispatch", args: { title: "无效选项", instruction: "核对记录", runner: "agy" } },
+        { mcp: "dispatch", args: { title: "核对记录", instruction: "核对记录", runner: "claude", model: "sonnet", effort: "medium" } },
+        { text: "已派工" },
+      ] },
+    ]);
+    const clock = new ManualClock(T0);
+    const fetch = async (engine: CliEngine): Promise<CliModelCatalog> => ({
+      engine,
+      models: engine === "claude" ? [OPUS, SONNET] : [{ id: "codex-test", label: "Codex Test", efforts: ["low", "high"] }],
+      recommended: engine === "claude" ? { model: "opus", effort: "high" } : { model: "codex-test", effort: "high" },
+      fetchedAt: clock.now(),
+    });
+    const env = { NG_AGENT_RUNNERS: "claude,codex", NG_CLAUDE_BIN: claude.bin, NG_CODEX_BIN: codex.bin };
+    const opts = {
+      dataDir, clock, env, detectCli: () => true,
+      kernel: { modelSwitch: { fetch }, cli: { claude: { bin: claude.bin, env: claude.env }, codex: { bin: codex.bin, env: codex.env } } },
+    };
+    const d = await bootRealDesk(opts);
+    await d.post("/api/cells/desk/messages", { text: "请核对记录", clientId: "open" });
+    await d.kernel.idle();
+
+    const project = d.kernel.listCells({ parentId: "desk" }).find((c) => c.preset === "project")!;
+    const workers = d.kernel.listCells({ parentId: project.id });
+    expect(workers).toHaveLength(1);
+    const [worker] = workers;
+    expect(project.spec.processor).toMatchObject({ engine: "codex", model: "codex-test", effort: "low" });
+    expect(worker!.spec.processor).toMatchObject({ engine: "claude", model: "sonnet", effort: "medium" });
+    expect(claude.launches()[0]).toEqual(expect.arrayContaining(["--model", "opus", "--effort", "high"]));
+    expect(codex.launches()[0]).toEqual(expect.arrayContaining(["-m", "codex-test", 'model_reasoning_effort="low"']));
+    expect(claude.launches()[1]).toEqual(expect.arrayContaining(["--model", "sonnet", "--effort", "medium"]));
+    expect(codex.log().find((entry) => entry.type === "mcp_result" && entry.name === "dispatch")).toMatchObject({ isError: true });
+
+    const deskDescriptions = claude.log().find((entry) => entry.type === "mcp_ready")!["descriptions"];
+    const projectDescriptions = codex.log().find((entry) => entry.type === "mcp_ready")!["descriptions"];
+    expect(deskDescriptions).toMatchObject({ start_project: expect.stringContaining('codex: "codex-test" (effort: "low", "high")') });
+    expect(projectDescriptions).toMatchObject({ dispatch: expect.stringContaining('- claude: "opus"') });
+    expect(JSON.stringify(projectDescriptions)).not.toContain("- agy:");
+
+    const session = d.kernel.context.readStateSync<CliSessionRecord>(worker!.id, CLI_SESSION_KEY);
+    expect(session).toMatchObject({ engine: "claude", model: "sonnet@medium" });
+    expect((await put(d, { runner: "agy" })).status).toBe(400);
+    expect((await put(d, { runner: "codex" })).json).toMatchObject({ engine: "codex", runners: ["claude", "codex"] });
+    expect(await d.get<StatusDTO>("/api/status")).toMatchObject({ backend: "codex", model: "Codex Test · high" });
+    expect((await put(d, { tier: "strong", engine: "claude", mode: "auto" })).status).toBe(409);
+    const topology = await d.get<TopologyDTO>("/api/agents/topology");
+    expect(topology.nodes.find((n) => n.cellId === worker!.id)).toMatchObject({ engine: "claude", modelOverride: { model: "sonnet", effort: "medium" } });
+
+    await d.post(`/api/cells/${worker!.id}/messages`, { text: "请再核对", clientId: "follow-up" });
+    await d.post("/api/cells/desk/messages", { text: "还好吗", clientId: "switch" });
+    await d.kernel.idle();
+    expect(d.kernel.context.readStateSync(worker!.id, CLI_SESSION_KEY)).toMatchObject({ sessionId: session!.sessionId, engine: "claude" });
+    expect(d.kernel.context.readStateSync("desk", CLI_SESSION_KEY)).toMatchObject({ engine: "codex", model: "codex-test@high" });
+    expect(await d.kernel.describeRunnerOptions()).toContain("Default runner: codex");
+
+    await d.server.close();
+    const restarted = await bootRealDesk(opts);
+    expect((await restarted.get<ModelsDTO>("/api/models")).engine).toBe("codex");
+    const docs = await restarted.req<{ tools: Array<{ name: string; description: string }> }>("GET", "/api/agent/tools");
+    expect(docs.json.tools.find((t) => t.name === "create_project")?.description).toContain('Default runner: codex');
+    const spawn = { preset: "worker", title: "外部检查", instruction: "核对记录", model: "sonnet" };
+    const invalid = await restarted.req<{ isError: boolean; text: string }>("POST", "/api/agent/tools/spawn_cell", spawn);
+    expect(invalid.json).toMatchObject({ isError: true, text: expect.stringContaining('Runner codex does not list model "sonnet"') });
+    expect(restarted.kernel.listCells({ parentId: "desk" })).toHaveLength(0);
+    const started = await restarted.req<{ data: { cellId: string } }>("POST", "/api/agent/tools/spawn_cell", { ...spawn, runner: "claude", effort: "medium" });
+    expect(restarted.kernel.getCell(started.json.data.cellId)?.spec.processor).toMatchObject({ engine: "claude", model: "sonnet", effort: "medium" });
+    await restarted.kernel.idle();
+  });
+});
+
 describe("createModelSwitch", () => {
+  const runnerControls = { cliRunners: ["codex"] as const, setDefaultRunner: () => undefined };
   const settingsWith = (fetch: (e: CliEngine) => Promise<CliModelCatalog>, clock = new ManualClock(T0)) =>
     createModelSettings({ engine: "codex", dataDir: tempDir("models"), clock, fetch, firstFetchWaitMs: 20 });
 
   it("no switch: nothing to show, nothing to set, no label", async () => {
-    const sw = createModelSwitch({ modelSettings: () => null });
+    const sw = createModelSwitch({ ...runnerControls, modelSettings: () => null });
     expect((await sw.view()).available).toBe(false);
     await expect(sw.set({ tier: "strong", mode: "auto" })).rejects.toBeInstanceOf(NgError);
     expect(sw.label()).toBeNull();
@@ -213,7 +300,7 @@ describe("createModelSwitch", () => {
     const settings = settingsWith(async () => {
       throw new Error("codex: command not found");
     });
-    const sw = createModelSwitch({ modelSettings: () => settings });
+    const sw = createModelSwitch({ ...runnerControls, modelSettings: () => settings });
     const v = await sw.view();
     expect(v).toMatchObject({ available: true, engine: "codex", models: [], recommended: null, fetchedAt: null, error: "codex: command not found" });
     expect(v.effective).toEqual({ strong: null, fast: null });
@@ -232,7 +319,7 @@ describe("createModelSwitch", () => {
       recommended: { model: "gpt-6-codex", effort: "xhigh" },
       fetchedAt: clock.now(),
     }), clock);
-    const sw = createModelSwitch({ modelSettings: () => settings });
+    const sw = createModelSwitch({ ...runnerControls, modelSettings: () => settings });
     expect(sw.label()).toBeNull(); // nothing fetched yet
     await sw.view();
     expect(sw.label()).toBe("GPT-6 Codex · xhigh");

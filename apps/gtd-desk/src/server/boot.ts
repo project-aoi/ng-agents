@@ -104,12 +104,11 @@ export async function createDeskServer(opts: DeskServerOptions = {}): Promise<De
   {
     // What a CLI agent refused or why it failed belongs in the server log; launches only on request.
     const verbose = env["NG_CLI_DEBUG"] === "1";
-    const engineOpts = choice.kernelOptions.cli?.[choice.engine];
-    if (engineOpts) {
+    for (const [engine, engineOpts] of Object.entries(choice.kernelOptions.cli ?? {})) {
       engineOpts.onDebug = (e) => {
-        if (e.type === "notice") log(`${choice.engine} [${e.cellId}] ${e.text}`);
-        else if (e.type === "exit" && (e.code !== 0 || verbose)) log(`${choice.engine} [${e.cellId}] exited ${e.code ?? e.signal}${e.stderr.trim() ? `: ${e.stderr.trim().slice(-500)}` : ""}`);
-        else if (e.type === "launch" && verbose) log(`${choice.engine} [${e.cellId}] ${e.argv.join(" ")} (cwd ${e.cwd}) — ${e.permissions}`);
+        if (e.type === "notice") log(`${engine} [${e.cellId}] ${e.text}`);
+        else if (e.type === "exit" && (e.code !== 0 || verbose)) log(`${engine} [${e.cellId}] exited ${e.code ?? e.signal}${e.stderr.trim() ? `: ${e.stderr.trim().slice(-500)}` : ""}`);
+        else if (e.type === "launch" && verbose) log(`${engine} [${e.cellId}] ${e.argv.join(" ")} (cwd ${e.cwd}) — ${e.permissions}`);
       };
     }
   }
@@ -128,6 +127,7 @@ export async function createDeskServer(opts: DeskServerOptions = {}): Promise<De
     onError,
     // With a CLI agent behind the cells, the owner picks its model in the workbench; the list comes from the CLI.
     modelSwitch: true,
+    cliRunners: choice.runners,
     ...choice.kernelOptions,
     ...opts.kernel,
   });
@@ -142,7 +142,7 @@ export async function createDeskServer(opts: DeskServerOptions = {}): Promise<De
     const settings: DeskSettings = {
       ...DEFAULT_SETTINGS,
       ...opts.settings,
-      backend: choice.engine,
+      backend: kernel.agentBackend ?? choice.engine,
       tokenRequired: security.token !== null,
     };
     const desk = createDesk({ kernel, ui, settings, onError });
@@ -156,7 +156,7 @@ export async function createDeskServer(opts: DeskServerOptions = {}): Promise<De
         : security.loopback && security.generatedOwnerToken
           ? "open on loopback as agent:local"
           : "closed (set NG_AGENT_TOKEN)";
-    log(`data ${dataDir} · agents: ${choice.engine} · main-agent API /api/agent/*: ${agentAccess}`);
+    log(`data ${dataDir} · default runner: ${kernel.agentBackend} · enabled runners: ${kernel.cliRunners.join(", ")} · main-agent API /api/agent/*: ${agentAccess}`);
 
     let server: ServerType | null = null;
     let closing: Promise<void> | null = null;

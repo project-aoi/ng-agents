@@ -6,7 +6,8 @@ export interface RoutingLoopOptions {
   /** Executes locally assigned runs. */
   local: AgentLoop;
   /** Engine for llm cells without `processor.engine`; null = none available (such Runs fail with a clear error). */
-  defaultEngine: AgentEngine | null;
+  defaultEngine: AgentEngine | null | (() => AgentEngine | null);
+  allowedEngines?: readonly CliEngine[];
   /** Creates (once, on first use) the loop for a CLI engine. */
   cliLoop(engine: CliEngine): AgentLoop;
   /** Called per Run with the engine chosen (diagnostics). */
@@ -20,6 +21,7 @@ export interface RoutingLoop extends AgentLoop {
 }
 
 export function createRoutingLoop(opts: RoutingLoopOptions): RoutingLoop {
+  const defaultEngine = () => typeof opts.defaultEngine === "function" ? opts.defaultEngine() : opts.defaultEngine;
   const cli = new Map<CliEngine, AgentLoop>();
   const loopFor = (engine: CliEngine): AgentLoop => {
     let l = cli.get(engine);
@@ -29,7 +31,7 @@ export function createRoutingLoop(opts: RoutingLoopOptions): RoutingLoop {
 
   function engineFor(processor: PromptSnapshot["spec"]["processor"]): AgentEngine | "code" | null {
     if (processor.kind === "code") return "code";
-    return processor.engine ?? opts.defaultEngine;
+    return processor.engine ?? defaultEngine();
   }
 
   async function run(snapshot: PromptSnapshot, ports: RunPorts, signal: AbortSignal): Promise<RunOutcome> {
@@ -37,6 +39,7 @@ export function createRoutingLoop(opts: RoutingLoopOptions): RoutingLoop {
     if (engine) opts.onRoute?.({ cellId: snapshot.cellId, runId: snapshot.runId, engine });
     if (engine === "code" || engine === null) return opts.local.run(snapshot, ports, signal);
     if (!(CLI_ENGINES as readonly string[]).includes(engine)) throw new NgError("invalid_argument", `unknown engine "${String(engine)}"`);
+    if (opts.allowedEngines && !opts.allowedEngines.includes(engine)) throw new NgError("invalid_argument", `runner "${engine}" is not enabled`);
     const rec = await ports.context.readState<CliSessionRecord>(snapshot.cellId, CLI_SESSION_KEY).catch(() => null);
     if (rec && rec.engine !== engine) {
       await ports.context.commit(snapshot.cellId, { statePatches: { [CLI_SESSION_KEY]: null } }).catch(() => undefined);
@@ -44,5 +47,5 @@ export function createRoutingLoop(opts: RoutingLoopOptions): RoutingLoop {
     return loopFor(engine).run(snapshot, ports, signal);
   }
 
-  return { run, engineFor, defaultEngine: opts.defaultEngine };
+  return { run, engineFor, get defaultEngine() { return defaultEngine(); } };
 }

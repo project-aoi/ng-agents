@@ -7,6 +7,7 @@ import {
   CELL_STATUS_KEY,
   DEFAULT_RESOURCE_PAGE_CHARS,
   MAX_RESOURCE_PAGE_CHARS,
+  childRunnerOverride,
   isNgError,
   newId,
   type ActionRecord,
@@ -15,6 +16,7 @@ import {
   type CellRecord,
   type CellStatusLine,
   type SendToCellResult,
+  type RunnerSelection,
 } from "@ng/protocol";
 import type { ProjectRowDTO, SendCellMessageRequest, TimelineItemDTO } from "../shared/api";
 import type { Delivery } from "../server/agents";
@@ -57,12 +59,17 @@ function oneLine(text: string | null | undefined, max = 160): string {
 
 const str = (v: unknown): string | undefined => (typeof v === "string" && v.trim() ? v.trim() : undefined);
 
+function runnerSelection(args: Args): RunnerSelection {
+  return { runner: str(args["runner"]), model: str(args["model"]), effort: str(args["effort"]) };
+}
+
 // ==================== argument validation (against the schemas in guide.ts) ====================
 
 interface PropSchema {
   type?: string;
   enum?: readonly unknown[];
   items?: { type?: string };
+  minLength?: number;
 }
 
 /**
@@ -130,6 +137,7 @@ export function validateArgs(doc: AgentToolDoc, args: Args): string | null {
               ? Array.isArray(v) && (p.items?.type !== "string" || v.every((x) => typeof x === "string"))
               : true;
     if (!typeOk) problems.push(`"${k}" must be ${p.type === "array" ? `an array${p.items?.type ? ` of ${p.items.type}s` : ""}` : `a ${p.type}`}`);
+    else if (p.minLength !== undefined && typeof v === "string" && v.trim().length < p.minLength) problems.push(`"${k}" must not be blank`);
     else if (p.enum && !p.enum.includes(v)) problems.push(`"${k}" must be one of ${p.enum.map((e) => JSON.stringify(e)).join(", ")}`);
   }
   if (problems.length === 0) return null;
@@ -427,7 +435,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       return ok(`${where}\n---\n${page.content}`, page);
     },
 
-    create_project(args, principalId) {
+    async create_project(args, principalId) {
       const mode = (str(args["mode"]) ?? "now") as ProjectMode;
       const phases = Array.isArray(args["phases"]) ? (args["phases"] as string[]).map((p) => p.trim()).filter(Boolean) : [];
       const cwd = str(args["cwd"]);
@@ -439,6 +447,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         source: { label: "主 Agent", principalId, at: now() },
         ...(cwd ? { cwd } : {}),
         ...(phases.length ? { phases } : {}),
+        runnerOverride: await childRunnerOverride(kernel, runnerSelection(args)),
       };
       let r: { projectId: string; started: boolean };
       try {
@@ -750,7 +759,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       });
     },
 
-    spawn_cell(args, principalId) {
+    async spawn_cell(args, principalId) {
       const preset = str(args["preset"])!;
       if (preset === kernel.getCell(deskId)?.preset) return fail("主台角色只能用于根工作台");
       const title = str(args["title"])!;
@@ -760,13 +769,16 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const parent = kernel.getCell(parentId);
       if (!parent) return fail(`There is no cell "${parentId}" to attach it to.`);
       if (parent.status === "closed") return fail(`Cell ${parentId} has closed; attach the new cell elsewhere (default: the desk).`);
+      const base = kernel.registry.presets.get(preset)?.defaults.processor;
+      const runnerOverride = await childRunnerOverride(kernel, runnerSelection(args), base?.kind);
       let cellId: string;
       try {
         if (preset === "project") {
-          cellId = desk.createProject({ title, outcome: title, brief: instruction, source: { label: "主 Agent", principalId, at: now() }, ...(cwd ? { cwd } : {}) }, { principalId },parentId).projectId;
+          cellId = desk.createProject({ title, outcome: title, brief: instruction, source: { label: "主 Agent", principalId, at: now() }, ...(cwd ? { cwd } : {}), runnerOverride }, { principalId },parentId).projectId;
         } else {
           const spec: CellSpecInput = { preset: preset as NonNullable<CellSpecInput["preset"]>, title };
           if (cwd) spec.cwd = cwd;
+          if (runnerOverride && base?.kind === "llm") spec.processor = { ...base, ...runnerOverride };
           const addr = desk.spawnCell(parentId, spec, { instruction, title }, { principalId });
           cellId = addr.slice("inbox:".length);
         }
@@ -892,7 +904,12 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
   }
 
   return {
-    tools: () => AGENT_TOOLS,
+    async tools() {
+      const options = await kernel.describeRunnerOptions();
+      return AGENT_TOOLS.map((tool) => tool.name === "create_project" || tool.name === "spawn_cell"
+        ? { ...tool, description: `${tool.description}\n\n${options}` }
+        : tool);
+    },
     async call(name, rawArgs, principalId) {
       const doc = docs.get(name);
       const handler = handlers[name];

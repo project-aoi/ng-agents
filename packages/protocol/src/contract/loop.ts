@@ -13,6 +13,8 @@ export type ProcessorSpec =
       prompt?: string;                  // [ext] registered prompt name (Registry.prompts)
       toolsets?: readonly string[];     // [ext] registered toolset names (Registry.toolsets), filtered by selectRunTools
       engine?: AgentEngine;             // [ext] who executes this cell's Runs; absent = the kernel's default backend
+      model?: string;                   // [ext] model fixed for this cell on the specified engine
+      effort?: string;                  // [ext] effort supported by that model
     }
   | { kind: "code"; entry: string;      // zero-token deterministic processor or local check script (all/any join bookkeeping, scheduled checks, ...)
       args?: Record<string, unknown>;   // [ext] static JSON configuration handed to the processor
@@ -42,6 +44,30 @@ export type CliEngine = typeof CLI_ENGINES[number];
 export type AgentEngine = CliEngine;
 export type LlmProcessorSpec = Extract<ProcessorSpec, { kind: "llm" }>;
 export type CodeProcessorSpec = Extract<ProcessorSpec, { kind: "code" }>;
+export type RunnerOverride = { engine: CliEngine; model?: string; effort?: string };
+
+const runnerOverride = z.strictObject({ engine: z.enum(CLI_ENGINES), model: z.string().trim().min(1).optional(), effort: z.string().trim().min(1).optional() });
+export function isRunnerOverride(value: unknown): value is RunnerOverride {
+  const result = runnerOverride.safeParse(value);
+  return result.success && (!result.data.effort || Boolean(result.data.model));
+}
+
+export const runnerSelectionInput = {
+  runner: z.string().trim().min(1).optional().describe("CLI runner from the available options below. Omit for the workbench default."),
+  model: z.string().trim().min(1).optional().describe("Exact model ID for that runner. Omit to use its configured model for this tier."),
+  effort: z.string().trim().min(1).optional().describe("Reasoning effort supported by the selected model. Requires model."),
+};
+const runnerSelection = z.object(runnerSelectionInput);
+export type RunnerSelection = z.output<typeof runnerSelection>;
+export const runnerSelectionProperties = z.toJSONSchema(runnerSelection, { io: "input" }).properties;
+
+export async function childRunnerOverride(ports: Pick<RunPorts, "resolveRunnerSelection">, args: RunnerSelection, kind: ProcessorSpec["kind"] = "llm"): Promise<RunnerOverride | undefined> {
+  const { runner, model, effort } = args;
+  if (runner === undefined && model === undefined && effort === undefined) return undefined;
+  if (kind === "code") throw new NgError("invalid_argument", "Runner options apply only to model-backed cells.");
+  if (!ports.resolveRunnerSelection) throw new NgError("unsupported", "No CLI runner options are available.");
+  return ports.resolveRunnerSelection({ runner, model, effort });
+}
 
 /** Precedence when several tool calls in one step ask to end the Run. */
 export const RUN_END_PRECEDENCE = ["deferred_for_approval", "yielded_waiting", "completed"] as const;
@@ -85,6 +111,8 @@ export interface ToolDef {
   description: string;
   inputSchema: JsonSchema;              // JSON Schema (type: "object") handed to the model
   kind: ToolDefKind;
+  /** Include the host's current runner and model choices when exposing this tool. */
+  runnerOptions?: true;
   /** Receives the raw model input; tools built with defineTool validate it first. A thrown error becomes an isError result. */
   handler(args: unknown, ctx: ToolContext): ToolHandlerReturn;
   /**
@@ -140,6 +168,7 @@ export function defineTool<S extends z.ZodType>(def: {
   input: S;
   handler(args: z.output<S>, ctx: ToolContext): ToolHandlerReturn;
   availableFor?: ToolDef["availableFor"]; // [ext]
+  runnerOptions?: true;
 }): ToolDef {
   assertToolName(def.name);
   const { $schema: _ignored, ...inputSchema } = z.toJSONSchema(def.input, { io: "input" }) as JsonSchema;
@@ -157,6 +186,7 @@ export function defineTool<S extends z.ZodType>(def: {
     },
   };
   if (def.availableFor) tool.availableFor = def.availableFor;
+  if (def.runnerOptions) tool.runnerOptions = true;
   return tool;
 }
 

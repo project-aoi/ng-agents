@@ -1,7 +1,7 @@
 import type { Kernel, ModelSelection, ModelSettings } from "@ng/cell";
 import { fastRecommendation } from "@ng/loop";
 import { NgError, type ModelTier } from "@ng/protocol";
-import type { ModelChoiceDTO, ModelsDTO, SetModelRequest } from "../shared/api";
+import type { ModelChoiceDTO, ModelsDTO, RunnerDTO, SetModelRequest, SetRunnerRequest } from "../shared/api";
 
 /**
  * The owner's model switch over HTTP (`/api/models`). The list and the recommendation come from the backend CLI
@@ -9,14 +9,14 @@ import type { ModelChoiceDTO, ModelsDTO, SetModelRequest } from "../shared/api";
  */
 export interface ModelSwitch {
   view(opts?: { refresh?: boolean }): Promise<ModelsDTO>;
-  set(req: SetModelRequest): Promise<ModelsDTO>;
+  set(req: SetModelRequest | SetRunnerRequest): Promise<ModelsDTO>;
   /** "Opus 5.5 · xhigh" for the top bar; null when there is no switch or nothing is known yet. */
   label(): string | null;
 }
 
 const TIERS: readonly ModelTier[] = ["strong", "fast"];
 
-function dto(settings: ModelSettings): ModelsDTO {
+function dto(settings: ModelSettings, runners: readonly RunnerDTO[]): ModelsDTO {
   const v = settings.view();
   const labelOf = (id: string) => v.catalog?.models.find((m) => m.id === id)?.label ?? id;
   const choice = (c: { model: string; effort?: string } | null): ModelChoiceDTO | null =>
@@ -24,6 +24,7 @@ function dto(settings: ModelSettings): ModelsDTO {
   return {
     available: true,
     engine: v.engine,
+    runners,
     models: v.catalog?.models ?? [],
     recommended: choice(v.catalog?.recommended ?? null),
     recommendedFast: choice(v.catalog ? fastRecommendation(v.catalog) : null),
@@ -37,6 +38,7 @@ function dto(settings: ModelSettings): ModelsDTO {
 const NONE: ModelsDTO = {
   available: false,
   engine: null,
+  runners: [],
   models: [],
   recommended: null,
   fetchedAt: null,
@@ -45,21 +47,28 @@ const NONE: ModelsDTO = {
   effective: { strong: null, fast: null },
 };
 
-export function createModelSwitch(kernel: Pick<Kernel, "modelSettings">): ModelSwitch {
+export function createModelSwitch(kernel: Pick<Kernel, "modelSettings" | "cliRunners" | "setDefaultRunner">): ModelSwitch {
   const settings = () => kernel.modelSettings();
+  async function view(opts: { refresh?: boolean } = {}): Promise<ModelsDTO> {
+    const s = settings();
+    if (!s) return NONE;
+    await s.catalog(opts.refresh ? { refresh: true } : {}).catch(() => undefined);
+    return dto(s, kernel.cliRunners);
+  }
   return {
-    async view(opts = {}) {
-      const s = settings();
-      if (!s) return NONE;
-      // A failed fetch is reported in the view (`error`), not thrown: the switch still shows the selection.
-      await s.catalog(opts.refresh ? { refresh: true } : {}).catch(() => undefined);
-      return dto(s);
-    },
+    view,
     async set(req) {
       const s = settings();
       // Messages here are shown to the owner as they are (the panel prints them under the select).
       if (!s) throw new NgError("unsupported", "当前不是由 CLI Agent 驱动，没有可切换的模型");
-      if (!req || !TIERS.includes(req.tier)) throw new NgError("invalid_argument", "tier 必须是 strong（主力）或 fast（轻量）");
+      if (!req || typeof req !== "object") throw new NgError("invalid_argument", "请提供 runner 或模型设置");
+      if ("runner" in req) {
+        if (typeof req.runner !== "string") throw new NgError("invalid_argument", "请选择已启用的 runner");
+        kernel.setDefaultRunner(req.runner);
+        return view();
+      }
+      if (!TIERS.includes(req.tier)) throw new NgError("invalid_argument", "tier 必须是 strong（主力）或 fast（轻量）");
+      if (req.engine !== undefined && req.engine !== s.engine) throw new NgError("conflict", "默认 runner 已切换，请核对模型后重试");
       const sel: ModelSelection =
         req.mode === "auto" ? { mode: "auto" } : { mode: "fixed", model: String(req.model ?? ""), ...(req.effort ? { effort: String(req.effort) } : {}) };
       // Check against the CLI's current list (fetched if we have none yet).
@@ -71,8 +80,9 @@ export function createModelSwitch(kernel: Pick<Kernel, "modelSettings">): ModelS
           throw new NgError("invalid_argument", `${m.label} 不提供推理强度 "${sel.effort}"（可选：${m.efforts.join(", ") || "无"}）`);
         }
       }
+      if (req.engine !== undefined && settings()?.engine !== s.engine) throw new NgError("conflict", "默认 runner 已切换，请核对模型后重试");
       s.select(req.tier, sel);
-      return dto(s);
+      return dto(settings() ?? s, kernel.cliRunners);
     },
     label() {
       const s = settings();

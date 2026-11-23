@@ -362,6 +362,7 @@ function Detail({
           <section>
             <p>{plan.outcome}</p>
             {plan.background && <p>{plan.background}</p>}
+            {plan.runnerOverride && <p>项目 Runner <code>{[plan.runnerOverride.engine, plan.runnerOverride.model, plan.runnerOverride.effort].filter(Boolean).join(" · ")}</code></p>}
             {plan.cwd && (
               <p>
                 工作目录 <code>{plan.cwd}</code>

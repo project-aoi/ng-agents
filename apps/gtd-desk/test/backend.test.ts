@@ -16,4 +16,15 @@ describe("CLI selection", () => {
   it("rejects an unknown engine", () => {
     expect(() => selectBackend({ NG_AGENT_BACKEND: "invalid" })).toThrow(/unknown backend/);
   });
+
+  it("uses the ordered runner list and prepares each runner's own executable and models", () => {
+    const env = { NG_AGENT_RUNNERS: "codex, claude, codex", NG_CLAUDE_BIN: "/tools/claude", NG_CLAUDE_MODEL_STRONG: "opus" };
+    const choice = selectBackend(env, { detect: (engine, bin) => engine === "codex" || bin === "/tools/claude" });
+    expect(choice.engine).toBe("codex");
+    expect(choice.runners).toEqual(["codex", "claude"]);
+    expect(choice.kernelOptions.cli?.claude).toEqual({ bin: "/tools/claude", models: { strong: "opus" }, env });
+    expect(choice.kernelOptions.cli?.codex).toEqual({ bin: "codex", env });
+    expect(() => selectBackend({ NG_AGENT_RUNNERS: "codex,unknown" }, { detect: () => true })).toThrow(/unknown runner/);
+    expect(() => selectBackend(env, { detect: (engine) => engine === "codex" })).toThrow(/NG_CLAUDE_BIN/);
+  });
 });
