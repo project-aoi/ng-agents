@@ -1,6 +1,6 @@
 import { isProjectRoot, type Kernel } from "@ng/cell";
 import { gtdKeys } from "@ng/presets";
-import { createEnvelope, inboxAddr, newId, PAYLOAD, type TimerFiredPayload } from "@ng/protocol";
+import { createEnvelope, inboxAddr, isNgError, newId, PAYLOAD, type TimerFiredPayload } from "@ng/protocol";
 import type {
   CellControlRequest,
   CellControlResponse,
@@ -18,6 +18,7 @@ import type {
 import { inputOf, type DeskSettings } from "./projections/common";
 import {
   isLeafCell,
+  pendingQuestions,
   projectNode,
   projectTimeline,
   projectTopology,
@@ -43,7 +44,7 @@ export interface AgentsDeps {
   requireActor(actor: {principalId: string}): {principalId: string};
   kernel: Kernel;
   commands:{
-    message(id:string, req:Parameters<Kernel["directMessage"]>[1], as:{principalId:string}):ReturnType<Kernel["directMessage"]>;
+    message(id:string, req:KernelMessage, as:{principalId:string}):ReturnType<Kernel["directMessage"]>;
     control(id:string, req:Parameters<Kernel["control"]>[1], as:{principalId:string}):ReturnType<Kernel["control"]>;
     close(id:string,as:{principalId:string}): ReturnType<Kernel["closeCell"]>;
     trigger(id:string,epoch:number,as:{principalId:string}): unknown;
@@ -51,12 +52,26 @@ export interface AgentsDeps {
   settings: DeskSettings;
   status(): StatusDTO;
   /** Radar's project buttons: pause / resume / cancel of a cell that holds a project go through them. */
-  projectOp(projectId: string, op: "pause" | "resume" | "cancel", as: { principalId: string }): Promise<ProjectMutationResponse>;
+  projectOp(projectId: string, op: "pause" | "resume" | "cancel", as: { principalId: string; note?: string }): Promise<ProjectMutationResponse>;
   errors: AgentsErrors;
 }
 
 const CLIENT_ID = /^[\w.:-]{1,80}$/;
 const REPLY_ID = /^[\w.:#@-]{1,120}$/;
+const AGENT_CONTEXT_MAX = 8_000;
+
+/**
+ * A person's message as the kernel takes it, plus what the owner's coding agent added on its own (audit E02): the
+ * owner's words stay in `text`; `agentContext` travels beside them in the payload and is shown to the cell as the
+ * agent's note, never as the owner's words.
+ */
+export type KernelMessage = Parameters<Kernel["directMessage"]>[1] & { agentContext?: string };
+
+/** A message typed in the workbench or passed on by the owner's agent (the control plane adds a conversation and a note). */
+export type PersonMessage = SendCellMessageRequest & { conversationId?: string; agentContext?: string };
+
+/** Notes of a cell the control plane may read by URI (the kernel's own read_resource resolves them the same way). */
+const NOTE_SCHEMES = ["reference://", "working_note://"] as const;
 
 /** "web": what is typed in the workbench's own chat box (the external agent's words carry its own conversation id). */
 export const WEB_CONVERSATION = "web";
@@ -89,11 +104,33 @@ export function createAgentsApi({ requireActor, commands, kernel, settings, stat
     return t;
   }
 
-  function resource(uri: string, offset = 0, limit = RESOURCE_PAGE_DEFAULT): ResourcePageDTO {
-    if (typeof uri !== "string" || !uri.startsWith("res://")) throw errors.bad("只能读取 res:// 开头的完整输出");
+  /** The unanswered question each of these cells is asking, if any (get_cell's pendingQuestion, for many at once). */
+  const questions = (cellIds: readonly string[]) => pendingQuestions(input(), cellIds);
+
+  /**
+   * One page of stored text: a spilled output (`res://…`, readable from anywhere), or a cell's note
+   * (`reference://<name>`, `working_note://<name>`, read as that cell sees it — e.g. a source's 观察笔记).
+   */
+  function resource(uri: string, offset = 0, limit = RESOURCE_PAGE_DEFAULT, cellId?: string): ResourcePageDTO {
     if (!Number.isInteger(offset) || offset < 0) throw errors.bad("offset 必须是非负整数");
     if (!Number.isInteger(limit) || limit < 1) throw errors.bad("limit 必须是正整数");
-    const page = resourcePage(kernel, uri, offset, Math.min(limit, RESOURCE_PAGE_MAX));
+    const max = Math.min(limit, RESOURCE_PAGE_MAX);
+    if (typeof uri === "string" && NOTE_SCHEMES.some((scheme) => uri.startsWith(scheme))) {
+      if (!cellId) throw errors.bad("读取笔记需要 cellId：笔记所属的分身（信源列表和 get_cell 里有）");
+      if (!kernel.getCell(cellId)) throw errors.missing("找不到这个分身");
+      let text: string;
+      try {
+        text = kernel.context.readResourceSync(cellId, uri, { offset: 0, limit: Number.MAX_SAFE_INTEGER });
+      } catch (err) {
+        if (isNgError(err, "not_found")) throw errors.missing("这个分身没有这份笔记");
+        if (isNgError(err, "invalid_argument")) throw errors.bad(`读不了这个地址：${uri}`);
+        throw err;
+      }
+      const content = text.slice(offset, offset + max);
+      return { uri, content, offset, limit: max, totalChars: text.length, hasMore: offset + content.length < text.length };
+    }
+    if (typeof uri !== "string" || !uri.startsWith("res://")) throw errors.bad("只能读取 res://（完整输出）、reference:// 或 working_note://（分身的笔记）");
+    const page = resourcePage(kernel, uri, offset, max);
     if (!page) throw errors.missing("找不到这份输出");
     return page;
   }
@@ -104,7 +141,7 @@ export function createAgentsApi({ requireActor, commands, kernel, settings, stat
    * Validate and hand a person's message to the kernel (directMessage, strictly as `as.principalId` — never falling
    * back to the owner), and say in plain words what happened. Shared by the chat box and the control plane.
    */
-  function deliver(cellId: string, req: SendCellMessageRequest & { conversationId?: string }, as: { principalId: string }): Delivery {
+  function deliver(cellId: string, req: PersonMessage, as: { principalId: string }): Delivery {
     const actor = requireActor(as);
     const text = typeof req?.text === "string" ? req.text.trim() : "";
     if (!text) throw errors.bad("消息不能为空");
@@ -113,6 +150,8 @@ export function createAgentsApi({ requireActor, commands, kernel, settings, stat
     if (req.notifyParent !== undefined && req.notifyParent !== "silent" && req.notifyParent !== "wakeup") throw errors.bad("notifyParent 只能是 silent 或 wakeup");
     if (req.replyToId !== undefined && (typeof req.replyToId !== "string" || !REPLY_ID.test(req.replyToId))) throw errors.bad("replyToId 格式不对");
     if (req.conversationId !== undefined && (typeof req.conversationId !== "string" || !REPLY_ID.test(req.conversationId))) throw errors.bad("conversationId 格式不对");
+    if (req.agentContext !== undefined && (typeof req.agentContext !== "string" || req.agentContext.length > AGENT_CONTEXT_MAX)) throw errors.bad(`补充说明必须是不超过 ${AGENT_CONTEXT_MAX} 字的文本`);
+    const agentContext = req.agentContext?.trim();
     const cell = kernel.getCell(cellId);
     if (!cell) return { outcome: "not_found", ok: false, message: "找不到这个分身", id: null, before: null, ccTo: null, ccTitle: null };
 
@@ -129,6 +168,7 @@ export function createAgentsApi({ requireActor, commands, kernel, settings, stat
         ...(req.replyToId ? { replyToId: req.replyToId } : {}),
         ...(replyToText ? { replyToText } : {}),
         conversationId: req.conversationId ?? WEB_CONVERSATION,
+        ...(agentContext ? { agentContext } : {}),
       },
       actor,
     );
@@ -173,8 +213,9 @@ export function createAgentsApi({ requireActor, commands, kernel, settings, stat
   }
 
   /** POST /api/cells/:cellId/control. A project goes through Radar's own buttons (its books and cards follow). */
-  async function control(cellId: string, req: CellControlRequest, as: { principalId: string }): Promise<CellControlResponse> {
+  async function control(cellId: string, req: CellControlRequest, as: { principalId: string; note?: string }): Promise<CellControlResponse> {
     const actor = requireActor(as);
+    const note = as.note?.trim();
     const action = req?.action;
     if (action !== "pause" && action !== "resume" && action !== "cancel") throw errors.bad("action 只能是 pause / resume / cancel");
     const cell = kernel.getCell(cellId);
@@ -185,14 +226,14 @@ export function createAgentsApi({ requireActor, commands, kernel, settings, stat
       return controlResult("not_applied", false, "总助理是整个工作台的根，不能暂停或叫停：停下它，所有后台工作都会停", cellId);
     }
     if (isProjectRoot(kernel.registry, cell)) {
-      const r = await projectOp(cellId, action, actor);
+      const r = await projectOp(cellId, action, { ...actor, ...(note ? { note } : {}) });
       const outcome = r.outcome === "paused" || r.outcome === "resumed" || r.outcome === "cancelled" ? r.outcome : "not_applied";
       return controlResult(outcome, r.ok, r.message, cellId);
     }
     switch (action) {
       case "pause": {
         if (cell.status === "paused") return controlResult("paused", true, `「${name}」已经暂停了`, cellId);
-        const r = commands.control(cellId, { action: "pause" }, actor);
+        const r = commands.control(cellId, { action: "pause", ...(note ? { note } : {}) }, actor);
         return r.applied ? controlResult("paused", true, `已暂停「${name}」`, cellId) : controlResult("not_applied", false, "暂停没有生效", cellId);
       }
       case "resume": {
@@ -228,5 +269,5 @@ export function createAgentsApi({ requireActor, commands, kernel, settings, stat
     return result("triggered", true, "已触发一次检查");
   }
 
-  return { topology, timeline, resource, deliver, sendMessage, control, trigger };
+  return { topology, timeline, questions, resource, deliver, sendMessage, control, trigger };
 }

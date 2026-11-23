@@ -55,6 +55,16 @@ describe("evidence and Inline & Spill", () => {
     expect(over.spill).toBeDefined();
   });
 
+  it("E22: inspect_cell bounds its own answer, so a full inspection stays whole up to that bound", () => {
+    const h = setup({ store: { limits: LIMITS } });
+    const full = "i".repeat(39_000);
+    const whole = h.store.appendEvidenceSync("desk", { kind: "tool_result", toolUseId: "t1", name: "inspect_cell", output: full, runId: "run1", at: 1 });
+    expect(whole.spill).toBeUndefined();
+    expect(whole.modelText).toBe(full);
+    const over = h.store.appendEvidenceSync("desk", { kind: "tool_result", toolUseId: "t2", name: "inspect_cell", output: "j".repeat(60_000), runId: "run1", at: 2 });
+    expect(over.spill).toBeDefined();
+  });
+
   it("announces each appended record after commit with its stored seq", () => {
     const h = setup({ cells: [{ id: "desk" }, { id: "w1", parentId: "desk" }] });
     const bus = createBus();

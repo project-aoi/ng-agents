@@ -121,6 +121,18 @@ export function pageOf(text: string, page: ResourcePage | undefined): string {
 /** Room left after a read_resource page for its paging line ("…[characters a–b shown; more follows: read_resource(…)]"). */
 const PAGE_NOTE_CHARS = 2_000;
 
+/**
+ * inspect_cell bounds its own answer (at most 40 000 characters for detail "full", with a marker that says how to read
+ * an omitted middle) — an explicit read like read_resource: cutting it again would only make the caller read it twice.
+ * Kept here because EXPLICIT_READ_TOOLS (protocol) does not list it.
+ */
+const SELF_BOUNDED_READS: Readonly<Record<string, number>> = {
+  read_resource: MAX_RESOURCE_PAGE_CHARS + PAGE_NOTE_CHARS,
+  inspect_cell: 40_000 + PAGE_NOTE_CHARS,
+};
+
+const isExplicitRead = (tool: string) => EXPLICIT_READ_TOOLS.has(tool) || Object.hasOwn(SELF_BOUNDED_READS, tool);
+
 export function createEvidence(deps: Deps): EvidenceModule {
   const { db, bus, clock, limits } = deps;
 
@@ -130,7 +142,7 @@ export function createEvidence(deps: Deps): EvidenceModule {
    * reads (a whole artifact) stay whole up to EXPLICIT_READ_INLINE_CHARS. Never below the normal inline limit.
    */
   function explicitReadInlineChars(tool: string): number {
-    return Math.max(limits.inlineChars, tool === "read_resource" ? MAX_RESOURCE_PAGE_CHARS + PAGE_NOTE_CHARS : EXPLICIT_READ_INLINE_CHARS);
+    return Math.max(limits.inlineChars, Object.hasOwn(SELF_BOUNDED_READS, tool) ? SELF_BOUNDED_READS[tool]! : EXPLICIT_READ_INLINE_CHARS);
   }
 
   function writeResource(cellId: string, content: string, meta: { runId?: string; mime?: string; source?: string } = {}): string {
@@ -158,7 +170,7 @@ export function createEvidence(deps: Deps): EvidenceModule {
       let spilledInline: string | null = null;
       if (record.kind === "tool_result" || record.kind === "external") {
         const big = record.kind === "tool_result" ? record.output : record.text;
-        const inlineLimit = record.kind === "tool_result" && EXPLICIT_READ_TOOLS.has(record.name) ? explicitReadInlineChars(record.name) : limits.inlineChars;
+        const inlineLimit = record.kind === "tool_result" && isExplicitRead(record.name) ? explicitReadInlineChars(record.name) : limits.inlineChars;
         if (big.length > inlineLimit) {
           const uri = writeResource(cellId, big, {
             ...(record.runId ? { runId: record.runId } : {}),

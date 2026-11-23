@@ -96,3 +96,23 @@ export function clip(text: string, max: number): string {
   return t.length > max ? `${t.slice(0, max)}…` : t;
 }
 
+const TOKEN_CHAR = /[\w./:#@%+=~-]/;
+
+/**
+ * Like clip, for a line a person reads: it never ends inside an ASCII token — half a commit hash, path or URL looks
+ * complete and is wrong — but backs off to where that token starts (unless that loses more than half the line).
+ */
+export function clipLine(text: string, max: number): string {
+  const t = text.trim();
+  if (t.length <= max) return t;
+  let end = max;
+  if (TOKEN_CHAR.test(t[end - 1]!) && TOKEN_CHAR.test(t[end]!)) {
+    let start = end;
+    while (start > 0 && TOKEN_CHAR.test(t[start - 1]!)) start--;
+    if (start >= max / 2) end = start;
+  }
+  const code = t.charCodeAt(end - 1);
+  if (code >= 0xd800 && code <= 0xdbff) end--;
+  return `${t.slice(0, end).trimEnd()}…`;
+}
+

@@ -1,6 +1,9 @@
 import type { CliAdapter, CliCapabilities, CliDriver, CliEvent, LaunchRequest } from "../types";
 import { asRecord, contentText, HOST_UNSANDBOXED, str, tomlInlineTable, tomlValue } from "./util";
 
+/** `<plugin>@<marketplace>` of the workbench's external-agent plugin (apps/gtd-desk/main-agent, .agents/plugins). */
+export const WORKBENCH_AGENT_PLUGIN = "ng-desk@ng-agents";
+
 /**
  * OpenAI Codex CLI (`codex exec --json`), prompt on stdin.
  *
@@ -50,6 +53,10 @@ export function codexArgs(req: LaunchRequest): string[] {
     `mcp_servers.${server}.startup_timeout_sec=30`,
     `mcp_servers.${server}.tool_timeout_sec=3600`,
     `mcp_servers.${server}.default_tools_approval_mode=${tomlValue("approve")}`,
+    // The owner's config loads whole — except the plugin that makes a Codex session the owner's main agent on this
+    // workbench: a background cell must not be handed the owner's control plane and that identity. (The key is taken
+    // unquoted; other plugins keep their own setting, and naming one that is not installed changes nothing.)
+    `plugins.${WORKBENCH_AGENT_PLUGIN}.enabled=false`,
   ];
   if (req.caps.web) cfg.push(`web_search=${tomlValue("live")}`);
   if (req.session?.mode !== "resume" && req.system.length <= CODEX_INLINE_INSTRUCTIONS_MAX) cfg.push(`developer_instructions=${tomlValue(req.system)}`);

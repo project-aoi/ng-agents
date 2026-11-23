@@ -1,15 +1,31 @@
 # 远期研究、停靠与再激活
 
-主人想探索一个新方案，但本周不实施。项目以 research_then_park 运行，形成报告并停靠。几周后主台发现同一议题，概述原结论并询问是否继续。
+主人想探索一个新方案，但本周不实施。项目以 research_then_park 运行，形成报告并停靠。几周后主人在另一个会话里又提起，主台概述原结论并询问是否继续。
+
+本机替身：[fixtures/uc04.sh](fixtures/uc04.sh)（`notes-cli` 与两份本地资料，代替联网调研）。
 
 ## 行为约定
 
-**`INV-UC04-01`**　停靠保留原项目、工作记录和文稿，后台停止唤醒。
+**`INV-UC04-01`**　停靠保留原项目、工作记录和文稿，后台停止唤醒。谁停靠、何时、原话都有记录，主台和项目都看得到。
 
-**`INV-UC04-02`**　再次提及类似主题时先查重并说明已有结论，明确得到继续指令后才恢复。
+**`INV-UC04-02`**　再次提及类似主题时先查重并说明已有结论，明确得到继续指令后才恢复。经外部助手提问时，答复必须是主人看到问题之后说的话。停靠前没处理的旧指令不作为继续指令，恢复时注明它来自停靠之前。
 
 **`INV-UC04-03`**　项目全局可以打开停靠报告，并区分停靠和人工暂停。
 
+## 端到端步骤
+
+1. 主人：“以后想给 notes-cli 加语音转写，这周不做，先研究，存着。只看本地资料。” → 只读分身写报告，项目停靠。
+2. 新开一个外部助手会话（几周后）：“/todo 给 notes-cli 做一个对着话筒说话就能记笔记的功能。” → 主台说明报告结论并询问。
+3. 主人：“工作台怎么说？” → 外部助手**只转述**，不代答。
+4. 主人：“继续，先只做「读入文本→预览→确认→保存」，录音和引擎留接口，不装包。” → 同一项目、同一分身接着做，范围以这句为准。
+5. 变体：先激活、主人再说“先停一下，我还没想好”、之后再次 /todo → 仍应先询问，不能沿用停靠前的“开始”。
+
+## 2026-11-23 实测
+
+01 通过（理由未记录，E05）。02 不满足：第 2 步主台做对了，第 3 步外部助手替主人答了“开始”（E02）；变体里主台直接重启（E05），旧指令在恢复时重放（E06）。第 4 步最终范围正确，但实现膨胀到 405 行（E21）。03 的总览部分成立，界面未验证。明细见[核对报告](../03-bugs/audits/2026-11-23-codex-e2e-workflows.md)。
+
+同日修复，自动回归通过，尚未实机复跑。E02、E05、E06、E21：提问标明是给主人的，停靠留下谁、何时和原话，恢复后项目先于分身运行、旧指令带注明，项目提示词加了范围约束。
+
 ## 回归入口
 
-[scenario-someday.test.ts](../../presets/test/scenario-someday.test.ts)、[integration.test.ts](../../apps/gtd-desk/test/integration.test.ts)。
+[scenario-someday.test.ts](../../presets/test/scenario-someday.test.ts)、[integration.test.ts](../../apps/gtd-desk/test/integration.test.ts)、[pause-record.test.ts](../../packages/cell/test/pause-record.test.ts)、[agent-relay.test.ts](../../apps/gtd-desk/test/agent-relay.test.ts)、[conventions.test.ts](../../presets/test/conventions.test.ts)。

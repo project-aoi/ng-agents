@@ -622,7 +622,7 @@ describe("control plane: chat_with_desk, message_cell, inspect_cell, read_resour
     const k = d.kernel;
     d.script.add("desk", tool("send_message", { to: "channel:ui:owner", text: "代码在哪个本地目录下呀？", summary: "问路径" }));
     const sent = await agentOk(d, "chat_with_desk", { text: "帮我把支付重试改成指数退避" });
-    expect(sent.text).toContain("Passed to the desk as the owner's words");
+    expect(sent.text).toMatch(/^Passed to the desk \(message agchat_\w+, conversation agent:local\) as the owner's words\./);
     expect(sent.text).toContain("No reply from the desk yet");
     const { cursor, messageId } = sent.data as { cursor: number; messageId: string };
     expect(k.inbox.listMessagesSync({ cellId: "desk", envelopeId: messageId })[0]!.envelope).toMatchObject({
@@ -634,7 +634,8 @@ describe("control plane: chat_with_desk, message_cell, inspect_cell, read_resour
     const read = await agentOk(d, "chat_with_desk", { since: cursor });
     const replies = (read.data as { replies: Array<{ id: string; text: string; question: boolean; toOwner: boolean }> }).replies;
     expect(replies).toEqual([expect.objectContaining({ text: "代码在哪个本地目录下呀？", question: true, toOwner: true })]);
-    expect(read.text).toContain(`answer with replyToId ${replies[0]!.id}`);
+    // A question from the desk is the owner's to answer, not the agent's (audit E02).
+    expect(read.text).toContain(`a question for the owner — put it to them, and send their answer back with chat_with_desk and replyToId ${replies[0]!.id}; do not answer it yourself.`);
 
     let saw = "";
     d.script.add("desk", (req) => {

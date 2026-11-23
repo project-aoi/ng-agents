@@ -123,7 +123,7 @@ describe("tools", () => {
     expect(got.text).toContain("项目本身在等：human");
 
     const msg = await ok(d, "message_project", { id: projectId, text: "做完后用 /ship-mr 提 MR" });
-    expect(msg.text).toContain(`Delivered to ${projectId}`);
+    expect(msg.text).toContain(`Delivered the owner's words to ${projectId}`);
     expect(texts(d, projectId)).toEqual([{ text: "做完后用 /ship-mr 提 MR", principalId: "agent:local" }]);
     await d.kernel.idle();
     // an agent speaking for the owner answers the project's wait on "human"
@@ -474,7 +474,9 @@ interface Rpc {
 }
 
 function startMcp(env: Record<string, string>): Rpc {
-  const child: ChildProcessWithoutNullStreams = spawn(process.execPath, [BIN], { env: { ...process.env, ...env }, stdio: ["pipe", "pipe", "pipe"] });
+  // A test run inside one of the workbench's own cells must not turn the server under test into the in-cell one.
+  const { NG_WORKBENCH_CELL_ID: _inherited, ...base } = process.env;
+  const child: ChildProcessWithoutNullStreams = spawn(process.execPath, [BIN], { env: { ...base, ...env }, stdio: ["pipe", "pipe", "pipe"] });
   const lines = createInterface({ input: child.stdout });
   const queue: Array<Record<string, unknown>> = [];
   const waiting: Array<(m: Record<string, unknown>) => void> = [];

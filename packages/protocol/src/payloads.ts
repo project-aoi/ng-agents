@@ -81,6 +81,11 @@ export interface UserMessagePayload {
   eventKind?: string;
   /** Free labels the adapter derived (chat name, repo, label names…). */
   tags?: string[];
+  /**
+   * What the owner's coding agent added on its own when it passed the owner's words on (background it looked up, its
+   * reading of the situation). Never the owner's words: `text` holds those; this is shown apart, labelled as the agent's.
+   */
+  agentContext?: string;
 }
 
 /** A deliverAt reminder, or a cron tick. */
@@ -213,6 +218,8 @@ export interface CellMessagePayload {
   replyToId?: string;
   replyToText?: string;
   conversationId?: string;
+  /** The owner's coding agent's own note on the owner's words (see UserMessagePayload.agentContext). */
+  agentContext?: string;
 }
 
 /**
@@ -230,6 +237,8 @@ export interface CellDirectChatPayload {
   messageId: string;
   replyToId?: string;
   conversationId?: string;
+  /** The owner's coding agent's own note on the owner's words (see UserMessagePayload.agentContext). */
+  agentContext?: string;
   projectCellId?: string;
   at: number;
 }
@@ -314,6 +323,7 @@ export const kernelPayloadSchemas = {
     mentions: z.array(z.string()).optional(),
     eventKind: z.string().optional(),
     tags: z.array(z.string()).optional(),
+    agentContext: z.string().optional(),
   }),
   "timer.fired": z.looseObject({
     label: z.string(),
@@ -397,7 +407,7 @@ export const kernelPayloadSchemas = {
     uri: z.string().optional(),
     data: z.unknown().optional(),
   }),
-  "cell.message": z.looseObject({ fromCellId: z.string(), text: z.string(), summary: z.string().optional(), data: z.unknown().optional() }),
+  "cell.message": z.looseObject({ fromCellId: z.string(), text: z.string(), summary: z.string().optional(), data: z.unknown().optional(), agentContext: z.string().optional() }),
   "cell.direct_chat": z.looseObject({
     childCellId: z.string(),
     childTitle: z.string().optional(),
@@ -406,6 +416,7 @@ export const kernelPayloadSchemas = {
     messageId: z.string(),
     replyToId: z.string().optional(),
     conversationId: z.string().optional(),
+    agentContext: z.string().optional(),
     projectCellId: z.string().optional(),
     at: z.number(),
   }),

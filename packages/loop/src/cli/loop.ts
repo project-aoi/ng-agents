@@ -33,9 +33,11 @@ import { spawnCli, type CliProcess } from "./process";
 import { launchChoice, type CliModelChoice } from "./models";
 import { rebuildFreshPrompt, renderEvidenceExternal, renderEvidenceInbound, type AppendedInput } from "./input";
 import { CLI_MCP_SERVER, kernelSystem } from "./instructions";
-import { forkNoteIndex, freshPrompt, tailText } from "./render";
+import { forkNoteIndex, freshPrompt, historyUnderOwnSystem, tailText } from "./render";
 import type { CliAdapter, CliCapabilities, CliDriver, CliEvent, CliModels, CliSessionRecord, DriverIO, LaunchRequest } from "./types";
 
+/** Set in the environment of every CLI process a cell runs (and so of whatever that CLI starts): the cell's id. */
+export const WORKBENCH_CELL_ENV = "NG_WORKBENCH_CELL_ID";
 /** Context state key holding the cell's CLI session (CliSessionRecord). */
 export const CLI_SESSION_KEY = "cli:session";
 /** Set by the kernel on a fork_prefix child: the parent's CliSessionRecord at spawn time. */
@@ -43,7 +45,7 @@ export const CLI_FORK_SESSION_KEY = "cli:session:fork";
 export { CLI_MCP_SERVER } from "./instructions";
 
 export const RUN_ENDED_NOTICE =
-  "[The kernel ended this run with that result. Stop now: make no further tool calls and do no further work; reply with at most one short sentence. You will be woken with the next message.]";
+  "[The kernel ended this run with that result. Stop now: make no further tool calls and do no further work. If something is still unsaid to whoever reads you, say it in one short sentence — it is kept on your record. You will be woken with the next message.]";
 export const RUN_ALREADY_ENDED = "Not executed: this run has already ended. Stop now; you will be woken with the next message.";
 
 export function cliAdapterFor(engine: CliEngine): CliAdapter {
@@ -209,7 +211,6 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
     // ---------- input ----------
     const initialBatchIds = new Set(snapshot.batch.envelopes.map((e) => e.id));
     const tracked = new Map<string, AppendedInput>();
-    const initialTail = tailText(snapshot);
     const initialSteerItems: AppendedInput[] = [];
     for (const m of ports.drainSteer()) {
       const text = steerNoteText(m.message);
@@ -217,8 +218,13 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
       tracked.set(item.envelopeId, item);
       initialSteerItems.push(item);
     }
-    const input = [initialTail, ...initialSteerItems.map((i) => i.text)].filter((t) => t.trim()).join("\n\n");
+    const inputOf = (tail: string) => [tail, ...initialSteerItems.map((i) => i.text)].filter((t) => t.trim()).join("\n\n");
+    // What a session of this cell's own starts from (also the fallback when a resume or a fork fails).
+    const input = inputOf(tailText(snapshot));
     if (!input) return "completed";
+    // A fork_prefix cell without its parent's session to continue: its own role as the system prompt.
+    const ownSystem = snapshot.system.own;
+    const ownHistory = ownSystem !== undefined && snapshot.spec.fork ? historyUnderOwnSystem(snapshot.history, cellId, snapshot.spec.fork.fromCellId) : snapshot.history;
 
     // ---------- session plan ----------
     const own = await ports.context.readState<CliSessionRecord>(cellId, CLI_SESSION_KEY);
@@ -228,6 +234,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
     let sessionBaselineSeq = snapshot.historyUptoSeq;
     if (own && own.engine === engine && own.cwd === access.root && own.systemHash === snapshot.system.hash && sameModel(own)) {
       sessionBaselineSeq = own.lastDeliveredEvidenceSeq;
+      const resumedInput = inputOf(tailText(snapshot, { resumed: true })) || input;
       const seenEnvelopes = new Set([...initialBatchIds, ...tracked.keys()]);
       const missed = ports.listEvidence?.({ afterSeq: sessionBaselineSeq }) ?? [];
       const catchup = missed.flatMap(({ seq, record }) => {
@@ -239,9 +246,9 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
         if (id) seenEnvelopes.add(id);
         return [record.kind === "inbound" ? renderEvidenceInbound(record.envelope) : record.text];
       });
-      plan = { session: { id: own.sessionId, mode: "resume" }, prompt: [...(catchup.length ? ["[Earlier events already handled while you were asleep — use as context]\n" + catchup.join("\n")] : []), input].join("\n\n") };
+      plan = { session: { id: own.sessionId, mode: "resume" }, prompt: [...(catchup.length ? ["[Earlier events already handled while you were asleep — use as context]\n" + catchup.join("\n")] : []), resumedInput].join("\n\n") };
     } else {
-      plan = { prompt: freshPrompt(snapshot.history, input) };
+      plan = { prompt: freshPrompt(ownHistory, input) };
       const forkIdx = snapshot.mode === "fork_prefix" && adapter.canFork && !own ? forkNoteIndex(snapshot.history) : -1;
       if (forkIdx >= 0) {
         const parent = await ports.context.readState<CliSessionRecord>(cellId, CLI_FORK_SESSION_KEY);
@@ -259,13 +266,16 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
 
     // ---------- Run state ----------
     const tmpDir = mkdtempSync(join(tmpdir(), `ng-cli-${engine}-`));
-    const systemText = kernelSystem(snapshot.system.text, adapter, caps, tools);
+    // The parent's system text only where the parent's session is continued (a native fork); otherwise the cell's own.
+    const systemFor = (session: LaunchRequest["session"]) =>
+      kernelSystem(session?.mode === "fork" || ownSystem === undefined ? snapshot.system.text : ownSystem, adapter, caps, tools);
     const systemFile = join(tmpDir, "system.md");
-    writeFileSync(systemFile, systemText, { mode: 0o600 });
     const env = cliEnvironment(opts.env ?? process.env, {
       ...(opts.keepEnv ? { keep: opts.keepEnv } : {}),
       ...(opts.dropEnv ? { drop: opts.dropEnv } : {}),
-      ...(adapter.env ? { set: { ...adapter.env } } : {}),
+      // Marks every process below as started by a workbench cell: the owner's own entrances into the workbench (the
+      // external-agent MCP shim) stay closed to it.
+      set: { ...adapter.env, [WORKBENCH_CELL_ENV]: cellId },
     });
 
     let sessionId: string | null = plan.session?.mode === "resume" ? plan.session.id : null;
@@ -275,6 +285,8 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
     let sessionModel: string | null = null;
     let sessionCreatedAt = own && plan.session?.mode === "resume" ? own.createdAt : clock.now();
     let endOutcome: EndOutcome | undefined;
+    /** The turn in which a tool ended the Run is over: nothing the CLI says after that is this Run's. */
+    let closingDone = false;
     let refused = false;
     let awaitsWakeup = false;
     let stopReason: StopReason | null = null;
@@ -314,6 +326,17 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
       persist = persist.then(() => ports.context.commit(cellId, { statePatches: patches })).catch(() => undefined);
     };
 
+    /**
+     * The session has taken something in. It is put on record now, not only when the Run ends: a kernel that dies in
+     * the middle of a cell's very first turn must find the session again, or the next Run primes a second one with
+     * the same task.
+     */
+    const progressed = () => {
+      if (sessionProgress) return;
+      sessionProgress = true;
+      persistSession(false);
+    };
+
     const killNow = (grace = killGraceMs) => {
       if (live.proc) void live.proc.kill(grace);
     };
@@ -349,7 +372,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
       const callSignal = AbortSignal.any([signal, meta.signal]);
       const stale = () => callSignal.aborted || callLeg !== leg;
       if (stale()) return {text: RUN_ALREADY_ENDED, isError: true};
-      sessionProgress = true;
+      progressed();
       const tool = byName.get(name)!;
       const toolUseId = `mcp_${runId}_${++callCounter}`;
       await append({ kind: "tool_call", toolUseId, name, input: args });
@@ -386,7 +409,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
 
     function confirmTurn(legNo: number, turn: number) {
       if (endOutcome || stopReason === "cancelled" || stopReason === "timeout" || signal.aborted) return;
-      sessionProgress = true;
+      progressed();
       for (const item of tracked.values()) {
         if (item.status !== "sent" || item.sentInLeg !== legNo || (item.confirmAtTurn ?? 1) !== turn) continue;
         item.status = "confirmed";
@@ -452,7 +475,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
               !plan.parentHash || !ports.canForkSession(point.fromCellId,point.uptoSeq,nextSession.id,sessionBaselineSeq,plan.parentHash)) {
             nextSession=undefined;
             sessionBaselineSeq = snapshot.historyUptoSeq;
-            nextPrompt=freshPrompt(snapshot.history,input);
+            nextPrompt=freshPrompt(ownHistory,input);
             delete plan.forkedFrom;
           } else {
             readingParent.set(point.fromCellId,new Promise<void>(resolve=>{
@@ -460,6 +483,8 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
             }));
           }
         }
+        const systemText = systemFor(nextSession);
+        writeFileSync(systemFile, systemText, { mode: 0o600 });
         const req: LaunchRequest = {
           engine,
           bin,
@@ -512,7 +537,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
           delete plan.forkedFrom;
           nextSession = undefined;
           nextPromptItems = out.relaunchItems;
-          nextPrompt = rebuildFreshPrompt(snapshot, initialBatchIds, ports, tracked, out.relaunchItems);
+          nextPrompt = rebuildFreshPrompt(snapshot, initialBatchIds, ports, tracked, out.relaunchItems, ownHistory);
           continue;
         }
         const canRelaunch =
@@ -541,7 +566,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
               // No session to continue (the CLI never reported one): rebuild from SQLite evidence + unconfirmed inputs.
               nextSession = undefined;
               nextPromptItems = out.relaunchItems;
-              nextPrompt = rebuildFreshPrompt(snapshot, initialBatchIds, ports, tracked, out.relaunchItems);
+              nextPrompt = rebuildFreshPrompt(snapshot, initialBatchIds, ports, tracked, out.relaunchItems, ownHistory);
               continue;
             }
           }
@@ -681,8 +706,13 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
 
       const handle = async (e: CliEvent): Promise<void> => {
         if ((endOutcome || refused) && e.type !== "session") {
+          // The closing words after the tool that ended the Run (the kernel asked for them: RUN_ENDED_NOTICE) are
+          // what the owner reads as the answer — "方案已提交，等你确认后开始" — so they go on the record.
+          // Only up to the end of that turn: text after it answers input the kernel has put back in the queue.
+          if (e.type === "text" && endOutcome && !refused && !closingDone && e.text.trim()) await append({ kind: "assistant_text", text: e.text, model: sessionModel ?? model ?? engine });
           if (e.type === "tool_start") interruptAndKill();
           if (e.type === "turn_end") {
+            closingDone = true;
             finished = true;
             killNow();
           }
@@ -708,7 +738,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
             }
             break;
           case "text":
-            sessionProgress = true;
+            progressed();
             await append({ kind: "assistant_text", text: e.text, model: sessionModel ?? model ?? engine });
             break;
           case "tool_start": {
@@ -717,7 +747,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
               killNow();
               break;
             }
-            sessionProgress = true;
+            progressed();
             const id = `cli_${runId}_${legNo}_${e.id}`;
             native.set(e.id, id);
             await append({ kind: "tool_call", toolUseId: id, name: e.name, input: e.input });
@@ -748,7 +778,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
               break;
             } else if (e.ok && e.stopped && legTurns === 1 && !signal.aborted && !stopReason) {
               // The adapter acknowledged the original prompt. A later interrupted correction still needs a retry.
-              sessionProgress = true;
+              progressed();
               awaitingSessionConfirmation = !sessionId;
               confirmCursor();
             } else if (!e.ok && (!e.stopped || e.error)) {

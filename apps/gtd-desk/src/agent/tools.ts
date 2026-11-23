@@ -1,6 +1,6 @@
 import type { CellSpecInput, Kernel } from "@ng/cell";
 
-import { type ProjectInit, type ProjectMode } from "@ng/presets";
+import { OBSERVATION_NOTE, type ProjectInit, type ProjectMode } from "@ng/presets";
 import type { ProjectRecord } from "@ng/presets/records";
 import {
   CELL_DIRECT_CHAT_KEY,
@@ -9,14 +9,19 @@ import {
   DEFAULT_RESOURCE_PAGE_CHARS,
   MAX_RESOURCE_PAGE_CHARS,
   childRunnerOverride,
+  get,
   isNgError,
   newId,
+  PAYLOAD,
   type ActionRecord,
   type BallOwner,
   type CellDirectChatState,
   type CellRecord,
+  type CellResultPayload,
   type CellStatusLine,
+  type ProjectProposal,
   type SendToCellResult,
+  type SourceHitPayload,
   type RunnerSelection,
 } from "@ng/protocol";
 import type {
@@ -33,17 +38,16 @@ import type {
   PlanSaveRequest,
   ProjectRowDTO,
   RunnerDTO,
-  SendCellMessageRequest,
   TimelineItemDTO,
   UpdateModelsRequest,
 } from "../shared/api";
-import type { Delivery } from "../server/agents";
+import type { Delivery, PersonMessage } from "../server/agents";
 import { DeskError, type Desk, type DeskActor, type ProjectOp } from "../server/desk";
 import { isLeafCell, notesOf, unpulledOf } from "../server/projections/agents";
 import { projectOfAction, readActions, readProjects, SKILL_SUGGESTION_PREFIX, type Located, type SkillSuggestion } from "../server/projections/common";
 import { parseDecisions } from "../server/projections/format";
 import { AGENT_TOOLS, type AgentToolDoc } from "./guide";
-import type { AgentControlPlane, AgentToolResult } from "./routes";
+import type { AgentCallContext, AgentControlPlane, AgentToolResult } from "./routes";
 
 // docs/05 §5.3 — the external main agent's control plane: every tool of guide.ts, run as the caller's `agent:<id>`
 // principal. Reads go through the same projections as the web client; changes go through the same Desk functions as
@@ -58,7 +62,10 @@ export interface AgentControlPlaneDeps {
 
 type Args = Record<string, unknown>;
 type Principal = `agent:${string}`;
-type Handler = (args: Args, principalId: Principal) => Promise<AgentToolResult> | AgentToolResult;
+type Handler = (args: Args, principalId: Principal, call: AgentCallContext) => Promise<AgentToolResult> | AgentToolResult;
+
+/** chat_with_desk waits at most this long for the desk's answer (audit E08): a bounded look, never a poll. */
+const MAX_WAIT_SECONDS = 30;
 
 /** Who has the ball, as the agent reads it. */
 const OWNER_TEXT: Readonly<Record<BallOwner, string>> = { human: "主人", agent: "agent", waiting: "等待外部" };
@@ -350,6 +357,122 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
     return { lines, data: out };
   }
 
+  // ---------- what a source found (audit E19) ----------
+
+  const NOTE_TAIL_CHARS = 1_500;
+
+  /**
+   * The latest hits of a source as text: for an observe-mode source the tail of its observation note (a cell-scoped
+   * reference record of the source cell); for an active one the last hit it posted to its parent's inbox.
+   */
+  function latestHits(sensorId: string, mode: "active" | "observe"): { label: string; text: string | null; more: string | null } {
+    const note = context.getKnowledgeSync({ kind: "reference", name: OBSERVATION_NOTE, scope: "cell", cellId: sensorId })?.body.trim() ?? "";
+    if (mode === "observe" || note) {
+      if (!note) return { label: "观察笔记", text: null, more: null };
+      // Whole entries from the end, as many as fit.
+      const entries = note.split(/\n(?=- )/);
+      const kept: string[] = [];
+      let size = 0;
+      for (let i = entries.length - 1; i >= 0 && (kept.length === 0 || size + entries[i]!.length <= NOTE_TAIL_CHARS); i--) {
+        kept.unshift(entries[i]!.length > NOTE_TAIL_CHARS ? `${entries[i]!.slice(0, NOTE_TAIL_CHARS)}…` : entries[i]!);
+        size += entries[i]!.length;
+      }
+      const more = kept.length < entries.length ? `（共 ${entries.length} 条，前面的：read_resource { uri: "reference://${OBSERVATION_NOTE}", cellId: "${sensorId}" }）` : null;
+      return { label: `观察笔记（最近 ${kept.length} 条）`, text: kept.join("\n"), more };
+    }
+    const parentId = kernel.getCell(sensorId)?.parentId;
+    const row = parentId
+      ? get<{ envelope: string }>(kernel.db, "SELECT envelope FROM inbox_messages WHERE cell_id = ? AND type = ? AND json_extract(envelope, '$.payload.sourceCellId') = ? ORDER BY seq DESC LIMIT 1", [parentId, PAYLOAD.sourceHit, sensorId])
+      : undefined;
+    if (!row) return { label: "最近一次命中", text: null, more: null };
+    try {
+      const hit = (JSON.parse(row.envelope) as { payload: SourceHitPayload }).payload;
+      return { label: "最近一次命中（已投进信箱）", text: `${hit.title}：${oneLine(hit.summary, 1_000)}${hit.uri ? `（${hit.uri}）` : ""}`, more: null };
+    } catch {
+      return { label: "最近一次命中", text: null, more: null };
+    }
+  }
+
+  // ---------- what the overview adds: questions for the owner, hubs, the desk's own workers ----------
+
+  /** First line of a text, shortened: the gist of a report. */
+  function firstLine(text: string | null | undefined, max = 160): string {
+    return oneLine((text ?? "").split("\n").find((l) => l.trim()) ?? "", max);
+  }
+
+  const roleOf = (c: CellRecord) => (typeof c.spec.meta?.["role"] === "string" ? (c.spec.meta["role"] as string) : null);
+
+  /**
+   * Audit E08: the questions the desk and other live cells are asking the owner and nobody has answered — what get_cell
+   * shows one cell at a time. Cheap: only cells that can ask the owner something (the desk, coordinators, and workers the
+   * owner has spoken to); closed cells and scripts are never read. A cell's plain words count as a question to the owner
+   * only for the desk or after the owner spoke to it; a message sent to the owner always does.
+   */
+  function openQuestions(): { lines: string[]; data: Array<{ cellId: string; title: string | null; id: string; text: string; answerWith: string }> } {
+    const candidates = kernel.listCells().filter((c) => {
+      if (c.status === "closed" || c.spec.processor.kind === "code") return false;
+      if (c.id === deskId) return true;
+      const role = roleOf(c);
+      if (role === "sensor" || role === "checker") return false;
+      if (!isLeafCell(c)) return true;
+      return (context.readStateSync<CellDirectChatState>(c.id, CELL_DIRECT_CHAT_KEY)?.total ?? 0) > 0;
+    });
+    const asked = desk.questions(candidates.map((c) => c.id));
+    const data = candidates.flatMap((c) => {
+      const q = asked.get(c.id);
+      if (!q || !(c.id === deskId || q.toOwner || q.afterOwner)) return [];
+      const answerWith = c.id === deskId ? "chat_with_desk" : "message_cell";
+      return [{ cellId: c.id, title: c.title, id: q.id, text: q.text, answerWith }];
+    });
+    const lines = data.map((q) => {
+      const who = q.cellId === deskId ? "主台" : `${q.cellId}${q.title ? `「${q.title}」` : ""}`;
+      return `- ${who}在问主人：${oneLine(q.text, 300)}\n  ↳ ${questionNote(q.id, q.answerWith as "chat_with_desk" | "message_cell")}`;
+    });
+    return { lines, data };
+  }
+
+  /** The latest result a leaf handed its parent (cell.result), without the kernel's stand-ins for "it said nothing". */
+  function latestResultOf(c: CellRecord): string | null {
+    if (!c.parentId) return null;
+    const row = get<{ envelope: string }>(
+      kernel.db,
+      "SELECT envelope FROM inbox_messages WHERE cell_id = ? AND type = ? AND json_extract(envelope, '$.payload.childCellId') = ? ORDER BY seq DESC LIMIT 1",
+      [c.parentId, PAYLOAD.cellResult, c.id],
+    );
+    if (!row) return null;
+    try {
+      const summary = ((JSON.parse(row.envelope) as { payload?: Partial<CellResultPayload> }).payload?.summary ?? "").trim();
+      return !summary || /^(Finished without a report\.|Its turn ended without a word|Closed \((completed|cancelled)\) by )/.test(summary) ? null : summary;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Audit E27: live hubs, with their state and status line (a review with a blocking conclusion shows here). */
+  function hubLines(): { lines: string[]; data: unknown[] } {
+    const hubs = kernel.listCells().filter((c) => c.status !== "closed" && roleOf(c) === "hub");
+    const data = hubs.map((c) => ({ cellId: c.id, title: c.title, state: cellStateText(c), statusLine: statusLineOf(c.id) }));
+    const lines = data.map((h) => `- ${h.cellId}${h.title ? `「${h.title}」` : ""}（${h.state}）${h.statusLine ? ` — ${oneLine(h.statusLine, 160)}` : ""}`);
+    return { lines, data };
+  }
+
+  /**
+   * Audit E27: the workers the desk itself started (a shared fix, a one-off look) — not under any project, so nothing
+   * else shows them: state, the first line of their latest result or status, and what the desk has not taken in yet.
+   */
+  function deskLeafLines(): { lines: string[]; data: unknown[] } {
+    const leaves = kernel.listCells({ parentId: deskId }).filter((c) => c.status !== "closed" && isLeafCell(c) && roleOf(c) !== "sensor");
+    const data = leaves.map((c) => {
+      const result = latestResultOf(c);
+      return { cellId: c.id, title: c.title, preset: c.preset, state: cellStateText(c), latestResult: result ? firstLine(result, 200) : null, statusLine: statusLineOf(c.id), unpulled: unpulledOf(kernel, c).count };
+    });
+    const lines = data.map((w) => {
+      const gist = w.latestResult ? `最近结果：${w.latestResult}` : w.statusLine ? `状态：${oneLine(w.statusLine, 160)}` : "";
+      return `- ${w.cellId}${w.title ? `「${w.title}」` : ""}（${w.preset ?? "cell"}，${w.state}）${gist ? ` — ${gist}` : ""}${w.unpulled ? `；主台还没看过的新记录 ${w.unpulled} 条` : ""}`;
+    });
+    return { lines, data };
+  }
+
   // ---------- commands, documents and settings as text ----------
 
   interface JobLine {
@@ -383,6 +506,17 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
   }
 
   const parkedData = (parked: ArtifactDTO["parked"]) => parked.map(({ dismiss: _, ...p }) => p);
+
+  /** A plan's stages, directory and steps in one line (what the owner approves with it). */
+  function planFacts(p: ProjectProposal): string {
+    return [
+      `「${p.title}」`,
+      p.phases?.length ? `阶段：${p.phases.map((x, i) => `${i + 1}. ${x}`).join(" → ")}` : "不分阶段",
+      `目录：${p.cwd ?? "—"}`,
+      ...(p.repos?.length ? [`仓库：${p.repos.map((r) => `${r.name} ${r.cwd}`).join("、")}`] : []),
+      `${p.actions.length} 个步骤`,
+    ].join("；");
+  }
 
   const PARKED_INLINE = 2_000;
   function parkedSection(artifactId: string, parked: ArtifactDTO["parked"]): string[] {
@@ -496,13 +630,47 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
     }
   }
 
-  function deliveredText(id: string, r: Extract<SendToCellResult, { status: "delivered" }>, isProject: boolean): string {
+  function deliveredText(id: string, r: Extract<SendToCellResult, { status: "delivered" }>, isProject: boolean, withNote = false): string {
+    const what = withNote ? "the owner's words, with your note marked as yours" : "the owner's words";
     if (r.targetStatus === "paused") {
       return isProject && kernel.getCell(id)?.pauseReason === "parked"
-        ? `Delivered to ${id}, but it is parked ("someday"): it reads this when it is activated. To have it act now, set_project_state ${id} activate (with the owner's words as note).`
-        : `Delivered to ${id}, but it is paused: it reads this when it is resumed (set_project_state / control_cell resume).`;
+        ? `Delivered ${what} to ${id}, but it is parked ("someday"): it reads them when it is activated. To have it act now, set_project_state ${id} activate (with the owner's words as note).`
+        : `Delivered ${what} to ${id}, but it is paused: it reads them when it is resumed (set_project_state / control_cell resume).`;
     }
-    return `Delivered to ${id} (message ${r.envelopeId}); it reads it at its next turn${isProject ? " and acts on it with a new worker if needed" : ""}. Results arrive asynchronously — check later with ${isProject ? "get_project" : "get_cell"}.`;
+    return `Delivered ${what} to ${id} (message ${r.envelopeId}); it reads them at its next turn${isProject ? " and acts on them with a new worker if needed" : ""}. Results arrive asynchronously — check later with ${isProject ? "get_project" : "get_cell"}.`;
+  }
+
+  /** How a question from the workbench is put to the agent: it is the owner's to answer (audit E02). */
+  function questionNote(questionId: string, tool: "chat_with_desk" | "message_cell"): string {
+    return `a question for the owner — put it to them, and send their answer back with ${tool} and replyToId ${questionId}; do not answer it yourself.`;
+  }
+
+  /**
+   * chat_with_desk's waitSeconds: resolves once the desk has taken the message in and its turn is over (so the answer
+   * is its whole reply, not a "let me look" on the way), or when the time is up. Event-driven on the kernel's bus.
+   */
+  function deskSettles(messageId: string, ms: number): Promise<"settled" | "timeout"> {
+    const settled = () => {
+      if (kernel.activeRuns().some((r) => r.cellId === deskId)) return false;
+      const [m] = kernel.inbox.listMessagesSync({ cellId: deskId, envelopeId: messageId, limit: 1 });
+      return !m || (m.status !== "pending" && m.status !== "claimed");
+    };
+    return new Promise((resolve) => {
+      let over = false;
+      const finish = (r: "settled" | "timeout") => {
+        if (over) return;
+        over = true;
+        clearTimeout(timer);
+        off();
+        resolve(r);
+      };
+      // After the run's own bookkeeping (the claim is settled in the same tick that announces the end).
+      const off = kernel.bus.on("run.finished", (e) => {
+        if (e.cellId === deskId) setTimeout(() => settled() && finish("settled"), 0);
+      });
+      const timer = setTimeout(() => finish("timeout"), ms);
+      if (settled()) finish("settled");
+    });
   }
 
   // ==================== tools ====================
@@ -516,11 +684,16 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const radar = desk.radar();
       const running = runningLines();
       const ws = workspaceLines();
+      const questions = openQuestions();
+      const hubs = hubLines();
+      const leaves = deskLeafLines();
       const { today, backend, model } = desk.status();
       const parts = [
-        section("待我处理", items.map(cardLine)),
+        section("待我处理", [...items.map(cardLine), ...questions.lines]),
         section("进行中的项目", radar.projects.map(projectLine)),
         section("已停靠", radar.someday.map((p) => `- ${p.id}「${p.title}」— 以后再说${p.summary ? `；摘要：${oneLine(p.summary, 120)}` : ""}${p.cwd ? `；目录 ${p.cwd}` : ""}`)),
+        ...(hubs.lines.length ? [section("领域中枢", hubs.lines)] : []),
+        ...(leaves.lines.length ? [section("主台直接派出的分身", leaves.lines)] : []),
         section("正在运行", running.lines),
         section("工作目录占用", ws.lines),
         `今日（自 ${isoMin(today.since)}）：静默归档通知 ${today.archivedNotifications}，存笔记 ${today.notesSaved}，设提醒 ${today.remindersSet}，撤卡 ${today.cardsWithdrawn}（list_activity 看明细）`,
@@ -546,8 +719,11 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         generatedAt: now(),
         humanActions: actions.map((item) => ({ ...item, nextStep: item.description, projectId: item.project?.id ?? null, overdue: item.dueAt != null && item.dueAt < now() })),
         cards,
+        questions: questions.data,
         projects: radar.projects.map(projectData),
         parked: radar.someday.map(projectData),
+        hubs: hubs.data,
+        deskWorkers: leaves.data,
         running: running.data,
         workspaces: ws.data,
         snoozedCards: snoozed,
@@ -570,48 +746,65 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       return ok(`Captured message ${receipt.id}. The workbench routes it to the matching subscriber or the desk.`,{envelopeId:receipt.id});
     },
 
-    chat_with_desk(args, principalId) {
+    async chat_with_desk(args, principalId, call) {
       const text = str(args["text"]);
+      const note = str(args["context"]);
       const since = typeof args["since"] === "number" ? Math.max(0, Math.floor(args["since"])) : undefined;
-      if (!text && since === undefined) return fail("Give text (the owner's words for the desk), or since (to read the desk's replies after that cursor).");
-      const conversationId = str(args["conversationId"]) ?? principalId;
+      if (note && !text) return fail("context goes with text: it is your note on the owner's words, sent together with them.");
+      if (!text && since === undefined) return fail("Give text (only the owner's words for the desk), or since (to read the desk's replies after that cursor).");
+      const conversationId = str(args["conversationId"]) ?? call.conversationId ?? principalId;
       const replyToId = str(args["replyToId"]);
+      const waitSeconds = text && typeof args["waitSeconds"] === "number" ? Math.max(0, Math.min(MAX_WAIT_SECONDS, args["waitSeconds"])) : 0;
       const from = since ?? context.lastEvidenceSeqSync(deskId);
       let sent: Delivery | null = null;
       if (text) {
-        sent = desk.directMessage(deskId, { text, clientId: newId("agchat", clock), conversationId, ...(replyToId ? { replyToId } : {}) }, { principalId });
+        sent = desk.directMessage(
+          deskId,
+          { text, clientId: newId("agchat", clock), conversationId, ...(replyToId ? { replyToId } : {}), ...(note ? { agentContext: note } : {}) },
+          { principalId },
+        );
         if (!sent.ok) return fail(`Not passed on: ${sent.message}`, { outcome: sent.outcome });
       }
+      const waited = sent?.id && waitSeconds > 0 ? await deskSettles(sent.id, waitSeconds * 1_000) : null;
       const t = desk.timeline(deskId, { afterSeq: from, limit: 50 });
       const replies = t.items.filter((i): i is Extract<TimelineItemDTO, { kind: "assistant_reply" }> => i.kind === "assistant_reply");
       const cursor = Math.max(from, t.lastSeq);
-      const lines = replies.map((r) => `- [${r.id}${r.question ? ", a question — answer with replyToId " + r.id : ""}] ${r.text}`);
-      const head = sent ? `Passed to the desk as the owner's words (message ${sent.id}, conversation ${conversationId}${replyToId ? `, answering ${replyToId}` : ""}). ` : "";
+      const lines = replies.map((r) => `- [${r.id}] ${r.text}${r.question ? `\n  ↳ ${questionNote(r.id, "chat_with_desk")}` : ""}`);
+      const head = sent
+        ? `Passed to the desk (message ${sent.id}, conversation ${conversationId}${replyToId ? `, answering ${replyToId}` : ""}) ${note ? "as the owner's words, with your note marked as yours" : "as the owner's words"}. `
+        : "";
       const body = replies.length
-        ? `The desk's replies after #${from}:\n${lines.join("\n")}\nRelay them to the owner. To read later replies: chat_with_desk with since ${cursor}.`
-        : `No reply from the desk yet — it answers in the background. When the owner asks (never in a loop), read its answer with chat_with_desk { since: ${cursor} }.`;
+        ? `The desk's replies after #${from}:\n${lines.join("\n")}\nRelay them to the owner. Later replies: chat_with_desk { since: ${cursor} }.`
+        : waited === "timeout"
+          ? `No reply from the desk within ${waitSeconds} s — it is still on it. Tell the owner it is under way; read its answer later with chat_with_desk { since: ${cursor} } (when the owner asks, never in a loop).`
+          : waited === "settled"
+            ? `The desk has taken it in without a written reply (get_cell desk shows what it did).`
+            : `No reply from the desk yet — it answers in the background. When the owner asks (never in a loop), read its answer with chat_with_desk { since: ${cursor} }, or pass waitSeconds next time.`;
       return ok(`${head}${body}`, {
         ...(sent ? { messageId: sent.id } : {}),
         conversationId,
         cursor,
-        replies: replies.map((r) => ({ id: r.id, text: r.text, question: r.question, toOwner: r.toOwner, at: r.at })),
+        ...(waited ? { waited } : {}),
+        replies: replies.map((r) => ({ id: r.id, text: r.text, question: r.question, forOwner: r.question, toOwner: r.toOwner, at: r.at })),
       });
     },
 
-    message_cell(args, principalId) {
+    message_cell(args, principalId, call) {
       const id = str(args["id"])!;
       const mode = (str(args["mode"]) ?? "enqueue") as "enqueue" | "steer";
       const notifyParent = str(args["notifyParent"]) as "silent" | "wakeup" | undefined;
       const replyToId = str(args["replyToId"]);
-      const req: SendCellMessageRequest & { conversationId: string } = {
+      const note = str(args["context"]);
+      const req: PersonMessage = {
         text: str(args["text"])!,
         clientId: newId("agmsg", clock),
         mode,
         ...(notifyParent ? { notifyParent } : {}),
         ...(replyToId ? { replyToId } : {}),
-        conversationId: str(args["conversationId"]) ?? principalId,
+        ...(note ? { agentContext: note } : {}),
+        conversationId: str(args["conversationId"]) ?? call.conversationId ?? principalId,
       };
-      return deliveredToCell(id, desk.directMessage(id, req, { principalId }), mode, notifyParent);
+      return deliveredToCell(id, desk.directMessage(id, req, { principalId }), mode, notifyParent, Boolean(note));
     },
 
     inspect_cell(args) {
@@ -638,9 +831,9 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const uri = str(args["uri"])!;
       const offset = typeof args["offset"] === "number" ? Math.max(0, Math.floor(args["offset"])) : 0;
       const limit = typeof args["limit"] === "number" ? Math.max(1, Math.min(MAX_RESOURCE_PAGE_CHARS, Math.floor(args["limit"]))) : DEFAULT_RESOURCE_PAGE_CHARS;
-      const page = desk.resource(uri, offset, limit);
+      const page = desk.resource(uri, offset, limit, str(args["cellId"]));
       const end = offset + page.content.length;
-      const where = `${uri} — characters ${offset}–${end} of ${page.totalChars}${page.hasMore ? `; the rest: read_resource { uri, offset: ${end} }` : " (to the end)"}`;
+      const where = `${uri}${args["cellId"] ? ` of ${str(args["cellId"])}` : ""} — characters ${offset}–${end} of ${page.totalChars}${page.hasMore ? `; the rest: read_resource { uri, ${args["cellId"] ? "cellId, " : ""}offset: ${end} }` : " (to the end)"}`;
       return ok(`${where}\n---\n${page.content}`, page);
     },
 
@@ -782,20 +975,22 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       });
     },
 
-    message_project(args, principalId) {
+    message_project(args, principalId, call) {
       const id = str(args["id"])!;
       const text = str(args["text"])!;
+      const note = str(args["context"]);
+      const conversationId = str(args["conversationId"]) ?? call.conversationId ?? principalId;
       const record = projectRecordOf(id);
       if (!record && !kernel.registry.presets.get(kernel.getCell(id)?.preset ?? "")?.projectRoot) return noProject(id);
       const mode=args["urgent"]===true ? "steer" : "enqueue";
       const cell=kernel.getCell(id);
       if (cell?.status==="closed") return sendFailure(id,{status:"closed",closeReason:cell.closeReason},true);
-      const r=desk.directMessage(id,{text,mode,clientId:newId("agmsg",clock),conversationId:principalId},{principalId});
+      const r=desk.directMessage(id,{text,mode,clientId:newId("agmsg",clock),conversationId,...(note ? {agentContext:note} : {})},{principalId});
       if (mode==="enqueue" && r.ok && r.id) {
         const delivered={status:"delivered" as const,envelopeId:r.id,targetStatus:cell?.status==="paused" ? "paused" as const : "active" as const};
-        return ok(deliveredText(id,delivered,true),delivered);
+        return ok(deliveredText(id,delivered,true,Boolean(note)),{...delivered,conversationId});
       }
-      return deliveredToCell(id,r,mode,undefined);
+      return deliveredToCell(id,r,mode,undefined,Boolean(note));
     },
 
     async set_project_state(args, principalId) {
@@ -820,7 +1015,9 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
 
     list_human_items(args) {
       const items = desk.listHumanItems(args["includeSnoozed"] === true);
-      return ok(`待处理 ${items.length} 项\n${JSON.stringify(items, null, 2)}`, {items});
+      // A project confirmation card's plan in one line each (stages included), ahead of the full JSON (audit E17).
+      const plans = items.flatMap((i) => (i.proposal ? [`- ${i.id} 立项方案 v${i.artifactVersion ?? "—"}：${planFacts(i.proposal)}`] : []));
+      return ok(`待处理 ${items.length} 项\n${plans.length ? `${plans.join("\n")}\n` : ""}${JSON.stringify(items, null, 2)}`, {items});
     },
     async decide_human_item(args,principalId) {
       const result = await desk.decideHumanItem(str(args.id)!,{
@@ -990,7 +1187,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         `在等：${waits.length ? waits.map((w) => `${w.waitingFor}（${oneLine(w.reason, 80)}${w.timeoutAt ? `，${isoMin(w.timeoutAt)} 超时` : ""}）`).join("；") : "—"}`,
         ...(project ? [`持有项目记录：${project.lifecycle}「${project.title}」`] : []),
         ...(cards.length ? [`等你决定：${cards.map(cardLine).join(", ")}`] : []),
-        ...(pendingQuestion ? [`在问主人（${pendingQuestion.id}，用 ${id === deskId ? "chat_with_desk" : "message_cell"} 带 replyToId 回答）：${oneLine(pendingQuestion.text, 600)}`] : []),
+        ...(pendingQuestion ? [`在问主人（${pendingQuestion.id}）：${oneLine(pendingQuestion.text, 600)}\n  ↳ ${questionNote(pendingQuestion.id, id === deskId ? "chat_with_desk" : "message_cell")}`] : []),
         ...(jobs.length ? [section("在途后台命令", jobs.map((j) => jobLine(j, false)))] : []),
         ...(notes ? [`白板\n${notes}`] : []),
         `子节点：${children.length ? children.map((x) => `${x.id}（${x.preset ?? "cell"}，${x.status}）`).join("、") : "—"}`,
@@ -1060,15 +1257,17 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       );
     },
 
-    async control_cell(args, principalId) {
+    async control_cell(args, principalId, call) {
       const id = str(args["id"])!;
       const action = args["action"] as "message" | "steer" | "pause" | "resume" | "cancel" | "trigger";
       const text = str(args["text"]);
+      const note = str(args["context"]);
       const isProject = projectRecordOf(id) !== null;
-      if ((action === "message" || action === "steer") && !text) return fail(`control_cell ${action} needs text: what to tell the cell.`);
+      if ((action === "message" || action === "steer") && !text) return fail(`control_cell ${action} needs text: the owner's words for the cell.`);
       if (action === "message" || action === "steer") {
         const mode = action === "steer" ? "steer" : "enqueue";
-        return deliveredToCell(id, desk.directMessage(id, { text: text!, clientId: newId("agmsg", clock), mode, conversationId: principalId }, { principalId }), mode, undefined);
+        const req: PersonMessage = { text: text!, clientId: newId("agmsg", clock), mode, conversationId: call.conversationId ?? principalId, ...(note ? { agentContext: note } : {}) };
+        return deliveredToCell(id, desk.directMessage(id, req, { principalId }), mode, undefined, Boolean(note));
       }
       const cell = kernel.getCell(id);
       if (!cell) return sendFailure(id, { status: "not_found" }, isProject);
@@ -1082,7 +1281,8 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         return sendFailure(id, { status: "closed", closeReason: cell.closeReason }, isProject);
       }
       // BUG-020: route pause / resume / cancel through DeskService (keeps root guard, project lifecycle & cards in sync).
-      const r = await desk.cellControl(id, { action }, as(principalId));
+      // The owner's words that came with a pause are kept with the cell (audit E05).
+      const r = await desk.cellControl(id, { action }, as(principalId, action === "pause" ? text : undefined));
       if (!r.ok) return fail(`Not applied: ${r.message}`, { applied: false, outcome: r.outcome });
       const what: Record<"pause" | "resume" | "cancel", string> = {
         pause: "it and everything below it are paused",
@@ -1127,30 +1327,38 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
           outcome: str(args["outcome"])!,
           ...(args["background"] !== undefined ? { background: args["background"] as string } : {}),
           ...(args["runnerOverride"] !== undefined ? { runnerOverride: args["runnerOverride"] as NonNullable<PlanSaveRequest["proposal"]["runnerOverride"]> | null } : {}),
+          ...(args["phases"] !== undefined ? { phases: args["phases"] as string[] } : {}),
+          ...(args["cwd"] !== undefined ? { cwd: args["cwd"] as string | null } : {}),
+          ...(args["repos"] !== undefined ? { repos: args["repos"] as PlanSaveRequest["proposal"]["repos"] } : {}),
           actions: args["actions"] as PlanSaveRequest["proposal"]["actions"],
         },
       };
       const r = await desk.savePlan(id, req, as(principalId));
       if (!r.ok) return conflictOf(`Not saved: the plan of ${id} has moved on since v${req.expectedVersion}`, r.current, r.outcome);
       const item = desk.listHumanItems(true).find((i) => i.id === id);
-      return ok(`Saved the plan of ${id} as v${r.artifact.version}. To approve it: decide_human_item with seenArtifactVersion ${r.artifact.version}${item ? ` and seenItemRevision ${item.itemRevision}` : ""}.`, {
-        outcome: r.outcome, itemRevision: item?.itemRevision ?? null, ...artifactData(r.artifact),
-      });
+      const saved = r.artifact.data as ProjectProposal | undefined;
+      return ok(
+        `Saved the plan of ${id} as v${r.artifact.version}. ${saved ? `Now: ${planFacts(saved)}. ` : ""}Show the owner what changed; to approve it on their word: decide_human_item with seenArtifactVersion ${r.artifact.version}${item ? ` and seenItemRevision ${item.itemRevision}` : ""}.`,
+        { outcome: r.outcome, itemRevision: item?.itemRevision ?? null, ...artifactData(r.artifact), proposal: saved ?? null },
+      );
     },
 
     // ---------- scheduled sources ----------
 
     list_sources() {
       const { sensors } = desk.sources();
-      const lines = sensors.map((s) =>
-        [
+      const hits = new Map(sensors.map((s) => [s.id, latestHits(s.id, s.mode)]));
+      const lines = sensors.map((s) => {
+        const h = hits.get(s.id)!;
+        return [
           `- ${s.id}「${s.title}」`,
           ` ${s.scheduleText}；${s.processorLabel}；${s.modeLabel}；${s.statusLabel}；跑了 ${s.runCount} 次，命中 ${s.hitCount} 次；上次运行 ${isoMin(s.lastRunAt)}，上次命中 ${isoMin(s.lastHitAt)}`,
           s.description ? `；${oneLine(s.description, 200)}` : "",
           s.lastError ? `；⚠ 最近错误：${oneLine(s.lastError, 300)}` : "",
-        ].join(""),
-      );
-      return ok(section("信源", lines), { sensors: sensors.map(({ buttons: _, ...s }) => s) });
+          h.text ? `\n  ${h.label}：\n${h.text.split("\n").map((l) => `    ${l}`).join("\n")}${h.more ? `\n  ${h.more}` : ""}` : "",
+        ].join("");
+      });
+      return ok(section("信源", lines), { sensors: sensors.map(({ buttons: _, ...s }) => ({ ...s, latestHits: hits.get(s.id)!.text })) });
     },
 
     create_source(args, principalId) {
@@ -1297,7 +1505,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
   };
 
   /** A person's message to a cell (message_cell / control_cell message|steer), told to the agent in plain words. */
-  function deliveredToCell(id: string, d: Delivery, mode: "enqueue" | "steer", notifyParent: "silent" | "wakeup" | undefined): AgentToolResult {
+  function deliveredToCell(id: string, d: Delivery, mode: "enqueue" | "steer", notifyParent: "silent" | "wakeup" | undefined, withNote = false): AgentToolResult {
     const data = { outcome: d.outcome, messageId: d.id, ccTo: d.ccTo };
     switch (d.outcome) {
       case "not_found":
@@ -1325,7 +1533,8 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         const cc = d.ccTo
           ? ` Its project ${d.ccTo}${d.ccTitle ? `「${d.ccTitle}」` : ""} was given a copy of the owner's words${notifyParent === "wakeup" ? " and woken" : " (it reads it at its next wake-up; it is not woken for it)"}.`
           : "";
-        return ok(`Delivered (message ${d.id}). ${what}${cc} Results arrive asynchronously — look later with get_cell / inspect_cell ${id}.`, data);
+        const mine = withNote ? " Your note went with them, marked as yours." : "";
+        return ok(`Delivered (message ${d.id}). ${what}${mine}${cc} Results arrive asynchronously — look later with get_cell / inspect_cell ${id}.`, data);
       }
     }
   }
@@ -1383,7 +1592,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         ? { ...tool, description: `${tool.description}\n\n${options}` }
         : tool);
     },
-    async call(name, rawArgs, principalId) {
+    async call(name, rawArgs, principalId, call = {}) {
       const doc = docs.get(name);
       const handler = handlers[name];
       if (!doc || !handler) {
@@ -1393,7 +1602,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const invalid = validateArgs(doc, args);
       if (invalid) return fail(invalid);
       try {
-        return await handler(args, principalId);
+        return await handler(args, principalId, call);
       } catch (err) {
         // Caller mistakes and refusals are answers, not server errors.
         if (err instanceof DeskError) return fail(`${err.status === 404 ? "Not found" : err.status === 409 ? "Not possible now" : "Not accepted"}: ${err.message}`, { code: err.code });

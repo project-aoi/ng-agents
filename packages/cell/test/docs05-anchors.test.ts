@@ -516,3 +516,42 @@ it("matches a chat reply to an unnamed human wait and keeps a named backend wait
   await h.kernel.idle();
   expect(h.kernel.listWaits(["proj"])).toMatchObject([{refId:"estimate"}]);
 });
+
+// Audit 2026-11-23 E03: a project that put the question to the owner (an action recorded as theirs, then wait "human")
+// can answer the worker waiting on it once the owner acts — that is not a stall.
+it("grounds a worker's wait on a project that itself waits for the owner with an open action", async () => {
+  const h = await boot({ start: false });
+  project(h);
+  h.kernel.spawnCell("proj", { id: "w", preset: "worker" }, undefined, { principalId: h.kernel.ownerPrincipal });
+  addWait(h, "w", "proj");
+  h.kernel.humanItems.create({ category: "action", title: "确认未提交的改动怎么处理", subjectKey: "action:proj:dirty",
+    options: [{ id: "done", label: "已办完", effect: "reply" }] }, "proj");
+  // The open action alone does not cover a wait nobody will answer (P-SAFE-6: an unrelated to-do must not mask it)…
+  const stranded = h.kernel.anchorsOf("proj");
+  expect(stranded).toMatchObject({ internal: false, human: false, stalled: true });
+  expect(stranded.detail).toContain("w waits for inbox:proj");
+  expect(stranded.detail).not.toContain("the owner has no card or open action");
+  // …but once the project itself waits for the owner on it, the chain worker → project → owner is whole.
+  run(h.kernel.db, `INSERT INTO cell_waits(cell_id, wait_id, registration_id, waiting_for, reason, epoch, created_at)
+    VALUES ('proj','human','human','human','等主人确认',?,?)`, [h.kernel.getCell("proj")!.epoch, h.clock.now()]);
+  expect(h.kernel.anchorsOf("proj")).toMatchObject({ internal: true, human: true, stalled: false });
+});
+
+// Audit 2026-11-23 E04: the instant a shared fixer's turn ends, its result sits in the desk's inbox (or is being
+// handled by the desk's run); the projects waiting on the desk are about to be answered.
+it("grounds waits on the desk while a related fixer's result is pending or claimed there", async () => {
+  const h = await boot({ start: false });
+  project(h);
+  project(h, "other");
+  addWait(h, "proj", "desk", "ci");
+  addWait(h, "other", "desk", "ci");
+  h.kernel.spawnCell("desk", { id: "fixer", preset: "worker", meta: { relatedProjectIds: ["proj"] } }, undefined, { principalId: h.kernel.ownerPrincipal });
+  h.kernel.inbox.cancelScheduledSync({ cellId: "fixer" });
+  for (const m of h.kernel.inbox.listMessagesSync({ cellId: "fixer", status: ["pending"] })) h.kernel.inbox.consumePendingSync("fixer", m.envelope.id, h.kernel.getCell("fixer")!.epoch);
+  expect(h.kernel.anchorsOf("proj")).toMatchObject({ internal: false, stalled: true });
+  h.kernel.inbox.enqueueSync("desk", createEnvelope({ from: "inbox:fixer", to: "inbox:desk", principalId: "cell:fixer", kind: "result", type: PAYLOAD.cellResult,
+    payload: { childCellId: "fixer", status: "completed", summary: "ci 已修复", childState: "dormant" } }, h.clock));
+  expect(h.kernel.anchorsOf("proj")).toMatchObject({ internal: true, stalled: false });
+  // The fixer was started for "proj" only: its result says nothing about "other".
+  expect(h.kernel.anchorsOf("other")).toMatchObject({ internal: false, stalled: true });
+});

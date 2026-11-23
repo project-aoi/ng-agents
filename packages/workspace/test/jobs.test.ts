@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { groupAlive, isNgError, run, validatePayload, type JobResultPayload } from "@ng/protocol";
 import { JOB_MARKER } from "../src";
 import { markedAlive, processHasMarker, processInspection, psEnvironment } from "../src/util";
+import { AwakeClock } from "../src/jobs";
 import { cleanupAll, harness, pidGone, waitFor } from "./helpers";
 
 afterEach(cleanupAll);
@@ -614,5 +615,29 @@ describe("job runtime timeout protection (BUG-027)", () => {
     expect(job).toMatchObject({ state: "failed", exitCode: 124 });
     expect(job.error).toMatch(/timed out/);
     expect(() => process.kill(-pid, 0)).toThrow();
+  });
+});
+
+// Audit 2026-11-23 E32: after the whole host had been frozen for 100 s, a job was reported "no output for 5 minutes" —
+// the frozen time was counted as quiet time.
+describe("AwakeClock", () => {
+  it("counts the spans in which the process itself stood still, and only their part inside the asked window", () => {
+    let now = 1_000_000;
+    const clock = new AwakeClock(5_000, () => now);
+    for (let i = 0; i < 3; i++) {
+      now += 5_000;
+      clock.beat();
+    }
+    expect(clock.asleepBetween(1_000_000, now)).toBe(0);
+    // A slow beat is a busy event loop, not a frozen process.
+    now += 9_000;
+    clock.beat();
+    expect(clock.asleepBetween(1_000_000, now)).toBe(0);
+    // 100 s without a beat: the process did not run for all of it but the one beat that was due.
+    const before = now;
+    now += 100_000;
+    expect(clock.asleepBetween(1_000_000, now)).toBe(95_000);
+    expect(clock.asleepBetween(before + 60_000, now)).toBe(40_000);
+    expect(clock.asleepBetween(1_000_000, before)).toBe(0);
   });
 });

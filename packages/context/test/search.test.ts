@@ -41,6 +41,19 @@ describe("searchHistory", () => {
     for (const s of hits) expect(typeof s.rank).toBe("number");
   });
 
+  it("E23: earlier searches — the call, its result and the result's spill — are not hits", async () => {
+    const h = seed();
+    const s = h.store;
+    const at = () => h.clock.advance(1000);
+    s.appendEvidenceSync("w", { kind: "tool_call", toolUseId: "t2", name: "search_history", input: { query: "报价单" }, runId: "r2", at: at() });
+    s.appendEvidenceSync("w", { kind: "tool_result", toolUseId: "t2", name: "search_history", output: `- [#1 inbound] 帮我催一下供应商 C 的报价单\n${"y".repeat(1000)}`, runId: "r2", at: at() });
+    for (const scope of ["lineage", "global"] as const) {
+      const hits = await s.searchHistory("w", "报价单", { scope });
+      expect(hits.length).toBeGreaterThan(0);
+      expect(hits.filter((x) => x.kind === "tool_call" || x.kind === "tool_result" || x.source === "resource")).toEqual([]);
+    }
+  });
+
   it("falls back to LIKE for 1-2 character queries and combines terms", () => {
     const h = seed();
     expect(h.store.searchHistorySync("w", "报价").map((s) => s.kind).sort()).toEqual(["assistant_text", "inbound", "preference", "working_note"]);

@@ -47,6 +47,10 @@ export interface SourceState {
   lastRunAt?: number;
   lastCheckKey?: string;
   lastHitAt?: number;
+  /** Digest of the last reported hit: the same hit again is counted, not reported again, until a check finds nothing. */
+  lastHitDigest?: string;
+  /** How many later checks found that same hit again. */
+  lastHitRepeats?: number;
   lastError?: string;
   runCount: number;
   hitCount: number;

@@ -4,6 +4,7 @@ import type {
   CellSpec,
   CellsRepo,
   ChildSummary,
+  Envelope,
   Clock,
   Db,
   InboxWriter,
@@ -76,7 +77,7 @@ export interface ContextStoreOptions {
    * [docs/05] Extra volatile notes for the tail (active workspaces, open waits): each non-blank note becomes one user
    * text message, verbatim, after the roster and before the batch, and is listed in `tail.notes`. Never persisted.
    */
-  tailNotesProvider?: (cellId: string) => string[];
+  tailNotesProvider?: (cellId: string, incoming?: readonly Envelope[]) => string[];
   /**
    * Compaction summariser. Default: a deterministic truncating summary (no model). When one is injected, only the
    * async paths (`hydrate`, `compact`) compact; `hydrateSync` never calls it and leaves an over-budget history as is.

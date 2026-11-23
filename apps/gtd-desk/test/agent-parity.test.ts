@@ -492,7 +492,8 @@ describe("topology, cells and projects", () => {
     await d.kernel.idle();
     const asked = await ok<{ pendingQuestion: { id: string; text: string } }>(d, "get_cell", { id: "desk" });
     expect(asked.data.pendingQuestion).toMatchObject({ text: "仓库的绝对路径是哪个？" });
-    expect(asked.text).toContain(`${asked.data.pendingQuestion.id}，用 chat_with_desk 带 replyToId 回答`);
+    expect(asked.text).toContain(`在问主人（${asked.data.pendingQuestion.id}）：仓库的绝对路径是哪个？`);
+    expect(asked.text).toContain(`send their answer back with chat_with_desk and replyToId ${asked.data.pendingQuestion.id}; do not answer it yourself`);
   });
 
   it("capture takes links, a voice transcript or a bare link; add_action takes the kind of time; snoozed items are listed when asked", async () => {

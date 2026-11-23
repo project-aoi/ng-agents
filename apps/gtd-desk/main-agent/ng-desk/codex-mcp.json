@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "ng-desk": {
+      "command": "ng-desk-mcp",
+      "env_vars": ["NG_DESK_URL", "NG_MCP_TIMEOUT_MS", "NG_WORKBENCH_CELL_ID"],
+      "startup_timeout_sec": 30,
+      "tool_timeout_sec": 180
+    }
+  }
+}

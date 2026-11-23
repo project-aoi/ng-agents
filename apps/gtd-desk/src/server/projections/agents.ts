@@ -396,14 +396,47 @@ function page(ctx: BuildCtx, q: TimelineQuery): { items: TimelineItemDTO[]; firs
   }
 }
 
-/** The latest question the node asked the owner that nobody has answered yet. */
-function pendingQuestionOf(ctx: BuildCtx): CellTimelineDTO["pendingQuestion"] {
-  let q: CellTimelineDTO["pendingQuestion"] = null;
+/** An unanswered question of a cell, and how it was asked. */
+export interface OpenQuestion {
+  id: string;
+  text: string;
+  at: number;
+  /** Sent to the owner as a message (send_message to the owner), not only said in a turn. */
+  toOwner: boolean;
+  /** Said after a person (the owner, or their agent) spoke to the cell in the records read: the answer to them. */
+  afterOwner: boolean;
+}
+
+/** The latest question the node asked that nobody has answered yet (a person's message answers it). */
+function openQuestionOf(ctx: BuildCtx): OpenQuestion | null {
+  let q: OpenQuestion | null = null;
+  let spoken = false;
   for (const { item } of buildItems({ ...ctx, steers: ctx.steers.map((s) => ({ ...s, used: false })) }, tailRecords(ctx.v.input.kernel, ctx.cell.id, 200))) {
-    if (item.kind === "assistant_reply" && item.question) q = { id: item.id, text: item.text };
-    else if (item.kind === "user_chat") q = null;
+    if (item.kind === "assistant_reply" && item.question) q = { id: item.id, text: item.text, at: item.at, toOwner: item.toOwner, afterOwner: spoken };
+    else if (item.kind === "user_chat") {
+      q = null;
+      spoken = true;
+    }
   }
   return q;
+}
+
+function pendingQuestionOf(ctx: BuildCtx): CellTimelineDTO["pendingQuestion"] {
+  const q = openQuestionOf(ctx);
+  return q ? { id: q.id, text: q.text } : null;
+}
+
+/** The open question of each of these cells (one view for all of them): what the overview lists for the owner. */
+export function pendingQuestions(input: ProjectionInput, cellIds: readonly string[]): Map<string, OpenQuestion> {
+  const out = new Map<string, OpenQuestion>();
+  if (cellIds.length === 0) return out;
+  const v = agentsView(input, cellIds);
+  for (const id of cellIds) {
+    const cell = v.cells.get(id);
+    const q = cell && cell.status !== "closed" ? openQuestionOf(buildCtx(v, cell)) : null;
+    if (q) out.set(id, q);
+  }
+  return out;
 }
 
 /** The text of the timeline item `id` of this cell (what a reply refers to), if it can be found. */

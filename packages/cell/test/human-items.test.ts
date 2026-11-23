@@ -471,3 +471,55 @@ it("withdraws a normal card of an earlier generation and refuses reopening benea
   kernel.directMessage("leaf",{text:"继续"}, { principalId: kernel.ownerPrincipal });
   expect(kernel.getCell("leaf")?.status).toBe("closed");
 });
+
+// Audit 2026-11-23 E07: a plain card (present_to_owner, request_approval with options) can be about a draft. It is
+// bound to the version that exists when it is raised; the owner's decision names the version they saw, and the
+// issuing cell is told which version was decided and whether the owner edited it.
+it("binds a custom card to its draft's version and reports the owner's edit with the decision", async () => {
+  const { kernel } = await boot();
+  kernel.context.commitSync("desk", { artifact: { artifactId: "sms", content: { format: "text", body: "初稿" }, updatedBy: "agent" } });
+  const reply = { id: "final", label: "定稿", effect: "reply" as const };
+  expect(() => kernel.humanItems.create({ title: "短信草稿", subjectKey: "sms", options: [reply], artifactId: "nope" }, "desk")).toThrow(/no artifact/);
+  const item = kernel.humanItems.create({ title: "短信草稿", subjectKey: "sms", options: [reply], artifactId: "sms" }, "desk");
+  expect(item).toMatchObject({ artifactId: "sms", artifactVersion: 1, humanEdited: false });
+  expect(item.options.map((o) => o.id)).toEqual(expect.arrayContaining(["final", "system.revise"]));
+
+  kernel.context.commitSync("desk", { artifact: { artifactId: "sms", expectedVersion: 1, content: { format: "text", body: "主人改过的定稿" }, updatedBy: "human" } });
+  const edited = kernel.humanItems.get(item.id)!;
+  expect(edited).toMatchObject({ artifactVersion: 2, humanEdited: true });
+  // A decision made on the version the owner did not see is refused; on the current one it goes through.
+  await expect(kernel.humanItems.decide(item.id, { optionId: "final", seenItemRevision: edited.itemRevision, seenArtifactVersion: 1 }, "owner")).rejects.toThrow(/草稿已变动/);
+  await kernel.humanItems.decide(item.id, { optionId: "final", seenItemRevision: edited.itemRevision, seenArtifactVersion: 2 }, "owner");
+  const resolved = kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.approvalResolved }).at(-1)!.envelope.payload;
+  expect(resolved).toMatchObject({ actionId: item.id, action: { artifactId: "sms" }, artifactVersion: 2, humanEdited: true });
+});
+
+// Audit 2026-11-23 E13 / E17: a cell can take back a card of its own (or of a cell below it) that is still undecided.
+it("lets a cell withdraw its own undecided card, and nobody else's", async () => {
+  const { kernel } = await boot();
+  kernel.spawnCell("desk", { id: "proj", preset: "project", meta: { projectCellId: "proj" } }, undefined, { principalId: kernel.ownerPrincipal });
+  kernel.spawnCell("desk", { id: "other", preset: "project", meta: { projectCellId: "other" } }, undefined, { principalId: kernel.ownerPrincipal });
+  const card = kernel.humanItems.create({ title: "阶段 1 完成，是否开始阶段 2", subjectKey: "phase:2", options: [{ id: "go", label: "开始", effect: "reply" }] }, "proj");
+  expect(kernel.humanItems.withdrawOwn(card.id, "other", "not mine")).toBe("not_found");
+  expect(kernel.humanItems.get(card.id)!.status).toBe("pending");
+  // The desk is above the project: it may close a card the project raised.
+  expect(kernel.humanItems.withdrawOwn(card.id, "desk", "计划改了，不再分阶段")).toBe("withdrawn");
+  expect(kernel.humanItems.get(card.id)!.status).toBe("cancelled");
+  expect(kernel.humanItems.list().some((i) => i.id === card.id)).toBe(false);
+  expect(kernel.humanItems.withdrawOwn(card.id, "proj", "again")).toBe("not_pending");
+  expect(kernel.humanItems.withdrawOwn("act_missing", "proj", "x")).toBe("not_found");
+});
+
+// Audit 2026-11-23 E26: what the owner writes while approving a proposal reached nobody, so it was sent a second time
+// as a separate message. It now goes to the project that the approval starts, and stays on the desk's record.
+it("hands the owner's note on an approved proposal to the project it starts", async () => {
+  const { kernel } = await boot({ start: false });
+  const approval = kernel.gate.authorizeSync({ type: "project.start", subjectKey: "proposal:note", summary: "启动项目", sideEffect: "external",
+    proposal: { title: "测试项目", outcome: "交付总结", actions: [] } }, { cellId: "desk", epoch: 0, principalId: "cell:desk" });
+  if (approval.type !== "defer") throw Error("expected a proposal card");
+  await kernel.humanItems.decide(approval.actionId, { optionId: "system.execute", seenItemRevision: 1, note: "无效行沿用 parse 的行为" }, "owner");
+  const project = `project-${approval.actionId}`;
+  const notes = kernel.inbox.listMessagesSync({ cellId: project, type: PAYLOAD.cellMessage });
+  expect(notes.map((m) => [m.envelope.principalId, (m.envelope.payload as { text: string }).text])).toEqual([["owner", "无效行沿用 parse 的行为"]]);
+  expect(kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.approvalResolved }).at(-1)!.envelope.payload).toMatchObject({ status: "approved", note: "无效行沿用 parse 的行为" });
+});

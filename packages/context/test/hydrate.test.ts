@@ -315,6 +315,8 @@ describe("hydrate: history and tail", () => {
           { ...base, cellId: "w1a", preset: null, depth: 3, parentId: "w1" },
           { ...base, cellId: "watch", preset: "checker", status: "paused", depth: 1, cwd: "/tmp/probe" },
           { ...base, cellId: "plain" },
+          // What it is doing stands where the lifecycle word would (audit 2026-11-23 E36: "active · dormant").
+          { ...base, cellId: "rested", activity: "dormant", statusLine: "dormant — its turn is over" },
         ],
       },
     });
@@ -327,9 +329,10 @@ describe("hydrate: history and tail", () => {
         "    - w1a · active",
         "- watch · checker · paused · cwd /tmp/probe",
         "- plain · worker · active",
+        "- rested · worker · dormant: dormant — its turn is over",
       ].join("\n"),
     );
-    expect(snap.tail.roster.map((c) => c.depth)).toEqual([1, 2, 3, 1, undefined]);
+    expect(snap.tail.roster.map((c) => c.depth)).toEqual([1, 2, 3, 1, undefined, undefined]);
   });
 
   it("puts the kernel's tail notes verbatim after the roster and before the batch, never into history", () => {
@@ -480,6 +483,16 @@ describe("hydrate: fork_prefix", () => {
     h.store.appendEvidenceSync("desk", { kind: "run_boundary", phase: "end", epoch: 0, outcome: "completed", runId, at: 5 });
     return { h, parentSnap, uptoSeq };
   }
+
+  // Audit 2026-11-23 E11: a Loop that cannot continue the parent's session needs the child's own role as the system text.
+  it("a fork child's snapshot also carries its own system text; an isolated cell's does not", () => {
+    const { h, parentSnap } = forkScenario();
+    const child = h.store.hydrateSync("fixer", batchOf("fixer", []), "fork_prefix");
+    expect(child.system.text).toBe(parentSnap.system.text);
+    expect(child.system.own).toContain("You are a worker. Fix the bug you are given.");
+    expect(child.system.own).not.toContain("You are the desk.");
+    expect(parentSnap.system.own).toBeUndefined();
+  });
 
   it("the child's prefix equals the parent's: same system bytes, parent's history up to the fork point, then a fork note", () => {
     const { h, parentSnap } = forkScenario();
@@ -710,4 +723,26 @@ it("retains structured assignments and every reference when an oversized summary
   expect(summary).toContain("LATEST SUMMARY DECISION");
   expect(snap.tail.notes?.[0]).toContain('"target":"prod"');
   expect(summary.length).toBeLessThanOrEqual(900);
+});
+
+// Audit 2026-11-23 E10 / E15: the tail is read again after the wake-up's bookkeeping, and the first task is a field of
+// its own so that a Loop continuing a session can leave it out.
+it("refreshTailSync reads the notes again and keeps the original task apart from them", () => {
+  let notes = ["[your open actions]\n- act_1 [agent] \"改代码\""];
+  const h = deskHarness({ store: { tailNotesProvider: () => notes } });
+  const task = { ...userEnvelope(h.clock, ""), type: "cell.task", payload: { parentCellId: "lead", instruction: "重试五次" } };
+  simulateRun(h, "desk", [task], reply("ok"));
+  const batch = batchOf("desk", [userEnvelope(h.clock, "改成三次")]);
+  const snap = h.store.hydrateSync("desk", batch, "isolated");
+  expect(snap.tail.originalTask).toMatch(/^\[original task\] \(as first given — later messages may have changed it\) parent=lead 重试五次/);
+  expect(snap.tail.notes).toEqual([snap.tail.originalTask, notes[0]]);
+
+  notes = [];
+  const again = h.store.refreshTailSync(snap, ["[actions closed for you at this wake-up]\n- act_1 \"改代码\""]);
+  expect(again.tail.notes).toEqual([snap.tail.originalTask, "[actions closed for you at this wake-up]\n- act_1 \"改代码\""]);
+  expect(json(again.tail.messages)).not.toContain("[your open actions]");
+  expect(json(again.tail.messages.at(-1))).toContain("改成三次");
+  // Everything but the tail is the same snapshot.
+  expect(again.history).toBe(snap.history);
+  expect(again.system).toBe(snap.system);
 });

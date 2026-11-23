@@ -30,9 +30,11 @@ export interface HumanItemDraft {
   category?: "action" | "decision";
   dueAt?: number;
   effort?: string;
+  /** A versioned draft the card is about: the card is bound to the version current when it is raised, and a decision must name the version the owner saw. */
+  artifactId?: string;
 }
 
-export interface HumanItem extends HumanItemDraft {
+export interface HumanItem extends Omit<HumanItemDraft, "artifactId"> {
   category: "action" | "decision";
   id: string;
   cellId: string | null;
@@ -85,9 +87,13 @@ export function checkCardOptions(options: CardOption[], opts: { callback: boolea
   if (opts.controlled && !options.some((o) => o.effect === "execute")) invalid("the controlled action needs an execute option");
 }
 
+/**
+ * Every option whose decision goes back to someone (reply, approve/execute, complete) takes the owner's words with
+ * it — a condition on an approval belongs on the approval, not in a second message (audit E26).
+ */
 export function addCardExits(options: CardOption[], callback: boolean): CardOption[] {
   const all = options.map(
-    (o): CardOption => (!o.input && (o.effect === "complete" || o.effect === "reply") ? { ...o, input: { mode: "optional" } } : o),
+    (o): CardOption => (!o.input && (o.effect === "complete" || o.effect === "reply" || o.effect === "execute") ? { ...o, input: { mode: "optional" } } : o),
   );
   if (!all.some((o) => o.effect === "defer")) all.push({ id: "system.defer", label: "推迟", effect: "defer", group: "more" });
   if (!all.some((o) => o.effect === "terminate" && o.terminateMode !== "cancel_task"))

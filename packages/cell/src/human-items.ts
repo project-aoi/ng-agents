@@ -7,6 +7,7 @@ import {
   createEnvelope,
   get,
   KERNEL_FROM,
+  cellIdOf,
   newId,
   timerFrom,
   NgError,
@@ -30,6 +31,7 @@ import { requiresApproval } from "@ng/gate";
 import { isProjectRoot, type KernelCore } from "./core";
 import { RESURFACE_MARKER } from "./constants";
 import { isKernelEscalation } from "./escalations";
+import { sendCellMessage } from "./messages";
 
 interface ItemRow {
   principal_id: string;
@@ -289,7 +291,11 @@ export function createHumanItems(core: KernelCore) {
               : []),
           ]
         : [{ id: "system.complete", label: "已办完", effect: "complete", input: { mode: "optional" } }];
-      options = addCardExits(r.options ? (JSON.parse(r.options) as CardOption[]) : defaults, callback);
+      const custom = r.options ? (JSON.parse(r.options) as CardOption[]) : null;
+      // A card about a draft can always be sent back for another draft, whatever choices its cell listed.
+      if (custom && callback && r.artifact_id && !custom.some((o) => o.effect === "revise"))
+        custom.push({ id: "system.revise", label: "请修改", effect: "revise", input: { mode: "required" }, group: "more" });
+      options = addCardExits(custom ?? defaults, callback);
     }
     const art = r.artifact_id ? context.getArtifactSync(r.artifact_id) : null;
     const related = JSON.parse(r.related_project_ids) as string[];
@@ -350,6 +356,9 @@ export function createHumanItems(core: KernelCore) {
           throw new NgError("invalid_argument", "cancel target must be an explicitly related project");
       const now = clock.now();
       if (draft.dueAt !== undefined && !Number.isFinite(draft.dueAt)) throw new NgError("invalid_argument", "invalid due date");
+      // A card about a draft is bound to the version that exists now: the owner's decision names the version they saw.
+      const art = draft.artifactId ? context.getArtifactSync(draft.artifactId) : null;
+      if (draft.artifactId && !art) throw new NgError("invalid_argument", `there is no artifact "${draft.artifactId}"`);
       const prior = get<ItemRow>(
         db,
         "SELECT * FROM human_items WHERE subject_key = ? AND cell_id IS ? AND status IN ('pending','snoozed')",
@@ -361,7 +370,8 @@ export function createHumanItems(core: KernelCore) {
         body: draft.description ?? draft.title,
         data: { prep: draft.prep, rawInput: draft.rawInput, source: draft.source },
       });
-      const action = { type: "custom", name: "human.reply", summary: draft.title, sideEffect: "none", subjectKey: draft.subjectKey };
+      // The draft's id travels on the action, as it does for a gated approval: `approval.resolved` names it there.
+      const action = { type: "custom", name: "human.reply", summary: draft.title, sideEffect: "none", subjectKey: draft.subjectKey, ...(art ? { artifactId: art.artifactId } : {}) };
       const existingId = row(id);
       if (existingId && existingId.action_id !== prior?.action_id) throw new NgError("conflict", "事项编号已被占用");
       if (prior) {
@@ -371,9 +381,10 @@ export function createHumanItems(core: KernelCore) {
         id = prior.action_id;
         run(
           db,
-          `UPDATE human_items SET card=?, options=?, related_project_ids=?, item_revision=item_revision+1,
-          updated_at=?, due_at=?, effort=?, category=? WHERE action_id=?`,
+          `UPDATE human_items SET action=?, card=?, options=?, related_project_ids=?, item_revision=item_revision+1,
+          updated_at=?, due_at=?, effort=?, category=?, artifact_id=?, proposed_version=?, bound_version=?, human_edited=0 WHERE action_id=?`,
           [
+            JSON.stringify(action),
             card,
             JSON.stringify(draft.options),
             JSON.stringify(related),
@@ -381,6 +392,9 @@ export function createHumanItems(core: KernelCore) {
             draft.dueAt ?? null,
             draft.effort ?? null,
             draft.category ?? "decision",
+            art?.artifactId ?? null,
+            art?.version ?? null,
+            art?.version ?? null,
             id,
           ],
         );
@@ -388,8 +402,8 @@ export function createHumanItems(core: KernelCore) {
         run(
           db,
           `INSERT INTO human_items
-        (action_id, cell_id, epoch, principal_id, subject_key, action_type, action, action_hash, card, options, related_project_ids, category, due_at, effort, created_at, updated_at)
-        VALUES (?,?,?,?,?,'custom',?,'',?,?,?,?,?,?,?,?)`,
+        (action_id, cell_id, epoch, principal_id, subject_key, action_type, action, action_hash, card, options, related_project_ids, category, due_at, effort, artifact_id, proposed_version, bound_version, created_at, updated_at)
+        VALUES (?,?,?,?,?,'custom',?,'',?,?,?,?,?,?,?,?,?,?,?)`,
           [
             id,
             cellId,
@@ -403,6 +417,9 @@ export function createHumanItems(core: KernelCore) {
             draft.category ?? "decision",
             draft.dueAt ?? null,
             draft.effort ?? null,
+            art?.artifactId ?? null,
+            art?.version ?? null,
+            art?.version ?? null,
             now,
             now,
           ],
@@ -527,8 +544,14 @@ export function createHumanItems(core: KernelCore) {
           const parent = issuer.preset && core.registry.presets.get(issuer.preset)?.approvedSpawn ? issuer : cells.require(core.deskCellId);
           const spawn = parent.preset ? core.registry.presets.get(parent.preset)?.approvedSpawn?.(approved, context, clock) : undefined;
           if (!spawn) throw new NgError("conflict", "当前任务无法执行这项已批准的操作，请交回主台");
-          core.lifecycle.spawnCell(parent.id, spawn.spec, spawn.task, { principalId: cellPrincipal(parent.id) });
-          deliverResolved(approved, "approved", actor);
+          const started = core.lifecycle.spawnCell(parent.id, spawn.spec, spawn.task, { principalId: cellPrincipal(parent.id) });
+          // What the owner wrote while approving is for the project that now starts: it reads it with its task.
+          const note = d.note?.trim();
+          if (note) {
+            sendCellMessage(core, { from: KERNEL_FROM.control, principalId: actor, sender: actor, toCellId: cellIdOf(started), id: `${id}:approval-note`,
+              message: { text: note, summary: "主人批准方案时的补充" } });
+          }
+          deliverResolved(approved, "approved", actor, note ? { note } : {});
           return { status: "approved" };
         }
         const retry = isKernelEscalation(rec.action) && rec.action.args.reason === "retry_limit" ? rec.action.args : null;
@@ -821,6 +844,14 @@ export function createHumanItems(core: KernelCore) {
           if (related.every(pid => cells.get(pid)?.status === "closed")) withdraw(r.action_id, "project_closed");
         }
       }
+    },
+    /** A cell takes back an undecided card or human action of its own, or of a cell below it. */
+    withdrawOwn(id: string, cellId: string, reason: string): "withdrawn" | "not_pending" | "not_found" {
+      const r = row(id);
+      if (!r || r.cell_id === null || (r.cell_id !== cellId && !cells.ancestors(r.cell_id).some(a => a.id === cellId))) return "not_found";
+      if (r.disposition !== "pending") return "not_pending";
+      withdraw(id, reason);
+      return "withdrawn";
     },
     armResurface,
     resurface,

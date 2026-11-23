@@ -45,6 +45,11 @@ export interface ContextStore {
   readStateSync<T = unknown>(cellId: string, key: string): T | null;
   commitSync(cellId: string, tx: CommitTx): CommitResult;
   hydrateSync(cellId: string, batch: ClaimedBatch, mode: ContextMode): PromptSnapshot;
+  /**
+   * The same snapshot with its volatile tail (roster, notes) read again — after the preset's bookkeeping for this
+   * wake-up has run, so the notes describe the records as the model will find them. `extraNotes` go in front.
+   */
+  refreshTailSync(snapshot: PromptSnapshot, extraNotes?: readonly string[]): PromptSnapshot;
   appendEvidenceSync(cellId: string, record: StepOrExternalEvidence): EvidenceAppendResult;
   readResourceSync(cellId: string, uri: string, page?: ResourcePage): string;
   searchHistorySync(cellId: string, query: string, opts?: SearchOptions): Snippet[];
@@ -473,7 +478,12 @@ export interface PromptSnapshot {
   spec: CellSpec;                       // resolved spec as stored in cells.spec (preset defaults applied)
   bounds: PolicyBounds;                 // effective bounds of the cell
   batch: ClaimedBatch;
-  system: { text: string; hash: string };
+  /**
+   * `own`: only for a fork_prefix cell whose `text` is its parent's — the cell's own system text, for a Loop that
+   * cannot continue the parent's session natively (a CLI session in another directory) and so gains nothing from
+   * sharing the parent's prefix. `hash` stays the identity of the prefix either way.
+   */
+  system: { text: string; hash: string; own?: string };
   history: ModelMessage[];
   summaryUptoSeq?: number;
   historyUptoSeq: number;               // last evidence seq folded into history
@@ -482,6 +492,11 @@ export interface PromptSnapshot {
     messages: ModelMessage[];
     /** [docs/05] Extra volatile notes the kernel adds after the roster (active workspaces, open waits). */
     notes?: string[];
+    /**
+     * The cell's first task as one of `messages` (so a compaction never loses it). It is the task as first given: a
+     * Loop that continues a session which already holds it leaves it out.
+     */
+    originalTask?: string;
   };
   skills: SkillIndexEntry[];            // the index embedded in `system` (bodies are read on demand)
   createdAt: number;

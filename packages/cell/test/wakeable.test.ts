@@ -67,7 +67,7 @@ describe("a wakeable worker's turn settles: the parent is told, the worker stays
       status: "completed",
       summary: "退避逻辑已实现，提交 9f2c1",
       childState: "dormant",
-      turn: { fromSeq: 1, hadDirectUserChat: false, directChats: 0, steps: 1, outcome: "completed", preview: "退避逻辑已实现，提交 9f2c1" },
+      turn: { fromSeq: 1, hadDirectUserChat: false, directChats: 0, steps: 1, outcome: "completed", preview: null },
     });
     expect(first!.id).toBe(`w1:${first!.turn!.runId}:settled`);
     const settled = h.kernel.context.readStateSync<{ settledSeq: number; notices: number }>("w1", CELL_TURN_KEY)!;
@@ -462,4 +462,40 @@ it.each(["one_shot", "wakeable"] as const)("enforces the leaf boundary for the %
   h.kernel.spawnCell("desk", { id: "leaf", preset: "inline", lifetime, bounds: { maxDepth: 3 } }, undefined, { principalId: h.kernel.ownerPrincipal });
   expect(h.kernel.getCell("leaf")?.bounds.maxDepth).toBe(0);
   expect(() => h.kernel.spawnCell("leaf", { preset: "worker" }, undefined, { principalId: h.kernel.ownerPrincipal })).toThrow(/maxDepth 0/);
+});
+
+// Audit 2026-11-23 E14 / E36: notes that pushed a worker to do something nobody needs — "its parent waits on it" (the
+// parent is told when the turn ends anyway) and "someone else is in your work tree" (its own project, mid-turn).
+it("a worker's notes list neither its parent's wait on it nor its own coordinator as someone else in the work tree", async () => {
+  const repo = tempDir("repo");
+  execFileSync("git", ["init", "-q", repo]);
+  forgetWorkTreeKeys();
+  const h = await boot();
+  h.kernel.spawnCell("desk", { id: "proj", preset: "project", title: "proj", cwd: repo, meta: { role: "proj" } }, undefined, { principalId: h.kernel.ownerPrincipal });
+  h.kernel.spawnCell("desk", { id: "other", preset: "project", title: "other", meta: { role: "other" } }, undefined, { principalId: h.kernel.ownerPrincipal });
+  let tail = "";
+  let release!: () => void;
+  const held = new Promise<void>((r) => (release = r));
+  // The project is still in its own turn (in the same directory) while its worker starts.
+  h.script.add("proj", async () => {
+    worker(h, "w", "proj", "change files", { cwd: repo });
+    await held;
+    return { text: "dispatched" };
+  });
+  h.script.add("w", (req) => {
+    tail = requestText(req);
+    release();
+    return { text: "done" };
+  });
+  const wait = (from: string) => h.kernel.db.prepare(`INSERT INTO cell_waits(cell_id, wait_id, registration_id, waiting_for, reason, epoch, created_at)
+    VALUES (?,?,?,?,?,?,?)`).run(from, `on-w-${from}`, `on-w-${from}`, "inbox:w", "等它做完", h.kernel.getCell(from)!.epoch, h.clock.now());
+  wait("proj");
+  wait("other");
+  h.kernel.sendToCell("proj", { text: "go" }, { principalId: h.kernel.ownerPrincipal });
+  await h.kernel.idle();
+  expect(tail).not.toContain("[others active in your work tree right now");
+  // Another cell waiting on it is still shown — that one is told only by a message.
+  expect(tail).toContain("[cells waiting on you]");
+  expect(tail).toMatch(/other \[waitId=on-w-other\]/);
+  expect(tail).not.toMatch(/proj \[waitId=on-w-proj\]/);
 });

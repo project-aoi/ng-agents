@@ -55,6 +55,13 @@ const OMITTED_FIELDS: Readonly<Record<string, readonly string[]>> = {
   "user.message": ["raw"],
 };
 
+/**
+ * What the owner's coding agent added on its own when it passed the owner's words on (payload `agentContext`) is
+ * shown after them as a block of its own, so nobody downstream takes it for the owner's requirement.
+ */
+export const AGENT_NOTE_LABEL = "[note added by the owner's coding agent — not the owner's words]";
+const AGENT_NOTE_TYPES: ReadonlySet<string> = new Set(["user.message", "cell.message", "cell.direct_chat"]);
+
 function isoTime(ms: number): string {
   if (!Number.isFinite(ms)) return String(ms);
   const d = new Date(ms);
@@ -74,11 +81,16 @@ function renderPayload(env: Envelope): string {
     text = obj[primary] as string;
     omit.add(primary);
   }
+  let note = "";
+  if (AGENT_NOTE_TYPES.has(env.type) && typeof obj["agentContext"] === "string") {
+    note = (obj["agentContext"] as string).trim();
+    omit.add("agentContext");
+  }
   const rest: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(obj)) if (!omit.has(k) && v !== undefined) rest[k] = v;
-  if (Object.keys(rest).length === 0) return text;
-  const json = prettyJson(rest);
-  return text ? `${text}\n${json}` : json;
+  const json = Object.keys(rest).length > 0 ? prettyJson(rest) : "";
+  const body = text && json ? `${text}\n${json}` : text || json;
+  return note ? `${body}\n\n${AGENT_NOTE_LABEL}\n${note}` : body;
 }
 
 /**
@@ -242,7 +254,8 @@ export function rosterMessage(roster: readonly ChildSummary[]): ModelMessage {
     const parts = [c.cellId];
     if (c.title) parts.push(`"${c.title}"`);
     if (c.preset) parts.push(c.preset);
-    parts.push(c.status);
+    // What it is doing, not the lifecycle word: "active · dormant" read as a contradiction.
+    parts.push(c.status === "active" && c.activity ? c.activity : c.status);
     if (c.cwd) parts.push(`cwd ${c.cwd}`);
     const indent = "  ".repeat(Math.max(0, (c.depth ?? 1) - 1));
     return `${indent}- ${parts.join(" · ")}${c.statusLine ? `: ${c.statusLine}` : ""}`;

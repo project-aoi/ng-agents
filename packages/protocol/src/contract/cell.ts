@@ -134,6 +134,8 @@ export interface RunPorts extends CellPorts {
   actionBooks?: ActionBooks;
   isDirectChild(id: string): boolean;
   createHumanItem?(draft: HumanItemDraft): { id: string; itemRevision: number };
+  /** Take back a card or human action that this cell (or a cell below it) raised and the owner has not decided yet. */
+  withdrawHumanItem?(id: string, reason: string): "withdrawn" | "not_pending" | "not_found";
 
   readonly self: RunSelf;
   /** Gate.authorize bound to self (cellId, epoch, principal). */

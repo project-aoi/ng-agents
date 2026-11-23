@@ -207,6 +207,62 @@ describe("conventions: every prompt names only tools its role has", () => {
     expect(defs[PROMPTS.worker]).toContain("Asia/Shanghai");
   });
 
+  it("audit 2026-11-23: the contracts the prompts state, each said once and to the roles that need it", async () => {
+    const defs = Object.fromEntries(promptDefs(resolveConfig()).map((p) => [p.name, p.text]));
+    const roles = [PROMPTS.desk, PROMPTS.project, PROMPTS.worker, PROMPTS.checker, PROMPTS.hub];
+    const count = (text: string, needle: string) => text.split(needle).length - 1;
+    for (const name of roles) {
+      const text = defs[name]!;
+      // E20: what "reading" covers is shared, so the hub and the desk read it too — and nobody gets it twice.
+      expect(count(text, "`git fetch`")).toBe(1);
+      // E09: write first, then call the tool that ends the turn.
+      expect(text).toContain("A tool that ends the turn (wait, request_approval, and any tool whose description says so) ends it at once");
+      // E02: the owner's agent's own note is not the owner's words.
+      expect(text).toContain("`[note added by the owner's coding agent — not the owner's words]` is that agent's own background");
+      // E37: ids stay out of what a person reads; E14: a leaf's closing account reaches its parent.
+      expect(text).toContain("instead of giving its id (art_…, act_…, a cell id)");
+      expect(text).toContain("the account a worker or checker ends its turn with is delivered to the cell that started it");
+    }
+    for (const name of [PROMPTS.project, PROMPTS.worker]) expect(defs[name]).not.toMatch(/Reading is not dangerous|Reading includes everything/);
+    expect(defs[PROMPTS.desk]).not.toContain("write your chat reply (or send_message when woken asynchronously) **before** calling wait");
+    // E14
+    expect(defs[PROMPTS.worker]).toContain("do not also send it with send_message (that wakes it twice)");
+    // E07, E13, E21, E39, E12 (desk)
+    const desk = defs[PROMPTS.desk]!;
+    expect(desk).toContain("put on a card with its artifactId (present_to_owner or request_approval)");
+    expect(desk).toContain("unless that source already has an open card or project for the same condition: then it is not new");
+    expect(desk).toContain("start_project's itemId");
+    expect(desk).toContain("An errand in the world that no tool here can carry out");
+    expect(desk).toContain("is taken as it is: do not send finished work back to run again");
+    expect(desk).toContain("who merges it (the repository's README or owner rules decide");
+    expect(desk).toContain("Close the fixer (close_cell) once nothing more is expected from it.");
+    // E16, E17, E21, E38 (project)
+    const project = defs[PROMPTS.project]!;
+    expect(project).toContain("**One review action per deliverable.**");
+    expect(project).toContain("A review the owner did not do is never marked done by you");
+    expect(project).toContain("A project is staged only when the owner wants to look at each stage before the next starts");
+    expect(project).toContain("A phase that is the owner's own to do needs no such card");
+    expect(project).toContain("withdraw_card for a card of yours that no longer applies");
+    expect(project).toContain("findings beyond the requested scope are notes, not blockers");
+    expect(project).toContain("rename it (update_cell with its cellId and title)");
+    // E38 (hub)
+    expect(defs[PROMPTS.hub]).toContain("the earlier report is superseded");
+    // E12, E16, E17, E20, E38 in the playbooks
+    const skill = (name: string) => BUILTIN_SKILLS.find((s) => s.name === name)!.body;
+    expect(skill(SKILL_WORKSPACE_ARBITRATION)).toContain("who merges it: the repository's own rules decide");
+    expect(skill(SKILL_WORKSPACE_ARBITRATION)).toContain("Close the fixer (close_cell)");
+    expect(skill(SKILL_PROJECT_RELAY)).toContain("is cancelled, not done, and finish_project's summary says they did not review it");
+    expect(skill(SKILL_PROJECT_RELAY)).toContain("A phase that is the owner's own work needs no such card");
+    expect(skill(SKILL_DOMAIN_HUB)).toContain("a worker that ran `git fetch` to see the new commits did nothing wrong");
+    expect(skill(SKILL_DOMAIN_HUB)).toContain("superseded");
+    // E09: every desk tool that ends the run says so.
+    const h = await boot();
+    const deskTools = h.registry.resolveTools(["gtd.desk", "kernel.comms"]);
+    for (const name of ["present_to_owner", "propose_project", "request_approval"]) {
+      expect(deskTools.find((t) => t.name === name)!.description).toContain("ends your run");
+    }
+  });
+
   it("includes deterministic seeded actionIds in the project brief and open human actions in project wake-up tail notes", async () => {
     const h = await boot();
     let firstPrompt = "";

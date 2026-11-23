@@ -1,3 +1,6 @@
+import { statSync } from "node:fs";
+import { homedir } from "node:os";
+import { isAbsolute, join, resolve } from "node:path";
 import { createModelSwitch } from "./models";
 import type { UpdateModelsRequest } from "../shared/api";
 import { isRunnerOverride, type HumanDecision, type HumanItem, type CardOption, type RunnerOverride } from "@ng/protocol";
@@ -296,11 +299,12 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     const parentId = parent.id;
     const t = now();
     const source = card?.source ?? { label: "以后再说", at: t };
+    const note = decision.note?.trim();
     const init: ProjectInit = {
       id: projectIdForApproval(cardId),
       title: proposal.title,
       outcome: proposal.outcome,
-      brief: parkedBrief(proposal, as),
+      brief: parkedBrief(proposal, as, note),
       proposal,
       plan: proposal.actions,
       source,
@@ -322,13 +326,13 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     const projectId = withTx(kernel.db, () => {
       if (gate.withdrawSync(cardId, "someday", {seenItemRevision:seenRev}) !== "cancelled") throw wrongState("立项卡已变动");
       const started = startProjectSync(kernel, init, { parentId, ...actorOf(as) });
-      const paused = kernel.control(started.projectId, { action: "pause",pauseReason:"parked" }, actorOf(as));
+      const paused = kernel.control(started.projectId, { action: "pause",pauseReason:"parked",...(note ? {note} : {}) }, actorOf(as));
       if (!paused.applied) throw new Error(`could not park the new project: ${paused.reason ?? "pause refused"}`);
       // The project's books seed its record on its first run only when there is none: this one is kept as it is.
       commitState(started.projectId, { [gtdKeys.project]: record });
       const receipt = createEnvelope({id:`${cardId}:parked:${seenRev}`,from:KERNEL_FROM.approval,principalId:approverId,
         kind:"result",type:PAYLOAD.approvalResolved,delivery:"wakeup",expectedEpoch:parent.epoch,
-        payload:{actionId:cardId,status:"cancelled",decision:"someday",action:rec.action,approverId,projectId:started.projectId}},kernel.clock);
+        payload:{actionId:cardId,status:"cancelled",decision:"someday",action:rec.action,approverId,projectId:started.projectId,...(note ? {note} : {})}},kernel.clock);
       kernel.inbox.enqueueSync(parentId,receipt);
       if (!kernel.inbox.listMessagesSync({cellId:parentId,envelopeId:receipt.id,status:["pending"]}).length) throw wrongState("立项结果无法送达");
       return started.projectId;
@@ -337,10 +341,11 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
   }
 
   /** The first message of a project parked straight from its proposal: the plan the owner saw, as text. */
-  function parkedBrief(proposal: ProjectProposal, as: DeskActor): string {
+  function parkedBrief(proposal: ProjectProposal, as: DeskActor, note?: string): string {
     const owners: Record<BallOwner, string> = { agent: "交给 worker", human: "主人来做", waiting: "等外部" };
     return [
       `${whoText(as)}在立项卡上点了“先放进以后再说”：这个项目先停着，什么都不做。你读到这条消息时，主人已经把它重新启动了——按下面的方案开始推进（方案也在你的项目记录里，proposal 字段）。`,
+      note ? `放进以后再说时${whoText(as)}的话：${note}` : "",
       proposal.background ?? "",
       proposal.actions.length ? ["方案里的步骤（启动时自动记入行动记录）：", ...proposal.actions.map((a) => `- [${owners[a.owner]}] ${a.title}${a.nextStep ? `：${a.nextStep}` : ""}`)].join("\n") : "",
     ]
@@ -390,13 +395,35 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
         }
         nextRunnerOverride = candidate;
       }
-      const { runnerOverride: _oldRunner, ...restProposal } = baseProposal;
+      const { runnerOverride: _oldRunner, phases: oldPhases, cwd: oldCwd, repos: oldRepos, ...restProposal } = baseProposal;
+      // E17: the stages and directories are part of the plan the owner approves, so they can be changed with it.
+      let phases = oldPhases;
+      if (p.phases !== undefined) {
+        if (!Array.isArray(p.phases) || p.phases.some((x) => typeof x !== "string")) throw bad("阶段必须是文字列表");
+        const list = p.phases.map((x) => x.trim()).filter(Boolean);
+        phases = list.length ? list : undefined;
+      }
+      const cwd = p.cwd === undefined ? oldCwd : p.cwd === null ? undefined : existingDir(p.cwd, "项目目录");
+      let repos = oldRepos;
+      if (p.repos === null) repos = undefined;
+      else if (p.repos !== undefined) {
+        if (!Array.isArray(p.repos)) throw bad("仓库必须是列表");
+        repos = p.repos.map((r) => {
+          if (!r || typeof r.name !== "string" || !r.name.trim()) throw bad("每个仓库都需要名字");
+          const defaultBranch = typeof r.defaultBranch === "string" && r.defaultBranch.trim() ? r.defaultBranch.trim() : undefined;
+          return { name: r.name.trim(), cwd: existingDir(r.cwd, `仓库「${r.name.trim()}」的目录`), ...(defaultBranch ? { defaultBranch } : {}) };
+        });
+        if (repos.length === 0) repos = undefined;
+      }
       const proposal: ProjectProposal = {
         ...restProposal,
         title: typeof p.title === "string" && p.title.trim() ? p.title.trim() : baseProposal.title,
         outcome: p.outcome.trim(),
         ...(p.background !== undefined ? { background: p.background } : {}),
         ...(nextRunnerOverride ? { runnerOverride: nextRunnerOverride } : {}),
+        ...(cwd ? { cwd } : {}),
+        ...(repos ? { repos } : {}),
+        ...(phases ? { phases } : {}),
         actions,
       };
       if (!isProjectProposal(proposal)) throw bad("请核对方案背景、行动说明及项目目录");
@@ -413,6 +440,23 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
       }
       return { ok: true, outcome: "saved", message: `已保存方案 v${r.artifactVersion}`, artifact: artifact(art.artifactId), deskStatus: status() };
     });
+  }
+
+  /** A directory the owner named: absolute (or ~/…) and existing on this machine — never guessed. */
+  function existingDir(path: unknown, what: string): string {
+    if (typeof path !== "string" || !path.trim()) throw bad(`${what}需要一个绝对路径`);
+    const raw = path.trim();
+    const expanded = raw === "~" ? homedir() : raw.startsWith("~/") ? join(homedir(), raw.slice(2)) : raw;
+    if (!isAbsolute(expanded)) throw bad(`${what}必须是绝对路径：${raw}`);
+    const dir = resolve(expanded);
+    let ok = false;
+    try {
+      ok = statSync(dir).isDirectory();
+    } catch {
+      ok = false;
+    }
+    if (!ok) throw bad(`${what}在本机不存在：${dir}。请向主人确认正确的绝对路径，不要猜`);
+    return dir;
   }
 
   // ==================== drafts ====================
@@ -502,7 +546,9 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     const record = projectRecord(projectId);
     const cell = kernel.getCell(projectId);
     const open = cell !== undefined && cell.status !== "closed";
-    const control = (action: "pause" | "resume") => kernel.control(projectId, { action }, actorOf(as));
+    // E05: the words that came with a pause or a parking ("先停一下，我还没想好") are kept on the cell's record.
+    const note = as.note?.trim();
+    const control = (action: "pause" | "resume") => kernel.control(projectId, { action, ...(action === "pause" && note ? { note } : {}) }, actorOf(as));
     switch (op) {
       case "pause": {
         if (!open) return projectResult("not_applied", false, "这个项目没有在运行的任务");
@@ -537,7 +583,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
         if (cell?.pauseReason === "parked") return projectResult("someday", true, "已经在以后再说里了");
         if (!open || record.lifecycle !== "active") return projectResult("not_applied", false, "只有进行中的项目可以移进以后再说");
         {
-          const r = kernel.control(projectId,{action:"pause",pauseReason:"parked"},actorOf(as));
+          const r = kernel.control(projectId,{action:"pause",pauseReason:"parked",...(note ? {note} : {})},actorOf(as));
           if (!r.applied) return projectResult("not_applied", false, "暂停没有生效");
         }
         return projectResult("someday", true, `「${record.title}」已移进以后再说，后台任务已暂停，记录和报告都留着`);
@@ -797,7 +843,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
   function deskOptions(item: HumanItem): CardOption[] {
     if (item.action?.type !== "project.start") return item.options;
     return item.options.flatMap(option => option.id === "system.execute"
-      ? [{...option, label: "确认立项"}, {id: "system.someday", label: "先放进以后再说", effect: "execute" as const}]
+      ? [{...option, label: "确认立项"}, {id: "system.someday", label: "先放进以后再说", effect: "execute" as const, input: {mode: "optional" as const}}]
       : [option]);
   }
 
@@ -829,6 +875,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     status,
     topology: agents.topology,
     timeline: agents.timeline,
+    questions: agents.questions,
     resource: agents.resource,
     sendCellMessage: agents.sendMessage,
     directMessage: agents.deliver,

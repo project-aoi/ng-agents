@@ -29,6 +29,7 @@ import {
 import { RESURFACE_MARKER } from "./constants";
 import { effectiveCwd } from "./workdir";
 import type { KernelCore } from "./core";
+import { recordPaused } from "./pauses";
 import { buildRunPorts } from "./ports";
 import type { IdleOptions, RunInfo, RunResult } from "./types";
 
@@ -48,6 +49,8 @@ export interface RunHandle {
   stallOnly: boolean;
   /** RunPorts.settleSelf: what to do with the cell once this Run has settled. */
   selfSettle: SelfSettleRequest | null;
+  /** Launch order within this kernel process. */
+  seq: number;
   cliInput?: { sessionId: string; throughSeq: number };
 }
 
@@ -70,6 +73,12 @@ export interface Dispatcher {
   holdForUnknownOrphan(cellId: string): void;
   /** Runs in flight with what the stall check and the occupancy view need. */
   running(): Array<{ cwd: string | null; cellId: string; stallOnly: boolean }>;
+  /**
+   * `root` was just resumed and `cellIds` (below it) woke with it. While the root has a Run to do, theirs wait for it
+   * to settle: the coordinator reads what was said at the resume before a worker picks up an instruction from before
+   * the pause. A root with nothing to do holds nobody.
+   */
+  holdUntilSettled(root: string, cellIds: readonly string[]): void;
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -90,6 +99,9 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
   /** Cells deferred because a previous CLI process is alive with unreadable identity (`null`). */
   const unknownOrphans = new Set<string>();
   const reapingOrphans = new Set<string>();
+  /** holdUntilSettled: cell → the resumed root it waits for, and the launch count when the hold was set. */
+  const resumeHolds = new Map<string, { root: string; after: number }>();
+  let launchSeq = 0;
   let orphanTimer: ReturnType<typeof setInterval> | undefined;
   let started = false;
   let pumpScheduled = false;
@@ -224,6 +236,12 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
       if (core.lifecycle.cleaningUp(cellId)) continue; // The previous epoch notifies us when its runtime has stopped.
       // A cell with a Run in flight is re-notified when that Run ends; the claim is the real lock either way.
       if (inFlight(cellId) > 0) continue;
+      const hold = resumeHolds.get(cellId);
+      if (hold) {
+        // Re-notified when the root's Run ends (launch's finally). A root with nothing to do, or gone, holds nobody.
+        if (cells.isActiveInTree(hold.root) && (inFlight(hold.root) > 0 || inbox.dueCellIdsSync().includes(hold.root))) continue;
+        resumeHolds.delete(cellId);
+      }
       if (core.workspace.listJobsSync({cellId, state:["running"]}).some(job => job.cancelRequestedAt !== null)) continue;
       if (reapingOrphans.has(cellId)) continue;
       if (cell.spec.processor.kind === "llm") {
@@ -248,7 +266,12 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
         core.onError(err, `claim ${cellId}`);
         continue;
       }
-      if (!batch) continue;
+      if (!batch) {
+        // Nothing to run after all (its due message was a kernel notice settled without a Run): whoever was held back
+        // for this cell is looked at again.
+        for (const [id, hold] of resumeHolds) if (hold.root === cellId) notify(id);
+        continue;
+      }
       launch(batch, cell);
     }
   }
@@ -272,6 +295,7 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
       done: Promise.resolve(),
       stallOnly: batch.envelopes.every(e => e.type === PAYLOAD.stalledCheck || e.delivery === "silent_inject"),
       selfSettle: null,
+      seq: ++launchSeq,
     };
     runs.set(handle.claimId, handle);
     let set = byCell.get(handle.cellId);
@@ -282,6 +306,12 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
       .finally(() => {
         detach(handle);
         notify(handle.cellId);
+        // The resumed coordinator has had its Run: the cells that waited for it go.
+        for (const [id, hold] of resumeHolds) {
+          if (hold.root !== handle.cellId || handle.seq <= hold.after) continue;
+          resumeHolds.delete(id);
+          notify(id);
+        }
         schedulePump();
         wakeWaiters();
       });
@@ -403,7 +433,9 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
       artifactIds: [...artifactIds],
       steps,
       outcome: how.failed !== undefined ? how.outcome : cand?.status === "failed" ? "failed" : how.outcome,
-      preview: said ? (said.length > 600 ? `${said.slice(0, 600)}…` : said) : null,
+      // The summary below is the worker's last words unless it reported a structured result: only then is there
+      // something more to preview.
+      preview: said && cand?.summary && said !== cand.summary ? (said.length > 600 ? `${said.slice(0, 600)}…` : said) : null,
     };
     const parent = cell.parentId ? cells.get(cell.parentId) : undefined;
     if (parent && parent.status !== "closed") {
@@ -571,7 +603,9 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
       }
       if (self?.statePatches) context.commitSync(cellId, { statePatches: self.statePatches });
       if (self?.action === "pause") {
-        if (cur.status === "active") pauseSelf(self.pauseReason);
+        if (cur.status === "active" && pauseSelf(self.pauseReason).applied) {
+          recordPaused(core, cellId, { by: cellPrincipal(cellId), ...(self.pauseReason ? { reason: self.pauseReason } : {}), ...(self.summary ? { note: self.summary } : {}) });
+        }
         return;
       }
       closed = deliverAndClose(cur, handle, { reason: self?.action === "cancel" ? "cancelled" : "completed", ...(self?.summary ? { summary: self.summary } : {}) });
@@ -613,16 +647,19 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
         handle.controller.abort(new Error("cell paused, closed or cancelled before the run started"));
       }
       signal.throwIfAborted();
-      const snapshot = await context.hydrate(cellId, batch, cell.spec.contextMode ?? "isolated");
+      let snapshot = await context.hydrate(cellId, batch, cell.spec.contextMode ?? "isolated");
       signal.throwIfAborted();
       const at = clock.now();
       context.appendEvidenceSync(cellId, { kind: "run_boundary", phase: "start", epoch: handle.epoch, runId, at });
       for (const envelope of batch.envelopes) context.appendEvidenceSync(cellId, { kind: "inbound", envelope, runId, at });
       ranLoop = true;
       const ports = buildRunPorts(core, { cell, batch, handle, snapshot });
-      const prepare = cell.preset ? core.registry.presets.get(cell.preset)?.prepareRun : undefined;
+      const preset = cell.preset ? core.registry.presets.get(cell.preset) : undefined;
+      const prepare = preset?.prepareRun;
       let handled = false;
       if (prepare) {
+        const books = preset?.actionBooks?.(core, cellId);
+        const openBefore = new Set((books?.list() ?? []).filter((a) => a.status === "open").map((a) => a.id));
         try {
           handled = (await prepare({ snapshot, ports, signal, clock })) === "handled";
         } catch (err) {
@@ -631,6 +668,15 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
           core.onError(err, `prepareRun of ${cellId}`);
         }
         signal.throwIfAborted();
+        if (!handled) {
+          // The notes were read before the bookkeeping ran; the model must see the records as they are now — and be
+          // told what was closed on its behalf, so it neither closes it again nor takes a wrong closing for granted.
+          const closed = (books?.list() ?? []).filter((a) => openBefore.has(a.id) && a.status === "done");
+          const note = closed.length
+            ? `[actions closed for you at this wake-up — the turn of the cell carrying each ended as completed. If its report says the work is not actually done, reopen it: track_action with status "open"]\n${closed.map((a) => `- ${a.id} "${a.title}"${a.cellId ? ` (cell ${a.cellId})` : ""}`).join("\n")}`
+            : null;
+          snapshot = context.refreshTailSync(snapshot, note ? [note] : []);
+        }
       }
       result = handled ? "completed" : await core.loop.run(snapshot, ports, signal);
     } catch (err) {
@@ -748,6 +794,9 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
     renewAll,
     idle,
     holdForUnknownOrphan,
+    holdUntilSettled(root, cellIds) {
+      for (const id of cellIds) resumeHolds.set(id, { root, after: launchSeq });
+    },
     running: () => [...runs.values()].map((h) => ({ cellId: h.cellId, cwd: h.cwd, stallOnly: h.stallOnly })),
   };
 }

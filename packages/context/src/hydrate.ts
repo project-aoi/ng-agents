@@ -13,6 +13,7 @@ import {
   type ClaimedBatch,
   type CompactionResult,
   type ContextMode,
+  type Envelope,
   type KnowledgeRecord,
   type ModelMessage,
   type PromptSnapshot,
@@ -64,6 +65,7 @@ export interface CompactionPlan {
 
 export interface HydrateModule {
   hydrate(cellId: string, batch: ClaimedBatch, mode: ContextMode, compactWith: ((input: SummaryInput) => string) | null): PromptSnapshot;
+  refreshTail(snapshot: PromptSnapshot, extraNotes?: readonly string[]): PromptSnapshot;
   planCompaction(cellId: string, mode: ContextMode, force: boolean): CompactionPlan | null;
   applyCompaction(plan: CompactionPlan, summary: string): CompactionResult | null;
   refreshPrefix(cellId: string): void;
@@ -77,7 +79,8 @@ export interface HydrateDeps extends Deps {
   toolContract(cell: CellRecord): unknown;
   resolvePrompt(cell: CellRecord): string;
   roster(cellId: string): ChildSummary[];
-  tailNotes(cellId: string): string[];
+  /** `incoming`: the batch the Run is about to see (a wait it answers is no longer shown as open). */
+  tailNotes(cellId: string, incoming?: readonly Envelope[]): string[];
 }
 
 export function createHydrate(deps: HydrateDeps): HydrateModule {
@@ -158,7 +161,7 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
     const refs = referencesIn(task);
     const instruction = typeof task.instruction === "string" ? oneLine(task.instruction, 800) : "";
     const input = task.input === undefined ? "" : "input=" + stableStringify(task.input);
-    const full = [`[original task] parent=${task.parentCellId ?? ""}`, instruction, input, ...refs].filter(Boolean).join(" ");
+    const full = [`[original task] (as first given — later messages may have changed it) parent=${task.parentCellId ?? ""}`, instruction, input, ...refs].filter(Boolean).join(" ");
     return resourceExcerpt(cellId, full, Math.max(128, Math.floor(limits.summaryMaxChars / 4)), "original-task");
   }
 
@@ -414,14 +417,9 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
       WHERE cell_id=? AND type=? AND status IN ('pending','claimed') AND (expected_epoch IS NULL OR expected_epoch=?)`,
       [cellId, PAYLOAD.controlSteer, cell.epoch])) incoming.add(message.envelope_id);
     const history = renderHistory(cell, row, undefined, "error", incoming);
-    const roster = deps.roster(cellId);
-    const notes = (deps.tailNotes(cellId) ?? []).filter((n) => typeof n === "string" && n.trim() !== "");
-    const task = originalTask(cell.id);
-    if (task && cell.spec.processor.kind === "llm") notes.unshift(task);
-    const tail: ModelMessage[] = [];
-    if (roster.length > 0) tail.push(rosterMessage(roster));
-    for (const note of notes) tail.push(textMessage("user", note));
-    for (const env of batch.envelopes) tail.push(textMessage("user", renderEnvelope(env)));
+    // A fork child shares its parent's system bytes (the provider cache serves both); a Loop that cannot use that
+    // gets the child's own role instead of the parent's.
+    const own = row.fork_note !== null ? buildSystem(cell).text : undefined;
     return {
       cellId,
       epoch: batch.epoch,
@@ -430,18 +428,36 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
       spec: cell.spec,
       bounds: cell.bounds,
       batch,
-      system: { text: row.text, hash: row.hash },
+      system: { text: row.text, hash: row.hash, ...(own !== undefined && own !== row.text ? { own } : {}) },
       history: history.messages,
       historyUptoSeq: history.uptoSeq,
       summaryUptoSeq: row.summary_upto_seq,
-      tail: notes.length > 0 ? { roster, messages: tail, notes } : { roster, messages: tail },
+      tail: tailOf(cell, batch, []),
       skills: JSON.parse(row.skills) as SkillIndexEntry[],
       createdAt: clock.now(),
     };
   }
 
+  /** The volatile tail: roster, the first task, the kernel's notes, then the batch. Read from the records as they are now. */
+  function tailOf(cell: CellRecord, batch: ClaimedBatch, extraNotes: readonly string[]): PromptSnapshot["tail"] {
+    const roster = deps.roster(cell.id);
+    const notes = [...extraNotes, ...(deps.tailNotes(cell.id, batch.envelopes) ?? [])].filter((n) => typeof n === "string" && n.trim() !== "");
+    const task = cell.spec.processor.kind === "llm" ? originalTask(cell.id) : null;
+    if (task) notes.unshift(task);
+    const messages: ModelMessage[] = [];
+    if (roster.length > 0) messages.push(rosterMessage(roster));
+    for (const note of notes) messages.push(textMessage("user", note));
+    for (const env of batch.envelopes) messages.push(textMessage("user", renderEnvelope(env)));
+    return { roster, messages, ...(notes.length > 0 ? { notes } : {}), ...(task ? { originalTask: task } : {}) };
+  }
+
+  function refreshTail(snapshot: PromptSnapshot, extraNotes: readonly string[] = []): PromptSnapshot {
+    return { ...snapshot, tail: tailOf(cells.require(snapshot.cellId), snapshot.batch, extraNotes) };
+  }
+
   return {
     hydrate,
+    refreshTail,
     planCompaction,
     applyCompaction,
     refreshPrefix,

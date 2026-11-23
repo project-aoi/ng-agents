@@ -21,7 +21,7 @@ import {
 import { projectLaunch, startProjectSync, type ProjectInit, type RepoRef } from "../project/launch";
 import { RESTORE_REASON, ROLES, type PresetsConfig } from "../shared/config";
 import { notifyOwner } from "../shared/notify";
-import { newActivity, primaryItem, type RawInput } from "../shared/records";
+import { clipLine, newActivity, primaryItem, type RawInput } from "../shared/records";
 
 /** What the desk remembers about a proposal until the owner decides (`desk:proposal:<artifactId>`). */
 export interface ProposalItem {
@@ -131,8 +131,8 @@ export async function launchProject(ports: RunPorts, init: ProjectInit, clock: C
 /**
  * The desk's bookkeeping, run by the kernel at the start of every desk Run (PresetDef.prepareRun) — so a reminder that
  * came due, an approved proposal  is in the records even when the model does nothing useful with the
- * wake-up. A batch of nothing but such events never reaches the model; a cell's result always does. What it applied
- * is kept for the Run's apply_updates.
+ * wake-up. A batch of nothing but such events never reaches the model (a project's normal end is one of them); any
+ * other cell's result does. What it applied is kept for the Run's apply_updates.
  */
 export function createDeskBooks(cfg: PresetsConfig) {
   const applied = new Map<string, string[]>();
@@ -183,8 +183,8 @@ export async function settleDesk(cfg: PresetsConfig, ctx: ToolContext): Promise<
 
 /**
  * settleDesk plus whether every envelope of the batch was pure bookkeeping (nothing left for the model: a reminder that
- * came due, a decided proposal, a progress note). A `cell.result` is never pure bookkeeping: a fixer's
- * result must reach the model so it can tell the cells that wait on it.
+ * came due, a decided proposal, a progress note, a project that completed normally while no cell waits on the desk).
+ * Any other `cell.result` is not: a fixer's result must reach the model so it can tell the cells that wait on it.
  */
 export async function settleDeskBatch(cfg: PresetsConfig, ctx: ToolContext): Promise<{ lines: string[]; consumedAll: boolean }> {
   const { ports, clock } = ctx;
@@ -193,18 +193,25 @@ export async function settleDeskBatch(cfg: PresetsConfig, ctx: ToolContext): Pro
   const out: string[] = [];
   await ensureWeeklyReview(cfg, ports);
 
-  /** A project of the desk finished: one line in the "后台已处理" drawer. Once per project. */
-  async function projectFinished(p: CellResultPayload): Promise<void> {
-    if (p.status !== "completed") return;
+  /**
+   * A project of the desk finished: one line in the "后台已处理" drawer. Once per project. True when it was a project
+   * that completed normally — the owner has been told and nothing else follows from it.
+   */
+  async function projectFinished(p: CellResultPayload): Promise<boolean> {
+    if (p.status !== "completed") return false;
     const project = await ports.context.readState<ProjectRecord>(p.childCellId, gtdKeys.project).catch(() => null);
-    if (!project || project.lifecycle !== "completed") return;
+    if (!project || project.lifecycle !== "completed") return false;
     const id = `done-${p.childCellId}`;
-    if (await ports.context.readState(self, gtdKeys.activity(id))) return;
-    await notifyOwner(ports, `「${project.title}」已完成：${p.summary.split("\n")[0]!.slice(0, 120)}`, `finished:${p.childCellId}:${id}`);
+    if (await ports.context.readState(self, gtdKeys.activity(id))) return true;
+    await notifyOwner(ports, `「${project.title}」已完成：${clipLine(p.summary.split("\n")[0]!, 120)}`, `finished:${p.childCellId}:${id}`);
     const a: ActivityRecord = newActivity({ id, kind: "action_completed", title: `已完成：${project.title}`, detail: p.summary, ...(project.source ? { source: project.source } : {}), restorable: false }, now);
     await ports.context.commit(self, { statePatches: { [gtdKeys.activity(id)]: a } });
     out.push(`项目已完成：${project.title}`);
+    return true;
   }
+  // A cell that waits on the desk may be waiting for exactly what a finished project changes (who goes first, a
+  // blocker it fixed): then its result reaches the model.
+  const waitedOn = (ctx.snapshot.tail.notes ?? []).some((n) => n.startsWith("[cells waiting on you]"));
 
   /** True when the envelope needs nothing from the model. */
   async function settleOne(env: Envelope): Promise<boolean> {
@@ -224,8 +231,9 @@ export async function settleDeskBatch(cfg: PresetsConfig, ctx: ToolContext): Pro
       }
       return false;
     } else if (isEnvelopeOfType(env, "cell.result")) {
-      await projectFinished(env.payload as CellResultPayload);
-      return false;
+      // A project that completed normally has told the owner itself; its result is bookkeeping. Every other result —
+      // a fixer's, a failure, one somebody waits on — is for the model.
+      return (await projectFinished(env.payload as CellResultPayload)) && !waitedOn;
     } else if (isEnvelopeOfType(env, "cell.progress")) {
       return true;
     }

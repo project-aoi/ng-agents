@@ -90,6 +90,51 @@ export interface JobDeps {
   hostEnv(): Record<string, string>;
 }
 
+/**
+ * The spans in which this process itself did not run — the host asleep, or the whole process group stopped. A job
+ * of ours printed nothing then either, so that time is not "quiet". Found by a heartbeat that notices when far more
+ * wall time passed between two beats than the beat allows.
+ */
+export class AwakeClock {
+  #spans: Array<{ from: number; to: number }> = [];
+  #last: number;
+  #timer: NodeJS.Timeout | null = null;
+
+  constructor(private readonly beatMs: number, private readonly now: () => number = Date.now) {
+    this.#last = now();
+  }
+
+  start(): void {
+    if (this.#timer) return;
+    this.#last = this.now();
+    this.#timer = setInterval(() => this.beat(), this.beatMs);
+    this.#timer.unref();
+  }
+
+  stop(): void {
+    if (this.#timer) clearInterval(this.#timer);
+    this.#timer = null;
+  }
+
+  beat(): void {
+    const t = this.now();
+    // A late beat is a busy event loop; one later than a whole extra beat (and a second) is a process that stood still.
+    if (t - this.#last > this.beatMs + Math.max(1_000, this.beatMs)) {
+      this.#spans.push({ from: this.#last + this.beatMs, to: t });
+      if (this.#spans.length > 64) this.#spans.shift();
+    }
+    this.#last = t;
+  }
+
+  /** How much of [from, to] this process spent not running. */
+  asleepBetween(from: number, to: number): number {
+    this.beat();
+    let sum = 0;
+    for (const s of this.#spans) sum += Math.max(0, Math.min(to, s.to) - Math.max(from, s.from));
+    return sum;
+  }
+}
+
 export function readTail(path: string | null, maxChars: number): string {
   if (!path) return "";
   let fd: number;
@@ -121,6 +166,8 @@ export class JobManager {
   #closed = false;
 
   readonly #starting = new Map<string, Promise<void>>();
+
+  #awake: AwakeClock | null = null;
 
   constructor(private readonly d: JobDeps) {}
 
@@ -272,12 +319,16 @@ export class JobManager {
   #watchOutput(live: LiveJob): void {
     const threshold = this.d.limits.jobQuietWarningMs;
     if (!live.logPath || threshold <= 0) return;
+    const awake = (this.#awake ??= new AwakeClock(Math.min(5_000, Math.max(50, Math.floor(threshold / 4)))));
+    awake.start();
     const check = () => {
       const job = this.d.store.getJob(live.jobId);
       if (!job || job.state !== "running" || live.cancelReason !== null) return;
-      // Log timestamps are filesystem wall time, independent of the scheduler clock.
+      // Log timestamps are filesystem wall time, independent of the scheduler clock. Time the host (and the job with
+      // it) stood still is not time without output.
       const modified = statSync(live.logPath, { throwIfNoEntry: false })?.mtimeMs;
-      const remaining = modified === undefined ? 0 : threshold - (Date.now() - modified);
+      const now = Date.now();
+      const remaining = modified === undefined ? 0 : threshold - (now - modified - awake.asleepBetween(modified, now));
       if (remaining > 0) arm(remaining);
       else if (!this.#warn(job, "quiet", `Job has produced no output for ${threshold} ms: ${job.command}`)) arm(threshold);
     };
@@ -657,6 +708,7 @@ export class JobManager {
   /** Stop watching without killing anything (the processes outlive this manager). */
   close(): void {
     this.#closed = true;
+    this.#awake?.stop();
     for (const live of this.#live.values()) {
       if (live.quietTimer) clearTimeout(live.quietTimer);
       if (live.terminationRetry) clearTimeout(live.terminationRetry);

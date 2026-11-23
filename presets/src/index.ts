@@ -66,7 +66,7 @@ export { sensorPreset };
 export { PROMPTS, TOOLSETS, PROCESSORS, ROLES, KEYS, RESTORE_REASON } from "./shared/config";
 export { BUILTIN_SKILLS, type BuiltinSkill } from "./shared/skills";
 export { seedBuiltinSkills } from "./shared/seed";
-export { createSensorSpec,sensorProcessor,createScriptSensor,defineSensorCheck, ensureSource, recordCheck, OBSERVATION_NOTE, type SensorHit, type SensorCheckInput, type SourceInit } from "./shared/sensor";
+export { createSensorSpec,sensorProcessor,createScriptSensor,defineSensorCheck, ensureSource, recordCheck, OBSERVATION_NOTE, type CheckOutcome, type HitOrigin, type SensorHit, type SensorCheckInput, type SourceInit } from "./shared/sensor";
 export { notifyProjectOfOwnerChangeSync } from "./shared/sync";
 export { startProjectSync, projectLaunch, type ProjectInit, type ProjectLaunch, type ProjectTaskInput, type ProjectSeed, type PlannedAction, type RepoRef, type ProjectMode } from "./project/launch";
 export { startApprovedProjectSync, projectIdForApproval, type ProposalItem } from "./inline-desk/items";

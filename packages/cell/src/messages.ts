@@ -18,6 +18,7 @@ import {
   type SendToCellResult,
   type UserMessagePayload,
 } from "@ng/protocol";
+import { AGENT_NOTE_LABEL } from "@ng/context";
 import { isProjectRoot, type KernelCore } from "./core";
 import type { DirectMessage, DirectMessageResult } from "./types";
 
@@ -40,7 +41,7 @@ export function isPersonPrincipal(core: Pick<KernelCore, "registry" | "ownerPrin
 export function ccDirectChat(
   core: MessageCore,
   target: CellRecord,
-  o: { text: string; mode: "enqueue" | "steer"; messageId: string; principalId: string; notifyParent?: "silent" | "wakeup"; replyToId?: string; replyToText?: string; conversationId?: string },
+  o: { text: string; mode: "enqueue" | "steer"; messageId: string; principalId: string; notifyParent?: "silent" | "wakeup"; replyToId?: string; replyToText?: string; conversationId?: string; agentContext?: string },
 ): string | null {
   const now = core.clock.now();
   const prev = core.context.readStateSync<CellDirectChatState>(target.id, CELL_DIRECT_CHAT_KEY);
@@ -63,6 +64,7 @@ export function ccDirectChat(
     messageId: o.messageId,
     ...(o.replyToId ? { replyToId: o.replyToId } : {}),
     ...(o.conversationId ? { conversationId: o.conversationId } : {}),
+    ...(o.agentContext ? { agentContext: o.agentContext } : {}),
     ...(project ? { projectCellId: project } : {}),
     at: now,
   };
@@ -95,7 +97,7 @@ export function ccDirectChat(
  */
 export function sendCellMessage(
   core: MessageCore,
-  o: { from: Envelope["from"]; principalId: string; sender: string; toCellId: string; id: string; message: CellMessageDraft; replyToId?: string; replyToText?: string; conversationId?: string; notifyParent?: "silent" | "wakeup" },
+  o: { from: Envelope["from"]; principalId: string; sender: string; toCellId: string; id: string; message: CellMessageDraft; replyToId?: string; replyToText?: string; conversationId?: string; agentContext?: string; notifyParent?: "silent" | "wakeup" },
 ): SendToCellResult {
   return withTx(core.db, () => {
     const target = core.cells.get(o.toCellId);
@@ -113,6 +115,7 @@ export function sendCellMessage(
       ...(o.replyToId ? { replyToId: o.replyToId } : {}),
       ...(o.replyToText ? { replyToText: clip(o.replyToText) } : {}),
       ...(o.conversationId ? { conversationId: o.conversationId } : {}),
+      ...(o.agentContext ? { agentContext: o.agentContext } : {}),
     };
     const envelope = createEnvelope<CellMessagePayload>(
       {
@@ -131,7 +134,7 @@ export function sendCellMessage(
     const accepted = core.inbox.enqueueSync(target.id, envelope) === "accepted";
     // A retried send (same id) is not copied twice either.
     if (accepted && isPersonPrincipal(core, o.principalId)) {
-      ccDirectChat(core, target, { text: o.message.text, mode: "enqueue", messageId: envelope.id, principalId: o.principalId, ...(o.notifyParent ? { notifyParent: o.notifyParent } : {}), ...(o.replyToId ? { replyToId: o.replyToId } : {}), ...(o.conversationId ? { conversationId: o.conversationId } : {}) });
+      ccDirectChat(core, target, { text: o.message.text, mode: "enqueue", messageId: envelope.id, principalId: o.principalId, ...(o.notifyParent ? { notifyParent: o.notifyParent } : {}), ...(o.replyToId ? { replyToId: o.replyToId } : {}), ...(o.conversationId ? { conversationId: o.conversationId } : {}), ...(o.agentContext ? { agentContext: o.agentContext } : {}) });
     }
     return { status: "delivered", envelopeId: envelope.id, targetStatus: target.status };
   });
@@ -149,6 +152,7 @@ export function directMessage(
   if (!isPersonPrincipal(core, principalId)) {
     return { status: "refused", reason: "not_allowed", detail: `${principalId} is not the owner or an agent on the control plane; cells talk to cells with send_message` };
   }
+  const agentContext = typeof message.agentContext === "string" && message.agentContext.trim() ? message.agentContext.trim() : undefined;
   const mode = message.mode ?? "enqueue";
   if (mode !== "enqueue" && mode !== "steer") throw new NgError("invalid_argument", `unknown mode "${String(mode)}" (enqueue | steer)`);
   return withTx(core.db, (): DirectMessageResult => {
@@ -177,11 +181,14 @@ export function directMessage(
       ...(message.replyToId ? { replyToId: message.replyToId } : {}),
       ...(message.replyToText ? { replyToText: clip(message.replyToText) } : {}),
       ...(message.conversationId ? { conversationId: message.conversationId } : {}),
+      ...(agentContext ? { agentContext } : {}),
     };
     const common = { text, mode, messageId: id, principalId, ...(message.notifyParent ? { notifyParent: message.notifyParent } : {}), ...refs };
     let ccTo: string | null;
     if (mode === "steer") {
-      const r = core.inbox.controlSync(cellId, { action: "steer", principalId, steerMessage: text, steerEnvelopeId: id, ...(message.replyToId && { steerReplyToId: message.replyToId }) });
+      // A steer carries one text: the agent's note rides in it under the same label the other messages render it with.
+      const steerMessage = agentContext ? `${text}\n\n${AGENT_NOTE_LABEL}\n${agentContext}` : text;
+      const r = core.inbox.controlSync(cellId, { action: "steer", principalId, steerMessage, steerEnvelopeId: id, ...(message.replyToId && { steerReplyToId: message.replyToId }) });
       if (!r.applied) return { status: "refused", reason: "not_allowed", detail: r.reason ?? "the steer was refused" };
       ccTo = ccDirectChat(core, target, common);
     } else if (target.parentId === null) {

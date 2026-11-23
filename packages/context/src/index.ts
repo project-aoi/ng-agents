@@ -9,6 +9,7 @@ export {
   HISTORY_START_TEXT,
   NO_RESULT_TEXT,
   renderEnvelope,
+  AGENT_NOTE_LABEL,
   renderExternal,
   renderRecords,
 } from "./render";

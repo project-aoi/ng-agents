@@ -13,6 +13,7 @@ import {
   type JobResultPayload,
 } from "@ng/protocol";
 import type { KernelCore } from "./core";
+import { pauseLine } from "./pauses";
 
 // The parent pulls; the worker is not asked to push. A worker that the owner talked to directly answers the owner
 // and stops — nothing makes it summarise three rounds of changes for a parent it has half forgotten. What it did is
@@ -123,7 +124,10 @@ export function inspectCell(
         if (person) directChats++;
         const from = person ? `the owner, directly (${env.principalId})` : env.type === PAYLOAD.cellTask ? "its task" : `${env.type} from ${env.from}`;
         const body = payloadText(env);
-        line = `#${seq} ← ${from}: ${detail === "full" ? body : one(body, 600)}`;
+        // The relaying agent's own note is not what the owner said: it is shown apart, as it was to the cell itself.
+        const added = (env.payload as { agentContext?: unknown } | null)?.agentContext;
+        const note = person && typeof added === "string" && added.trim() ? ` ‖ note added by their coding agent, not the owner's words: ${detail === "full" ? added.trim() : one(added, 300)}` : "";
+        line = `#${seq} ← ${from}: ${detail === "full" ? body : one(body, 600)}${note}`;
         break;
       }
       case "system_note":
@@ -224,6 +228,7 @@ export function inspectCell(
   const fromSeq = lines.length > 0 ? afterSeq + 1 : 0;
   const head = [
     `${targetId}${target.title ? ` "${target.title}"` : ""} — ${activity?.why ?? target.status}`,
+    target.status === "paused" ? pauseLine(core, targetId) : null,
     target.spec.cwd ? `directory ${target.spec.cwd}` : null,
     lines.length > 0 ? `records #${afterSeq + 1}–#${toSeq}` : `nothing new after #${afterSeq}`,
     directChats > 0 ? `the owner spoke to it directly ${directChats} time(s) in this stretch` : chat?.total ? "the owner has spoken to it directly before this stretch" : null,

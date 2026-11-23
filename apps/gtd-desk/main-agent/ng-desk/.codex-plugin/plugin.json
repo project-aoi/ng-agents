@@ -1,0 +1,22 @@
+{
+  "name": "ng-desk",
+  "version": "0.1.0",
+  "description": "Connects Codex as the external main agent for the local ng-agents GTD workbench via MCP and workflow skills.",
+  "author": {
+    "name": "ar8327"
+  },
+  "license": "MIT",
+  "keywords": ["gtd", "workbench", "ng-agents", "mcp", "todo"],
+  "skills": "./skills/",
+  "mcpServers": "./codex-mcp.json",
+  "interface": {
+    "displayName": "ng-agents GTD Workbench",
+    "shortDescription": "Drive the local ng-agents workbench",
+    "longDescription": "Hand work to the local ng-agents workbench, follow its projects, decide its cards and talk to its background workers from Codex.",
+    "developerName": "ar8327",
+    "category": "Productivity",
+    "capabilities": ["Interactive", "Read", "Write"],
+    "defaultPrompt": ["手头有啥事？", "/todo 把这件事交给工作台"],
+    "logo": "./assets/logo.svg"
+  }
+}

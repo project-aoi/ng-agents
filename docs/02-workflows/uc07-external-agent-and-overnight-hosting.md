@@ -1,17 +1,37 @@
 # 外部助手交办与跨夜续接
 
-主人在日常助手中先核对项目和长期偏好，再明确哪些工作可以立项。助手以自己的身份交办并返回。宿主跨夜休眠或服务重启后，工作台核对认领、进程和已有会话再继续处理。
+主人在日常助手（Codex、Antigravity 等）中先核对项目和长期偏好，再明确哪些工作可以立项。助手以自己的身份交办并返回。宿主跨夜休眠或服务重启后，工作台核对认领、进程和已有会话再继续处理。
+
+本机替身：[fixtures/uc07.sh](fixtures/uc07.sh)（`log-tool` 与约四分钟的 soak 脚本）。重启用 `kill -9`，休眠用冻结工作台所在 PID 命名空间里的全部进程。
+
+Codex 用 [ng-desk 插件](../../apps/gtd-desk/main-agent/ng-desk/README.md)接入。后台分身不得看到外部助手的控制面工具。
 
 ## 行为约定
 
 **`INV-UC07-01`**　交办前检查已有项目与活跃目录，提交后返回项目标识，供主人随时查询。
 
-**`INV-UC07-02`**　外部助手用 `create_project` 直接交办，主台分身用 `start_project`。需要主人确认时生成 `project.start` 卡。外部助手可以按主人的指示直接批准、停靠、推迟、退回修改或拒绝，也可以编辑方案，权限与网页相同；提交时带所见版本，冲突返回最新内容。后台节点不能批准这张卡。工作台、宿主启动程序与外部助手均显式传入身份，缺少身份的内核写入会被拒绝。
+**`INV-UC07-02`**　外部助手用 `create_project` 直接交办，主台分身用 `start_project`。需要主人确认时生成 `project.start` 卡。外部助手可以按主人的指示直接批准、停靠、推迟、退回修改或拒绝，也可以编辑方案（含阶段），权限与网页相同；提交时带所见版本，冲突返回最新内容。后台节点不能批准这张卡。主人没有看过的待拍板段落由主人决定；助手补充的内容与主人的原话分开记录。工作台、宿主启动程序与外部助手均显式传入身份，缺少身份的内核写入会被拒绝。
 
 **`INV-UC07-03`**　外部助手的 `create_project` 和 `spawn_cell` 与内置立项、派工工具共用宿主启用的 runner 列表和模型目录。拒绝无效的选择，保留原有交办和审批权限。
 
-**`INV-UC07-05`**　唤醒时保护仍存活的运行。回收旧进程完成后才允许同一分身启动新命令行。身份暂时不可读时保留登记。后台脚本退出后，恢复流程核对仍存活的同组子进程，再发布任务结果。
+**`INV-UC07-05`**　唤醒时保护仍存活的运行。回收旧进程完成后才允许同一分身启动新命令行。身份暂时不可读时保留登记。后台脚本退出后，恢复流程核对仍存活的同组子进程，再发布任务结果。休眠时间不计入“长时间没有输出”。
+
+## 端到端步骤
+
+1. 主人：“先看有没有在做 log-tool 的项目、有没有相关偏好。” → 只查不动。
+2. 主人：“直接立项：parse 支持毫秒时间戳……交付前跑 soak。” → 返回项目标识。
+3. soak 进行中 `kill -9` 工作台，15 秒后重启 → 脚本不断，结果只投递一次。
+4. 主人：“加 JSON 输出，先出方案卡。” “改成只做 to_json(line)，改完就确认。” → 改方案、批准，旧阶段不再生效；未拍板处先给主人看。
+5. 两个节点正在运行时 `kill -9` 再重启 → 各重投一次，不重复启动。
+6. 用未启用的 runner、不存在的模型、不存在的目录、旧的事项修订号各试一次 → 均被拒且说明原因。
+7. 冻结全部进程：模型回合中 90 秒、后台任务中 100 秒 → 恢复后照常结束，结果一次。
+
+## 2026-11-23 实测
+
+01、02、03、05 通过。第 4 步暴露 E02 与 E17；第 7 步有一次误报的“没有输出”（E32）；首个回合中途崩溃会丢命令行会话但不丢工作（E33）。后台能看到控制面见 E01。明细见[核对报告](../03-bugs/audits/2026-11-23-codex-e2e-workflows.md)。
+
+同日修复，自动回归通过，尚未实机复跑。E01、E02、E17、E32、E33：后台进程拿不到主人的控制面工具，批准时的备注送达项目，冻结时段不计入静默，会话在首次进展时登记。
 
 ## 回归入口
 
-[agent.test.ts](../../apps/gtd-desk/test/agent.test.ts)、[models.test.ts](../../apps/gtd-desk/test/models.test.ts)、[restart.test.ts](../../packages/cell/test/restart.test.ts)、[cli-orphans.test.ts](../../packages/loop/test/cli-orphans.test.ts)。
+[agent.test.ts](../../apps/gtd-desk/test/agent.test.ts)、[models.test.ts](../../apps/gtd-desk/test/models.test.ts)、[restart.test.ts](../../packages/cell/test/restart.test.ts)、[cli-orphans.test.ts](../../packages/loop/test/cli-orphans.test.ts)、[agent-relay.test.ts](../../apps/gtd-desk/test/agent-relay.test.ts)、[adapters.test.ts](../../packages/loop/test/adapters.test.ts)、[cli.test.ts](../../packages/loop/test/cli.test.ts)、[jobs.test.ts](../../packages/workspace/test/jobs.test.ts)。

@@ -1,0 +1,12 @@
+{
+  "name": "ng-agents",
+  "interface": { "displayName": "ng-agents (local)" },
+  "plugins": [
+    {
+      "name": "ng-desk",
+      "source": { "source": "local", "path": "./apps/gtd-desk/main-agent/ng-desk" },
+      "policy": { "installation": "AVAILABLE", "authentication": "ON_INSTALL" },
+      "category": "Productivity"
+    }
+  ]
+}

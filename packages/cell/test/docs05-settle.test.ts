@@ -187,7 +187,7 @@ describe("leaf settlement", () => {
 
     const [run] = runsOf(h, "plain");
     expect(results(h)).toMatchObject([
-      { id: `plain:${run}:settled`, childCellId: "plain", status: "completed", summary: "改好了：tui/table.ts 复制时输出 Markdown 源码。", childState: "dormant", turn: { steps: 0, preview: "改好了：tui/table.ts 复制时输出 Markdown 源码。" } },
+      { id: `plain:${run}:settled`, childCellId: "plain", status: "completed", summary: "改好了：tui/table.ts 复制时输出 Markdown 源码。", childState: "dormant", turn: { steps: 0, preview: null } },
     ]);
     expect(h.kernel.getCell("plain")!.status).toBe("active");
     expect(h.kernel.activityOf(["plain", "waiting"])).toEqual(

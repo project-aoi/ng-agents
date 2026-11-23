@@ -103,7 +103,7 @@ export function projectToolset(): Toolset {
     description: [
       "Hand one piece of work to a new child and put it on the books in the same step.",
       'preset "worker" (default): reads or changes code, runs tests, researches. You are woken when its turn is over; it then rests and a send_message to it continues it with everything it knows. preset "checker": a light checker of one outside condition (an MR merged, CI green, a path exists); it looks now, keeps checking, reports when the condition holds and is then closed — with check, a command does the checking and no model runs until it reports.',
-      "The child sees nothing of your conversation: the instruction carries everything. It starts at once — nothing queues or locks a directory, so if someone is already changing that repository (the note \"active workspaces\"), say in the instruction how to share it. The action it carries is closed for you when its turn ends well.",
+      "The child sees nothing of your conversation: the instruction carries everything. It starts at once — nothing queues or locks a directory, so if someone is already changing that repository (the note \"active workspaces\"), say in the instruction how to share it. The actions it carries are closed for you when its turn ends well.",
     ].join(" "),
     input: z.object({
       title: z.string().min(1).describe("short Chinese title of this piece of work (shown to the owner)"),
@@ -238,7 +238,15 @@ export function projectToolset(): Toolset {
         );
       } else {
         const cur = (await readActions(ctx.ports)).find((a) => a.id === args.id);
-        if (!cur) return { output: `There is no action ${args.id}; leave id out to create one.`, isError: true };
+        if (!cur) {
+          const card = ctx.ports.listOwnDecisions().some((d) => d.record.actionId === args.id);
+          return {
+            output: card
+              ? `${args.id} is one of your cards, not an action on the books: track_action does not change it. withdraw_card takes it back while the owner has not decided it.`
+              : `There is no action ${args.id}; leave id out to create one.`,
+            isError: true,
+          };
+        }
         action = patchAction(cur, { ...fields, ...(args.status ? { status: args.status } : {}), ...(args.status === "open" ? { completedAt: null } : {}) }, now);
       }
       if (action.owner === "human") delete action.cellId;
@@ -284,15 +292,18 @@ export function projectToolset(): Toolset {
   const finishProject = tool({
     name: "finish_project",
     description: [
-      "Record the project's end on the owner's board and close (or park) the project cell in one step.",
+      "Record the project's end on the owner's board and close (or park) the project cell in one step. It ends your run: tell the owner first.",
       '"completed": done and accepted. "someday": parked with everything kept, to be brought back later. "cancelled": stopped; what is still running under the project is stopped with it.',
-      'For outcome "completed", every open action (including a human review action that the owner accepted verbally in chat without ticking it off) must be closed with track_action first — otherwise settlement is refused with a conflict listing the unfinished work. Active children and jobs also block settlement unless closeChildren is true (for cancelled, open work is stopped automatically).',
+      'For outcome "completed", every open action (including a human review action that the owner accepted verbally in chat without ticking it off) must be closed with track_action first — otherwise settlement is refused with a conflict listing the unfinished work. Children still at work also block settlement unless closeChildren is true (for cancelled, open work is stopped automatically).',
     ].join(" "),
     input: z.object({
       outcome: z.enum(["completed", "cancelled", "someday"]),
       summary: z.string().min(1).describe("what was delivered and where it is (artifact, MR link), or why it stops — plain Chinese"),
       retro: z.string().optional().describe("names of confirmed owner preferences you reported to the desk for reuse"),
-      closeChildren: z.boolean().optional().describe("true: also stop child cells that are still open (always the case for cancelled)"),
+      closeChildren: z
+        .boolean()
+        .optional()
+        .describe('true: settle although child cells are still at work. "completed" closes them; "someday" pauses them with the project (their running turns and jobs stop, everything they know is kept, and they come back when it is resumed); "cancelled" always closes them'),
     }),
     async run(args, ctx) {
       const { ports } = ctx;
@@ -317,8 +328,12 @@ export function projectToolset(): Toolset {
         throw err;
       }
       const what = "Requested project settlement after this run drains";
+      const children =
+        args.outcome === "someday" && args.closeChildren
+          ? " Child cells still at work are paused with the project, not closed: their running turns and jobs stop, and they come back when it is resumed."
+          : "";
       const left = args.outcome !== "cancelled" && open.length > 0 ? ` Note: these actions were still open on the books — ${open.map(describe).join("; ")}.` : "";
-      return { output: `${what}; stop here.${left}`, endRun: "completed" };
+      return { output: `${what}; stop here.${children}${left}`, endRun: "completed" };
     },
   });
 

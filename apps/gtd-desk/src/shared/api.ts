@@ -305,6 +305,12 @@ export interface PlanSaveRequest {
     background?: string;
     runnerOverride?: { engine: RunnerDTO; model?: string; effort?: string } | null;
     actions: Array<{ title: string; owner: BallOwner; effort?: Effort; nextStep?: string }>;
+    /** The stages in order, replacing the old ones; [] = not staged. Omitted: keep what the plan says. */
+    phases?: string[];
+    /** The directory the work happens in (must exist); null = none. Omitted: keep it. */
+    cwd?: string | null;
+    /** The repositories the work spans, replacing the old list; null = none. Omitted: keep them. */
+    repos?: Array<{ name: string; cwd: string; defaultBranch?: string }> | null;
   };
 }
 

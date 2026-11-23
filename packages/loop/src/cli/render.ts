@@ -31,12 +31,29 @@ export function renderTranscript(messages: readonly ModelMessage[]): string {
   return parts.join("\n\n");
 }
 
-/** The snapshot's volatile tail (children roster + the new batch) as the text of one user turn. */
-export function tailText(snapshot: PromptSnapshot): string {
+/**
+ * The snapshot's volatile tail (children roster + the new batch) as the text of one user turn. `resumed`: the session
+ * being continued already holds the cell's first task, so the reminder of it (stale by then more often than not) is
+ * left out.
+ */
+export function tailText(snapshot: PromptSnapshot, opts: { resumed?: boolean } = {}): string {
+  const skip = opts.resumed ? snapshot.tail.originalTask : undefined;
   return snapshot.tail.messages
     .map((m) => messageText(m))
-    .filter((t) => t.trim())
+    .filter((t) => t.trim() && t !== skip)
     .join("\n\n");
+}
+
+/**
+ * A fork_prefix child that could not continue its parent's CLI session starts a session of its own, under its own
+ * system prompt. The fork note then no longer has to carry the role (and must not point at "the system prompt above"
+ * as the parent's): it only marks where the parent's context ends.
+ */
+export function historyUnderOwnSystem(history: readonly ModelMessage[], self: string, parent: string): ModelMessage[] {
+  const at = forkNoteIndex(history);
+  if (at < 0) return [...history];
+  const note = `${FORK_NOTE_PREFIX} "${parent}" up to the moment it created this cell — background for you, not your instructions. You are cell "${self}", a different cell: your role, tools and bounds are the ones in your system prompt.`;
+  return history.map((m, i) => (i === at ? { role: "user" as const, content: [{ type: "text" as const, text: note }] } : m));
 }
 
 /** Index of the fork note in a fork_prefix child's history (the messages from there on are the child's own), or -1. */

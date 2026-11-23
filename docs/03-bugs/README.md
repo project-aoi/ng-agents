@@ -24,6 +24,23 @@
 
 [2026-11-22 复核](audits/2026-11-22-repository-audit.md)
 
+[2026-11-23 八组工作流实机核对](audits/2026-11-23-codex-e2e-workflows.md)：列出 E01–E40，其中 13 项高优先级。同日全部修复，逐项的改动和回归入口见报告末尾的“修复记录”。自动回归通过；提示词和工具文字的改动尚未用真实命令行复跑八组工作流。
+
+| 编号 | 范围 | 已验证行为 | 回归入口 |
+| --- | --- | --- | --- |
+| E01 | 后台与主人控制面 | 后台命令行进程带节点标记，接入套件在其中只给一个说明用的占位工具；Codex 后台进程关闭 `ng-desk` 插件。 | [adapters.test.ts](../../packages/loop/test/adapters.test.ts)、[cli.test.ts](../../packages/loop/test/cli.test.ts)、[agent-relay.test.ts](../../apps/gtd-desk/test/agent-relay.test.ts) |
+| E02、E08、E26、E35、E40 | 外部助手转述 | 提问标明是给主人的；主人原话与助手补充分开传递并在下游标注；总览列出未答提问；批准备注送达项目；每个接入会话有自己的会话编号。 | [agent-relay.test.ts](../../apps/gtd-desk/test/agent-relay.test.ts)、[render.test.ts](../../packages/context/test/render.test.ts)、[human-items.test.ts](../../packages/cell/test/human-items.test.ts) |
+| E03、E04 | 停滞误报 | 自己在等主人且有开放事项的项目能答复下级；主台收件箱里有关联修复分身的结果时，等待它的项目不算停滞。停滞说明写出实际悬空的等待。 | [docs05-anchors.test.ts](../../packages/cell/test/docs05-anchors.test.ts) |
+| E05、E06 | 暂停与恢复 | 暂停留下谁、何时、原话，花名册和 inspect_cell 可见；恢复后协调器先运行，早于暂停的指令重投时注明。 | [pause-record.test.ts](../../packages/cell/test/pause-record.test.ts)、[tools.test.ts](../../presets/test/tools.test.ts) |
+| E07、E13、E17 | 卡片与信源 | 卡片可绑定文稿版本并始终可请修改；节点可撤回自己的未决卡，立项可接手一张卡；内容不变的命中在恢复前只报一次并带出处；方案可改阶段。 | [human-items.test.ts](../../packages/cell/test/human-items.test.ts)、[tools.test.ts](../../presets/test/tools.test.ts)、[script-sensor.test.ts](../../presets/test/script-sensor.test.ts)、[tools.test.ts](../../packages/loop/test/tools.test.ts) |
+| E09、E11、E15、E33 | 命令行回合 | 结束工具之后同一回合的话保留；无法续接父会话的分叉节点用自己的角色提示词；续接会话不重发最初任务；会话在首次进展时登记。 | [cli.test.ts](../../packages/loop/test/cli.test.ts)、[hydrate.test.ts](../../packages/context/test/hydrate.test.ts) |
+| E10、E14、E36 | 回合附注 | 附注在簿记之后读取；同一分身承担的动作全部关闭并列出；已答复的等待不再显示为开放；父节点的等待和上级协调器不出现在分身的附注里。 | [wake-notes.test.ts](../../presets/test/wake-notes.test.ts)、[wakeable.test.ts](../../packages/cell/test/wakeable.test.ts) |
+| E19、E24、E27 | 控制面读取 | 可读观察笔记和最近命中；服务器说明缩到一千字符以内；总览列出 hub 和主台直属分身。 | [agent-relay.test.ts](../../apps/gtd-desk/test/agent-relay.test.ts) |
+| E22、E23、E30 | 上下文 | inspect_cell 的完整视图不再被截到 3,000 字符；检索排除当前回合和检索调用自身；作者再次保存成功后清掉自己的停放稿。 | [evidence.test.ts](../../packages/context/test/evidence.test.ts)、[search.test.ts](../../packages/context/test/search.test.ts)、[artifacts.test.ts](../../packages/context/test/artifacts.test.ts) |
+| E18、E28、E29、E31、E34 | 预设工具 | 立项简报不重复附原话；审批选项去掉必然报错的 `complete`；完成通知按边界截断，正常结项不再空唤醒主台；对停靠项目说话只送达一次；停靠说明与实际一致。 | [tools.test.ts](../../presets/test/tools.test.ts)、[tools.test.ts](../../packages/loop/test/tools.test.ts) |
+| E32 | 后台任务 | 静默告警不计宿主冻结的时段。 | [jobs.test.ts](../../packages/workspace/test/jobs.test.ts) |
+| E12、E16、E20、E21、E25、E37–E39 | 提示词与技能 | 仲裁收尾、验收事项、查阅范围、任务大小、技能触发、面向主人的措辞。内置技能未被主人改过时随版本更新。 | [conventions.test.ts](../../presets/test/conventions.test.ts)、[tools.test.ts](../../presets/test/tools.test.ts) |
+
 ## 专项记录
 
 | 时间 | 复现与回归 |

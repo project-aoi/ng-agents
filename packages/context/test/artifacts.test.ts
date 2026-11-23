@@ -157,6 +157,23 @@ describe("versioned artifacts", () => {
     expect(h.store.commitSync("w2", { artifact: agent("w2 builds on the human edit", 2) })).toEqual({ ok: true, artifactVersion: 3 });
   });
 
+  it("E30: a cell's own parked text is cleared once it saves a version of its own; another cell's stays", () => {
+    const h = setup({ cells: [{ id: "desk" }, { id: "w1", parentId: "desk" }, { id: "w2", parentId: "desk" }] });
+    const open = () => h.store.listParkedSync("draft").map((p) => p.content.body);
+    h.store.commitSync("w1", { artifact: agent("v1") });
+    h.store.commitSync("desk", { artifact: human("human v2", 1) });
+    h.store.commitSync("w1", { artifact: agent("w1 from v1", 1) });
+    h.store.commitSync("w2", { artifact: agent("w2 from v1", 1) });
+    expect(open()).toEqual(["w1 from v1", "w2 from v1"]);
+    expect(h.store.commitSync("w1", { artifact: agent("w1 merged into v2", 2) })).toEqual({ ok: true, artifactVersion: 3 });
+    expect(open()).toEqual(["w2 from v1"]);
+    expect(h.store.listParkedSync("draft", { includeDismissed: true }).find((p) => p.content.body === "w1 from v1")?.dismissedAt).toBe(h.clock.now());
+    // The store's own note of whose text it was is gone with it, and never was searchable content.
+    expect(h.store.readStateSync("w1", "sys:parked:draft")).toBeNull();
+    expect(h.store.readStateSync("w2", "sys:parked:draft")).toHaveLength(1);
+    expect(h.store.searchHistorySync("desk", "sys:parked", { scope: "global" }).filter((s) => s.source === "state")).toEqual([]);
+  });
+
   it("records the writing cell on each version (null for human edits)", () => {
     const h = setup({ cells: [{ id: "desk" }, { id: "w1", parentId: "desk" }, { id: "w2", parentId: "desk" }] });
     h.store.commitSync("w1", { artifact: agent("v1") });

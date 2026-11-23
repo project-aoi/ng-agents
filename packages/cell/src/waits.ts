@@ -43,6 +43,8 @@ export interface Waits {
    * only by its own party (or its own timeout) — an unrelated message that happens to wake the cell leaves it open.
    */
   answeredBy(cellId: string, envelopes: readonly Envelope[], runId?: string): string[];
+  /** The waits `answeredBy` would close for these envelopes, without closing them (what a Run about to see them is told). */
+  wouldAnswer(cellId: string, envelopes: readonly Envelope[], runId?: string): WaitRecord[];
   list(cellIds?: readonly string[]): WaitRecord[];
   /** Closed cells wait for nothing. */
   dropFor(cellIds: readonly string[]): void;
@@ -106,6 +108,29 @@ export function createWaits(core: Pick<KernelCore, "db" | "clock" | "inbox" | "b
     return env.from === wait.waitingFor;
   }
 
+  /** Which open waits of the cell these envelopes answer, each wait at most once, in envelope order. */
+  function matched(cellId: string, envelopes: readonly Envelope[], runId: string | undefined): WaitRecord[] {
+    const open = all<Row>(db, "SELECT * FROM cell_waits WHERE cell_id = ?", [cellId]).map(toRecord);
+    const done = new Map<string, WaitRecord>();
+    for (const env of envelopes) {
+      const p = env.payload as Record<string, unknown> | null;
+      const data = p?.data as Record<string, unknown> | undefined;
+      const refs = [p?.refId, p?.waitId, p?.replyToId, data?.refId, data?.waitId, data?.replyToId].filter((x) => typeof x === "string" && x.trim().length > 0);
+      const candidates = open.filter(w => !done.has(w.waitId) && w.registeredRun !== runId && answers(w, env));
+      const keys = p?.actionId ? [...refs, p.actionId] : refs;
+      const explicit = candidates.filter(w => keys.includes(w.waitId) || (w.refId !== null && keys.includes(w.refId)));
+      const direct = env.from === KERNEL_FROM.control && ["owner", "agent"].includes(parsePrincipal(env.principalId, core.ownerPrincipal).kind);
+      const unnamed = candidates.filter(w => w.refId === null && w.waitId === w.waitingFor);
+      const chatReply = direct && !p?.actionId && ![p?.refId, p?.waitId, data?.refId, data?.waitId].some(Boolean);
+      const fallback = chatReply && !refs.length ? candidates
+        : chatReply ? unnamed.filter(w => w.waitingFor === "human")
+        : !refs.length && candidates.length === 1 ? unnamed : [];
+      const matches = env.type === PAYLOAD.waitTimeout ? candidates : explicit.length ? explicit : fallback;
+      for (const w of matches) done.set(w.waitId, w);
+    }
+    return [...done.values()];
+  }
+
   function remove(cellId: string, waitingFor: string): boolean {
     const r = run(db, "DELETE FROM cell_waits WHERE cell_id = ? AND wait_id = ?", [cellId, waitingFor]);
     if (r.changes === 0) return false;
@@ -165,27 +190,11 @@ export function createWaits(core: Pick<KernelCore, "db" | "clock" | "inbox" | "b
 
     answeredBy(cellId, envelopes, runId) {
       if (envelopes.length === 0) return [];
-      return withTx(db, () => {
-        const open = all<Row>(db, "SELECT * FROM cell_waits WHERE cell_id = ?", [cellId]).map(toRecord);
-        const done = new Set<string>();
-        for (const env of envelopes) {
-          const p = env.payload as Record<string, unknown> | null;
-          const data = p?.data as Record<string, unknown> | undefined;
-          const refs = [p?.refId, p?.waitId, p?.replyToId, data?.refId, data?.waitId, data?.replyToId].filter((x) => typeof x === "string" && x.trim().length > 0);
-          const candidates = open.filter(w => !done.has(w.waitId) && w.registeredRun !== runId && answers(w, env));
-          const keys = p?.actionId ? [...refs, p.actionId] : refs;
-          const explicit = candidates.filter(w => keys.includes(w.waitId) || (w.refId !== null && keys.includes(w.refId)));
-          const direct = env.from === KERNEL_FROM.control && ["owner", "agent"].includes(parsePrincipal(env.principalId, core.ownerPrincipal).kind);
-          const unnamed = candidates.filter(w => w.refId === null && w.waitId === w.waitingFor);
-          const chatReply = direct && !p?.actionId && ![p?.refId, p?.waitId, data?.refId, data?.waitId].some(Boolean);
-          const fallback = chatReply && !refs.length ? candidates
-            : chatReply ? unnamed.filter(w => w.waitingFor === "human")
-            : !refs.length && candidates.length === 1 ? unnamed : [];
-          const matches = env.type === PAYLOAD.waitTimeout ? candidates : explicit.length ? explicit : fallback;
-          for (const w of matches) if (remove(cellId, w.waitId)) done.add(w.waitId);
-        }
-        return [...done];
-      });
+      return withTx(db, () => matched(cellId, envelopes, runId).filter(w => remove(cellId, w.waitId)).map(w => w.waitId));
+    },
+
+    wouldAnswer(cellId, envelopes, runId) {
+      return envelopes.length === 0 ? [] : matched(cellId, envelopes, runId);
     },
 
     list(cellIds) {

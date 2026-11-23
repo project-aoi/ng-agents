@@ -66,6 +66,9 @@ function formatStatusLine(value: unknown): string | null {
 
 const SEARCH_SCOPES: readonly SearchScope[] = ["lineage", "subtree", "global"];
 
+/** In the writing cell's state (a reserved `sys:` key): the ids of its own text parked beside this artifact. */
+const parkedByKey = (artifactId: string) => `sys:parked:${artifactId}`;
+
 const KNOWLEDGE_SCHEMES: ReadonlyArray<[string, KnowledgeKind]> = [
   ["skill://", "skill"],
   ["working_note://", "working_note"],
@@ -88,6 +91,18 @@ export function createContextStore(opts: ContextStoreOptions): ContextStore {
   const readStateSync = <T = unknown>(cellId: string, key: string): T | null => {
     const r = get<StateRow>(db,"SELECT * FROM cell_state WHERE cell_id=? AND key=?",[cellId,key]);
     return r ? toEntryState(r).value as T : null;
+  };
+
+  /** The store's own records in a cell's state (no state.changed: nothing outside the store reads them). */
+  const writeBookkeeping = (cellId: string, key: string, value: unknown): void => {
+    if (value === null) run(db, "DELETE FROM cell_state WHERE cell_id = ? AND key = ?", [cellId, key]);
+    else
+      run(
+        db,
+        `INSERT INTO cell_state (cell_id, key, value, updated_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT(cell_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+        [cellId, key, toJson(value), clock.now()],
+      );
   };
 
   const defaultRoster = (cellId: string): ChildSummary[] =>
@@ -144,13 +159,16 @@ export function createContextStore(opts: ContextStoreOptions): ContextStore {
     return withTx(db, (): CommitResult => {
       const decision = tx.artifact ? artifacts.decide(tx.artifact) : null;
       if (decision?.kind === "conflict") {
-        // The whole commit is rejected; the only write that survives is the parked agent content.
+        // The whole commit is rejected; the only write that survives is the parked agent content (and the note of
+        // whose it is).
         let parked: ParkedAddition | undefined;
         if (decision.park) {
           parked = artifacts.park(tx.artifact!.artifactId, {
             content: tx.artifact!.content,
             basedOnVersion: tx.artifact!.expectedVersion ?? 0,
           });
+          const key = parkedByKey(tx.artifact!.artifactId);
+          writeBookkeeping(cellId, key, [...(readStateSync<string[]>(cellId, key) ?? []), parked.id]);
         }
         return parked ? { ok: false, currentArtifact: decision.current, parked } : { ok: false, currentArtifact: decision.current };
       }
@@ -178,6 +196,16 @@ export function createContextStore(opts: ContextStoreOptions): ContextStore {
         knowledge.upsert(cellId, { ...tx.appendReference, kind: "reference", scope: "cell", mode: "append" });
       }
       const version = decision ? artifacts.apply(cellId, tx.artifact!, decision) : undefined;
+      if (version !== undefined && tx.artifact!.updatedBy === "agent") {
+        // The cell saved a version of its own: what it had parked beside an older version is obsolete now.
+        const key = parkedByKey(tx.artifact!.artifactId);
+        const own = readStateSync<string[]>(cellId, key);
+        if (own) {
+          const open = new Set(artifacts.listParked(tx.artifact!.artifactId).map((p) => p.id));
+          for (const id of own) if (open.has(id)) artifacts.dismissParked(id);
+          writeBookkeeping(cellId, key, null);
+        }
+      }
 
       for (const out of tx.inboxOut ?? []) {
         inbox.enqueueSync(cellIdOf(out.to), { ...out.envelope, to: out.to }, out.schedule);
@@ -256,6 +284,7 @@ export function createContextStore(opts: ContextStoreOptions): ContextStore {
       // An injected summariser may be a model call, so only the built-in one runs on the sync path.
       return hydrateMod.hydrate(cellId, batch, mode, opts.summarize ? null : truncatingSummary);
     },
+    refreshTailSync: (snapshot, extraNotes) => hydrateMod.refreshTail(snapshot, extraNotes),
     appendEvidenceSync: (cellId, record) => evidence.append(cellId, record),
     readResourceSync,
     searchHistorySync(cellId, query, o) {

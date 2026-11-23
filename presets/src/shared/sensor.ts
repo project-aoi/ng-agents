@@ -10,6 +10,7 @@ import type { SourceRecord, SourceState } from "./product-records";
 import {
   defineTool,
   PAYLOAD,
+  sha256Hex,
   type CommitTx,
   type CodeProcessor,
   type CodeProcessorInput,
@@ -55,38 +56,101 @@ export async function ensureSource(ports: RunPorts, now: number): Promise<Source
   return rec;
 }
 
+/** Where a hit came from (`source.hit` payload `data.origin`): enough for the desk and the owner to follow it up. */
+export interface HitOrigin {
+  sourceTitle: string;
+  sourceCellId: string;
+  /** `script:<path>`, a registered check's name, or "model" (an llm source filtering by its rule). */
+  check: string;
+  /** The directory the check runs in. */
+  cwd?: string;
+  /** A report URL or path the check printed (also the hit's `uri` when it gave none). */
+  location?: string;
+}
+
+const PRINTED_URL = /https?:\/\/[^\s"'<>()（），。；、]+/;
+const PRINTED_PATH = /(?:^|[\s(（:：=])((?:~|\.{1,2})?\/[^\s"'<>,，;；()（）。、]+)/m;
+
+/** A report location the check's output names: the first URL, else the first absolute path. */
+function printedLocation(text: string): string | undefined {
+  return PRINTED_URL.exec(text)?.[0] ?? PRINTED_PATH.exec(text)?.[1];
+}
+
+function originOf(ports: RunPorts, src: SourceState, hit: SensorHit): HitOrigin {
+  const p = ports.self.spec.processor;
+  const script = p.kind === "code" && p.entry === PROCESSORS.sensorScript ? p.args?.["script"] : undefined;
+  const check = p.kind !== "code" ? "model" : typeof script === "string" ? `script:${script}` : p.entry;
+  const location = hit.uri ?? (p.kind === "code" ? printedLocation(hit.rawInput ?? hit.summary) : undefined);
+  return { sourceTitle: src.title, sourceCellId: ports.self.cellId, check, ...(ports.self.spec.cwd ? { cwd: ports.self.spec.cwd } : {}), ...(location ? { location } : {}) };
+}
+
+/** The line a code check's hit carries in its summary, in the owner's words. */
+function originLine(o: HitOrigin): string {
+  if (o.check === "model") return "";
+  const what = o.check.startsWith("script:") ? `脚本 ${o.check.slice("script:".length)}` : `检查 ${o.check}`;
+  return `\n（信源「${o.sourceTitle}」，${what}${o.cwd ? `，在 ${o.cwd} 运行` : ""}${o.location ? `；报告位置：${o.location}` : ""}）`;
+}
+
+/** Same hit = same title, text, excerpt, link and data (an llm source's differently worded report is a new one). */
+function hitDigest(hit: SensorHit): string {
+  return sha256Hex(JSON.stringify([hit.title ?? "", hit.summary, hit.rawInput ?? "", hit.uri ?? "", hit.data ?? null])).slice(0, 24);
+}
+
+export interface CheckOutcome {
+  source: SourceState;
+  /** The hit was the one already reported (unchanged since): counted, not reported again. */
+  repeated: boolean;
+}
+
 /**
  * One finished check: SourceRecord counters, then the hit (if any) goes to the desk — or, in observe mode, into the
- * observation notes only. `runKey` makes a retried Run post the same hit only once.
+ * observation notes only. `runKey` makes a retried Run post the same hit only once. A hit identical to the last one
+ * reported is counted but not reported again until a check finds nothing (recovery); a failed check changes neither.
  */
-export async function recordCheck(ports: RunPorts, now: number, result: { hit: SensorHit | null; error?: string }, runKey: string): Promise<SourceState> {
+export async function recordCheck(ports: RunPorts, now: number, result: { hit: SensorHit | null; error?: string }, runKey: string): Promise<CheckOutcome> {
   const src = await ensureSource(ports, now);
-  if (src.lastCheckKey === runKey) return src;
+  if (src.lastCheckKey === runKey) return { source: src, repeated: false };
   let appendReference: CommitTx["appendReference"];
+  let repeated = false;
   const next: SourceState = { ...src, lastCheckKey: runKey, runCount: src.runCount + 1, lastRunAt: now, updatedAt: now };
   if (result.error) next.lastError = clip(result.error, 300);
   else delete next.lastError;
   const hit = result.hit;
   if (hit && !result.error) {
-    next.hitCount = src.hitCount + 1;
-    next.lastHitAt = now;
-    if (src.mode === "observe") {
-      const line = `- ${new Date(now).toISOString()} ${hit.title ?? src.title}：${clip(hit.summary, 500)}${hit.uri ? ` (${hit.uri})` : ""}\n`;
-      appendReference = { name: OBSERVATION_NOTE, description: `${src.title} 的观察记录`, body: line };
+    const digest = hitDigest(hit);
+    if (src.lastHitDigest === digest) {
+      repeated = true;
+      next.lastHitRepeats = (src.lastHitRepeats ?? 0) + 1;
     } else {
-      const payload: SourceHitPayload = {
-        sourceCellId: ports.self.cellId,
-        title: hit.title ?? src.title,
-        summary: hit.summary,
-        ...(hit.rawInput !== undefined ? { rawInput: hit.rawInput } : {}),
-        ...(hit.uri !== undefined ? { uri: hit.uri } : {}),
-        ...(hit.data !== undefined ? { data: hit.data } : {}),
-      };
-      await ports.emitToParent(PAYLOAD.sourceHit, payload, { id: `${ports.self.cellId}:hit:${runKey}` });
+      next.lastHitDigest = digest;
+      delete next.lastHitRepeats;
+      next.hitCount = src.hitCount + 1;
+      next.lastHitAt = now;
+      const origin = originOf(ports, src, hit);
+      const uri = origin.location;
+      if (src.mode === "observe") {
+        const line = `- ${new Date(now).toISOString()} ${hit.title ?? src.title}：${clip(hit.summary, 500)}${uri ? ` (${uri})` : ""}\n`;
+        appendReference = { name: OBSERVATION_NOTE, description: `${src.title} 的观察记录`, body: line };
+      } else {
+        const data = hit.data !== undefined && (typeof hit.data !== "object" || hit.data === null || Array.isArray(hit.data)) ? { value: hit.data } : (hit.data as Record<string, unknown> | undefined);
+        const payload: SourceHitPayload = {
+          sourceCellId: ports.self.cellId,
+          title: hit.title ?? src.title,
+          summary: `${hit.summary}${originLine(origin)}`,
+          ...(hit.rawInput !== undefined ? { rawInput: hit.rawInput } : {}),
+          ...(uri !== undefined ? { uri } : {}),
+          data: { ...data, origin },
+        };
+        await ports.emitToParent(PAYLOAD.sourceHit, payload, { id: `${ports.self.cellId}:hit:${runKey}` });
+      }
     }
+  } else if (!result.error) {
+    // Nothing found: the condition is gone, so its next occurrence is news again.
+    delete next.lastHitDigest;
+    delete next.lastHitRepeats;
   }
   await ports.context.commit(ports.self.cellId, { statePatches: { [gtdKeys.source]: next }, appendReference });
-  return next;
+  return { source: next, repeated };
 }
 
 /** A check is due on a schedule firing or a watched message; the first `cell.task` only sets the source up. */
@@ -190,8 +254,11 @@ export function sensorToolset(): Toolset {
           }
           const { artifactId, ...hit } = args;
           const uri = hit.uri ?? (artifactId ? `artifact://${artifactId}` : undefined);
-          const src = await recordCheck(ctx.ports, ctx.clock.now(), { hit: { ...hit, ...(uri ? { uri } : {}), ...(artifactId ? { data: { artifactId } } : {}) } }, due[0]!.id);
-          return { output: src.mode === "observe" ? "Noted (observation mode: no item created)." : "Reported to the desk.", endRun: "completed" };
+          const r = await recordCheck(ctx.ports, ctx.clock.now(), { hit: { ...hit, ...(uri ? { uri } : {}), ...(artifactId ? { data: { artifactId } } : {}) } }, due[0]!.id);
+          const output = r.repeated
+            ? "Same as the hit already reported, unchanged since: counted, not reported again."
+            : r.source.mode === "observe" ? "Noted (observation mode: no item created)." : "Reported to the desk.";
+          return { output, endRun: "completed" };
         },
       }),
       defineTool({

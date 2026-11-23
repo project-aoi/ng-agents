@@ -33,6 +33,7 @@ import { isProjectRoot, type KernelCore } from "./core";
 import type { RunHandle } from "./dispatcher";
 import { inspectCell } from "./inspect";
 import { sendCellMessage } from "./messages";
+import { controlWithRecord } from "./pauses";
 import { ensureCwd } from "./workdir";
 
 export interface RunContext {
@@ -322,6 +323,10 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
       assertLive("createHumanItem");
       return core.humanItems.create(draft, cellId);
     },
+    withdrawHumanItem(id, reason) {
+      assertLive("withdrawHumanItem");
+      return core.humanItems.withdrawOwn(id, cellId, reason);
+    },
 
     confirmCliInput(sessionId, throughSeq) {
       assertLive("confirm CLI input");
@@ -417,6 +422,7 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
     async controlCell(targetId, cmd) {
       assertLive("controlCell");
       requireDescendant(targetId, "controlCell");
+      if (cmd.action === "pause" || cmd.action === "resume") return controlWithRecord(core, targetId, { action: cmd.action, principalId });
       return inbox.controlSync(targetId, {
         action: cmd.action,
         principalId,
@@ -507,7 +513,10 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
           throw new NgError(
             "conflict",
             `${open.length} child cell(s) are still at work (${open.map((b) => `${b.cell.id}${b.cell.title ? ` "${b.cell.title}"` : ""}: ${b.why}`).join("; ")}). ` +
-              `Wait for them (or close the ones that are no longer needed) before you ${request.action === "pause" ? "park" : "finish"}. Call again with closeChildren: true if stopping them is what you mean.`,
+              `Wait for them (or close the ones that are no longer needed) before you ${request.action === "pause" ? "park" : "finish"}. ` +
+              (request.action === "pause"
+                ? "Call again with closeChildren: true to park anyway: what they are running is stopped and they are paused with you (not closed) — they pick up again when you are resumed."
+                : "Call again with closeChildren: true if stopping them is what you mean."),
           );
         }
       }

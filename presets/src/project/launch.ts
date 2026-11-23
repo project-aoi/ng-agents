@@ -55,7 +55,7 @@ export interface ProjectInit {
   proposal?: ProjectProposal;
   /** Fixed project cell id (makes the start idempotent). Default: a new `proj_…` id. */
   id?: string;
-  /** The owner's original words, quoted in the brief. */
+  /** The message that triggered the start (possibly the last of several); quoted in the brief unless the brief already contains it. */
   rawInput?: string;
   /** Continue from the starting cell's conversation (fork_prefix). */
   continueConversation?: boolean;
@@ -107,7 +107,10 @@ export function seededActionId(projectId: string, index: number): string {
 export function renderBrief(init: ProjectInit, projectId?: string): string {
   const out: string[] = [];
   const section = (title: string, ...lines: string[]) => out.push(`## ${title}`, ...lines, "");
-  section("主人的要求", ...(init.rawInput && init.rawInput.trim() && init.rawInput.trim() !== init.brief.trim() ? [`原话：${init.rawInput.trim()}`] : []), init.brief.trim());
+  // The message that triggered the start may be only the last of several: quoted as what it is, and only when the
+  // brief does not already carry it.
+  const raw = init.rawInput?.trim();
+  section("主人的要求", ...(raw && !init.brief.includes(raw) ? [`触发这次立项的消息（可能只是几条消息中的最后一条）：${raw}`] : []), init.brief.trim());
   section("目标（做到什么算完成）", init.outcome.trim());
   section(
     "工作目录",
@@ -129,7 +132,7 @@ export function renderBrief(init: ProjectInit, projectId?: string): string {
     section(
       "分阶段",
       ...init.phases.map((p, i) => `${i + 1}. ${p}`),
-      "一次只推进一个阶段：当前阶段完成后，用 request_approval 请主人确认，得到同意再开始下一阶段。",
+      "一次只推进一个阶段：当前阶段完成后，用 request_approval 请主人确认，得到同意再开始下一阶段。由主人自己完成的阶段不用另请确认：主人勾掉那一步就是同意。",
     );
   }
   const planned = (init.plan ?? []).filter((a) => a && typeof a.title === "string" && a.title.trim());

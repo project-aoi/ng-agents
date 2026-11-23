@@ -73,8 +73,15 @@ interface ResourceHit {
 const LIKE = "LIKE ? ESCAPE '\\'";
 const IN_JSON = "IN (SELECT value FROM json_each(?))";
 
-/** Bookkeeping keys, not content: CLI session records and the cell's final result. */
-const SEARCHABLE_STATE = "s.key NOT GLOB 'cli:*' AND s.key NOT GLOB 'cell:result*'";
+/** Bookkeeping keys, not content: CLI session records, the cell's final result and the store's own records. */
+const SEARCHABLE_STATE = "s.key NOT GLOB 'cli:*' AND s.key NOT GLOB 'cell:result*' AND s.key NOT GLOB 'sys:*'";
+
+/**
+ * Earlier searches are not history: a search_history call and its result only repeat the query and what other records
+ * already say (their indexed text starts with the tool's name, see evidence.ts searchableText).
+ */
+const NOT_A_SEARCH = "NOT (e.kind IN ('tool_call', 'tool_result') AND e.text GLOB 'search_history*')";
+const NOT_A_SEARCH_SPILL = "(r.source IS NULL OR r.source <> 'tool:search_history')";
 
 /** A WHERE fragment and its parameters. */
 interface Clause {
@@ -190,7 +197,8 @@ function searchEvidence(deps: Deps, t: Terms, limit: number, scope: Clause): Sni
     ftsFrom: "evidence_fts JOIN evidence e ON e.seq = evidence_fts.rowid",
     likeFrom: "evidence e",
     text: "e.text",
-    ...scope,
+    where: `${scope.where} AND ${NOT_A_SEARCH}`,
+    params: scope.params,
     recency: "e.seq DESC",
   });
   return rows.map((r) => {
@@ -309,7 +317,8 @@ function searchResources(deps: Deps, t: Terms, limit: number, scope: Clause): Sn
     ftsFrom: "resource_fts JOIN resources r ON r.rowid = resource_fts.rowid",
     likeFrom: "resources r",
     text: "r.content",
-    ...scope,
+    where: `${scope.where} AND ${NOT_A_SEARCH_SPILL}`,
+    params: scope.params,
     recency: "r.created_at DESC, r.uri",
   });
   return rows.map((r) => {

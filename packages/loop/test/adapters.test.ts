@@ -375,3 +375,15 @@ describe("codex driver: items", () => {
 
 
 });
+
+// Audit 2026-11-23 E01: a background cell loaded the owner's ng-desk plugin and with it the owner's whole control plane
+// (and the "you are the owner's main agent" skill). Checked against codex-cli 0.171: this unquoted key switches that
+// one plugin off for the invocation, leaves other plugins alone, and is harmless when the plugin is not installed.
+it("codex: every launch of a cell switches the workbench's own main-agent plugin off", () => {
+  for (const session of [undefined, { id: "thread-1", mode: "resume" as const }, { id: "thread-1", mode: "fork" as const }]) {
+    const argv = codexArgs(launch("codex", capsOf("host-write"), session ? { session } : {}));
+    const at = argv.indexOf("plugins.ng-desk@ng-agents.enabled=false");
+    expect(at).toBeGreaterThan(0);
+    expect(argv[at - 1]).toBe("-c");
+  }
+});

@@ -83,13 +83,16 @@ const readArtifact = defineTool({
  * a caller that never got as far as committing passes false.
  */
 function artifactConflict(cur: VersionedArtifact, retry: string, parked = cur.updatedBy === "human"): ToolResult {
-  const kept = parked ? " Your text was kept beside it as a suggestion; the human's version stays." : "";
+  const kept = parked ? " Your text was kept beside it as a suggestion until you save a version of your own; the human's version stays." : "";
   return {
-    output: `Version conflict: ${cur.artifactId} is at v${cur.version} (last edited by ${cur.updatedBy}).${kept} ${retry} Current content:\n---\n${cur.content.body}`,
+    output: `Version conflict: ${cur.artifactId} is at v${cur.version} (last edited by ${cur.updatedBy}).${kept} Its current text is below: ${retry} with expectedVersion ${cur.version}.\n---\n${cur.content.body}`,
     isError: true,
     data: { artifactId: cur.artifactId, currentVersion: cur.version, updatedBy: cur.updatedBy },
   };
 }
+
+const SAVE_AGAIN = "merge your change into it and save";
+const PATCH_AGAIN = "apply your edits to it and patch";
 
 const saveArtifact = defineTool({
   name: "save_artifact",
@@ -126,7 +129,7 @@ const saveArtifact = defineTool({
       },
     });
     if (r.ok) return { output: `Saved ${artifactId} v${r.artifactVersion ?? "?"}.`, data: { artifactId, version: r.artifactVersion } };
-    return artifactConflict(r.currentArtifact, `To revise, save again with expectedVersion ${r.currentArtifact.version}.`);
+    return artifactConflict(r.currentArtifact, SAVE_AGAIN);
   },
 });
 
@@ -318,7 +321,6 @@ const patchArtifact = defineTool({
       const instead = cur.content.format === "json" ? " Save the whole new JSON with save_artifact (format json) instead." : "";
       return { output: `${artifactId} is a ${cur.content.format} artifact; patch_artifact only edits text and Markdown bodies.${instead}`, isError: true };
     }
-    const retry = (v: number) => `To revise, read it again and patch with expectedVersion ${v}.`;
     const stale = cur.version !== expectedVersion;
     let base = cur.content.body;
     if (stale) {
@@ -327,12 +329,12 @@ const patchArtifact = defineTool({
       try {
         base = await ctx.ports.context.readResource(selfId(ctx), `artifact://${artifactId}@${expectedVersion}`, { offset: 0, limit: Number.MAX_SAFE_INTEGER });
       } catch {
-        return artifactConflict(cur, retry(cur.version), false);
+        return artifactConflict(cur, PATCH_AGAIN, false);
       }
     }
     const patched = applyEdits(base, args.edits);
     if (!patched.ok) {
-      if (stale) return artifactConflict(cur, retry(cur.version), false);
+      if (stale) return artifactConflict(cur, PATCH_AGAIN, false);
       return { output: `${patched.error} Nothing was saved; ${artifactId} stays at v${cur.version}.`, isError: true, data: { artifactId, version: cur.version } };
     }
     const title = args.title?.trim() ? args.title : undefined;
@@ -341,7 +343,7 @@ const patchArtifact = defineTool({
     }
     const content: Deliverable = { ...cur.content, body: patched.body, ...(title !== undefined ? { title } : {}) };
     const r = await ctx.ports.context.commit(selfId(ctx), { artifact: { artifactId, content, updatedBy: "agent", expectedVersion } });
-    if (!r.ok) return artifactConflict(r.currentArtifact, retry(r.currentArtifact.version));
+    if (!r.ok) return artifactConflict(r.currentArtifact, PATCH_AGAIN);
     const n = args.edits.length;
     const renamed = title !== undefined && title !== cur.content.title ? `; title now "${title}"` : "";
     return {
@@ -402,12 +404,15 @@ const searchHistory = defineTool({
   name: "search_history",
   kind: "kernel",
   description: [
-    "Full-text search (Chinese and English) over what was said, done and saved.",
+    "Full-text search (Chinese and English) over what was said, done and saved — earlier searches and this wake-up's own records are left out.",
     "scope lineage (default): this cell's own messages, tool output and notes, plus shared notes. scope subtree: also everything below you — closed workers included — with their artifacts, state and the full text of long tool outputs. scope global: every cell on the workbench — use it before starting something new (is there already a project, a report or a preference about this?) and to find how something was done before.",
   ].join(" "),
   input: z.object({ query: z.string().min(1), scope: z.enum(["lineage", "subtree", "global"]).optional() }),
   async handler(args, ctx) {
-    const hits = (await ctx.ports.context.searchHistory(selfId(ctx), args.query, args.scope ? { scope: args.scope } : undefined)).slice(0, 20);
+    // This run's own records (the messages that woke it, what it said and did so far) are already in front of the
+    // caller: asked for a few more so that leaving them out still fills the page.
+    const all = await ctx.ports.context.searchHistory(selfId(ctx), args.query, { limit: 40, ...(args.scope ? { scope: args.scope } : {}) });
+    const hits = all.filter((h) => h.runId !== ctx.snapshot.runId).slice(0, 20);
     if (hits.length === 0) return `No matches for "${args.query}"${args.scope ? ` (scope ${args.scope})` : ""}.`;
     return hits
       .map((h) => {

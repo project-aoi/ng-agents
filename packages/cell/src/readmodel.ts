@@ -8,13 +8,15 @@ import { inboxAddr,
   pullCursorKey,
   type CellRecord,
   type CellStatusLine,
+  type Envelope,
   type ChildSummary,
   type WorkspaceOccupancy,
   type WorkspaceUser,
 } from "@ng/protocol";
 import { isProjectRoot, type KernelCore } from "./core";
 import type { AnchorReport, CellActivity, CellNode, KernelStats, RosterEntry } from "./types";
-import { waitTargetCell, type WaitRecord } from "./waits";
+import { pauseLine, prePauseNote } from "./pauses";
+import { WAIT_HUMAN, waitTargetCell, type WaitRecord } from "./waits";
 import { effectiveCwd, workTreeKey } from "./workdir";
 
 export interface ReadModel {
@@ -44,7 +46,7 @@ export interface ReadModel {
   /** Internal waits whose target can make progress for the waiting cell. */
   groundedWaits(waits: readonly WaitRecord[], localCells: ReadonlySet<string>): WaitRecord[];
   /** Context's tailNotesProvider: the volatile notes a coordinating cell sees after its roster. */
-  tailNotes(cellId: string): string[];
+  tailNotes(cellId: string, incoming?: readonly Envelope[]): string[];
 }
 
 interface Facts {
@@ -260,6 +262,8 @@ export function createReadModel(core: KernelCore): ReadModel {
       if (r.statusLine) parts.push(r.statusLine);
       if (r.running) parts.push("working now");
       else if (a?.state === "dormant") parts.push("dormant — its turn is over; send_message to it wakes it with everything it knows");
+      const paused = r.status === "paused" ? pauseLine(core, r.cellId) : null;
+      if (paused) parts.push(paused);
       for (const j of r.jobs) parts.push(`job running: ${j.command.length > 80 ? `${j.command.slice(0, 80)}…` : j.command}`);
       for (const w of waits.get(r.cellId) ?? []) parts.push(w);
       if (r.waitingOn.threads.length) parts.push(`watching ${r.waitingOn.threads.join(", ")}`);
@@ -343,14 +347,17 @@ export function createReadModel(core: KernelCore): ReadModel {
       } catch {
         return null;
       }
-      all = all.filter((o) => o.key === own).map((o) => ({ ...o, active: o.active.filter((u) => u.cellId !== forCell.id) }));
+      all = all.filter((o) => o.key === own);
     }
-    all = all.filter((o) => o.active.length > 0);
+    // "Who else": not the reader, and not the coordinators above it whose turn merely overlaps — they sent it here
+    // (a background command of theirs is still someone working in the tree).
+    const above = new Set(cells.ancestors(forCell.id).map((a) => a.id));
+    all = all.map((o) => ({ ...o, active: o.active.filter((u) => u.cellId !== forCell.id && !(above.has(u.cellId) && u.state === "running")) })).filter((o) => o.active.length > 0);
     if (all.length === 0) return null;
     const who = (u: WorkspaceUser) => {
       const where = u.cwd !== all.find((o) => o.active.includes(u))?.key ? ` in ${u.cwd}` : "";
       const project = u.projectTitle ? ` of project "${u.projectTitle}"` : "";
-      return `${u.cellId}${u.title ? ` "${u.title}"` : ""}${project}${where} — ${u.state === "job" ? "background job" : "working"}${u.statusLine ? `: ${u.statusLine}` : ""}`;
+      return `${u.cellId}${u.title ? ` "${u.title}"` : ""}${u.preset ? ` (${u.preset})` : ""}${project}${where} — ${u.state === "job" ? "background job" : "working"}${u.statusLine ? `: ${u.statusLine}` : ""}`;
     };
     const lines = all.flatMap((o) => [`- ${o.key}`, ...o.active.map((u) => `  - ${who(u)}`)]);
     const head = leaf
@@ -380,18 +387,30 @@ export function createReadModel(core: KernelCore): ReadModel {
     return `[your notes — kept across every wake-up; update with save_note]\n${blocks.join("\n\n")}`;
   }
 
-  function tailNotes(cellId: string): string[] {
+  function tailNotes(cellId: string, incoming: readonly Envelope[] = []): string[] {
     const cell = cells.get(cellId);
     if (!cell) return [];
     const leaf = isLeafLifetime(cell.spec.lifetime);
     const notes: string[] = [];
-    const own = core.waits.list([cellId]);
+    // A wait the messages of this wake-up answer is closed when the Run settles; it is no longer something to act on.
+    const answered = new Set(core.waits.wouldAnswer(cellId, incoming).map((w) => w.waitId));
+    const all_ = core.waits.list([cellId]);
+    const own = all_.filter((w) => !answered.has(w.waitId));
+    const waitLine = (w: WaitRecord) => `- waiting for ${w.waitingFor}: ${w.reason} [${w.waitId}]`;
     if (own.length) {
-      notes.push(`[your open waits]\n${own.map((w) => `- waiting for ${w.waitingFor}: ${w.reason} [${w.waitId}]${w.timeoutAt ? ` (times out ${new Date(w.timeoutAt).toISOString()})` : ""}`).join("\n")}`);
+      notes.push(`[your open waits]\n${own.map((w) => `${waitLine(w)}${w.timeoutAt ? ` (times out ${new Date(w.timeoutAt).toISOString()})` : ""}`).join("\n")}`);
     }
+    if (answered.size) {
+      notes.push(`[waits answered by this wake-up — already closed for you, no clear_wait needed]\n${all_.filter((w) => answered.has(w.waitId)).map(waitLine).join("\n")}`);
+    }
+    // A leaf's parent is told when the leaf's turn ends and reads what it did: its wait needs no message from the leaf.
     const waiting = all<{cell_id: string; wait_id: string; ref_id: string | null; reason: string}>(db, `SELECT w.cell_id, w.wait_id, w.ref_id, w.reason FROM cell_waits w
-      JOIN cells c ON c.id=w.cell_id AND c.epoch=w.epoch AND c.status='active' WHERE w.waiting_for=? ORDER BY w.created_at`, [`inbox:${cellId}`]);
+      JOIN cells c ON c.id=w.cell_id AND c.epoch=w.epoch AND c.status='active' WHERE w.waiting_for=? ORDER BY w.created_at`, [`inbox:${cellId}`])
+      .filter(w => !(leaf && w.cell_id === cell.parentId));
     if (waiting.length) notes.push("[cells waiting on you]\n" + waiting.map(w => `${w.cell_id} [waitId=${w.wait_id}${w.ref_id && w.ref_id !== w.wait_id ? `, refId=${w.ref_id}` : ""}] ${w.reason}`).join("\n"));
+    const fromBefore = prePauseNote(core, cellId, incoming);
+    if (fromBefore) notes.push(fromBefore);
+    const listed = new Set<string>();
     if (isProjectRoot(core.registry, cell)) {
       const preset = cell.preset ? core.registry.presets.get(cell.preset) : undefined;
       const openActions = (preset?.actionBooks?.(core, cellId)?.list() ?? []).filter(a => a.status === "open");
@@ -399,10 +418,13 @@ export function createReadModel(core: KernelCore): ReadModel {
         notes.push("[your open actions]\n" + openActions.map(a =>
           `- ${a.id} [${a.owner}] "${a.title}"${a.cellId ? ` (cell ${a.cellId})` : ""}${a.phase ? ` (phase ${a.phase})` : ""}${a.nextStep && a.nextStep !== a.title ? ` — ${a.nextStep}` : ""}`
         ).join("\n"));
+        for (const a of openActions) listed.add(a.id);
       }
     }
+    // An action that is the owner's to do is shown once, under the actions above (track_action changes it); what is
+    // left here are the cards: questions and approvals raised with request_approval and the like.
     const cards = all<{action_id: string; category: string; subject_key: string; status: string; card: string}>(db, `SELECT action_id,category,subject_key,status,card FROM human_items
-      WHERE cell_id=? AND status IN ('pending','snoozed')`, [cellId]);
+      WHERE cell_id=? AND status IN ('pending','snoozed')`, [cellId]).filter(c => !listed.has(c.action_id));
     if (cards.length) notes.push("[your open cards]\n" + cards.map(c => {
       let title = "";
       let body = "";
@@ -482,9 +504,23 @@ export function createReadModel(core: KernelCore): ReadModel {
       WHERE cell_id IS NOT NULL AND category='decision' AND status IN ('pending','snoozed')`);
     const incidents = openIncidentWaits();
     const cardOwners = new Set(cards.map(card => card.cell_id));
-    const hasSource = (id: string) => working.has(id) || f.jobs.has(id) || f.due.has(id) || f.watching.has(id) || f.nextTimer.has(id) || cardOwners.has(id);
+    // A cell that itself waits for the owner and holds an open item of any kind (a card, or an action it recorded as
+    // the owner's) is woken when the owner acts on it, and can then answer whoever waits on it.
+    const itemOwners = new Set(all<{cell_id:string}>(db, `SELECT DISTINCT cell_id FROM human_items
+      WHERE cell_id IS NOT NULL AND status IN ('pending','snoozed')`).map(r => r.cell_id));
+    const askedOwner = new Set(core.waits.list().filter(w => w.waitingFor === WAIT_HUMAN && live.get(w.cellId)?.epoch === w.epoch && itemOwners.has(w.cellId)).map(w => w.cellId));
+    const hasSource = (id: string) => working.has(id) || f.jobs.has(id) || f.due.has(id) || f.watching.has(id) || f.nextTimer.has(id) || cardOwners.has(id) || askedOwner.has(id);
     const requests = inbox.listMessagesSync({status:["pending","claimed"]}).filter(m => m.envelope.delivery !== "silent_inject" &&
       (m.expectedEpoch === null || m.expectedEpoch === live.get(m.cellId)?.epoch));
+    // A result one of the coordinator's own leaves (a fixer) has just handed it, not yet taken in or still being
+    // worked on: the coordinator is about to act on it, for the projects that leaf was started for.
+    const resultFor = (target: string, project: string | undefined) => requests.some(m => {
+      if (m.cellId !== target || m.envelope.type !== PAYLOAD.cellResult) return false;
+      const child = allCells.get(waitTargetCell(m.envelope.from) ?? "");
+      if (!child || child.parentId !== target || !isLeafLifetime(child.spec.lifetime)) return false;
+      const related = child.spec.meta?.relatedProjectIds;
+      return !Array.isArray(related) || (project !== undefined && related.includes(project));
+    });
     function canAnswer(from: string, target: string, seen: Set<string>, wait?: WaitRecord): boolean {
       const t = live.get(target);
       if (!t || seen.has(target) || inCycle(target)) return false;
@@ -500,6 +536,7 @@ export function createReadModel(core: KernelCore): ReadModel {
         if (cards.some(c => c.cell_id === target && !c.subject_key.startsWith("kernel:stalled:") &&
           (c.subject_key === `cell:${from}` || refs.includes(c.subject_key) ||
           (!wait?.refId && project && JSON.parse(c.related_project_ids).includes(project))))) return true;
+        if (resultFor(target, project)) return true;
         if (!project) return false;
         return cells.children(target,{status:["active"]}).some(c => isLeafLifetime(c.spec.lifetime) &&
           Array.isArray(c.spec.meta?.relatedProjectIds) && c.spec.meta.relatedProjectIds.includes(project) && canAnswer(target, c.id, path));
@@ -555,11 +592,17 @@ export function createReadModel(core: KernelCore): ReadModel {
       "SELECT action_id,cell_id,related_project_ids,subject_key,category FROM human_items WHERE status IN ('pending','snoozed')");
     const incidents = new Set(openIncidentWaits().filter(i => waits.some(w => w.cellId === i.cellId && w.waitId === i.waitId && w.registrationId === i.registrationId)).map(i => i.actionId));
     const cards=open.filter(h=>incidents.has(h.action_id) || (h.cell_id && idSet.has(h.cell_id)) || (JSON.parse(h.related_project_ids) as string[]).includes(projectId ?? cellId));
-    const stranded = waits.some(w => waitTargetCell(w.waitingFor) !== null && !backed.includes(w));
+    const strandedWaits = waits.filter(w => waitTargetCell(w.waitingFor) !== null && !backed.includes(w));
+    const stranded = strandedWaits.length > 0;
     const human = cards.some(card => !stranded || card.category === "decision");
     if (human) why.push(`${cards.length} card(s) await the owner`);
 
     const stalled = !agent && !external && !internal && !human;
+    // Say what was actually found: a model told "the owner has no card" while its own notes list one stops trusting both.
+    const nothing = "nothing is running or queued, and no watch or timer is set";
+    const detail = !stalled ? why.join("; ")
+      : stranded ? `${nothing}; ${strandedWaits.map(w => `${w.cellId} waits for ${w.waitingFor} (${w.reason.replace(/\s+/g, " ").slice(0, 80)}), which has nothing in flight that would produce an answer`).join("; ")}${cards.length ? `; ${cards.length} open item(s) with the owner do not answer that wait` : ""}`
+      : `${nothing}, no open wait points at a live cell, and the owner has no card or open action`;
     return {
       cellId,
       agent: agent !== undefined,
@@ -568,7 +611,7 @@ export function createReadModel(core: KernelCore): ReadModel {
       human,
       parked: false,
       stalled,
-      detail: stalled ? "nothing is running or queued, no watch or timer is set, no open wait points at a live cell, and the owner has no card or open action" : why.join("; "),
+      detail,
     };
   }
 

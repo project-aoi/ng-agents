@@ -82,6 +82,7 @@ export function rebuildFreshPrompt(
   ports: RunPorts,
   tracked: ReadonlyMap<string, AppendedInput>,
   unconfirmed: readonly AppendedInput[],
+  history: readonly ModelMessage[] = snapshot.history,
 ): string {
   const entries = (ports.listEvidence?.({ afterSeq: snapshot.historyUptoSeq }) ?? []).filter((e) => e.record.runId === snapshot.runId);
   const progressed = entries.some(({ record }) => ["assistant_text", "tool_call", "tool_result"].includes(record.kind));
@@ -109,5 +110,5 @@ export function rebuildFreshPrompt(
   }
   for (const item of unconfirmed) include(item.envelopeId, item.text);
   if (progressed && !parts.length) parts.push("[Continue from the earlier work above and complete the task.]");
-  return freshPrompt([...snapshot.history, ...earlier], parts.join("\n\n"));
+  return freshPrompt([...history, ...earlier], parts.join("\n\n"));
 }

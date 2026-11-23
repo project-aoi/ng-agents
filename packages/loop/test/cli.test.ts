@@ -1,4 +1,4 @@
-import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -11,6 +11,7 @@ import {
   RUN_ALREADY_ENDED,
   RUN_ENDED_NOTICE,
   STANDARD_TOOLSETS,
+  WORKBENCH_CELL_ENV,
   type CliDebugEvent,
   type CliSessionRecord,
 } from "../src";
@@ -174,8 +175,8 @@ describe.each(ENGINES)("CLI loop with a fake %s", (engine) => {
     expect(tools).not.toContain("read");
     expect(tools).not.toContain("bash");
     expect(tools).not.toContain("job_start"); // job tools need bash, which a read-only cell lacks
-    // secrets and kernel configuration never reach the CLI
-    for (const e of s.fake.log().filter((x) => x.type === "argv")) expect(e["envNames"]).toEqual([]);
+    // secrets and kernel configuration never reach the CLI — only the mark that a workbench cell started it
+    for (const e of s.fake.log().filter((x) => x.type === "argv")) expect(e["envNames"]).toEqual([WORKBENCH_CELL_ENV]);
   });
 
 
@@ -443,6 +444,79 @@ describe.each(ENGINES)("CLI loop with a fake %s", (engine) => {
     expect(launches(s)[0]!.session).toBeUndefined();
     expect(s.fake.prompts()[0]).toContain("from the parent's history");
   });
+  // Audit 2026-11-23 E11: a forked project in its own directory ran under the desk's role prompt, its real role only
+  // in a user message.
+  it("gives a fork_prefix child that cannot continue the parent's session its own system prompt", async () => {
+    const s = setup(engine,[{actions:[{text:"fresh child"}]}]);
+    const child = s.run({
+      cellId:"child", parentId:"parent", system:"You are the owner's desk.",
+      spec:{processor:{kind:"llm",toolsets:TOOLSETS},contextMode:"fork_prefix",fork:{fromCellId:"parent",uptoSeq:1}},
+      history:[{role:"user",content:[{type:"text",text:"from the parent's history"}]}, {role:"user",content:[{type:"text",text:`${FORK_NOTE_PREFIX} "parent" …\n\n## Your instructions\nYou are a project.`}]}],
+    });
+    child.snapshot.system.own = "You are a project.";
+    child.ports.state.set(CLI_FORK_SESSION_KEY,{engine,sessionId:"parent",model:null,cwd:tempDir("another-workdir"),systemHash:"parent",lastDeliveredEvidenceSeq:1});
+    expect(await runOf(s,child)).toBe("completed");
+    expect(launches(s)[0]!.session).toBeUndefined();
+    const [system] = systemTexts(s);
+    expect(system).toContain("You are a project.");
+    expect(system).not.toContain("You are the owner's desk.");
+    const prompt = s.fake.prompts()[0]!;
+    // The parent's context is still there as background; the role is no longer repeated in a user message.
+    expect(prompt).toContain("from the parent's history");
+    expect(prompt).toContain(`${FORK_NOTE_PREFIX} "parent"`);
+    expect(prompt).not.toContain("## Your instructions");
+  });
+
+  // Audit 2026-11-23 E09: the kernel asked for one closing sentence and then threw it away — the desk's "方案已提交，
+  // 等你确认" never reached the owner.
+  it("keeps what the model says after the tool that ended the run", async () => {
+    const s = setup(engine, [{ actions: [{ mcp: "wait", args: { reason: "等主人确认", waitingFor: "human" } }, { text: "方案已提交到待我处理，等你确认后开始。" }] }]);
+    const r = s.run();
+    expect(await runOf(s, r)).toBe("yielded_waiting");
+    expect(r.ports.log.evidence.filter((e) => e.kind === "assistant_text").map((e) => e.text)).toEqual(["方案已提交到待我处理，等你确认后开始。"]);
+  });
+
+  // Audit 2026-11-23 E33: a kernel killed in the middle of a cell's first turn lost the CLI session (it was put on
+  // record only when the Run ended), so the next Run primed a second session with the same task.
+  it("puts a new session on record as soon as it has made progress, not only when the run ends", async () => {
+    const hold = join(tempDir("first-turn"), "release");
+    const s = setup(engine, [{ actions: [{ mcp: "set_state", args: { patches: { step: 1 } } }, { waitFile: hold }, { text: "done" }] }]);
+    const r = s.run();
+    const outcome = runOf(s, r);
+    await waitFor(() => r.ports.log.evidence.some((e) => e.kind === "tool_result" && e.name === "set_state"), "first progress");
+    await waitFor(() => r.ports.state.has(CLI_SESSION_KEY), "the session record while the run is still in flight");
+    const mid = r.ports.state.get(CLI_SESSION_KEY) as CliSessionRecord;
+    expect(mid).toMatchObject({ engine, runs: 0 });
+    writeFileSync(hold, "");
+    expect(await outcome).toBe("completed");
+    expect(r.ports.state.get(CLI_SESSION_KEY)).toMatchObject({ sessionId: mid.sessionId, runs: 1 });
+  });
+
+  // Audit 2026-11-23 E15: the first task was sent again at every wake-up of a session that already held it.
+  it("leaves the original-task reminder out when it continues a session", async () => {
+    const s = setup(engine, [{ actions: [{ text: "one" }] }, { actions: [{ text: "two" }] }, { actions: [{ text: "three" }] }]);
+    const reminder = "[original task] (as first given — later messages may have changed it) parent=proj do five retries";
+    const withTask = (opts: Partial<FakeRunOptions>) => {
+      const r = s.run({ tailNotes: [reminder], ...opts });
+      r.snapshot.tail.originalTask = reminder;
+      return r;
+    };
+    const first = withTask({ runId: "run_1" });
+    expect(await runOf(s, first)).toBe("completed");
+    expect(s.fake.prompts()[0]).toContain(reminder);
+    const second = withTask({ runId: "run_2", batch: ["make it three retries"] });
+    second.ports.state.set(CLI_SESSION_KEY, first.ports.state.get(CLI_SESSION_KEY));
+    expect(await runOf(s, second)).toBe("completed");
+    expect(launches(s)[1]!.session?.mode).toBe("resume");
+    expect(s.fake.prompts()[1]).toContain("make it three retries");
+    expect(s.fake.prompts()[1]).not.toContain("[original task]");
+    // A session that has to be built anew gets it back.
+    const third = withTask({ runId: "run_3", batch: ["and add a test"] });
+    expect(await runOf(s, third)).toBe("completed");
+    expect(launches(s)[2]!.session).toBeUndefined();
+    expect(s.fake.prompts()[2]).toContain(reminder);
+  });
+
   it("continues a fork_prefix child from the parent's CLI session when the CLI can fork", async () => {
     const s = setup(engine, [{ actions: [{ text: "parent" }] }, { actions: [{ text: "child" }] }]);
     const parent = s.run({ cellId: "parent", runId: "run_p" });

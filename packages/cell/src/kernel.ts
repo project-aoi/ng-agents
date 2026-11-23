@@ -46,6 +46,7 @@ import { createModelSettings, createRunnerSettings, type ModelSettings } from ".
 import { createReadModel } from "./readmodel";
 import { inspectCell } from "./inspect";
 import { ccDirectChat, directMessage, isPersonPrincipal, sendCellMessage } from "./messages";
+import { controlWithRecord } from "./pauses";
 import { ingest } from "./routing";
 import { createStallMonitor } from "./stall";
 import type { Kernel, KernelOptions } from "./types";
@@ -132,7 +133,7 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     dataDir,
     registry,
     rosterProvider: (cellId) => core.readModel.childSummaries(cellId),
-    tailNotesProvider: (cellId) => core.readModel.tailNotes(cellId),
+    tailNotesProvider: (cellId, incoming) => core.readModel.tailNotes(cellId, incoming),
     ...opts.context,
   });
   const workspace = createWorkspaceManager({
@@ -440,6 +441,7 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     control: (cellId, cmd, o) => {
       const principalId = requirePrincipalId(o?.principalId);
       const command = { action: cmd.action, principalId,...(cmd.pauseReason ? {pauseReason:cmd.pauseReason} : {}), ...(cmd.steerMessage !== undefined ? { steerMessage: cmd.steerMessage } : {}) };
+      if (cmd.action === "pause" || cmd.action === "resume") return controlWithRecord(core, cellId, { action: cmd.action, principalId, ...(cmd.pauseReason ? { pauseReason: cmd.pauseReason } : {}) }, cmd.note);
       if (cmd.action !== "steer" || !isPersonPrincipal(core, principalId)) return inbox.controlSync(cellId, command);
       // A person's steer is a direct message like any other: the worker's parent gets the words in the same transaction.
       return withTx(db, () => {

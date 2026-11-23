@@ -133,7 +133,7 @@ async function sendToInbox(ctx: ToolContext, to: `inbox:${string}`, args: { text
 }
 
 /**
- * `kernel.comms`: send_message, request_approval, report_to_parent, handback, wait, complete_self, pause_self.
+ * `kernel.comms`: send_message, request_approval, withdraw_card, report_to_parent, handback, wait, clear_wait, complete_self, pause_self.
  */
 export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
   const deskCellId = opts.deskCellId ?? DESK_CELL_ID;
@@ -165,14 +165,16 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
     description: [
       "Ask the owner to decide before you go on (not for plain notifications — send_message handles those).",
       "project: propose a multi-step project (on the desk, prefer propose_project so cwd, repos and phases are preserved); escalation: you are blocked or out of retries and need a decision; action: approve one specific operation (e.g. merging a PR or advancing a phase).",
-      "When you pass custom options or relatedProjectIds on an escalation (or an action without execute/action), this creates a workbench decision card with those explicit reply choices. Usually ends the run; you are woken with approval.resolved (or approval.revise if the owner asks for a revision).",
+      "When you pass custom options or relatedProjectIds on an escalation (or an action without execute/action), this creates a workbench decision card with those explicit reply choices.",
+      "artifactId (escalation or action): a draft the card is about — the card is bound to its current version, the owner can edit it there, and the decision names the version they saw (humanEdited, artifactVersion).",
+      "Raising the card ends your run: write any chat reply or message first. You are woken with approval.resolved (or approval.revise if the owner asks for a revision).",
     ].join(" "),
     input: z.object({
       kind: z.enum(["project", "escalation", "action"]),
       options: z.array(z.object({
         id: z.string().min(1).describe("stable option id returned in approval.resolved.optionId"),
         label: z.string().min(1).describe("short Chinese button label shown to the owner"),
-        effect: z.enum(["reply","revise","execute","defer","terminate","complete"]).describe('reply: return the owner\'s choice/note to you; execute: approve a protected action; terminate: decline or cancel a project; revise: ask you to redraft; defer: snooze'),
+        effect: z.enum(["reply","revise","execute","defer","terminate"]).describe('reply: return the owner\'s choice/note to you; execute: approve a protected action; terminate: decline or cancel a project; revise: ask you to redraft; defer: snooze'),
         primary: z.boolean().optional().describe("highlight as the primary button"),
         group: z.enum(["main","more"]).optional().describe("main button bar or secondary overflow menu"),
         hint: z.string().optional().describe("short Chinese explanation under the choice"),
@@ -209,17 +211,23 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
         .optional()
         .describe("kind escalation"),
       action: z.object({ name: z.string().min(1), args: z.unknown().optional() }).optional().describe("kind action"),
+      artifactId: z.string().min(1).optional().describe("escalation or action: the draft (artifact) the card is about; the card is bound to its current version"),
     }),
     async handler(args, ctx) {
       const subjectKey = args.subjectKey ?? defaultSubjectKey(ctx);
       const protectedAction = args.kind === "project";
+      // A draft card: bound to the version that exists now (a project proposal keeps its own plan draft).
+      const draft = args.artifactId && !protectedAction ? await ctx.ports.context.getArtifact(args.artifactId) : null;
+      if (args.artifactId && !protectedAction && !draft) return { output: `There is no artifact ${args.artifactId}: save the draft first (save_artifact), then put its id on the card.`, isError: true };
+      const bound = (v: number | undefined) => (draft && v !== undefined ? ` It is bound to ${draft.artifactId} v${v}: when the decision says humanEdited or a newer artifactVersion, read_artifact before you act on it.` : "");
       if (!protectedAction && (args.kind !== "action" || (!args.action && !args.options?.some(o => o.effect === "execute"))) && (args.options || args.relatedProjectIds)) {
         if (!ctx.ports.createHumanItem) return { output: "Custom cards are unavailable.", isError: true };
         const item = ctx.ports.createHumanItem({
           title: args.title, description: args.escalation?.explanation ?? args.summary, prep:prepOf(args.prep), source:itemSource(ctx.snapshot), rawInput:itemRawInput(ctx.snapshot), subjectKey: args.subjectKey ?? `arb:${primaryEnvelope(ctx.snapshot)?.id ?? ctx.snapshot.runId}`,
           options: args.options ?? [{ id: "reply", label: "回复", effect: "reply" }], relatedProjectIds: args.relatedProjectIds ?? [],
+          ...(draft ? { artifactId: draft.artifactId } : {}),
         });
-        return { output: `Card ${item.id} is waiting for a decision.`, data: item, endRun: "deferred_for_approval" };
+        return { output: `Card ${item.id} is waiting for a decision.${bound(draft?.version)}`, data: { ...item, ...(draft ? { artifactId: draft.artifactId, artifactVersion: draft.version } : {}) }, endRun: "deferred_for_approval" };
       }
       const base = { subjectKey, title: args.title, source: itemSource(ctx.snapshot), rawInput: itemRawInput(ctx.snapshot), prep: prepOf(args.prep) };
       let action: ProposedAction;
@@ -287,11 +295,16 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
       }
       if (args.options) action.cardOptions = args.options;
       if (args.relatedProjectIds) action.relatedProjectIds = args.relatedProjectIds;
+      if (draft) {
+        // Binds the decision to the draft version the owner saw, as for a project proposal.
+        action.artifactId = draft.artifactId;
+        artifactVersion = draft.version;
+      }
       const decision = await ctx.ports.authorize(action, artifactVersion !== undefined ? { artifactVersion } : undefined);
       if (decision.type === "deny") return { output: decision.feedback, isError: true, data: { decision: "deny" } };
       if (decision.type === "allow") return { output: "Approved.", data: { decision: "allow" } };
       return {
-        output: `Waiting for the owner's decision (card ${decision.actionId}). You will receive approval.resolved with the outcome.`,
+        output: `Waiting for the owner's decision (card ${decision.actionId}). You will receive approval.resolved with the outcome.${bound(decision.boundArtifactVersion)}`,
         endRun: "deferred_for_approval",
         data: { decision: "defer", actionId: decision.actionId, boundArtifactVersion: decision.boundArtifactVersion },
       };
@@ -469,6 +482,29 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
       return { output: removed ? "Wait cleared." : "No such open wait.", data: { waitId, removed } };
     },
   });
+  const withdrawCard = defineTool({
+    name: "withdraw_card",
+    kind: "kernel",
+    description:
+      "Take back a card or human action that you (or a cell below you) raised and the owner has not decided yet — the plan changed, a project took it over, or it is no longer needed. It leaves the owner's list.",
+    input: z.object({
+      id: z.string().trim().min(1).describe("the card's id"),
+      reason: z.string().trim().min(1).describe("why, in plain Chinese (the owner can see it)"),
+    }),
+    async handler(args, ctx) {
+      const withdraw = ctx.ports.withdrawHumanItem;
+      if (!withdraw) return { output: "Cards cannot be withdrawn in this environment.", isError: true };
+      const r = withdraw.call(ctx.ports, args.id, args.reason);
+      switch (r) {
+        case "withdrawn":
+          return { output: `Withdrew ${args.id}: it is off the owner's list.`, data: { id: args.id, result: r } };
+        case "not_pending":
+          return { output: `${args.id} is no longer waiting for the owner (already decided, done or withdrawn); nothing changed.`, data: { id: args.id, result: r } };
+        case "not_found":
+          return { output: `There is no card ${args.id} raised by you or a cell below you.`, isError: true, data: { id: args.id, result: r } };
+      }
+    },
+  });
   const completeSelf = defineTool({
     name: "complete_self",
     kind: "kernel",
@@ -515,7 +551,7 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
   });
   return {
     name: COMMS_TOOLSET,
-    description: "Workbench notifications and messages to other cells, approval requests, reports to the parent, handback, wait, complete_self / pause_self.",
-    tools: [sendMessage, requestApproval, reportToParent, handback, wait, clearWait, completeSelf, pauseSelf],
+    description: "Workbench notifications and messages to other cells, approval requests and withdrawing them, reports to the parent, handback, wait, complete_self / pause_self.",
+    tools: [sendMessage, requestApproval, withdrawCard, reportToParent, handback, wait, clearWait, completeSelf, pauseSelf],
   };
 }

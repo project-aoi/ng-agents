@@ -4,23 +4,44 @@
 // server instructions and every call are served by the workbench's own agent API (`/api/agent/tools`), so this file
 // never goes out of date with the server it talks to.
 //
-//   NG_DESK_URL        base URL of the workbench   (default http://127.0.0.1:8790)
-//   NG_MCP_TIMEOUT_MS  how long one call may take  (default 120000)
+//   NG_DESK_URL           base URL of the workbench   (default http://127.0.0.1:8790)
+//   NG_MCP_TIMEOUT_MS     how long one call may take  (default 120000)
+//   NG_WORKBENCH_CELL_ID  set by the workbench on every background CLI it starts: this server then runs inside one of
+//                         the workbench's own cells and offers none of the owner's tools (see `insideCell` below)
+//
+// Each run of this server is one session of the owner's agent: it names it with its own conversation id (sent as the
+// x-ng-conversation-id header), so the desk can tell two terminals apart.
 //
 // Plain ESM without dependencies: any Node >= 18 runs it straight from the source tree, e.g.
 //   claude mcp add ng-desk -- node /path/to/ng-agents/apps/gtd-desk/bin/ng-mcp.mjs
 //   codex  mcp add ng-desk -- node /path/to/ng-agents/apps/gtd-desk/bin/ng-mcp.mjs
+import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
 
 const base = (process.env.NG_DESK_URL || "http://127.0.0.1:8790").replace(/\/+$/, "");
 const SUPPORTED = ["2025-06-18", "2025-03-26", "2024-11-05"];
 const CALL_TIMEOUT_MS = Number(process.env.NG_MCP_TIMEOUT_MS) || 120_000;
+const CELL_ID = (process.env.NG_WORKBENCH_CELL_ID || "").trim();
+const SESSION = randomUUID().replace(/-/g, "").slice(0, 12);
+let clientName = "mcp";
+/** This session's conversation with the owner: the client's name and a random part, e.g. "codex-mcp-client-3f9a…". */
+const conversationId = () => `${clientName}-${SESSION}`;
+
+/**
+ * The owner's control plane is the owner's. A background CLI the workbench started (one of its own cells) may load the
+ * owner's plugins too; then this server answers, but offers nothing that acts on the workbench: one inert tool that
+ * says why, and no HTTP call at all (the system must not hand its own cells the owner's rights).
+ */
+const insideCell = CELL_ID
+  ? `The ng-desk tools are the owner's control plane of the ng-agents workbench. This process runs inside the workbench's own background cell ${CELL_ID}, where that control plane is not available: you are not the owner's main agent here, and the ng-desk skill does not apply to you. Do not call the workbench's HTTP API either. Use your own cell's tools and report to whoever gave you your task.`
+  : null;
 
 async function http(method, path, body) {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), CALL_TIMEOUT_MS);
   try {
-    const res = await fetch(`${base}${path}`, { method, headers: { "content-type": "application/json" }, ...(body !== undefined ? { body: JSON.stringify(body) } : {}), signal: ctl.signal });
+    const headers = { "content-type": "application/json", "x-ng-conversation-id": conversationId() };
+    const res = await fetch(`${base}${path}`, { method, headers, ...(body !== undefined ? { body: JSON.stringify(body) } : {}), signal: ctl.signal });
     const text = await res.text();
     let json;
     try {
@@ -62,15 +83,20 @@ async function handle(msg) {
   const isRequest = id !== undefined && id !== null;
   switch (method) {
     case "initialize": {
+      const client = typeof params?.clientInfo?.name === "string" ? params.clientInfo.name.replace(/[^\w.:-]+/g, "-").slice(0, 40) : "";
+      if (client) clientName = client;
       let instructions;
       let name = "ng-desk";
-      try {
-        const c = await loadCatalog();
-        instructions = c.instructions;
-        name = c.server || name;
-      } catch (err) {
-        // Still answer: the client must be able to list tools later, and the agent should learn why nothing works.
-        instructions = `ng-agents workbench tools — currently unavailable. ${err instanceof Error ? err.message : String(err)}`;
+      if (insideCell) instructions = insideCell;
+      else {
+        try {
+          const c = await loadCatalog();
+          instructions = c.instructions;
+          name = c.server || name;
+        } catch (err) {
+          // Still answer: the client must be able to list tools later, and the agent should learn why nothing works.
+          instructions = `ng-agents workbench tools — currently unavailable. ${err instanceof Error ? err.message : String(err)}`;
+        }
       }
       const requested = params?.protocolVersion;
       reply(id, {
@@ -85,6 +111,10 @@ async function handle(msg) {
       if (isRequest) reply(id, {});
       return;
     case "tools/list": {
+      if (insideCell) {
+        reply(id, { tools: [{ name: "not_available_in_workbench_cell", description: insideCell, inputSchema: { type: "object", properties: {} } }] });
+        return;
+      }
       try {
         const c = await loadCatalog();
         reply(id, { tools: c.tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })) });
@@ -99,6 +129,10 @@ async function handle(msg) {
     case "tools/call": {
       const name = params?.name;
       if (typeof name !== "string" || !name) return fail(id, -32602, "tools/call needs a tool name");
+      if (insideCell) {
+        reply(id, { content: [{ type: "text", text: insideCell }], isError: true });
+        return;
+      }
       try {
         const r = await http("POST", `/api/agent/tools/${encodeURIComponent(name)}`, params?.arguments ?? {});
         const text = typeof r.json?.text === "string" ? r.json.text : (r.json?.error?.message ?? `HTTP ${r.status}`);

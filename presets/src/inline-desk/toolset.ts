@@ -61,6 +61,17 @@ function prepOf(p: z.infer<typeof prepInput> | undefined, fallback: string) {
   return cardPrep(p?.summary ?? fallback, (p?.checked ?? []).map((c) => ({ label: c.label, uri: c.uri, ...(c.detail ? { detail: c.detail } : {}) })));
 }
 
+const PHASES_TEXT =
+  "staged work, only when the owner wants to look at each stage before the next starts (a small change is not staged): the phases in order; the project runs one at a time, each after the owner's go-ahead — a phase that is the owner's own to do needs none, their ticking it off is the go-ahead";
+
+/** Take back a card a project now carries; says what happened. */
+function withdrawn(ctx: ToolContext, id: string, reason: string): string {
+  const r = ctx.ports.withdrawHumanItem?.(id, reason);
+  if (r === "withdrawn") return `Card ${id} was withdrawn: the project carries it now.`;
+  if (r === "not_pending") return `Card ${id} was no longer waiting for the owner, so nothing was withdrawn.`;
+  return `There is no card ${id} of yours to withdraw; nothing else changed.`;
+}
+
 /** `gtd.desk`: the desk's GTD-aware composites. Each one runs the desk's bookkeeping for this wake-up first. */
 export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
   const owner = "channel:ui:owner";
@@ -190,24 +201,34 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
   const presentToOwner = tool({
     name: "present_to_owner",
     description:
-      "Put an item in front of the owner on a card when they should see or acknowledge it but nothing goes out (e.g. something they moved back from the archive, a finding they must know about). One card per item; confirming just files it as seen.",
+      "Put an item in front of the owner on a card when they should see or acknowledge it but nothing goes out (e.g. something they moved back from the archive, a finding they must know about, a draft they want to edit before it is final). One card per item; confirming just files it as seen. It ends your run: write any chat reply first.",
     input: z.object({
       title: z.string().min(1).describe("card title in Chinese"),
       summary: z.string().min(1).describe("what it is and what (if anything) the owner might do, in Chinese"),
       prep: prepInput.optional(),
+      artifactId: z.string().min(1).optional().describe("a draft saved with save_artifact that the card is about: the card is bound to its current version, the owner can edit it there, and their decision names the version they saw"),
+      subjectKey: z.string().min(1).optional().describe("when redrafting a pending card after approval.revise, its subjectKey: that card is updated instead of a second one raised"),
     }),
     async run(args, ctx) {
       const { ports } = ctx;
       const t = now(ctx);
       const env = currentItem(ctx);
-      const subjectKey = env ? subjectKeys.inbound(env.id) : subjectKeys.cell(self(ctx));
+      const subjectKey = args.subjectKey?.trim() || (env ? subjectKeys.inbound(env.id) : subjectKeys.cell(self(ctx)));
       if (!ports.createHumanItem) throw new Error("Human inbox is unavailable");
+      const draft = args.artifactId ? await ports.context.getArtifact(args.artifactId) : null;
+      if (args.artifactId && !draft) return { output: `There is no artifact ${args.artifactId}: save the draft first (save_artifact), then put its id on the card.`, isError: true };
       const item = ports.createHumanItem({
         title: args.title, description: args.summary, subjectKey,
         source: itemSource(env, t), rawInput: itemRawInput(env), prep: prepOf(args.prep, ""),
-        options: [{ id: "acknowledge", label: "知道了", effect: "reply" }],
+        options: draft
+          ? [{ id: "final", label: "定稿", effect: "reply" }, { id: "revise", label: "请修改", effect: "revise", input: { mode: "required" } }]
+          : [{ id: "acknowledge", label: "知道了", effect: "reply" }],
+        ...(draft ? { artifactId: draft.artifactId } : {}),
       });
-      return { output: "The card is waiting for the owner.", endRun: "deferred_for_approval", data: item };
+      const bound = draft
+        ? ` It is bound to ${draft.artifactId} v${draft.version}; the owner may edit the draft before deciding — when the decision says humanEdited or a newer artifactVersion, read_artifact before you act on it.`
+        : "";
+      return { output: `The card is waiting for the owner.${bound}`, endRun: "deferred_for_approval", data: { ...item, ...(draft ? { artifactId: draft.artifactId, artifactVersion: draft.version } : {}) } };
     },
   });
 
@@ -298,6 +319,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
       "Start a project for anything that takes more than a quick lookup (a task, a todo, a code change, research, an idea). A persistent project cell plans it, keeps its records and its report, and hands every piece of heavy work to workers; it starts at once and the owner gets a short notice.",
       "Put everything it needs into brief: the owner's exact words, constraints, links, what to deliver. cwd is the absolute path of the repository on this machine — ask the owner when you do not know it.",
       'mode "research_then_park" for an idea the owner only wants to keep for later: the project researches what it should be, saves a report and parks itself as someday.',
+      "itemId: a card of yours this project takes over (e.g. the one raised for a source hit) — it is withdrawn once the project has started.",
     ].join(" "),
     input: z.object({
       title: z.string().min(1).describe("short Chinese title shown in the owner's project list"),
@@ -306,8 +328,9 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
       cwd: z.string().optional().describe("absolute path of the directory the work happens in"),
       repos: z.array(repoInput).optional().describe("the repositories involved, when there are several"),
       mode: z.enum(["now", "research_then_park"]).optional(),
-      phases: z.array(z.string().min(1)).optional().describe("staged work: phases in order; the project runs one at a time, each after the owner's go-ahead"),
+      phases: z.array(z.string().min(1)).optional().describe(PHASES_TEXT),
       plan: planInput.optional(),
+      itemId: z.string().min(1).optional().describe("the id of a card of yours that this project takes over; it is withdrawn when the project starts"),
       continueConversation: z.boolean().optional().describe("the project continues from this conversation (it sees what you just discussed)"),
       ...runnerSelectionInput,
     }),
@@ -337,7 +360,8 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
       }
       const park = args.mode === "research_then_park";
       await notifyOwner(ctx.ports, park ? `已记下：${args.title}，先做个调研，完成后放进以后再说` : `已立项：${args.title}，后台开始推进`, `start:${r.projectId}`);
-      return `Started project ${r.projectId}「${args.title}」 and told the owner. Pass later changes to it with steer_item; stop it with stop_item.`;
+      const card = args.itemId ? ` ${withdrawn(ctx, args.itemId, `已由项目「${args.title}」接手`)}` : "";
+      return `Started project ${r.projectId}「${args.title}」 and told the owner. Pass later changes to it with steer_item; stop it with stop_item.${card}`;
     },
   });
 
@@ -347,6 +371,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
     description: [
       "Propose a project whose plan needs the owner's sign-off first (large, costly, or built on assumptions): one proposal card where the owner can edit the plan, approve it, or park it for later.",
       "On approval the project starts with the plan they approved automatically (apply_updates shows it). When revising an existing proposal after approval.revise, pass its original subjectKey so this updates the existing card instead of creating a duplicate.",
+      "It ends your run: write any chat reply first.",
     ].join(" "),
     input: z.object({
       title: z.string().min(1),
@@ -356,7 +381,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
       prep: prepInput.optional(),
       cwd: z.string().optional().describe("absolute path of the directory the work happens in"),
       repos: z.array(repoInput).optional(),
-      phases: z.array(z.string().min(1)).optional(),
+      phases: z.array(z.string().min(1)).optional().describe(PHASES_TEXT),
       subjectKey: z.string().min(1).optional().describe("when redrafting a pending proposal after approval.revise, reuse the original subjectKey to replace the existing card"),
       ...runnerSelectionInput,
     }),
@@ -410,7 +435,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
     switch (r.status) {
       case "delivered":
         return r.targetStatus === "paused"
-          ? { output: `${id} is parked: it reads this when it is resumed (reactivate_item resumes it now).` }
+          ? { output: `${id} is parked: the message is queued and it reads it when it is resumed. To resume it now, call reactivate_item without a message — the words are already with it.` }
           : { output: delivered };
       case "closed":
         return { output: closedItem(id), isError: true };
@@ -472,20 +497,29 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
   const reactivateItem = tool({
     name: "reactivate_item",
     description:
-      "Bring a parked project (someday, or paused) back: it is resumed and gets the owner's words; it continues from its records and its report instead of starting over.",
-    input: z.object({ itemId: z.string().min(1), message: z.string().min(1).describe("what the owner said: go ahead, the changed scope, the next phase") }),
+      "Bring a parked project (someday, or paused) back: it is resumed and gets the owner's words; it continues from its records and its report instead of starting over. Leave message out when you already passed the owner's words to it with steer_item: it reads them when it resumes.",
+    input: z.object({ itemId: z.string().min(1), message: z.string().min(1).optional().describe("what the owner said: go ahead, the changed scope, the next phase") }),
     async run(args, ctx) {
       const { ports } = ctx;
+      // The words go in first: on resume the project reads them before any of its workers takes up an older instruction.
+      let queued = false;
+      if (args.message) {
+        if (!ports.sendToCell) return { output: "Messages to items are not available in this environment.", isError: true };
+        const s = await ports.sendToCell(`inbox:${args.itemId}`, { text: args.message, summary: "主人要继续推进", id: `${ctx.snapshot.runId}:${ctx.toolUseId}:resume` });
+        if (s.status !== "delivered") return sendResult(args.itemId, s, "");
+        queued = true;
+      }
+      const words = queued ? " The owner's words are queued for it and are read when it is resumed." : "";
       let r;
       try {
         r = await ports.controlCell(args.itemId, { action: "resume" });
       } catch (err) {
-        return { output: `There is no item ${args.itemId} under the desk (${errorText(err)}).`, isError: true };
+        return { output: queued ? `${args.itemId} was not resumed (${errorText(err)}).${words}` : `There is no item ${args.itemId} under the desk (${errorText(err)}).`, isError: true };
       }
-      if (!r.applied) return { output: `Not resumed: ${r.reason ?? "refused"}.`, isError: true };
-      if (!ports.sendToCell) return { output: "Messages to items are not available in this environment.", isError: true };
-      const s = await ports.sendToCell(`inbox:${args.itemId}`, { text: args.message, summary: "主人要继续推进", id: `${ctx.snapshot.runId}:${ctx.toolUseId}:resume` });
-      return sendResult(args.itemId, s, `Resumed ${args.itemId} and passed on the owner's words; it continues from its records and report.`);
+      if (!r.applied) return { output: `Not resumed: ${r.reason ?? "refused"}.${words}`, isError: true };
+      return queued
+        ? `Resumed ${args.itemId} and passed on the owner's words; it continues from its records and report.`
+        : `Resumed ${args.itemId}; it reads the messages queued for it and continues from its records and report.`;
     },
   });
 

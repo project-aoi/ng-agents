@@ -5,6 +5,7 @@ export {
   CLI_SESSION_KEY,
   CLI_FORK_SESSION_KEY,
   CLI_MCP_SERVER,
+  WORKBENCH_CELL_ENV,
   RUN_ENDED_NOTICE,
   RUN_ALREADY_ENDED,
   type CliAgentLoopOptions,
@@ -25,7 +26,7 @@ export {
   type AgentBackendSetting,
 } from "./env";
 export { claudeAdapter, claudeArgs, claudeBuiltinTools } from "./adapters/claude";
-export { codexAdapter, codexArgs, codexSandboxMode } from "./adapters/codex";
+export { codexAdapter, codexArgs, codexSandboxMode, WORKBENCH_AGENT_PLUGIN } from "./adapters/codex";
 export { agyAdapter, agyArgs, agyPermissionAllowed } from "./adapters/agy";
 export { kernelSystem } from "./instructions";
 export { renderTranscript, tailText, freshPrompt, forkNoteIndex, FORK_NOTE_PREFIX } from "./render";

@@ -83,7 +83,7 @@ const isKernelNotice = (env: Envelope) => env.type.startsWith("kernel.");
  * records as they are now and changes only what is still out of step.
  *
  * 1. First Run: the record and the planned actions from the task's seed.
- * 2. A child's `cell.result`: the action it carried is done (completed); otherwise it stays open — still with a
+ * 2. A child's `cell.result`: the actions it carried are done (completed); otherwise they stay open — still with a
  *    dormant worker, which can be told what to change, or without a cell when the child is gone (the model
  *    re-dispatches or re-plans). A later turn of a worker whose action is already closed changes nothing here.
  * 4. Every open direct child is on the books: one started with plain spawn_cell (no action names it) gets an action too.
@@ -117,18 +117,19 @@ export async function prepareProjectRun({ snapshot, ports, clock }: PrepareRunIn
     for (const a of seeded.actions) if (!actions.has(a.id)) set(a);
   }
 
-  const carrying = (cellId: string) => [...actions.values()].find((a) => a.status === "open" && a.owner !== "human" && a.cellId === cellId);
+  // Every open action the child carries: a worker that was sent a second piece of work (track_action with its cellId)
+  // carries two, and its turn settles both — the kernel tells the model which ones were closed.
+  const carrying = (cellId: string) => [...actions.values()].filter((a) => a.status === "open" && a.owner !== "human" && a.cellId === cellId);
   for (const env of batch) {
     if (isEnvelopeOfType(env, "cell.result")) {
       const p = env.payload as CellResultPayload;
-      const a = carrying(p.childCellId);
-      if (!a) continue;
-      if (p.status === "completed") {
-        set(patchAction(a, { status: "done", ...(p.artifactId ? { artifactId: p.artifactId } : {}) }, now));
-      } else if (p.childState !== "dormant") {
-        set(patchAction(a, { cellId: null }, now));
+      for (const a of carrying(p.childCellId)) {
+        if (p.status === "completed") {
+          set(patchAction(a, { status: "done", ...(p.artifactId ? { artifactId: p.artifactId } : {}) }, now));
+        } else if (p.childState !== "dormant") {
+          set(patchAction(a, { cellId: null }, now));
+        }
       }
-
     }
   }
 

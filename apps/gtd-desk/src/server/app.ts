@@ -158,7 +158,7 @@ export function createDeskApp(deps: DeskAppDeps): Hono {
     if (limit === 0) throw new DeskError(400, "invalid_argument", "limit 必须是正整数");
     return c.json(desk.timeline(c.req.param("cellId"), { ...(afterSeq !== undefined ? { afterSeq } : {}), ...(beforeSeq !== undefined ? { beforeSeq } : {}), ...(limit !== undefined ? { limit } : {}) }));
   });
-  app.get("/api/resources", (c) => c.json(desk.resource(c.req.query("uri") ?? "", intQuery(c, "offset") ?? 0, intQuery(c, "limit") ?? undefined)));
+  app.get("/api/resources", (c) => c.json(desk.resource(c.req.query("uri") ?? "", intQuery(c, "offset") ?? 0, intQuery(c, "limit") ?? undefined, c.req.query("cellId") || undefined)));
   app.post("/api/cells/:cellId/messages", async (c) => c.json(desk.sendCellMessage(c.req.param("cellId"), await body(c), ownerActor)));
   app.post("/api/cells/:cellId/control", async (c) => c.json(await desk.cellControl(c.req.param("cellId"), await body(c), ownerActor)));
   app.post("/api/cells/:cellId/trigger", (c) => c.json(desk.cellTrigger(c.req.param("cellId"), ownerActor)));

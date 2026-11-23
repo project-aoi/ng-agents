@@ -140,6 +140,49 @@ describe("kernel.comms request_approval / report_to_parent / handback / wait", (
     expect(asDecisionCard(action.card?.data)).toMatchObject({ cardType: "escalation", escalation: { reason: "retry_limit" } });
   });
 
+  it("E07: binds a card to a draft's current version — a custom card through the draft, a gated one through authorize", async () => {
+    const run = fakeRun();
+    const drafts: unknown[] = [];
+    run.ports.createHumanItem = (draft) => (drafts.push(draft), { id: "act_card", itemRevision: 1 });
+    const saved = await invoke(run, "save_artifact", { title: "短信草稿", body: "v1" });
+    const id = (saved.data as { artifactId: string }).artifactId;
+    await invoke(run, "save_artifact", { artifactId: id, expectedVersion: 1, body: "v2" });
+
+    const custom = await invoke(run, "request_approval", { kind: "action", title: "短信定稿", summary: "改完再定", artifactId: id, options: [{ id: "ok", label: "定稿", effect: "reply" }] });
+    expect(drafts).toEqual([expect.objectContaining({ artifactId: id })]);
+    expect(custom).toMatchObject({ endRun: "deferred_for_approval", output: expect.stringContaining(`bound to ${id} v2`) });
+
+    const gated = await invoke(run, "request_approval", { kind: "action", title: "发出短信", summary: "发送", artifactId: id, action: { name: "sms.send" } });
+    const { action, opts } = run.ports.log.authorizations.at(-1)!;
+    expect(action.artifactId).toBe(id);
+    expect(opts).toEqual({ artifactVersion: 2 });
+    expect(gated.output).toContain(`bound to ${id} v2`);
+
+    const missing = await invoke(run, "request_approval", { kind: "action", title: "x", summary: "x", artifactId: "art_nope", options: [{ id: "ok", label: "好", effect: "reply" }] });
+    expect(missing).toMatchObject({ isError: true, output: expect.stringContaining("There is no artifact art_nope") });
+    expect(drafts).toHaveLength(1);
+  });
+
+  it("E28/E09: a card option cannot be 'complete' (personal items only), and the description says raising the card ends the run", async () => {
+    const run = fakeRun();
+    const r = await invoke(run, "request_approval", { kind: "escalation", title: "x", summary: "x", escalation: { reason: "blocked", explanation: "x" }, options: [{ id: "done", label: "完成", effect: "complete" }] });
+    expect(r).toMatchObject({ isError: true, output: expect.stringContaining("Invalid input for request_approval") });
+    expect(run.ports.log.authorizations).toEqual([]);
+    expect(JSON.stringify(tool("request_approval").inputSchema)).not.toContain('"complete"');
+    expect(tool("request_approval").description).toContain("ends your run");
+  });
+
+  it("withdraw_card takes back an undecided card through the kernel and says what happened", async () => {
+    const run = fakeRun();
+    const calls: Array<[string, string]> = [];
+    const answers = { act_open: "withdrawn", act_done: "not_pending" } as const;
+    run.ports.withdrawHumanItem = (id, reason) => (calls.push([id, reason]), answers[id as keyof typeof answers] ?? "not_found");
+    expect(await invoke(run, "withdraw_card", { id: "act_open", reason: "已由项目接手" })).toMatchObject({ output: "Withdrew act_open: it is off the owner's list." });
+    expect((await invoke(run, "withdraw_card", { id: "act_done", reason: "x" })).output).toContain("no longer waiting for the owner");
+    expect(await invoke(run, "withdraw_card", { id: "act_other", reason: "x" })).toMatchObject({ isError: true, output: "There is no card act_other raised by you or a cell below you." });
+    expect(calls).toEqual([["act_open", "已由项目接手"], ["act_done", "x"], ["act_other", "x"]]);
+  });
+
   it("reports results and silent progress to the parent and updates the roster status line", async () => {
     const run = fakeRun({ cellId: "w1" });
     await invoke(run, "report_to_parent", { kind: "progress", text: "报价已回 2/3", progress: { done: 2, total: 3 } });
@@ -365,6 +408,9 @@ describe("kernel.context", () => {
     expect(conflict.isError).toBe(true);
     expect(conflict.output).toContain("at v3 (last edited by human)");
     expect(conflict.output).toContain("人工 v3");
+    // E30: one instruction — the current text is right there; nothing says to read it again.
+    expect(conflict.output).toContain("Its current text is below: merge your change into it and save with expectedVersion 3.");
+    expect(conflict.output).not.toMatch(/read it again/i);
     expect(run.ports.artifacts.get(id)!.content.body).toBe("人工 v3");
     expect(run.ports.log.parked).toHaveLength(1);
     const read = await invoke(run, "read_artifact", { artifactId: id });
@@ -402,6 +448,16 @@ describe("kernel.context", () => {
     const capped = (await invoke(run, "read_resource", { uri: "res://cell1/big", limit: 1_000_000 })).output;
     expect(capped.startsWith(`${"z".repeat(64_000)}\n…[characters 0–64000 shown; more follows`)).toBe(true);
     expect((await invoke(run, "read_resource", { uri: "res://cell1/big", offset: 100_000, limit: 64_000 })).output).toBe("z".repeat(50_000));
+  });
+
+  it("E23: search_history leaves out this wake-up's own records", async () => {
+    const run = fakeRun({ runId: "run_now" });
+    await run.ports.context.appendEvidence("cell1", { kind: "assistant_text", text: "上周已经排查过支付重试", runId: "run_before", at: c.now() });
+    await run.ports.context.appendEvidence("cell1", { kind: "assistant_text", text: "我先搜一下支付重试", runId: "run_now", at: c.now() });
+    const out = (await invoke(run, "search_history", { query: "支付重试" })).output;
+    expect(out).toContain("上周已经排查过支付重试");
+    expect(out).not.toContain("我先搜一下");
+    expect(tool("search_history").description).toContain("this wake-up's own records are left out");
   });
 
   it("protects registered keys and prefixes without writing part of a rejected patch", async () => {

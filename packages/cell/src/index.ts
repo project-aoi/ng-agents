@@ -27,6 +27,7 @@ export {
   RESURFACE_MARKER,
 } from "./constants";
 export { WAIT_EXTERNAL, WAIT_HUMAN, type WaitRecord } from "./waits";
+export { CELL_PAUSE_KEY, type CellPauseState } from "./pauses";
 export { effectiveCwd, normalizeCwd, forgetWorkTreeKeys, workTreeKey } from "./workdir";
 export { isKernelEscalation, type KernelEscalationArgs } from "./escalations";
 export { scheduleEnvelopeId, watchFilterMatches } from "./spec";

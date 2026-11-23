@@ -270,7 +270,8 @@ export interface Kernel {
    */
   closeCell(cellId: string, reason: CloseReason | undefined, opts: CloseActorOptions): Promise<CloseResult>;
   /** Inbox.control as `opts.principalId`; the kernel aborts Runs / cancels Jobs / closes on cancel. */
-  control(cellId: string, cmd: { action: ControlAction; steerMessage?: string;pauseReason?:"manual"|"parked" }, opts: ActorOptions): ControlResult;
+  /** `note`: for pause/resume, the words that came with it (why the owner parked it) — kept on the cell's record. */
+  control(cellId: string, cmd: { action: ControlAction; steerMessage?: string; pauseReason?: "manual" | "parked"; note?: string }, opts: ActorOptions): ControlResult;
 
   // ---------- ingress and approvals ----------
   /** The hub's ingress sink: route by watches (thread / filter), else to the desk; durably enqueued before it resolves. */
@@ -356,6 +357,11 @@ export interface DirectMessage {
   replyToId?: string;
   replyToText?: string;
   conversationId?: string;
+  /**
+   * What the owner's coding agent adds on its own when it passes the owner's words on. It travels beside `text` and
+   * is shown to the cell as the agent's note — never as something the owner said.
+   */
+  agentContext?: string;
 }
 
 export type DirectMessageResult =
