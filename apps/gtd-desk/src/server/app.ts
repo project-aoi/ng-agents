@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { NgError } from "@ng/protocol";
-import type { SetModelRequest, SetRunnerRequest } from "../shared/api";
+import type { UpdateModelsRequest } from "../shared/api";
 import { Hono, type Context } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { streamSSE } from "hono/streaming";
@@ -124,7 +124,7 @@ export function createDeskApp(deps: DeskAppDeps): Hono {
   // ---------- top bar ----------
   app.get("/api/status", c => c.json(desk.status()));
   app.get("/api/models", async c => c.json(await desk.models(c.req.query("refresh") === "1")));
-  app.put("/api/models", async c => c.json(await desk.setModel(await body<SetModelRequest | SetRunnerRequest>(c), ownerActor)));
+  app.put("/api/models", async c => c.json(await desk.setModel(await body<UpdateModelsRequest>(c), ownerActor)));
   app.post("/api/capture", async (c) => c.json(await desk.ingest(await body(c),ownerActor)));
 
   app.get("/api/projects/closed", c => c.json({projects:desk.recentlyClosedProjects()}));

@@ -12,9 +12,9 @@ pnpm build
 pnpm start
 ```
 
-默认地址为 `http://127.0.0.1:8790`。用 `NG_AGENT_RUNNERS=claude,codex` 指定可用的本机 CLI runner，支持 `claude`、`codex` 和 `agy`。列表中的 runner 都须能运行，第一个是初始默认值。未配置列表时沿用 `NG_AGENT_BACKEND` 或自动选择首个可用 CLI。`NG_DESK_DATA_DIR` 指定本机数据目录。首次启动自动创建 v1 数据库。开发时可运行 `pnpm dev`。
+默认地址为 `http://127.0.0.1:8790`。启动时自动探测本机已安装的 CLI runner（`claude`、`codex`、`agy`），全部启用并以首个已安装 CLI 作为初始全局默认。也可用 `NG_AGENT_RUNNERS=claude,codex` 指定启用的 runner 列表（按顺序，首个为初始默认），或用 `NG_AGENT_BACKEND=claude` 限定单个引擎。`NG_DESK_DATA_DIR` 指定本机数据目录。首次启动自动创建 v1 数据库。开发时可运行 `pnpm dev`。
 
-网页右上角可保存全局默认 runner，以及该 runner 的主力和轻量模型与推理强度。`start_project`、`dispatch`、`spawn_cell` 等工具在说明中列出已启用的 runner 和各自的模型与推理强度。启动节点时可选填 `runner`、`model`、`effort`。三个参数都省略时，节点在每次运行时使用全局默认设置。指定 `model` 时会绑定所选 runner，省略 `runner` 时绑定当时的全局默认 runner。填写 `effort` 时也要填写 `model`。
+网页右上角「Runner 与模型默认配置」可设置全局默认 runner 与主力/轻量兜底模型，也可**按层级**（总助理、项目协调、执行分身、领域中枢、外部盯梢、信源巡检）分别指定默认的 `runner`、`model` 与 `effort`（配置持久化到数据目录）。`start_project`、`propose_project`、`dispatch`、`spawn_cell` 等工具说明中会自动列出各层级默认值及所有已启用 runner 的模型与推理强度。派生新节点时可选填 `runner`、`model`、`effort`：全不填跟随对应层级默认；可单独传 `runner`、`effort` 或组合指定，在多阶段任务中按阶段切换执行配置。
 
 | 视图 | 可以做什么 |
 | --- | --- |

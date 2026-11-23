@@ -48,9 +48,12 @@ export function selectBackend(env: Env, opts: SelectBackendOptions = {}): Backen
       if (!runner) throw new BackendConfigError(`NG_AGENT_RUNNERS: unknown runner "${entry}" (expected a comma-separated list of ${CLI_ENGINES.join(", ")})`);
       if (!runners.includes(runner)) runners.push(runner);
     }
-  } else {
-    const engine = setting === "auto" ? CLI_ENGINES.find(installed) : setting;
-    if (engine) runners.push(engine);
+  } else if (setting === "auto") {
+    for (const candidate of CLI_ENGINES) {
+      if (installed(candidate)) runners.push(candidate);
+    }
+  } else if (setting) {
+    runners.push(setting);
   }
   const engine = runners[0];
   if (!engine) throw new BackendConfigError("请安装 claude、codex 或 agy 后再启动工作台");

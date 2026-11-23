@@ -74,6 +74,34 @@ describe("GET/PUT /api/models on a CLI backend", () => {
       error: null,
       selection: { strong: { mode: "auto" }, fast: { mode: "auto" } },
       effective: { strong: { model: "opus", label: "Opus 5.5", effort: "xhigh" }, fast: { model: "haiku", label: "Haiku 5" } },
+      catalogs: {
+        claude: {
+          engine: "claude",
+          models: [OPUS, SONNET, HAIKU],
+          recommended: { model: "opus", label: "Opus 5.5", effort: "xhigh" },
+          recommendedFast: { model: "haiku", label: "Haiku 5" },
+          fetchedAt: T0,
+          error: null,
+          selection: { strong: { mode: "auto" }, fast: { mode: "auto" } },
+          effective: { strong: { model: "opus", label: "Opus 5.5", effort: "xhigh" }, fast: { model: "haiku", label: "Haiku 5" } },
+        },
+      },
+      roles: {
+        desk: { mode: "inherit" },
+        project: { mode: "inherit" },
+        worker: { mode: "inherit" },
+        hub: { mode: "inherit" },
+        checker: { mode: "inherit" },
+        sensor: { mode: "inherit" },
+      },
+      effectiveRoles: {
+        desk: { runner: "claude", choice: { model: "opus", label: "Opus 5.5", effort: "xhigh" }, inherited: true },
+        project: { runner: "claude", choice: { model: "opus", label: "Opus 5.5", effort: "xhigh" }, inherited: true },
+        worker: { runner: "claude", choice: { model: "opus", label: "Opus 5.5", effort: "xhigh" }, inherited: true },
+        hub: { runner: "claude", choice: { model: "opus", label: "Opus 5.5", effort: "xhigh" }, inherited: true },
+        checker: { runner: "claude", choice: { model: "haiku", label: "Haiku 5" }, inherited: true },
+        sensor: { runner: "claude", choice: { model: "haiku", label: "Haiku 5" }, inherited: true },
+      },
     });
     // fetched once (at kernel start); a plain GET uses the cached list
     expect(src.calls).toEqual(["claude"]);
@@ -192,6 +220,16 @@ describe("without a CLI backend", () => {
       error: null,
       selection: { strong: { mode: "auto" }, fast: { mode: "auto" } },
       effective: { strong: null, fast: null },
+      catalogs: {},
+      roles: {
+        desk: { mode: "inherit" },
+        project: { mode: "inherit" },
+        worker: { mode: "inherit" },
+        hub: { mode: "inherit" },
+        checker: { mode: "inherit" },
+        sensor: { mode: "inherit" },
+      },
+      effectiveRoles: { desk: null, project: null, worker: null, hub: null, checker: null, sensor: null },
     });
     expect((await d.get<ModelsDTO>("/api/models?refresh=1")).available).toBe(false);
     const r = await put(d, { tier: "strong", mode: "auto" });
@@ -281,6 +319,242 @@ describe("runner selection", () => {
     const started = await restarted.req<{ data: { cellId: string } }>("POST", "/api/agent/tools/spawn_cell", { ...spawn, runner: "claude", effort: "medium" });
     expect(restarted.kernel.getCell(started.json.data.cellId)?.spec.processor).toMatchObject({ engine: "claude", model: "sonnet", effort: "medium" });
     await restarted.kernel.idle();
+  });
+
+  it("supports per-role default runner/model/effort, effort-only overrides, auto-discovery and catalog error cooldown", async () => {
+    const dataDir = tempDir("roles-data");
+    const bins = tempDir("roles-bin");
+    const claude = installFakeCli(bins, "claude", [
+      // Turn 1: desk starts project with no explicit runner/model/effort (uses project role default)
+      { actions: [
+        { mcp: "start_project", args: { title: "分层测试", outcome: "完成多阶段执行", brief: "按阶段执行" } },
+        { text: "已立项" },
+      ] },
+      // Turn 2: project (on claude sonnet · medium) dispatches 3 workers + 1 invalid effort
+      { actions: [
+        { mcp: "dispatch", args: { title: "默认分身", instruction: "阶段 1：走 worker 层级默认" } },
+        { mcp: "dispatch", args: { title: "降档分身", instruction: "阶段 2：只改 effort", effort: "low" } },
+        { mcp: "dispatch", args: { title: "跨引擎分身", instruction: "阶段 3：指定 runner 和 effort", runner: "claude", effort: "low" } },
+        { mcp: "dispatch", args: { title: "非法强度", instruction: "无效测试", effort: "ultra" } },
+        { text: "已分阶段派工" },
+      ] },
+      // Turn 3: Worker C on claude (opus · low)
+      { actions: [{ text: "跨引擎完成" }] },
+    ]);
+    const codex = installFakeCli(bins, "codex", [
+      // Worker A (codex · codex-test · high from worker role default)
+      { actions: [{ text: "默认分身完成" }] },
+      // Worker B (codex · codex-test · low from effort-only override)
+      { actions: [{ text: "降档分身完成" }] },
+    ]);
+    const clock = new ManualClock(T0);
+    const fetch = async (engine: CliEngine): Promise<CliModelCatalog> => ({
+      engine,
+      models: engine === "claude" ? [OPUS, SONNET, HAIKU] : [{ id: "codex-test", label: "Codex Test", efforts: ["low", "high"] }],
+      recommended: engine === "claude" ? { model: "opus", effort: "xhigh" } : { model: "codex-test", effort: "high" },
+      fetchedAt: clock.now(),
+    });
+    // Auto-discovery without NG_AGENT_RUNNERS enables all detected CLIs (claude + codex).
+    const env = { NG_CLAUDE_BIN: claude.bin, NG_CODEX_BIN: codex.bin };
+    const opts = {
+      dataDir,
+      clock,
+      env,
+      detectCli: (engine: CliEngine) => engine === "claude" || engine === "codex",
+      kernel: { modelSwitch: { fetch }, cli: { claude: { bin: claude.bin, env: claude.env }, codex: { bin: codex.bin, env: codex.env } } },
+    };
+    const d = await bootRealDesk(opts);
+    const initial = await d.get<ModelsDTO>("/api/models");
+    expect(initial.runners).toEqual(["claude", "codex"]);
+    expect(Object.keys(initial.catalogs).sort()).toEqual(["claude", "codex"]);
+
+    // Reject invalid role configurations without mutating state.
+    expect((await put(d, { role: "unknown", mode: "inherit" })).status).toBe(400);
+    expect((await put(d, { role: "worker", mode: "custom", runner: "agy" })).status).toBe(400);
+    expect((await put(d, { role: "worker", mode: "custom", runner: "codex", model: "nope" })).status).toBe(400);
+    expect((await put(d, { role: "worker", mode: "custom", runner: "codex", model: "codex-test", effort: "ultra" })).status).toBe(400);
+
+    // Configure per-role defaults: project on claude sonnet·medium, worker on codex codex-test·high, checker on claude haiku.
+    const rProject = await put(d, { role: "project", mode: "custom", runner: "claude", model: "sonnet", effort: "medium" });
+    expect(rProject.status).toBe(200);
+    const rWorker = await put(d, { role: "worker", mode: "custom", runner: "codex", model: "codex-test", effort: "high" });
+    expect(rWorker.status).toBe(200);
+    const rChecker = await put(d, { role: "checker", mode: "custom", runner: "claude", model: "haiku" });
+    expect(rChecker.status).toBe(200);
+    expect(rChecker.json.effectiveRoles).toMatchObject({
+      desk: { runner: "claude", choice: { model: "opus", effort: "xhigh" }, inherited: true },
+      project: { runner: "claude", choice: { model: "sonnet", effort: "medium" }, inherited: false },
+      worker: { runner: "codex", choice: { model: "codex-test", effort: "high" }, inherited: false },
+      checker: { runner: "claude", choice: { model: "haiku" }, inherited: false },
+    });
+    expect(JSON.parse(readFileSync(join(dataDir, "role-models.json"), "utf8"))).toEqual({
+      project: { mode: "custom", runner: "claude", model: "sonnet", effort: "medium" },
+      worker: { mode: "custom", runner: "codex", model: "codex-test", effort: "high" },
+      checker: { mode: "custom", runner: "claude", model: "haiku" },
+    });
+
+    await d.post("/api/cells/desk/messages", { text: "开始分层测试", clientId: "role-run" });
+    await d.kernel.idle();
+
+    const project = d.kernel.listCells({ parentId: "desk" }).find((c) => c.preset === "project")!;
+    const workers = d.kernel.listCells({ parentId: project.id });
+    expect(workers).toHaveLength(3);
+    const wDefault = workers.find((w) => w.title === "默认分身")!;
+    const wEffort = workers.find((w) => w.title === "降档分身")!;
+    const wCross = workers.find((w) => w.title === "跨引擎分身")!;
+
+    // Project & default worker did not pin processor overrides; they followed role defaults dynamically.
+    expect(project.spec.processor).not.toHaveProperty("engine");
+    expect(wDefault.spec.processor).not.toHaveProperty("engine");
+    // Effort-only override resolved against worker's role default (codex · codex-test) with effort=low.
+    expect(wEffort.spec.processor).toMatchObject({ engine: "codex", model: "codex-test", effort: "low" });
+    // Runner+effort override resolved against claude's strong model (opus) with effort=low.
+    expect(wCross.spec.processor).toMatchObject({ engine: "claude", model: "opus", effort: "low" });
+
+    // Check actual CLI launches:
+    // claude launches: [0] desk (opus·xhigh), [1] project (sonnet·medium), [2] wCross (opus·low)
+    expect(claude.launches()[0]).toEqual(expect.arrayContaining(["--model", "opus", "--effort", "xhigh"]));
+    expect(claude.launches()[1]).toEqual(expect.arrayContaining(["--model", "sonnet", "--effort", "medium"]));
+    expect(claude.launches()[2]).toEqual(expect.arrayContaining(["--model", "opus", "--effort", "low"]));
+    // codex launches: wDefault (codex-test·high) and wEffort (codex-test·low)
+    const codexLaunches = codex.launches();
+    expect(codexLaunches).toHaveLength(2);
+    expect(codexLaunches.some((argv) => argv.includes("codex-test") && argv.includes('model_reasoning_effort="high"'))).toBe(true);
+    expect(codexLaunches.some((argv) => argv.includes("codex-test") && argv.includes('model_reasoning_effort="low"'))).toBe(true);
+    // Invalid effort call returned tool error
+    expect(claude.log().some((e) => e.type === "mcp_result" && e.name === "dispatch" && e.isError === true)).toBe(true);
+
+    // Topology accurately reflects per-role defaults & overrides.
+    const topo = await d.get<TopologyDTO>("/api/agents/topology");
+    expect(topo.nodes.find((n) => n.cellId === "desk")).toMatchObject({ engine: "claude", runnerSource: "default", effectiveModel: { model: "opus", effort: "xhigh" } });
+    expect(topo.nodes.find((n) => n.cellId === project.id)).toMatchObject({ engine: "claude", runnerSource: "role", effectiveModel: { model: "sonnet", effort: "medium" } });
+    expect(topo.nodes.find((n) => n.cellId === wDefault.id)).toMatchObject({ engine: "codex", runnerSource: "role", effectiveModel: { model: "codex-test", effort: "high" } });
+    expect(topo.nodes.find((n) => n.cellId === wEffort.id)).toMatchObject({ engine: "codex", runnerSource: "override", modelOverride: { model: "codex-test", effort: "low" } });
+
+    // External agent get_cell exposes effective runner/model/effort.
+    const cellInfo = await d.req<{ data: { runner: string; model: string; effort: string } }>("POST", "/api/agent/tools/get_cell", { id: wDefault.id });
+    expect(cellInfo.json.data).toMatchObject({ runner: "codex", model: "codex-test", effort: "high" });
+
+    // Tool descriptions include role defaults summary.
+    expect(await d.kernel.describeRunnerOptions()).toContain("worker=codex (codex-test · high)");
+
+    // Restart preserves role-models.json; resetting to inherit removes the role override.
+    await d.server.close();
+    const restarted = await bootRealDesk(opts);
+    const afterRestart = await restarted.get<ModelsDTO>("/api/models");
+    expect(afterRestart.roles.worker).toEqual({ mode: "custom", runner: "codex", model: "codex-test", effort: "high" });
+    const reset = await put(restarted, { role: "worker", mode: "inherit" });
+    expect(reset.status).toBe(200);
+    expect(reset.json.roles.worker).toEqual({ mode: "inherit" });
+    expect(reset.json.effectiveRoles.worker).toMatchObject({ runner: "claude", inherited: true });
+    await restarted.server.close();
+  });
+
+  it("caches catalogue fetch failures within cooldown so describeRunnerOptions does not repeatedly block", async () => {
+    const clock = new ManualClock(T0);
+    const calls: Record<CliEngine, number> = { claude: 0, codex: 0, agy: 0 };
+    const fetch = async (engine: CliEngine): Promise<CliModelCatalog> => {
+      calls[engine]++;
+      if (engine === "codex") throw new Error("codex: not logged in");
+      return { engine, models: [OPUS, SONNET], recommended: { model: "opus", effort: "xhigh" }, fetchedAt: clock.now() };
+    };
+    const d = await bootDesk({
+      clock,
+      env: { NG_AGENT_RUNNERS: "claude,codex", NG_CLAUDE_BIN: "/nonexistent/claude", NG_CODEX_BIN: "/nonexistent/codex" },
+      detectCli: () => true,
+      kernel: { modelSwitch: { fetch, errorRetryMs: 60_000 } },
+    });
+    expect(calls.codex).toBe(1);
+    await d.kernel.describeRunnerOptions();
+    await d.get<ModelsDTO>("/api/models");
+    // Still 1: failed fetch stays cooled down for automatic reads.
+    expect(calls.codex).toBe(1);
+    // Explicit refresh bypasses cooldown.
+    await d.get<ModelsDTO>("/api/models?refresh=1");
+    expect(calls.codex).toBe(2);
+  });
+
+  it("allows editing and clearing runnerOverride on a project proposal via savePlan", async () => {
+    const clock = new ManualClock(T0);
+    const fetch = async (engine: CliEngine): Promise<CliModelCatalog> => ({
+      engine,
+      models: engine === "claude" ? [OPUS, SONNET] : [{ id: "codex-test", label: "Codex Test", efforts: ["low", "high"] }],
+      recommended: engine === "claude" ? { model: "opus", effort: "xhigh" } : { model: "codex-test", effort: "high" },
+      fetchedAt: clock.now(),
+    });
+    const d = await bootDesk({
+      clock,
+      env: { NG_AGENT_RUNNERS: "claude,codex", NG_CLAUDE_BIN: "/nonexistent/claude", NG_CODEX_BIN: "/nonexistent/codex" },
+      detectCli: () => true,
+      kernel: { modelSwitch: { fetch } },
+    });
+    await d.get<ModelsDTO>("/api/models");
+    const art = d.kernel.context.commitSync("desk", {
+      artifact: {
+        artifactId: "art_plan_runner",
+        content: {
+          format: "json",
+          title: "测试方案",
+          body: "{}",
+          data: { title: "测试方案", outcome: "达成目标", actions: [{ title: "第一步", owner: "agent" }] },
+        },
+        updatedBy: "agent",
+      },
+    });
+    expect(art.ok).toBe(true);
+    const deskEpoch = d.kernel.getCell("desk")!.epoch;
+    const auth = d.kernel.gate.authorizeSync(
+      {
+        type: "project.start",
+        proposal: { title: "测试方案", outcome: "达成目标", actions: [{ title: "第一步", owner: "agent" }] },
+        artifactId: "art_plan_runner",
+        summary: "立项：测试方案",
+        subjectKey: "plan:runner-test",
+        sideEffect: "external",
+        card: {
+          format: "card",
+          title: "测试方案",
+          body: "达成目标",
+          data: {
+            cardType: "project_proposal",
+            subjectKey: "plan:runner-test",
+            title: "测试方案",
+            source: { label: "工作台", at: T0 },
+            rawInput: { text: "测试", kind: "message" },
+            prep: { summary: "", checked: [] },
+            proposal: { title: "测试方案", outcome: "达成目标", actions: [{ title: "第一步", owner: "agent" }] },
+            draft: { artifactId: "art_plan_runner", version: 1 },
+          },
+        },
+      },
+      { cellId: "desk", epoch: deskEpoch, principalId: "cell:desk", artifactVersion: 1 },
+    );
+    expect(auth.type).toBe("defer");
+    const cardId = auth.type === "defer" ? auth.actionId : "";
+    const saved = await d.req<{ ok: boolean }>("PUT", `/api/human-items/${cardId}/plan`, {
+      expectedVersion: 1,
+      proposal: {
+        title: "测试方案",
+        outcome: "达成目标",
+        runnerOverride: { engine: "codex", model: "codex-test", effort: "low" },
+        actions: [{ title: "第一步", owner: "agent" }],
+      },
+    });
+    expect(saved.status).toBe(200);
+    expect(d.kernel.context.getArtifactSync("art_plan_runner")?.content.data).toMatchObject({
+      runnerOverride: { engine: "codex", model: "codex-test", effort: "low" },
+    });
+    const cleared = await d.req<{ ok: boolean }>("PUT", `/api/human-items/${cardId}/plan`, {
+      expectedVersion: 2,
+      proposal: {
+        title: "测试方案",
+        outcome: "达成目标",
+        runnerOverride: null,
+        actions: [{ title: "第一步", owner: "agent" }],
+      },
+    });
+    expect(cleared.status).toBe(200);
+    expect(d.kernel.context.getArtifactSync("art_plan_runner")?.content.data).not.toHaveProperty("runnerOverride");
   });
 });
 

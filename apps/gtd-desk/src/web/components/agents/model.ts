@@ -287,12 +287,27 @@ export function dirBase(path: string): string {
   return i >= 0 ? t.slice(i + 1) || t : t;
 }
 
-/** "codex · strong", "零算力脚本"; null when nothing is known. */
-export function engineText(node: Pick<TopologyNodeDTO, "processorType" | "engine" | "modelTier" | "modelOverride">): string | null {
+/** "codex · GPT-6 Codex · high", "零算力脚本"; null when nothing is known. */
+export function engineText(node: Pick<TopologyNodeDTO, "processorType" | "engine" | "modelTier" | "modelOverride" | "effectiveModel">): string | null {
   if (node.processorType === "code") return "零算力脚本";
   const tier = node.modelTier === "strong" ? "高能力" : node.modelTier === "fast" ? "快速" : null;
-  const parts = [node.engine, node.modelOverride?.model ?? tier, node.modelOverride?.effort].filter((x): x is string => Boolean(x));
+  if (node.modelOverride) {
+    const parts = [node.engine, node.modelOverride.model, node.modelOverride.effort].filter((x): x is string => Boolean(x));
+    return parts.length ? parts.join(" · ") : null;
+  }
+  if (node.effectiveModel) {
+    const parts = [node.engine, node.effectiveModel.label, node.effectiveModel.effort].filter((x): x is string => Boolean(x));
+    return parts.length ? parts.join(" · ") : null;
+  }
+  const parts = [node.engine, tier].filter((x): x is string => Boolean(x));
   return parts.length ? parts.join(" · ") : null;
+}
+
+/** Compact badge for topology cards ("codex · GPT-6 Codex" or "claude"). */
+export function engineBadgeText(node: Pick<TopologyNodeDTO, "processorType" | "engine" | "modelOverride" | "effectiveModel">): string | null {
+  if (node.processorType === "code" || !node.engine) return null;
+  const model = node.modelOverride?.model ?? node.effectiveModel?.label ?? null;
+  return model ? `${node.engine} · ${model}` : node.engine;
 }
 
 /** "0.4 秒" · "12 秒" · "3 分 5 秒" */

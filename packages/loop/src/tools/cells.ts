@@ -1,6 +1,7 @@
 import { z } from "zod";
 import {
   cellIdOf,
+  cellRoleOf,
   childRunnerOverride,
   defineTool,
   isAddress,
@@ -114,7 +115,7 @@ export function cellsToolset(registry: Registry): Toolset {
       input: z.unknown().optional().describe("structured data for the child"),
       cwd: z.string().optional().describe("absolute path of the directory it works in; default: yours"),
       contextMode: z.enum(["isolated", "fork_prefix"]).optional(),
-      modelTier: z.enum(["fast", "strong"]).optional(),
+      modelTier: z.enum(["fast", "strong"]).optional().describe("fallback model tier when model is omitted"),
       ...runnerSelectionInput,
       allowedTools: z.array(z.enum(TOOL_KINDS)).optional().describe("workspace tools the child's model may see"),
       toolsets: z.array(z.string()).optional().describe("replaces the preset's toolsets"),
@@ -144,7 +145,8 @@ export function cellsToolset(registry: Registry): Toolset {
           ...(args.toolsets ? { toolsets: args.toolsets } : {}),
         };
       }
-      const runner = await childRunnerOverride(ctx.ports, args, processor.kind);
+      const role = cellRoleOf({ preset: args.preset, meta: { ...(preset.defaults.meta ?? {}), ...(args.meta ?? {}) } });
+      const runner = await childRunnerOverride(ctx.ports, args, { kind: processor.kind, role, ...(processor.kind === "llm" && processor.modelTier ? { tier: processor.modelTier } : {}) });
       const spec: CellSpec = { preset: args.preset, title: args.title, processor: { ...processor, ...runner } };
       if (args.cwd) spec.cwd = args.cwd;
       if (args.contextMode) spec.contextMode = args.contextMode;

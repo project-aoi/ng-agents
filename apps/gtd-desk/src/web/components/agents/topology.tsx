@@ -2,7 +2,7 @@ import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useSta
 import type { TopologyDTO, TopologyNodeDTO } from "../../../shared/api";
 import { useNavigate } from "../../state";
 import { Empty } from "../states";
-import { NODE_FILTERS, columnGroups, dirBase, edgePath, filterTree, navTarget, sharedTrees, treeOf, treeOrder, type NodeFilter, type TreeEntry } from "./model";
+import { NODE_FILTERS, columnGroups, dirBase, edgePath, engineBadgeText, engineText, filterTree, navTarget, sharedTrees, treeOf, treeOrder, type NodeFilter, type TreeEntry } from "./model";
 
 // The left pane: who is there. Three columns of plain buttons (focusable, arrow keys walk the tree) over one SVG layer
 // that draws parent→child curves and dashed waits from the cards' measured boxes. No graph library: the tree is at
@@ -329,6 +329,8 @@ function NodeCard(
   const lit = n.gitRoot !== null && props.highlight.has(n.gitRoot);
   const waits = props.topo.waits.filter(w => w.fromCellId === n.cellId && !props.drawnWaits?.has(`w:${w.fromCellId}>${w.targetCellId}`));
   const dirTitle = n.cwd && n.gitRoot && n.cwd !== n.gitRoot ? `${n.cwd}\n（仓库 ${n.gitRoot}）` : (dir ?? undefined);
+  const engineBadge = engineBadgeText(n);
+  const engineFull = engineText(n);
   const hasLinks = n.pendingCardId !== null || n.humanItemId !== null || (n.archivedChildren > 0 && !props.includeArchived);
 
   return (
@@ -370,11 +372,16 @@ function NodeCard(
             {n.stateDetail}
           </span>
         )}
-        {(dir || waits.length > 0) && (
+        {(dir || engineBadge || waits.length > 0) && (
           <span className="topo-meta">
             {dir && (
               <span className={`dir-badge${lit ? " on" : ""}`} title={dirTitle}>
                 {dirBase(dir)}
+              </span>
+            )}
+            {engineBadge && (
+              <span className={`topo-engine${n.runnerSource === "override" ? " override" : ""}`} title={engineFull ?? engineBadge}>
+                {engineBadge}
               </span>
             )}
             {waits.map((w) => (

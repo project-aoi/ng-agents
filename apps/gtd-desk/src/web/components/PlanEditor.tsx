@@ -5,17 +5,24 @@ import {
   type BallOwner,
   type Effort,
   type ArtifactDTO,
+  type ModelsDTO,
   type PlanSaveResponse,
   type HumanItemDTO,
+  type RunnerDTO,
 } from "../../shared/api";
 import { api } from "../api";
-import { useStatus, useToast, toFailure } from "../state";
+import { useResource, useStatus, useToast, toFailure } from "../state";
 import { Spinner } from "./controls";
+
+const RUNNER_NAMES: Record<RunnerDTO, string> = { claude: "Claude Code", codex: "Codex", agy: "Antigravity" };
 
 interface PlanForm {
   title: string;
   outcome: string;
   background: string;
+  runner: RunnerDTO | "";
+  model: string;
+  effort: string;
   actions: Array<{ title: string; owner: BallOwner; effort: Effort | ""; nextStep: string }>;
 }
 
@@ -24,6 +31,9 @@ function formOf(p: NonNullable<HumanItemDTO["proposal"]>): PlanForm {
     title: p.title,
     outcome: p.outcome,
     background: p.background ?? "",
+    runner: p.runnerOverride?.engine ?? "",
+    model: p.runnerOverride?.model ?? "",
+    effort: p.runnerOverride?.effort ?? "",
     actions: p.actions.map((a) => ({ title: a.title, owner: a.owner, effort: a.effort ?? "", nextStep: a.nextStep ?? "" })),
   };
 }
@@ -55,6 +65,7 @@ export function PlanEditor(props: {
   const card = props.item;
   const toast = useToast();
   const { setStatus } = useStatus();
+  const modelsRes = useResource<ModelsDTO>("models", () => api.models(), ["models"]);
   const [seed] = useState(() => unsavedPlans.get(card.id));
   const [initial] = useState(() => seed?.initial ?? formOf(card.proposal!));
   const [form, setForm] = useState<PlanForm>(seed?.form ?? initial);
@@ -105,12 +116,20 @@ export function PlanEditor(props: {
     setSaving(true);
     setError(null);
     try {
+      const runnerOverride = form.runner
+        ? {
+            engine: form.runner,
+            ...(form.model ? { model: form.model } : {}),
+            ...(form.model && form.effort ? { effort: form.effort } : {}),
+          }
+        : null;
       const r = await api.savePlan(card.id, {
         expectedVersion: version,
         proposal: {
           ...(form.title.trim() && {title: form.title.trim()}),
           outcome: form.outcome.trim(),
           background: form.background.trim(),
+          ...(modelsRes.data?.available ? { runnerOverride } : {}),
           actions: actions.map((a) => ({
             title: a.title.trim(),
             owner: a.owner,
@@ -219,6 +238,72 @@ export function PlanEditor(props: {
         <span>背景（可选）</span>
         <textarea disabled={saving} rows={2} value={form.background} onChange={(e) => setForm({ ...form, background: e.target.value })} />
       </label>
+
+      {modelsRes.data?.available && (() => {
+        const md = modelsRes.data;
+        const cat = form.runner ? md.catalogs?.[form.runner] : undefined;
+        const models = cat?.models ?? [];
+        const modelInfo = form.model ? models.find((x) => x.id === form.model) : undefined;
+        const efforts = modelInfo?.efforts ?? [];
+        return (
+          <fieldset disabled={saving} className="plan-runner">
+            <legend>项目 Runner（新建项目用，可选）</legend>
+            <div className={`mp-role-row${form.runner ? (form.model && efforts.length > 0 ? " cols-3" : " cols-2") : " cols-1"}`}>
+              <label className="field">
+                <span>Runner</span>
+                <select
+                  value={form.runner}
+                  onChange={(e) => {
+                    const next = md.runners.find((r) => r === e.target.value) ?? "";
+                    setForm({ ...form, runner: next, model: "", effort: "" });
+                  }}
+                >
+                  <option value="">跟随「项目协调」默认</option>
+                  {md.runners.map((r) => (
+                    <option key={r} value={r}>
+                      {RUNNER_NAMES[r]}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {form.runner && (
+                <label className="field">
+                  <span>模型</span>
+                  <select
+                    value={form.model}
+                    onChange={(e) => setForm({ ...form, model: e.target.value, effort: "" })}
+                  >
+                    <option value="">自动（跟随该 Runner 默认）</option>
+                    {form.model && !modelInfo && <option value={form.model}>{form.model}</option>}
+                    {models.map((x) => (
+                      <option key={x.id} value={x.id}>
+                        {x.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
+              {form.runner && form.model && efforts.length > 0 && (
+                <label className="field">
+                  <span>推理强度</span>
+                  <select
+                    value={form.effort}
+                    onChange={(e) => setForm({ ...form, effort: e.target.value })}
+                  >
+                    <option value="">默认</option>
+                    {form.effort && !efforts.includes(form.effort) && <option value={form.effort}>{form.effort}</option>}
+                    {efforts.map((ef) => (
+                      <option key={ef} value={ef}>
+                        {ef}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
+            </div>
+          </fieldset>
+        );
+      })()}
 
       <fieldset disabled={saving} className="plan-edit-actions">
         <legend>推进安排</legend>

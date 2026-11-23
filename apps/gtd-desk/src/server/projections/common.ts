@@ -25,6 +25,7 @@ export type DeskKernel = Pick<
   | "db"
   | "workspace"
   | "agentBackend"
+  | "effectiveRunnerFor"
   | "activityOf"
   | "activeWorkspaces"
   | "listWaits"

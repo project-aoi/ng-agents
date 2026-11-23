@@ -11,6 +11,7 @@ import type {
   Bus,
   CliEngine,
   CellRecord,
+  CellRole,
   CellSpec,
   CellStatus,
   Channel,
@@ -33,10 +34,11 @@ import type {
   RunOutcome,
   RunnerOverride,
   RunnerSelection,
+  RunnerSelectionTarget,
   SendToCellResult,
   WorkspaceOccupancy,
 } from "@ng/protocol";
-import type { ModelSettings, ModelSettingsOptions } from "./models";
+import type { EffectiveRunnerChoice, ModelSettings, ModelSettingsOptions, RoleModelSelection } from "./models";
 import type { WaitRecord } from "./waits";
 import type { WorkspaceManager, WorkspaceManagerOptions } from "@ng/workspace";
 
@@ -69,7 +71,7 @@ export interface KernelOptions {
    * comes from the CLI itself, and the default ("auto") is the CLI's own first choice. Off unless given — a bare
    * kernel launches CLIs with `cli[engine].models` or their own default. `true` = defaults.
    */
-  modelSwitch?: boolean | Pick<ModelSettingsOptions, "ttlMs" | "firstFetchWaitMs" | "fetch">;
+  modelSwitch?: boolean | Pick<ModelSettingsOptions, "ttlMs" | "firstFetchWaitMs" | "errorRetryMs" | "fetch">;
   clock?: Clock;
   bus?: Bus;
   /**
@@ -231,8 +233,12 @@ export interface Kernel {
   readonly agentBackend: AgentEngine | null;
   readonly cliRunners: readonly CliEngine[];
   setDefaultRunner(runner: string): void;
+  roleModelSettings(): Record<CellRole, RoleModelSelection>;
+  setRoleModel(role: CellRole, selection: RoleModelSelection): void;
+  effectiveRunnerForRole(role: CellRole): EffectiveRunnerChoice | null;
+  effectiveRunnerFor(spec: Pick<CellSpec, "preset" | "meta" | "processor">): EffectiveRunnerChoice | null;
   describeRunnerOptions(): Promise<string>;
-  resolveRunnerSelection(selection: RunnerSelection): Promise<RunnerOverride>;
+  resolveRunnerSelection(selection: RunnerSelection, target?: RunnerSelectionTarget): Promise<RunnerOverride>;
   /**
    * The model switch of a CLI engine (default: the backend engine); null when the switch is off (`modelSwitch`) or
    * the engine is not a CLI.

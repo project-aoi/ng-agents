@@ -350,6 +350,7 @@ export function nodeOf(v: AgentsView, c: CellRecord): TopologyNodeDTO {
   const chat = kernel.context.readStateSync<CellDirectChatState>(c.id, CELL_DIRECT_CHAT_KEY);
   const card = v.cards.get(c.id) ?? (v.projects.has(c.id) ? v.projectCards.get(c.id) : undefined);
   const human = isRoot(c) || c.status === "closed" ? undefined : v.human.get(c.id);
+  const effective = llm ? (kernel.effectiveRunnerFor?.(c.spec) ?? null) : null;
   return {
     cellId: c.id,
     parentId: c.parentId,
@@ -363,8 +364,9 @@ export function nodeOf(v: AgentsView, c: CellRecord): TopologyNodeDTO {
     stateDetail: s.stateDetail,
     processorType: llm ? "llm" : "code",
     canChat: llm && (c.status !== "closed" || reopenable(v, c)),
-    engine: llm ? (processor.engine ?? kernel.agentBackend ?? null) : null,
+    engine: llm ? (effective?.runner ?? processor.engine ?? kernel.agentBackend ?? null) : null,
     ...(llm && processor.model ? { modelOverride: { model: processor.model, effort: processor.effort } } : {}),
+    ...(llm && effective ? { effectiveModel: effective.choice, runnerSource: effective.source } : {}),
     modelTier: llm ? (processor.modelTier ?? "strong") : null,
     cwd,
     gitRoot: safeWorkTree(cwd),

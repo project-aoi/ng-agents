@@ -6,7 +6,7 @@ export interface RoutingLoopOptions {
   /** Executes locally assigned runs. */
   local: AgentLoop;
   /** Engine for llm cells without `processor.engine`; null = none available (such Runs fail with a clear error). */
-  defaultEngine: AgentEngine | null | (() => AgentEngine | null);
+  defaultEngine: AgentEngine | null | ((spec?: PromptSnapshot["spec"]) => AgentEngine | null);
   allowedEngines?: readonly CliEngine[];
   /** Creates (once, on first use) the loop for a CLI engine. */
   cliLoop(engine: CliEngine): AgentLoop;
@@ -16,12 +16,12 @@ export interface RoutingLoopOptions {
 
 export interface RoutingLoop extends AgentLoop {
   /** The engine an llm processor would run on (null = none available). */
-  engineFor(processor: PromptSnapshot["spec"]["processor"]): AgentEngine | "code" | null;
+  engineFor(processor: PromptSnapshot["spec"]["processor"], spec?: PromptSnapshot["spec"]): AgentEngine | "code" | null;
   readonly defaultEngine: AgentEngine | null;
 }
 
 export function createRoutingLoop(opts: RoutingLoopOptions): RoutingLoop {
-  const defaultEngine = () => typeof opts.defaultEngine === "function" ? opts.defaultEngine() : opts.defaultEngine;
+  const defaultEngine = (spec?: PromptSnapshot["spec"]) => typeof opts.defaultEngine === "function" ? opts.defaultEngine(spec) : opts.defaultEngine;
   const cli = new Map<CliEngine, AgentLoop>();
   const loopFor = (engine: CliEngine): AgentLoop => {
     let l = cli.get(engine);
@@ -29,13 +29,13 @@ export function createRoutingLoop(opts: RoutingLoopOptions): RoutingLoop {
     return l;
   };
 
-  function engineFor(processor: PromptSnapshot["spec"]["processor"]): AgentEngine | "code" | null {
+  function engineFor(processor: PromptSnapshot["spec"]["processor"], spec?: PromptSnapshot["spec"]): AgentEngine | "code" | null {
     if (processor.kind === "code") return "code";
-    return processor.engine ?? defaultEngine();
+    return processor.engine ?? defaultEngine(spec);
   }
 
   async function run(snapshot: PromptSnapshot, ports: RunPorts, signal: AbortSignal): Promise<RunOutcome> {
-    const engine = engineFor(snapshot.spec.processor);
+    const engine = engineFor(snapshot.spec.processor, snapshot.spec);
     if (engine) opts.onRoute?.({ cellId: snapshot.cellId, runId: snapshot.runId, engine });
     if (engine === "code" || engine === null) return opts.local.run(snapshot, ports, signal);
     if (!(CLI_ENGINES as readonly string[]).includes(engine)) throw new NgError("invalid_argument", `unknown engine "${String(engine)}"`);

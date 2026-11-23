@@ -42,9 +42,30 @@ export type RunOutcome = "completed" | "yielded_waiting" | "deferred_for_approva
 export const CLI_ENGINES = ["claude", "codex", "agy"] as const;
 export type CliEngine = typeof CLI_ENGINES[number];
 export type AgentEngine = CliEngine;
+export const CELL_ROLES = ["desk", "project", "worker", "hub", "checker", "sensor"] as const;
+export type CellRole = typeof CELL_ROLES[number];
+export const ROLE_DEFAULT_TIER: Readonly<Record<CellRole, import("./model").ModelTier>> = {
+  desk: "strong",
+  project: "strong",
+  worker: "strong",
+  hub: "strong",
+  checker: "fast",
+  sensor: "fast",
+};
+export function cellRoleOf(spec: Pick<CellSpec, "preset" | "meta">): CellRole | null {
+  const role = spec.meta?.["role"];
+  if (typeof role === "string" && (CELL_ROLES as readonly string[]).includes(role)) return role as CellRole;
+  if (spec.preset === "inline") return "desk";
+  if (spec.preset && (CELL_ROLES as readonly string[]).includes(spec.preset)) return spec.preset as CellRole;
+  return null;
+}
 export type LlmProcessorSpec = Extract<ProcessorSpec, { kind: "llm" }>;
 export type CodeProcessorSpec = Extract<ProcessorSpec, { kind: "code" }>;
 export type RunnerOverride = { engine: CliEngine; model?: string; effort?: string };
+export interface RunnerSelectionTarget {
+  role?: CellRole | null;
+  tier?: import("./model").ModelTier;
+}
 
 const runnerOverride = z.strictObject({ engine: z.enum(CLI_ENGINES), model: z.string().trim().min(1).optional(), effort: z.string().trim().min(1).optional() });
 export function isRunnerOverride(value: unknown): value is RunnerOverride {
@@ -53,20 +74,27 @@ export function isRunnerOverride(value: unknown): value is RunnerOverride {
 }
 
 export const runnerSelectionInput = {
-  runner: z.string().trim().min(1).optional().describe("CLI runner from the available options below. Omit for the workbench default."),
-  model: z.string().trim().min(1).optional().describe("Exact model ID for that runner. Omit to use its configured model for this tier."),
-  effort: z.string().trim().min(1).optional().describe("Reasoning effort supported by the selected model. Requires model."),
+  runner: z.string().trim().min(1).optional().describe("CLI runner from the available options below. Omit to follow the workbench default for this role."),
+  model: z.string().trim().min(1).optional().describe("Exact model ID for that runner. Omit to use its configured model for this role/tier."),
+  effort: z.string().trim().min(1).optional().describe("Reasoning effort supported by the selected (or default) model. May be set alone or together with runner/model."),
 };
 const runnerSelection = z.object(runnerSelectionInput);
 export type RunnerSelection = z.output<typeof runnerSelection>;
 export const runnerSelectionProperties = z.toJSONSchema(runnerSelection, { io: "input" }).properties;
 
-export async function childRunnerOverride(ports: Pick<RunPorts, "resolveRunnerSelection">, args: RunnerSelection, kind: ProcessorSpec["kind"] = "llm"): Promise<RunnerOverride | undefined> {
+export async function childRunnerOverride(
+  ports: Pick<RunPorts, "resolveRunnerSelection">,
+  args: RunnerSelection,
+  target: ProcessorSpec["kind"] | ({ kind?: ProcessorSpec["kind"] } & RunnerSelectionTarget) = "llm",
+): Promise<RunnerOverride | undefined> {
   const { runner, model, effort } = args;
   if (runner === undefined && model === undefined && effort === undefined) return undefined;
+  const kind = typeof target === "string" ? target : (target.kind ?? "llm");
   if (kind === "code") throw new NgError("invalid_argument", "Runner options apply only to model-backed cells.");
   if (!ports.resolveRunnerSelection) throw new NgError("unsupported", "No CLI runner options are available.");
-  return ports.resolveRunnerSelection({ runner, model, effort });
+  const selTarget: RunnerSelectionTarget | undefined =
+    typeof target === "string" ? undefined : { ...(target.role !== undefined ? { role: target.role } : {}), ...(target.tier !== undefined ? { tier: target.tier } : {}) };
+  return ports.resolveRunnerSelection({ runner, model, effort }, selTarget);
 }
 
 /** Precedence when several tool calls in one step ask to end the Run. */

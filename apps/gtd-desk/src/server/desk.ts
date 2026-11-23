@@ -1,7 +1,7 @@
 import { createModelSwitch } from "./models";
-import type { SetModelRequest, SetRunnerRequest } from "../shared/api";
+import type { UpdateModelsRequest } from "../shared/api";
 import { ownerOnlyApproval } from "@ng/gate";
-import type { HumanDecision, HumanItem, CardOption } from "@ng/protocol";
+import { isRunnerOverride, type HumanDecision, type HumanItem, type CardOption, type RunnerOverride } from "@ng/protocol";
 import { isProjectRoot, type Kernel } from "@ng/cell";
 import type { UiChannel } from "@ng/channel";
 import {
@@ -367,11 +367,37 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
         if (a.effort !== undefined && !isEffort(a.effort)) throw bad(`未知的精力标签 ${String(a.effort)}`);
         return { title: a.title.trim(), owner: a.owner, ...(a.effort ? { effort: a.effort } : {}), ...(a.nextStep ? { nextStep: a.nextStep } : {}) };
       });
+      const baseProposal = proposalOf(rec, card);
+      let nextRunnerOverride: RunnerOverride | undefined = baseProposal.runnerOverride;
+      if (p.runnerOverride === null) {
+        nextRunnerOverride = undefined;
+      } else if (p.runnerOverride !== undefined) {
+        const candidate: RunnerOverride = {
+          engine: p.runnerOverride.engine,
+          ...(typeof p.runnerOverride.model === "string" && p.runnerOverride.model.trim() ? { model: p.runnerOverride.model.trim() } : {}),
+          ...(typeof p.runnerOverride.effort === "string" && p.runnerOverride.effort.trim() ? { effort: p.runnerOverride.effort.trim() } : {}),
+        };
+        if (!isRunnerOverride(candidate)) throw bad("请核对项目 Runner、模型与推理强度（设置推理强度时需要选择模型）");
+        if (kernel.cliRunners.length > 0 && !kernel.cliRunners.includes(candidate.engine)) {
+          throw bad(`Runner「${candidate.engine}」未启用`);
+        }
+        const cat = kernel.modelSettings(candidate.engine)?.view().catalog;
+        if (cat && candidate.model) {
+          const m = cat.models.find((x) => x.id === candidate.model);
+          if (!m) throw bad(`${candidate.engine} 的模型列表里没有 "${candidate.model}"`);
+          if (candidate.effort && !m.efforts.includes(candidate.effort)) {
+            throw bad(`${m.label} 不提供推理强度 "${candidate.effort}"`);
+          }
+        }
+        nextRunnerOverride = candidate;
+      }
+      const { runnerOverride: _oldRunner, ...restProposal } = baseProposal;
       const proposal: ProjectProposal = {
-        ...proposalOf(rec, card),
-        title: typeof p.title === "string" && p.title.trim() ? p.title.trim() : proposalOf(rec, card).title,
+        ...restProposal,
+        title: typeof p.title === "string" && p.title.trim() ? p.title.trim() : baseProposal.title,
         outcome: p.outcome.trim(),
         ...(p.background !== undefined ? { background: p.background } : {}),
+        ...(nextRunnerOverride ? { runnerOverride: nextRunnerOverride } : {}),
         actions,
       };
       if (!isProjectProposal(proposal)) throw bad("请核对方案背景、行动说明及项目目录");
@@ -794,7 +820,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
   return {
     ownerPrincipal: owner,
     models: (refresh: boolean) => models.view({ refresh }),
-    async setModel(req: SetModelRequest | SetRunnerRequest, actor: DeskActor) {
+    async setModel(req: UpdateModelsRequest, actor: DeskActor) {
       principalOf(actor);
       const result = await models.set(req);
       kernel.bus.emit("runner.settings.changed", {});

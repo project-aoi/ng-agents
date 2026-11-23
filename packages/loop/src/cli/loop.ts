@@ -67,10 +67,10 @@ export interface CliAgentLoopOptions {
   /** Tier → model; `""` = the CLI's own default. Merged over the adapter defaults (strong = CLI default). */
   models?: CliModels;
   /**
-   * Asked at the start of every Run, before `models`: the owner's current choice for the tier (the workbench's model
-   * switch), so a change applies to the next Run without a restart. `undefined` = fall back to `models`.
+   * Asked at the start of every Run, before `models`: the owner's current choice for the tier/role (the workbench's
+   * model switch), so a change applies to the next Run without a restart. `undefined` = fall back to `models`.
    */
-  resolveModel?: (tier: ModelTier) => CliModelChoice | undefined | Promise<CliModelChoice | undefined>;
+  resolveModel?: (tier: ModelTier, ctx?: { spec: PromptSnapshot["spec"]; engine: CliEngine }) => CliModelChoice | undefined | Promise<CliModelChoice | undefined>;
   /** Tier when processor.modelTier is absent. Default "strong". */
   defaultTier?: ModelTier;
   /** Base environment for the CLI (default process.env), filtered by cliEnvironment. */
@@ -195,7 +195,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
     let chosen: CliModelChoice | undefined = processor.model ? { model: processor.model, effort: processor.effort } : undefined;
     if (!chosen) {
       try {
-        chosen = await opts.resolveModel?.(tier);
+        chosen = await opts.resolveModel?.(tier, { spec: snapshot.spec, engine });
       } catch {
         chosen = undefined;
       }

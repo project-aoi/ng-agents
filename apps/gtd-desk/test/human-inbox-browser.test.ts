@@ -93,6 +93,22 @@ async function mount(
     const body = init.body ? JSON.parse(String(init.body)) : {};
     requests.push({ path, method, body });
     if (path === "/api/human-items" && method === "GET") return Response.json({ items: readItems(), openArtifactIds: openIds() });
+    if (path === "/api/models" && method === "GET") {
+      return Response.json({
+        available: false,
+        engine: null,
+        runners: [],
+        models: [],
+        recommended: null,
+        fetchedAt: null,
+        error: null,
+        selection: { strong: { mode: "auto" }, fast: { mode: "auto" } },
+        effective: { strong: null, fast: null },
+        catalogs: {},
+        roles: { desk: { mode: "inherit" }, project: { mode: "inherit" }, worker: { mode: "inherit" }, hub: { mode: "inherit" }, checker: { mode: "inherit" }, sensor: { mode: "inherit" } },
+        effectiveRoles: { desk: null, project: null, worker: null, hub: null, checker: null, sensor: null },
+      });
+    }
     return write(path, body);
   });
   await renderAt(cardId);

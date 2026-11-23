@@ -5,6 +5,7 @@ import type { ProjectRecord } from "@ng/presets/records";
 import {
   CELL_DIRECT_CHAT_KEY,
   CELL_STATUS_KEY,
+  cellRoleOf,
   DEFAULT_RESOURCE_PAGE_CHARS,
   MAX_RESOURCE_PAGE_CHARS,
   childRunnerOverride,
@@ -447,7 +448,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         source: { label: "主 Agent", principalId, at: now() },
         ...(cwd ? { cwd } : {}),
         ...(phases.length ? { phases } : {}),
-        runnerOverride: await childRunnerOverride(kernel, runnerSelection(args)),
+        runnerOverride: await childRunnerOverride(kernel, runnerSelection(args), { role: "project", tier: "strong" }),
       };
       let r: { projectId: string; started: boolean };
       try {
@@ -503,9 +504,17 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         const carrier = r.cellId ? `，由 ${r.cellId} 承担` : "";
         return `- ${r.id}「${r.title}」${OWNER_TEXT[r.owner]}，${r.status}${carrier}${r.nextStep && r.nextStep !== r.title ? ` — 下一步：${oneLine(r.nextStep, 120)}` : ""}${r.dueAt ? `，到期 ${isoMin(r.dueAt)}` : ""}`;
       };
+      const runnerInfo = (cell: CellRecord) => {
+        if (cell.spec.processor.kind !== "llm") return null;
+        const eff = kernel.effectiveRunnerFor?.(cell.spec);
+        if (!eff) return cell.spec.processor.engine ?? kernel.agentBackend ?? null;
+        const m = eff.choice ? `${eff.choice.model}${eff.choice.effort ? ` · ${eff.choice.effort}` : ""}` : null;
+        return m ? `${eff.runner} · ${m}` : eff.runner;
+      };
       const cellLines = below.map((c) => {
         const line = statusLineOf(c.id);
-        return `- ${c.id}${c.title ? `「${c.title}」` : ""}（${c.preset ?? "cell"}，${cellStateText(c)}${c.spec.cwd ? `，目录 ${c.spec.cwd}` : ""}）${line && c.status !== "closed" ? ` — ${oneLine(line, 120)}` : ""}`;
+        const r = runnerInfo(c);
+        return `- ${c.id}${c.title ? `「${c.title}」` : ""}（${c.preset ?? "cell"}，${cellStateText(c)}${r ? `，${r}` : ""}${c.spec.cwd ? `，目录 ${c.spec.cwd}` : ""}）${line && c.status !== "closed" ? ` — ${oneLine(line, 120)}` : ""}`;
       });
       // Proposal 02 §四.2: what its workers did or were told past the project's own cursor, read live — the project
       // may not have woken since, but whoever asks sees it now (the owner's direct words included).
@@ -733,9 +742,15 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const cards = desk.listHumanItems(true).filter(r => r.category === "decision" && r.cellId === id);
       const project = projectRecordOf(id);
       const tail = n > 0 ? evidenceTail(id, n) : [];
+      const effRunner = c.spec.processor.kind === "llm" ? (kernel.effectiveRunnerFor?.(c.spec) ?? null) : null;
+      const runnerText = c.spec.processor.kind === "code"
+        ? "零算力脚本"
+        : effRunner
+          ? `${effRunner.runner}${effRunner.choice ? ` · ${effRunner.choice.model}${effRunner.choice.effort ? ` · ${effRunner.choice.effort}` : ""}` : ""}`
+          : (c.spec.processor.engine ?? kernel.agentBackend ?? "—");
       const head = [
         `cell ${id}${c.title ? `「${c.title}」` : ""} — ${c.preset ?? "cell"}，${cellStateText(c)}（${c.status}${c.closeReason ? `, ${c.closeReason}` : ""}${activity ? `; ${activity.why}` : ""}）`,
-        `父节点：${c.parentId ?? "—"}；目录：${c.spec.cwd ?? "（默认）"}；${isLeafCell(c) ? "叶节点：一轮做完待命，发消息即唤醒" : "常驻"}${chats ? `；主人直接和它说过 ${chats} 次话` : ""}`,
+        `父节点：${c.parentId ?? "—"}；目录：${c.spec.cwd ?? "（默认）"}；执行：${runnerText}；${isLeafCell(c) ? "叶节点：一轮做完待命，发消息即唤醒" : "常驻"}${chats ? `；主人直接和它说过 ${chats} 次话` : ""}`,
         `状态行：${statusLineOf(id) ?? "—"}`,
         `在等：${waits.length ? waits.map((w) => `${w.waitingFor}（${oneLine(w.reason, 80)}${w.timeoutAt ? `，${isoMin(w.timeoutAt)} 超时` : ""}）`).join("；") : "—"}`,
         ...(project ? [`持有项目记录：${project.lifecycle}「${project.title}」`] : []),
@@ -750,6 +765,9 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         closeReason: c.closeReason,
         parentId: c.parentId,
         cwd: c.spec.cwd ?? null,
+        runner: effRunner?.runner ?? (c.spec.processor.kind === "llm" ? (c.spec.processor.engine ?? kernel.agentBackend ?? null) : null),
+        model: effRunner?.choice?.model ?? (c.spec.processor.kind === "llm" ? (c.spec.processor.model ?? null) : null),
+        effort: effRunner?.choice?.effort ?? (c.spec.processor.kind === "llm" ? (c.spec.processor.effort ?? null) : null),
         state: activity?.state ?? "closed",
         directChats: chats, cards,
         running,
@@ -769,8 +787,14 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const parent = kernel.getCell(parentId);
       if (!parent) return fail(`There is no cell "${parentId}" to attach it to.`);
       if (parent.status === "closed") return fail(`Cell ${parentId} has closed; attach the new cell elsewhere (default: the desk).`);
-      const base = kernel.registry.presets.get(preset)?.defaults.processor;
-      const runnerOverride = await childRunnerOverride(kernel, runnerSelection(args), base?.kind);
+      const presetDef = kernel.registry.presets.get(preset);
+      const base = presetDef?.defaults.processor;
+      const role = cellRoleOf({ preset, meta: presetDef?.defaults.meta });
+      const runnerOverride = await childRunnerOverride(kernel, runnerSelection(args), {
+        kind: base?.kind,
+        role,
+        ...(base?.kind === "llm" && base.modelTier ? { tier: base.modelTier } : {}),
+      });
       let cellId: string;
       try {
         if (preset === "project") {

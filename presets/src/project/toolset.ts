@@ -115,7 +115,7 @@ export function projectToolset(): Toolset {
       cwd: z.string().optional().describe("absolute path of the directory it works in. Default: the project's (for a second writer in the same repository, give the path of a git worktree, or tell it in the instruction to create one)"),
       actionId: z.string().optional().describe("an action already on the books that this carries out (e.g. a planned step); default: a new action"),
       phase: z.number().int().min(1).optional().describe("phase of a staged project"),
-      modelTier: z.enum(["fast", "strong"]).optional(),
+      modelTier: z.enum(["fast", "strong"]).optional().describe("fallback model tier when model is omitted"),
       ...runnerSelectionInput,
       check: checkInput.optional(),
       watches: z.array(watchInput).optional().describe("checker: optional workbench message filters that wake it to check the current condition"),
@@ -158,7 +158,11 @@ export function projectToolset(): Toolset {
       let addr: InboxAddr;
       let instruction = args.instruction;
       try {
-        const runner = await childRunnerOverride(ctx.ports, args, processor.kind);
+        const runner = await childRunnerOverride(ctx.ports, args, {
+          kind: processor.kind,
+          role: preset === "checker" ? "checker" : "worker",
+          ...(processor.kind === "llm" && processor.modelTier ? { tier: processor.modelTier } : {}),
+        });
         if (runner) spec.processor = { ...processor, ...runner };
         if (args.watches?.length) spec.watches = args.watches.map((w) => toWatch(w));
         if (args.schedules?.length) spec.schedules = args.schedules.map(toSchedule);

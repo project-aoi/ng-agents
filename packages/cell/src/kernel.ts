@@ -19,6 +19,7 @@ import {
   STANDARD_TOOLSETS,
 } from "@ng/loop";
 import {
+  cellRoleOf,
   cellsRepo,
   KERNEL_FROM,
   newId, requirePrincipalId,
@@ -179,11 +180,28 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
   const cliProcDir = join(dataDir, "cli-procs");
   const loop: AgentLoop = createRoutingLoop({
     local: opts.loop ?? createCodeLoop(registry, clock),
-    defaultEngine: () => runnerSettings.current,
+    defaultEngine: (spec) => runnerSettings.engineFor(spec ? cellRoleOf(spec) : null),
     allowedEngines: opts.cliRunners,
     cliLoop: (engine) => {
       const settings = modelSettingsOf(engine);
-      return createCliAgentLoop({ ...opts.cli?.[engine], processRegistry: { dir: cliProcDir, ownerInstanceId: cliOwner.ownerInstanceId }, ...(settings ? { resolveModel: (tier) => settings.resolve(tier) } : {}), engine, registry, clock });
+      return createCliAgentLoop({
+        ...opts.cli?.[engine],
+        processRegistry: { dir: cliProcDir, ownerInstanceId: cliOwner.ownerInstanceId },
+        ...(settings
+          ? {
+              resolveModel: (tier, ctx) =>
+                runnerSettings.resolveRunModel(
+                  engine,
+                  tier,
+                  ctx?.spec ? cellRoleOf(ctx.spec) : null,
+                  Boolean(ctx?.spec.processor.kind === "llm" && ctx.spec.processor.engine),
+                ),
+            }
+          : {}),
+        engine,
+        registry,
+        clock,
+      });
     },
   });
 
@@ -374,6 +392,10 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     get agentBackend() { return runnerSettings.current; },
     cliRunners,
     setDefaultRunner: runnerSettings.select,
+    roleModelSettings: runnerSettings.roleSelections,
+    setRoleModel: runnerSettings.selectRole,
+    effectiveRunnerForRole: runnerSettings.effectiveForRole,
+    effectiveRunnerFor: runnerSettings.effectiveForSpec,
     describeRunnerOptions: runnerSettings.describe,
     resolveRunnerSelection: runnerSettings.resolve,
     modelSettings(engine) {

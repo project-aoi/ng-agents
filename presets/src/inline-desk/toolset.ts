@@ -329,7 +329,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
       };
       let r: { projectId: string; started: boolean };
       try {
-        init.runnerOverride = await childRunnerOverride(ctx.ports, args);
+        init.runnerOverride = await childRunnerOverride(ctx.ports, args, { role: "project", tier: "strong" });
         r = await launchProject(ctx.ports, init, ctx.clock);
       } catch (err) {
         if (isCwdError(err)) return cwdRefusal(err);
@@ -365,7 +365,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
       const t = now(ctx);
       const env = currentItem(ctx);
       const subjectKey = args.subjectKey?.trim() || (env ? subjectKeys.inbound(env.id) : subjectKeys.cell(self(ctx)));
-      const runnerOverride = await childRunnerOverride(ports, args);
+      const runnerOverride = await childRunnerOverride(ports, args, { role: "project", tier: "strong" });
       const proposal: ProjectProposal = {
         title: args.title,
         outcome: args.outcome,
@@ -527,7 +527,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
         args.rules,
       ].join("\n");
       try {
-        spec.processor = { ...HUB_PROCESSOR, ...await childRunnerOverride(ctx.ports, args) };
+        spec.processor = { ...HUB_PROCESSOR, ...await childRunnerOverride(ctx.ports, args, { role: "hub", tier: "strong" }) };
         await ctx.ports.spawnCell(spec, { instruction, input: { repos, rules: args.rules } });
       } catch (err) {
         return { output: `Not added: ${errorText(err)}`, isError: true };
@@ -571,7 +571,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
         mode: args.mode ?? "active",
         processor: processor.kind,
       };
-      const runner = await childRunnerOverride(ctx.ports, args, processor.kind);
+      const runner = await childRunnerOverride(ctx.ports, args, { kind: processor.kind, role: "sensor", tier: "fast" });
       const spec = createSensorSpec(newId("src", ctx.clock), source, { ...processor, ...runner }, args.watchThread);
       const addr = await ctx.ports.spawnCell(spec, { instruction: args.description ?? args.title });
       await notifyOwner(ctx.ports, `已添加信源：${args.title}${args.mode === "observe" ? "（观察模式，只记笔记不出卡）" : ""}`, `source:${spec.id}`);

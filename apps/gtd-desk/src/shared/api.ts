@@ -184,8 +184,29 @@ export interface ModelChoiceDTO {
 export type ModelSelectionDTO = { mode: "auto" } | { mode: "fixed"; model: string; effort?: string };
 export type ModelTierDTO = "strong" | "fast";
 export type RunnerDTO = "claude" | "codex" | "agy";
+export type CellRoleDTO = "desk" | "project" | "worker" | "hub" | "checker" | "sensor";
+export type RoleModelSelectionDTO =
+  | { mode: "inherit" }
+  | { mode: "custom"; runner: RunnerDTO; model?: string; effort?: string };
 
-/** GET /api/models (`?refresh=1` asks the CLI again) and the answer of PUT /api/models. */
+export interface RunnerCatalogDTO {
+  engine: RunnerDTO;
+  models: ModelInfoDTO[];
+  recommended: ModelChoiceDTO | null;
+  recommendedFast?: ModelChoiceDTO | null;
+  fetchedAt: number | null;
+  error: string | null;
+  selection: Record<ModelTierDTO, ModelSelectionDTO>;
+  effective: Record<ModelTierDTO, ModelChoiceDTO | null>;
+}
+
+export interface RoleEffectiveDTO {
+  runner: RunnerDTO;
+  choice: ModelChoiceDTO | null;
+  inherited: boolean;
+}
+
+/** GET /api/models (`?refresh=1` asks every enabled CLI again) and the answer of PUT /api/models. */
 export interface ModelsDTO {
   available: boolean;
   engine: RunnerDTO | null;
@@ -202,10 +223,20 @@ export interface ModelsDTO {
   selection: Record<ModelTierDTO, ModelSelectionDTO>;
   /** What the next run of each tier is launched with; null = the CLI's own default. */
   effective: Record<ModelTierDTO, ModelChoiceDTO | null>;
+  /** Per-runner model catalogues and tier selections for every enabled runner. */
+  catalogs: Partial<Record<RunnerDTO, RunnerCatalogDTO>>;
+  /** Per-role default overrides ("inherit" follows the global default runner and tier). */
+  roles: Record<CellRoleDTO, RoleModelSelectionDTO>;
+  /** What the next run of each role is launched with right now. */
+  effectiveRoles: Record<CellRoleDTO, RoleEffectiveDTO | null>;
 }
 /** PUT /api/models */
 export type SetModelRequest = { tier: ModelTierDTO; engine?: RunnerDTO } & ({ mode: "auto" } | { mode: "fixed"; model: string; effort?: string });
 export type SetRunnerRequest = { runner: RunnerDTO };
+export type SetRoleModelRequest =
+  | { role: CellRoleDTO; mode: "inherit" }
+  | { role: CellRoleDTO; mode: "custom"; runner: RunnerDTO; model?: string; effort?: string };
+export type UpdateModelsRequest = SetModelRequest | SetRunnerRequest | SetRoleModelRequest;
 
 export interface StatusDTO {
   humanPending: number;
@@ -274,6 +305,7 @@ export interface PlanSaveRequest {
     title?: string;
     outcome: string;
     background?: string;
+    runnerOverride?: { engine: RunnerDTO; model?: string; effort?: string } | null;
     actions: Array<{ title: string; owner: BallOwner; effort?: Effort; nextStep?: string }>;
   };
 }
@@ -437,6 +469,10 @@ export interface TopologyNodeDTO {
   engine: string | null;
   /** An explicit model and effort chosen at launch. */
   modelOverride?: { model: string; effort?: string };
+  /** Effective model and effort for the next run (explicit override, role default, or global default). */
+  effectiveModel?: ModelChoiceDTO | null;
+  /** Where this node's runner/model comes from. */
+  runnerSource?: "override" | "role" | "default";
   modelTier: "strong" | "fast" | null;
   cwd: string | null;
   /** The work tree its directory belongs to (same value on every cell sharing it); null when it has no directory. */
