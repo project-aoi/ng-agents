@@ -10,7 +10,7 @@ import type { ActivityKind, ApiError, DeskEvent } from "../shared/api";
 import { DeskError, type Desk } from "./desk";
 import type { EventHub } from "./events";
 import { mountAgentApi, type AgentControlPlane } from "../agent/routes";
-import { agentAuthFor, bearerOf, crossSiteReason, hostnameOf, tokenMatches, type SecurityPolicy } from "./security";
+import { crossSiteReason, hostnameOf, type SecurityPolicy } from "./security";
 
 const MAX_BODY = 1024 * 1024;
 const PING_MS = 25_000;
@@ -27,7 +27,7 @@ export interface DeskAppDeps {
   onError?: (err: unknown, where: string) => void;
 }
 
-function apiError(c: Context, status: 400 | 401 | 403 | 404 | 409 | 413 | 415 | 500, code: string, message: string) {
+function apiError(c: Context, status: 400 | 403 | 404 | 409 | 413 | 415 | 500, code: string, message: string) {
   const body: ApiError = { error: { code, message } };
   return c.json(body, status);
 }
@@ -63,7 +63,8 @@ async function body<T>(c: Context): Promise<T> {
 }
 
 /**
- * The HTTP surface: `/api/*` (bearer token when configured, same-site writes only), `/api/events` (SSE),
+ * The HTTP surface: `/api/*` as the owner, `/api/agent/*` as the external main agent (same rights, recorded as
+ * `agent:local`), `/api/events` (SSE) and the web client. No authentication; same-site writes only.
  */
 export function createDeskApp(deps: DeskAppDeps): Hono {
   const { desk, events, security } = deps;
@@ -97,24 +98,6 @@ export function createDeskApp(deps: DeskAppDeps): Hono {
     }
     const why = crossSiteReason({ method: c.req.method, url: c.req.url, header: (n) => c.req.header(n) });
     if (why) return apiError(c, why.startsWith("body") ? 415 : 403, "cross_site", `拒绝跨站请求（${why}）`);
-    if (c.req.path.startsWith("/api/agent/")) {
-      // A separate credential and a separate identity: the caller is `agent:<id>`, never the owner (docs/05 guard 3).
-      const auth = agentAuthFor(security, bearerOf(c.req.header("authorization")));
-      if (!auth.ok) {
-        c.header("WWW-Authenticate", 'Bearer realm="gtd-desk-agent"');
-        return apiError(c, 401, "unauthorized", auth.reason);
-      }
-      c.set("agentPrincipal" as never, auth.principalId as never);
-      c.header("Cache-Control", "no-store");
-      return next();
-    }
-    if (security.token) {
-      const presented = bearerOf(c.req.header("authorization")) ?? (c.req.path === "/api/events" ? (c.req.query("token") ?? null) : null);
-      if (!tokenMatches(presented, security.token)) {
-        c.header("WWW-Authenticate", 'Bearer realm="gtd-desk"');
-        return apiError(c, 401, "unauthorized", "需要访问令牌");
-      }
-    }
     c.header("Cache-Control", "no-store");
     return next();
   });
@@ -224,7 +207,7 @@ export function createDeskApp(deps: DeskAppDeps): Hono {
   );
 
   // ---------- external main agent ----------
-  if (deps.agent) mountAgentApi(app, deps.agent, (c) => (c.get("agentPrincipal" as never) as `agent:${string}` | undefined) ?? null);
+  if (deps.agent) mountAgentApi(app, deps.agent);
 
   app.all("/api/*", (c) => apiError(c, 404, "not_found", "没有这个接口"));
 

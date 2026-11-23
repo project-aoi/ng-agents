@@ -103,9 +103,8 @@ export function externalPrincipal(channelId: string, externalUserId: string): st
 }
 
 /**
- * [docs/05 §5.3] An external main agent on the control plane (MCP / `/api/agent/*`): `agent:<agentId>`. It may
- * orchestrate like the owner (spawn, update, message, pause/resume/steer/cancel, close) but is never the owner: it
- * must leave project approval to the owner.
+ * [docs/05 §5.3] An external main agent on the control plane (MCP / `/api/agent/*`): `agent:<agentId>`. It operates the
+ * workbench with the owner's rights, project approval included (proposal 07); the identity records the entrance.
  */
 export function agentPrincipal(agentId: string): `agent:${string}` {
   if (!agentId || agentId.includes(":")) throw new NgError("invalid_argument", `agentPrincipal: invalid agent id "${agentId}"`);

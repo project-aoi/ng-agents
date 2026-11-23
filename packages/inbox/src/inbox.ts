@@ -1187,7 +1187,7 @@ function defaultControlAuthorizer(cells: CellsRepo, owner: string): ControlAutho
       return { ok: false, reason: "cannot pause or cancel a root cell" };
     }
     const p = parsePrincipal(principalId, owner);
-    if (p.kind === "owner") return { ok: true };
+    if (p.kind === "owner" || p.kind === "agent") return { ok: true };
     if (p.kind === "cell") {
       if (p.cellId !== cellId && cells.ancestors(cellId).some((a) => a.id === p.cellId)) return { ok: true };
       return { ok: false, reason: `cell "${p.cellId}" may only control its own descendants` };

@@ -4,7 +4,7 @@ import { isNgError } from "@ng/protocol";
 import { cleanupAll, harness, initRepo } from "./helpers";
 
 afterEach(() => {
-  delete process.env.NG_DESK_TOKEN;
+  delete process.env.NG_DESK_DATA_DIR;
   cleanupAll();
 });
 
@@ -19,14 +19,14 @@ describe("bash", () => {
     await expect(port.exec("bash", { command: "" })).rejects.toSatisfy((e) => isNgError(e, "invalid_argument"));
   });
 
-  it("uses the owner's host environment (real HOME, PATH, git identity) minus the kernel's NG_* configuration and secrets", async () => {
-    process.env.NG_DESK_TOKEN = "s3cr3t-value-123";
+  it("uses the owner's host environment (real HOME, PATH, git identity) minus the kernel's NG_* configuration", async () => {
+    process.env.NG_DESK_DATA_DIR = "/private/desk-data-123";
     process.env.NGWS_TEST_OWNER_VAR = "owner-setting";
     const h = harness();
     const port = await h.mgr.acquire("w1");
     const r = await port.exec("bash", { command: "env" });
-    expect(r.output).not.toContain("s3cr3t-value-123");
-    expect(r.output).not.toContain("NG_DESK_TOKEN");
+    expect(r.output).not.toContain("/private/desk-data-123");
+    expect(r.output).not.toContain("NG_DESK_DATA_DIR");
     const vars = Object.fromEntries(
       r.output
         .trim()

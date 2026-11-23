@@ -1,6 +1,6 @@
 import { renderEnvelope } from "@ng/context";
 import { CLI_SESSION_KEY, type CliSessionRecord } from "@ng/loop";
-import { deliveryAllowed, ownerOnlyApproval } from "@ng/gate";
+import { deliveryAllowed } from "@ng/gate";
 import {
   acceptsApprovalDraft, all, get, CELL_RESULT_CANDIDATE_KEY,
   cellPrincipal,
@@ -207,8 +207,8 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
             "SELECT action, cell_id FROM human_items WHERE artifact_id=? AND disposition='pending'", [artifactId]);
           for (const binding of bindings) {
             const action = JSON.parse(binding.action) as ProposedAction;
-            if (binding.cell_id !== cellId && ownerOnlyApproval(action))
-              throw new NgError("bounds_violation", "只有发起任务和主人可以修改这份待批文稿");
+            if (binding.cell_id !== cellId && action.type === "project.start")
+              throw new NgError("bounds_violation", "只有发起任务或控制面可以修改这份待批立项方案");
             if (!acceptsApprovalDraft(action.type, tx.artifact.content.format, tx.artifact.content.data))
               throw new NgError("invalid_argument", "文稿内容不符合待批方案的要求");
           }

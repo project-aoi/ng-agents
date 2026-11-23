@@ -30,4 +30,6 @@ pnpm start
 
 在仓库根目录运行 `pnpm typecheck && pnpm test && pnpm build`。
 
-工作台在默认回环地址启动时生成本次主人的登录链接。配置 `NG_AGENT_TOKEN` 或 `NG_AGENT_TOKENS` 时，同时为主人配置独立的 `NG_DESK_TOKEN`。助手凭据只用于助手接口。
+网页与外部助手的操作权限相同，分别记录为主人和 `agent:local`。
+
+工作台没有鉴权。服务默认监听 `127.0.0.1`，Host 与跨站检查拦截浏览器里的其他网页；用 `NG_DESK_HOST` 绑定非回环地址后，能访问该端口的人可以完全控制工作台和在本机运行的分身，`NG_DESK_ALLOWED_HOSTS` 只限定接受的 Host 名称，不识别来访者。后台节点的身份规则约束它经内核发出的工具调用；本机任何进程，包括分身在 shell 里执行的命令，都能访问回环控制面，这一层没有凭据阻隔。

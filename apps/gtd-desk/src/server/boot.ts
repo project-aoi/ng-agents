@@ -14,7 +14,7 @@ import { selectBackend, type Env } from "./backend";
 import { createDesk, type Desk } from "./desk";
 import { createEventHub, type EventHub } from "./events";
 import { DEFAULT_SETTINGS, type DeskSettings } from "./projections/common";
-import { agentTokensFromEnv, securityPolicyFor, type SecurityPolicy } from "./security";
+import { securityPolicyFor, type SecurityPolicy } from "./security";
 
 export const DEFAULT_PORT = 8790;
 const APP_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -27,12 +27,8 @@ export interface DeskServerOptions {
   host?: string;
   /** Default NG_DESK_PORT, else 8790 (0 = any free port). */
   port?: number;
-  /** Bearer token for /api/*; default NG_DESK_TOKEN. Required for a non-loopback host. */
-  token?: string | null;
-  /** Extra Host header names accepted on a loopback bind; default NG_DESK_ALLOWED_HOSTS. */
+  /** Extra Host header names accepted; on a non-loopback bind, the only ones besides loopback. Default NG_DESK_ALLOWED_HOSTS. */
   allowedHosts?: string[];
-  /** External main agents allowed on `/api/agent/*`: agent id → bearer token. Default NG_AGENT_TOKEN / NG_AGENT_TOKENS. */
-  agentTokens?: Record<string, string>;
   /** Is this CLI agent installed? Default: `<bin> --version` runs (tests inject a fake). */
   detectCli?: (engine: CliEngine, bin: string) => boolean;
   clock?: Clock;
@@ -78,7 +74,6 @@ function portOf(v: string | undefined): number {
 
 /**
  * registry → presets → kernel and workbench channel → desk root cell → start → HTTP app.
- * Fails before touching the data directory when the bind would be unsafe.
  */
 export async function createDeskServer(opts: DeskServerOptions = {}): Promise<DeskServer> {
   const env = opts.env ?? process.env;
@@ -86,8 +81,7 @@ export async function createDeskServer(opts: DeskServerOptions = {}): Promise<De
   const onError = opts.onError ?? ((err: unknown, where: string) => console.error(`[desk] ${where}:`, err));
   const host = opts.host ?? (env["NG_DESK_HOST"] || "127.0.0.1");
   const port = opts.port ?? portOf(env["NG_DESK_PORT"]);
-  const token = opts.token !== undefined ? opts.token : (env["NG_DESK_TOKEN"] ?? null);
-  const security = securityPolicyFor(host, token, opts.allowedHosts ?? csv(env["NG_DESK_ALLOWED_HOSTS"]), opts.agentTokens ?? agentTokensFromEnv(env));
+  const security = securityPolicyFor(host, opts.allowedHosts ?? csv(env["NG_DESK_ALLOWED_HOSTS"]));
 
   const timeZone = env["NG_DESK_TZ"] || Intl.DateTimeFormat().resolvedOptions().timeZone;
   const choice = selectBackend(env, {
@@ -143,20 +137,14 @@ export async function createDeskServer(opts: DeskServerOptions = {}): Promise<De
       ...DEFAULT_SETTINGS,
       ...opts.settings,
       backend: kernel.agentBackend ?? choice.engine,
-      tokenRequired: security.token !== null,
     };
     const desk = createDesk({ kernel, ui, settings, onError });
     events = createEventHub(kernel);
     const webDir = opts.webDir === undefined ? resolve(APP_ROOT, "dist/web") : opts.webDir;
     const agent = createAgentControlPlane({ kernel, desk });
     const app = createDeskApp({ desk, events, security, agent, webDir, onError });
-    const agentAccess =
-      security.agentTokens.size > 0
-        ? `token for ${[...security.agentTokens.keys()].map((id) => `agent:${id}`).join(", ")}`
-        : security.loopback && security.generatedOwnerToken
-          ? "open on loopback as agent:local"
-          : "closed (set NG_AGENT_TOKEN)";
-    log(`data ${dataDir} · default runner: ${kernel.agentBackend} · enabled runners: ${kernel.cliRunners.join(", ")} · main-agent API /api/agent/*: ${agentAccess}`);
+    log(`data ${dataDir} · default runner: ${kernel.agentBackend} · enabled runners: ${kernel.cliRunners.join(", ")}`);
+    if (!security.loopback) log(`${host} is not a loopback address: everyone who can reach it operates this workbench and its agents on this machine${security.allowedHosts ? "" : " (NG_DESK_ALLOWED_HOSTS limits the Host names accepted)"}`);
 
     let server: ServerType | null = null;
     let closing: Promise<void> | null = null;

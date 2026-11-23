@@ -107,7 +107,7 @@ describe("GET/PUT /api/models on a CLI backend", () => {
     expect(src.calls).toEqual(["claude"]);
     const status = await d.get<StatusDTO>("/api/status");
     expect(status).toMatchObject({ backend: "claude", model: "Opus 5.5 · xhigh" });
-    const stream = await d.server.app.request("/api/events", { headers: {authorization: `Bearer ${d.server.security.token}`} });
+    const stream = await d.server.app.request("/api/events");
     const reader = stream.body!.getReader();
     try {
       let frame = "";
@@ -162,7 +162,7 @@ describe("GET/PUT /api/models on a CLI backend", () => {
     expect((await put(d, { tier: "medium", mode: "auto" })).status).toBe(400);
     expect((await put(d, { tier: "strong", mode: "fixed" })).status).toBe(400);
     expect((await put(d, {})).status).toBe(400);
-    const bad = await d.server.app.request("/api/models", { method: "PUT", headers: { authorization: `Bearer ${d.server.security.token}`, "content-type": "application/json" }, body: "{ nope" });
+    const bad = await d.server.app.request("/api/models", { method: "PUT", headers: { "content-type": "application/json" }, body: "{ nope" });
     expect(bad.status).toBe(400);
 
     expect((await d.get<ModelsDTO>("/api/models")).selection).toEqual({ strong: { mode: "auto" }, fast: { mode: "auto" } });

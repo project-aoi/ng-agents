@@ -42,7 +42,7 @@ it("commits one of two competing choices with its exact callback and preserves t
   ]);
 });
 
-it("shares simultaneous identical decisions and rejects other actors and stale draft versions", async () => {
+it("shares simultaneous identical decisions and rejects background and outside actors and stale draft versions", async () => {
   const { kernel } = await boot({ start: false });
   kernel.context.commitSync("desk", { artifact: { artifactId: "plan", content: { format: "text", body: "first" }, updatedBy: "agent" } });
   const gateResult = kernel.gate.authorizeSync({
@@ -52,7 +52,8 @@ it("shares simultaneous identical decisions and rejects other actors and stale d
   if (gateResult.type !== "defer") throw Error("expected a proposal card");
   const item = kernel.humanItems.get(gateResult.actionId)!;
   const choice = { optionId: "system.execute", seenItemRevision: item.itemRevision, seenArtifactVersion: 1 };
-  await expect(kernel.humanItems.decide(item.id, choice, "agent:helper")).rejects.toMatchObject({ code: "bounds_violation" });
+  for (const actor of ["cell:desk", "external:mail:someone"])
+    await expect(kernel.humanItems.decide(item.id, choice, actor)).rejects.toMatchObject({ code: "bounds_violation" });
   kernel.context.commitSync("desk", { artifact: { artifactId: "plan", expectedVersion: 1, content: { format: "text", body: "revised" }, updatedBy: "human" } });
   await expect(kernel.humanItems.decide(item.id, choice, "owner")).rejects.toMatchObject({ code: "conflict", message: "草稿已变动" });
   const reviewed = { ...choice, seenArtifactVersion: 2 };
@@ -65,7 +66,24 @@ it("shares simultaneous identical decisions and rejects other actors and stale d
   expect(kernel.inbox.listMessagesSync({ type: PAYLOAD.approvalResolved })).toHaveLength(1);
 });
 
-it("reserves undo for the owner when undo would reverse a decision on a project proposal", async () => {
+it("starts the project when an external agent approves its card, with the agent on record", async () => {
+  const { kernel } = await boot({ start: false });
+  const approval = kernel.gate.authorizeSync({ type: "project.start", subjectKey: "proposal:agent", summary: "启动项目", sideEffect: "external",
+    proposal: { title: "测试项目", outcome: "交付总结", actions: [] } }, { cellId: "desk", epoch: 0, principalId: "cell:desk" });
+  if (approval.type !== "defer") throw Error("expected a proposal card");
+  const choice = { optionId: "system.execute", seenItemRevision: 1 };
+  await expect(kernel.humanItems.decide(approval.actionId, { ...choice, seenItemRevision: 9 }, "agent:helper")).rejects.toMatchObject({ code: "conflict" });
+  await expect(kernel.humanItems.decide(approval.actionId, choice, "agent:helper")).resolves.toEqual({ status: "approved" });
+  expect(kernel.getCell(`project-${approval.actionId}`)).toMatchObject({ parentId: "desk", status: "active" });
+  expect(kernel.gate.getApprovalSync(approval.actionId)).toMatchObject({ status: "approved", approverId: "agent:helper" });
+  expect(kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.approvalResolved }).map(m => m.envelope.payload))
+    .toEqual([expect.objectContaining({ status: "approved", approverId: "agent:helper" })]);
+  // The same approval again, by the owner: it is decided already, and no second project starts.
+  await expect(kernel.humanItems.decide(approval.actionId, choice, "owner")).rejects.toMatchObject({ code: "conflict" });
+  expect(kernel.listCells({ parentId: "desk" })).toHaveLength(1);
+});
+
+it("lets an external agent undo a decision on a project proposal, and no background cell", async () => {
   const { kernel } = await boot({start:false});
   const approval = kernel.gate.authorizeSync({ type: "project.start", subjectKey: "proposal:undo",
     summary: "立项", sideEffect: "external", proposal: {title: "项目", outcome: "交付记录", actions: []} },
@@ -73,9 +91,11 @@ it("reserves undo for the owner when undo would reverse a decision on a project 
   if (approval.type !== "defer") throw Error("expected a pending proposal");
   const denied = await kernel.humanItems.decide(approval.actionId, { optionId: "system.deny", seenItemRevision: 1 }, "owner");
   expect(denied.activityId).toBeTruthy();
-  await expect(kernel.humanItems.undo(denied.activityId!, "agent:helper")).rejects.toMatchObject({ code: "bounds_violation" });
+  for (const actor of ["cell:desk", "external:mail:someone"])
+    await expect(kernel.humanItems.undo(denied.activityId!, actor)).rejects.toMatchObject({ code: "bounds_violation" });
   expect(kernel.humanItems.get(approval.actionId)?.status).toBe("cancelled");
-  await expect(kernel.humanItems.undo(denied.activityId!, "owner")).resolves.toMatchObject({status:"undone"});
+  await expect(kernel.humanItems.undo(denied.activityId!, "agent:helper")).resolves.toMatchObject({status:"undone"});
+  expect(kernel.humanItems.get(approval.actionId)?.status).toBe("pending");
 });
 
 it("undoes a completed item whose old snooze expired before the scheduler ran", async () => {

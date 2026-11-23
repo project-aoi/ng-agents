@@ -77,10 +77,6 @@ export function acceptsApprovalDraft(type: ProposedAction["type"], format: Deliv
   return type !== "project.start" || (format === "json" && isProjectProposal(data));
 }
 
-export function ownerOnlyApproval(action: ProposedAction): string | null {
-  return action["type"] === "project.start" ? "it starts a new project" : null;
-}
-
 export interface AuthorizeMeta {
   cellId: string;
   principalId: string;

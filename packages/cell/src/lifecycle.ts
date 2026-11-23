@@ -101,6 +101,11 @@ export function createLifecycle(core: KernelCore): Lifecycle {
     throw new NgError("bounds_violation", `principal "${principalId}" may not manage cells`);
   }
 
+  /** The owner or an external main agent; never a background cell (external principals are refused by actorKind). */
+  function assertControlPlane(principalId: string, what: string): void {
+    if (actorKind(principalId).kind === "cell") throw new NgError("bounds_violation", `only the owner or an agent on the control plane may ${what}`);
+  }
+
   function isStrictAncestor(ancestorId: string, cellId: string): boolean {
     return ancestorId !== cellId && cells.ancestors(cellId).some((a) => a.id === ancestorId);
   }
@@ -235,7 +240,7 @@ export function createLifecycle(core: KernelCore): Lifecycle {
 
   function createRootCell(spec: CellSpecInput, opts: RootCellOptions): CellRecord {
     const principalId = requirePrincipalId(opts?.principalId);
-    if (actorKind(principalId).kind !== "owner") throw new NgError("bounds_violation", "only the owner may create root cells");
+    assertControlPlane(principalId, "create root cells");
     return withTx(db, () => {
       const id = spec.id ?? newId("cell", clock);
       if (cells.get(id)) throw new NgError("duplicate", `cell "${id}" already exists`);
@@ -250,7 +255,7 @@ export function createLifecycle(core: KernelCore): Lifecycle {
   }
 
   function ensureRootCell(spec: CellSpecInput & { id: string }, opts: RootCellOptions): CellRecord {
-    if (actorKind(requirePrincipalId(opts?.principalId)).kind !== "owner") throw new NgError("bounds_violation", "only the owner may initialize root cells");
+    assertControlPlane(requirePrincipalId(opts?.principalId), "initialize root cells");
     return withTx(db, () => cells.get(spec.id) ?? createRootCell(spec, opts));
   }
 

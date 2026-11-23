@@ -8,7 +8,7 @@ import {
 } from "@ng/protocol";
 import { attenuateBounds, meetBounds } from "./attenuate";
 import { approvalCardFor } from "./card";
-import { actionShapeFeedback, ownerOnlyApproval, requiresApproval } from "./policy";
+import { actionShapeFeedback, requiresApproval } from "./policy";
 
 const CONTROL_ACTIONS: readonly ControlAction[] = ["cancel", "pause", "resume", "steer"];
 
@@ -242,13 +242,12 @@ export function createGate(opts: GateOptions): GateService {
 
   // ---------- rules ----------
 
-  function assertOwnerOrAgent(principalId: unknown, what: string): "owner" | "agent" {
+  function assertOwnerOrAgent(principalId: unknown, what: string): void {
     if (!isNonEmptyString(principalId)) throw new NgError("invalid_argument", `${what}: principal required`);
     const kind = parsePrincipal(principalId, ownerPrincipal).kind;
     if (kind !== "owner" && kind !== "agent") {
       throw new NgError("bounds_violation", `${what} needs the owner or an agent on the control plane; ${principalId} may not`);
     }
-    return kind;
   }
 
   // ==================== the Gate ====================
@@ -311,15 +310,10 @@ export function createGate(opts: GateOptions): GateService {
       });
     },
     approveSync(actionId, approverId, seenArtifactVersion, approveOpts = {}): ApproveResult {
-      const decider = assertOwnerOrAgent(approverId, "approving a card");
+      assertOwnerOrAgent(approverId, "approving a card");
       return withTx(db, (): ApproveResult => {
         const row = approvalRow(actionId);
         if (!row) return "not_found";
-        const action = fromJson<ProposedAction>(row.action);
-        if (decider !== "owner") {
-          const ownerOnly = ownerOnlyApproval({ ...action, card: fromJson<Deliverable>(row.card) });
-          if (ownerOnly !== null) throw new NgError("bounds_violation", `approving this card needs the owner (${ownerOnly}); ${approverId} may not`);
-        }
         if (row.status === "approved" || row.status === "executed") {
           if (approveOpts.seenItemRevision !== undefined && approveOpts.seenItemRevision !== row.item_revision) {
             return "revision_mismatch";
@@ -462,7 +456,6 @@ export function createGate(opts: GateOptions): GateService {
     },
 
     denySync(actionId, approverId, reason, denyOpts = {}) {
-      // Declining is never an escalation of privilege: an agent may deny even an owner-only card.
       assertOwnerOrAgent(approverId, "denying a card");
       return withTx(db, () => {
         const row = approvalRow(actionId);
@@ -540,7 +533,7 @@ export function createGate(opts: GateOptions): GateService {
       }
       if (!isNonEmptyString(principalId)) return { ok: false, reason: "principal required" };
       const p = parsePrincipal(principalId, ownerPrincipal);
-      // An external main agent orchestrates like the owner (docs/05 §5.3); it is only kept from owner-only decisions.
+      // An external main agent has the owner's rights on the control plane (proposal 07).
       if (p.kind === "owner" || p.kind === "agent") return { ok: true };
       if (p.kind !== "cell") return { ok: false, reason: "only the owner, an agent on the control plane, or an ancestor cell may control a cell" };
       const actor = cells.get(p.cellId);

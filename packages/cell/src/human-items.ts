@@ -26,7 +26,7 @@ import {
   type HumanItemStatus,
   type ProposedAction,
 } from "@ng/protocol";
-import { ownerOnlyApproval, requiresApproval } from "@ng/gate";
+import { requiresApproval } from "@ng/gate";
 import { isProjectRoot, type KernelCore } from "./core";
 import { RESURFACE_MARKER } from "./constants";
 import { isKernelEscalation } from "./escalations";
@@ -498,13 +498,6 @@ export function createHumanItems(core: KernelCore) {
     if (!o) throw new NgError("conflict", "选项已变动");
     if (item.artifactId && d.seenArtifactVersion !== item.artifactVersion)
       throw new NgError("conflict", "草稿已变动");
-    if (
-      o.effect === "execute" &&
-      actor !== core.ownerPrincipal &&
-      item.action &&
-      ownerOnlyApproval({ ...item.action, card: JSON.parse(r.card) })
-    )
-      throw new NgError("bounds_violation", "这张卡需要主人批准");
     if (o.input?.mode === "required" && !d.note?.trim()) throw new NgError("invalid_argument", "请填写说明");
     const locks = {
       approverId: actor,
@@ -528,7 +521,7 @@ export function createHumanItems(core: KernelCore) {
         const rec = gate.getApprovalSync(id);
         if (rec?.status !== "pending" || gate.approveSync(id, actor, d.seenArtifactVersion, locks) !== "approved")
           throw new NgError("conflict", "事项已变动");
-        if (ownerOnlyApproval(rec.action)) {
+        if (rec.action.type === "project.start") {
           const approved = gate.getApprovalSync(id)!;
           const issuer = cells.require(approved.cellId);
           const parent = issuer.preset && core.registry.presets.get(issuer.preset)?.approvedSpawn ? issuer : cells.require(core.deskCellId);
@@ -700,9 +693,6 @@ export function createHumanItems(core: KernelCore) {
       if (event.undone_at !== null) throw new NgError("conflict", "这次操作已撤销");
       const current = row(event.item_id);
       if (!current || current.item_revision !== event.after_revision) throw new NgError("conflict", "事项已有后续操作");
-      const original = JSON.parse(current.action) as ProposedAction | null;
-      if (actor !== core.ownerPrincipal && original && ownerOnlyApproval({ ...original, card: JSON.parse(current.card) }))
-        throw new NgError("bounds_violation", "这张卡需要主人处理");
       const receipt =
         event.receipt_cell && event.receipt_id
           ? core.inbox.listMessagesSync({ cellId: event.receipt_cell, envelopeId: event.receipt_id })[0]

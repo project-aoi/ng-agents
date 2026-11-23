@@ -1,6 +1,6 @@
 import { parseAddress, anyCovers, type ProposedAction, type PolicyBounds } from "@ng/protocol";
 
-export { actionShapeFeedback, ownerOnlyApproval } from "@ng/protocol";
+export { actionShapeFeedback } from "@ng/protocol";
 
 export function requiresApproval(action: ProposedAction): boolean {
   return action.type !== "custom" || action.name === "kernel.escalation" || action.sideEffect === "external";

@@ -17,14 +17,14 @@ const dir = mkdtempSync(join(tmpdir(), "ngcli-env-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
 describe("CLI environment", () => {
-  it("keeps the owner's CLI login and config, drops kernel secrets and parent-agent session markers", () => {
+  it("keeps the owner's CLI login and config, drops workbench settings, API keys and parent-agent session markers", () => {
     const env = cliEnvironment({
       HOME: "/home/u",
       PATH: "/usr/bin",
       CLAUDE_CONFIG_DIR: "/home/u/.claude-alt",
       CODEX_HOME: "/home/u/.codex",
-      NG_AGENT_TOKEN: "ghp_x",
-      NG_DESK_TOKEN: "test-desk-token",
+      NG_DESK_HOST: "0.0.0.0",
+      NG_DESK_DATA_DIR: "/home/u/.ng-desk",
       NG_AGENT_BACKEND: "claude",
       ANTHROPIC_API_KEY: "sk-ant",
       CLAUDECODE: "1",
@@ -33,7 +33,7 @@ describe("CLI environment", () => {
       UNDEFINED: undefined,
     });
     expect(env).toEqual({ HOME: "/home/u", PATH: "/usr/bin", CLAUDE_CONFIG_DIR: "/home/u/.claude-alt", CODEX_HOME: "/home/u/.codex" });
-    expect(cliEnvironment({ ANTHROPIC_API_KEY: "k", NG_DESK_TOKEN: "s" }, { keep: ["ANTHROPIC_API_KEY"], set: { A: "1" } })).toEqual({ ANTHROPIC_API_KEY: "k", A: "1" });
+    expect(cliEnvironment({ ANTHROPIC_API_KEY: "k", NG_DESK_DATA_DIR: "/d" }, { keep: ["ANTHROPIC_API_KEY"], set: { A: "1" } })).toEqual({ ANTHROPIC_API_KEY: "k", A: "1" });
     expect(cliEnvironment({ GITHUB_TOKEN: "g" }, { drop: [/TOKEN$/] })).toEqual({});
   });
 });

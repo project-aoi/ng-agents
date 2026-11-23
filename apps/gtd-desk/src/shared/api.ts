@@ -7,7 +7,7 @@
 // - Every mutation answers with the refreshed view the caller needs (`view`) plus the top bar (`status`), so a click
 //   never needs a second request to re-render.
 // - User-facing strings (labels, messages, status text) are Chinese and ready to display.
-// - Errors: non-2xx with `ApiError`. 401 = missing/wrong bearer token, 403 = cross-site or foreign Host,
+// - Errors: non-2xx with `ApiError`. 403 = cross-site or foreign Host,
 //   415 = a write without a JSON body, 404 = unknown id, 409 = the item is no longer in a state that allows this,
 //   400 = malformed input. Exceptions that carry a full result body instead: approve and the Agents view's cell
 //   messages / control / trigger (always 200, the outcome — not_found included — is in the body), and the two
@@ -28,7 +28,6 @@ export interface HumanItemDTO extends HumanItem {
   closeTargets: Record<string, Array<{id:string; title:string}>>;
   project: {id:string; title:string; paused:boolean; parked:boolean} | null;
   artifact: ArtifactDTO | null;
-  ownerOnly: boolean;
 }
 
 // ==================== shared vocabulary ====================
@@ -245,7 +244,6 @@ export interface StatusDTO {
   backend: string;
   /** The model the main agents run on right now, e.g. "Opus 5.5 · xhigh" (CLI backends, once the CLI has listed its models). */
   model?: string;
-  auth: { tokenRequired: boolean };
   background: {
     /** Background clones doing something right now (a run or a long command). */
     running: number;
@@ -778,7 +776,6 @@ export interface SourcesMutationResponse extends MutationResult<SourcesDTO, Sour
  * - `artifact`     { artifactId, version, updatedBy, parked } — a draft changed (the open editor shows the banner).
  * - `notification` NotificationDTO — a light top-bar notice for the owner.
  * - `ping`         {} every 25 s (keeps proxies from closing the stream).
- * With a bearer token configured, EventSource cannot send headers: pass `?token=` on this endpoint only.
  */
 export type DeskEvent =
   | { event: "hello"; data: { status: StatusDTO } }

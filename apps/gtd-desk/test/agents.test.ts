@@ -41,8 +41,6 @@ import { bootDesk, cleanupAll, HOUR, makeReviewCard, registerTestPresets, reques
 
 afterEach(cleanupAll);
 
-const OWNER_TOKEN = "owner-token-0123456789abcdef";
-const AGENT_TOKEN = "agent-token-0123456789abcdef";
 const noop: CodeProcessor = { name: "test.noop", run: async () => "completed" };
 
 function boot(opts: Parameters<typeof bootDesk>[0] = {}): Promise<TestDesk> {
@@ -91,7 +89,7 @@ const of = <K extends TimelineItemDTO["kind"]>(items: readonly TimelineItemDTO[]
 const INTERNAL = /\b(claim|epoch|silent_inject|serial_coalesce|kernel\.|run_\w+|cell\.result|cell\.task)\b/;
 
 async function agentCall(d: TestDesk, name: string, args: Record<string, unknown> = {}) {
-  return d.req<AgentToolResult>("POST", `/api/agent/tools/${name}`, args, { authorization: `Bearer ${AGENT_TOKEN}` });
+  return d.req<AgentToolResult>("POST", `/api/agent/tools/${name}`, args);
 }
 async function agentOk(d: TestDesk, name: string, args: Record<string, unknown> = {}): Promise<AgentToolResult> {
   const r = await agentCall(d, name, args);
@@ -596,7 +594,7 @@ describe("Radar: reports and the way into the Agents view (BUG-010); BUG-011", (
   });
 
   it("011.3: a parked project is not also paused — no double badge, not counted as paused; get_project says activate", async () => {
-    const d = await boot({ token: OWNER_TOKEN, agentTokens: { main: AGENT_TOKEN } });
+    const d = await boot();
     const k = d.kernel;
     project(d, "park", "极简模式");
     project(d, "hold", "周报");
@@ -620,7 +618,7 @@ describe("Radar: reports and the way into the Agents view (BUG-010); BUG-011", (
 
 describe("control plane: chat_with_desk, message_cell, inspect_cell, read_resource / read_artifact paging, get_project", () => {
   it("chat_with_desk: the owner's words reach the desk as the agent's; its replies are read back from a cursor; an answer carries replyToId", async () => {
-    const d = await boot({ token: OWNER_TOKEN, agentTokens: { main: AGENT_TOKEN } });
+    const d = await boot();
     const k = d.kernel;
     d.script.add("desk", tool("send_message", { to: "channel:ui:owner", text: "代码在哪个本地目录下呀？", summary: "问路径" }));
     const sent = await agentOk(d, "chat_with_desk", { text: "帮我把支付重试改成指数退避" });
@@ -629,8 +627,8 @@ describe("control plane: chat_with_desk, message_cell, inspect_cell, read_resour
     const { cursor, messageId } = sent.data as { cursor: number; messageId: string };
     expect(k.inbox.listMessagesSync({ cellId: "desk", envelopeId: messageId })[0]!.envelope).toMatchObject({
       type: PAYLOAD.userMessage,
-      principalId: "agent:main",
-      payload: { text: "帮我把支付重试改成指数退避", conversationId: "agent:main" },
+      principalId: "agent:local",
+      payload: { text: "帮我把支付重试改成指数退避", conversationId: "agent:local" },
     });
     await k.idle();
     const read = await agentOk(d, "chat_with_desk", { since: cursor });
@@ -653,7 +651,7 @@ describe("control plane: chat_with_desk, message_cell, inspect_cell, read_resour
   });
 
   it("message_cell wakes a dormant worker and says its project got a copy; refusals are plain; inspect_cell reads without moving the project's cursor", async () => {
-    const d = await boot({ token: OWNER_TOKEN, agentTokens: { main: AGENT_TOKEN } });
+    const d = await boot();
     const k = d.kernel;
     project(d, "proj", "支付重试改造");
     d.script.add("w1", { text: "退避已实现" });
@@ -664,14 +662,14 @@ describe("control plane: chat_with_desk, message_cell, inspect_cell, read_resour
     const r = await agentOk(d, "message_cell", { id: "w1", text: "最大重试改成 3" });
     expect(r.text).toContain("w1 was dormant and is woken by it");
     expect(r.text).toContain("Its project proj「支付重试改造」 was given a copy of the owner's words");
-    expect(k.inbox.listMessagesSync({ cellId: "proj", type: PAYLOAD.cellDirectChat })[0]!.envelope.principalId).toBe("agent:main");
+    expect(k.inbox.listMessagesSync({ cellId: "proj", type: PAYLOAD.cellDirectChat })[0]!.envelope.principalId).toBe("agent:local");
     await k.idle();
     expect((await agentRefused(d, "message_cell", { id: "probe", text: "hi" })).text).toContain("deterministic script probe");
     expect((await agentRefused(d, "message_cell", { id: "nope", text: "hi" })).text).toContain('there is no cell "nope"');
 
     const seen = await agentOk(d, "inspect_cell", { id: "w1" });
     expect(seen.text).toContain("实现指数退避");
-    expect(seen.text).toContain("the owner, directly (agent:main): 最大重试改成 3");
+    expect(seen.text).toContain("the owner, directly (agent:local): 最大重试改成 3");
     expect(k.context.readStateSync("proj", pullCursorKey("w1"))).toBeNull();
 
     // get_project shows what the project has not taken in yet, read live; once it pulls, the section is gone.
@@ -689,7 +687,7 @@ describe("control plane: chat_with_desk, message_cell, inspect_cell, read_resour
   });
 
   it("read_resource and read_artifact page through long text; versions can be read", async () => {
-    const d = await boot({ token: OWNER_TOKEN, agentTokens: { main: AGENT_TOKEN } });
+    const d = await boot();
     const k = d.kernel;
     const uri = k.context.writeResourceSync("desk", "a".repeat(10_000) + "b".repeat(10_000));
     const p1 = await agentOk(d, "read_resource", { uri });

@@ -1,6 +1,5 @@
 import { createModelSwitch } from "./models";
 import type { UpdateModelsRequest } from "../shared/api";
-import { ownerOnlyApproval } from "@ng/gate";
 import { isRunnerOverride, type HumanDecision, type HumanItem, type CardOption, type RunnerOverride } from "@ng/protocol";
 import { isProjectRoot, type Kernel } from "@ng/cell";
 import type { UiChannel } from "@ng/channel";
@@ -290,7 +289,6 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     const { rec, card } = pendingCard(cardId);
     const proposal = proposalOf(rec, card);
     const draftId = rec.artifactId ?? (card?.cardType === "project_proposal" ? card.draft?.artifactId : undefined);
-    if (approverId !== owner) throw new NgError("bounds_violation", "只有主人可以确认立项");
     if (draftId && context.getArtifactSync(draftId)?.version !== decision.seenArtifactVersion) throw wrongState("方案已变动，请重新查看");
     const holder = kernel.getCell(rec.cellId);
     if (!holder || holder.status === "closed" || holder.epoch !== rec.epoch) throw wrongState("事项所属任务已变动");
@@ -302,7 +300,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
       id: projectIdForApproval(cardId),
       title: proposal.title,
       outcome: proposal.outcome,
-      brief: parkedBrief(proposal),
+      brief: parkedBrief(proposal, as),
       proposal,
       plan: proposal.actions,
       source,
@@ -316,7 +314,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
       outcome: proposal.outcome,
       lifecycle: "active",
       source,
-      summary: "主人把这个方案放进了以后再说，还没有开始推进",
+      summary: `${whoText(as)}把这个方案放进了以后再说，还没有开始推进`,
       proposal,
       createdAt: t,
       updatedAt: t,
@@ -339,10 +337,10 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
   }
 
   /** The first message of a project parked straight from its proposal: the plan the owner saw, as text. */
-  function parkedBrief(proposal: ProjectProposal): string {
+  function parkedBrief(proposal: ProjectProposal, as: DeskActor): string {
     const owners: Record<BallOwner, string> = { agent: "交给 worker", human: "主人来做", waiting: "等外部" };
     return [
-      "主人在立项卡上点了“先放进以后再说”：这个项目先停着，什么都不做。你读到这条消息时，主人已经把它重新启动了——按下面的方案开始推进（方案也在你的项目记录里，proposal 字段）。",
+      `${whoText(as)}在立项卡上点了“先放进以后再说”：这个项目先停着，什么都不做。你读到这条消息时，主人已经把它重新启动了——按下面的方案开始推进（方案也在你的项目记录里，proposal 字段）。`,
       proposal.background ?? "",
       proposal.actions.length ? ["方案里的步骤（启动时自动记入行动记录）：", ...proposal.actions.map((a) => `- [${owners[a.owner]}] ${a.title}${a.nextStep ? `：${a.nextStep}` : ""}`)].join("\n") : "",
     ]
@@ -350,8 +348,9 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
       .join("\n\n");
   }
 
+  /** A control-plane revision (the owner's or the external agent's) is `updatedBy: "human"`, so it is never mistaken for a background write. */
   async function savePlan(cardId: string, req: PlanSaveRequest, as: DeskActor): Promise<PlanSaveResponse> {
-    if (byAgent(as)) throw new NgError("bounds_violation", "这项修改需要主人操作");
+    principalOf(as);
     return withTx(kernel.db, () => {
       const { rec, card } = pendingCard(cardId);
       if (card?.cardType !== "project_proposal") throw wrongState("这不是立项卡");
@@ -418,8 +417,9 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
 
   // ==================== drafts ====================
 
+  /** `updatedBy: "human"` as in savePlan: a background write based on an older version is parked, not merged over it. */
   function saveArtifact(artifactId: string, req: ArtifactSaveRequest, as: DeskActor): ArtifactSaveResponse {
-    if (byAgent(as)) throw new NgError("bounds_violation", "这项修改需要主人操作");
+    principalOf(as);
     return withTx(kernel.db, () => {
       const art = context.getArtifactSync(artifactId);
       if (!art) throw missing("这份草稿已移除");
@@ -853,7 +853,6 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     `).map(row => row.artifact_id),
     listHumanItems: (includeSnoozed = false) => kernel.humanItems.list(includeSnoozed).map(item => {
       const {project, paused} = decisionCells(item.cellId);
-      const rec = kernel.gate.getApprovalSync(item.id);
       const closeTargets: Record<string,ReturnType<typeof closureMembers>> = {};
       for (const o of item.options) if (o.terminateMode==="cancel_task") closeTargets[o.id]=closureMembers(o.targetCellIds![0]!);
       const projects=item.relatedProjectIds.map(id=>kernel.getCell(id)).filter(p=>p!==undefined)
@@ -861,7 +860,6 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
       const plan=item.action?.type==="project.start" ? (item.artifactId ? context.getArtifactSync(item.artifactId)?.content.data : item.action.proposal) : undefined;
       return {...item, options:deskOptions(item), resumeTarget:paused ? {id:paused.id, title:paused.title?.trim() || "未命名任务"} : null, proposal:isProjectProposal(plan) ? plan : null, projects, closeTargets, artifact:item.artifactId ? artifactDTO(kernel,item.artifactId,now()) : null,
         project:project ? {id:project.id,title:project.title?.trim() || "未命名项目",paused:project.status==="paused",parked:project.pauseReason==="parked"} : null,
-        ownerOnly:rec ? ownerOnlyApproval(rec.action)!==null : false,
       };
     }),
     async decideHumanItem(id: string, decision: HumanDecision, as: DeskActor) {

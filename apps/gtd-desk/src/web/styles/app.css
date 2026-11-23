@@ -1713,11 +1713,7 @@ textarea:focus-visible {
   font-weight: var(--fw-medium);
 }
 
-.token-form {
-  display: flex;
-  gap: var(--sp-2);
-  width: min(420px, 100%);
-}/* ==================== card details ==================== */
+/* ==================== card details ==================== */
 
 .position {
   margin-left: var(--sp-2);

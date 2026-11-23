@@ -172,7 +172,7 @@ describe("review options", () => {
     expect(result.status).toBe("cancelled");
     expect((await d.get<{ items: HumanItemDTO[] }>("/api/human-items")).items).toHaveLength(0);
     const undo = () => fetch(`${url}/api/human-activity/${result.activityId}/undo`, {
-      method:"POST", headers:{authorization: `Bearer ${d.server.security.token}`, "content-type":"application/json"}, body:"{}",
+      method:"POST", headers:{"content-type":"application/json"}, body:"{}",
     });
     const first = await undo();
     expect(first.status).toBe(200);
@@ -248,12 +248,12 @@ describe("project HTTP routes", () => {
     await d.kernel.closeCell(revoked, "cancelled", { principalId: d.kernel.ownerPrincipal });
 
     const closed = async () => {
-      const response = await fetch(url + "/api/projects/closed", { headers: {authorization: `Bearer ${d.server.security.token}`} });
+      const response = await fetch(url + "/api/projects/closed");
       expect(response.status).toBe(200);
       return (await response.json() as {projects: {id:string; title:string}[]}).projects;
     };
     const reopen = (id:string) => fetch(`${url}/api/projects/${id}/reopen`, {
-      method:"POST", headers:{authorization: `Bearer ${d.server.security.token}`, "content-type":"application/json"}, body:"{}",
+      method:"POST", headers:{"content-type":"application/json"}, body:"{}",
     });
     expect(await closed()).toEqual(expect.arrayContaining([
       expect.objectContaining({id:project,title:"发布计划"}), expect.objectContaining({id:revoked,title:"临时验证"}),
@@ -275,11 +275,11 @@ describe("project HTTP routes", () => {
     d.script.add("desk", tool("propose_project", {title:"验收发布", outcome:"发布完成", actions:[{title:"核对清单",owner:"human"}]}));
     await d.post("/api/capture", {text:"为这次发布制定计划"});
     await d.kernel.idle();
-    const list = await fetch(url + "/api/human-items", { headers: {authorization: `Bearer ${d.server.security.token}`} });
+    const list = await fetch(url + "/api/human-items");
     const {items} = await list.json() as {items:HumanItemDTO[]};
     const proposal = items.find(i => i.proposal)!;
     const save = (outcome: string) => fetch(`${url}/api/human-items/${proposal.id}/plan`, {
-      method:"PUT", headers:{authorization: `Bearer ${d.server.security.token}`, "content-type":"application/json"},
+      method:"PUT", headers:{"content-type":"application/json"},
       body:JSON.stringify({expectedVersion:proposal.artifactVersion, proposal:{...proposal.proposal,outcome}}),
     });
     expect((await save("   ")).status).toBe(400);

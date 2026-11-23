@@ -10,3 +10,4 @@
 | 怎样看到分身正在做什么，并找到它交付的报告？ | [分身实况](04-agents-topology-and-live-chat-tab.md) |
 | 哪个事项需要主人做什么，如何避免提交看过之后已被改动的内容？ | [待我处理](05-unified-human-inbox-and-custom-cards.md) |
 | 持久记录与命令行会话分别负责哪部分状态？ | [数据归属与会话恢复](06-architecture-ssot-cli-sync-and-boundaries.md) |
+| 外部助手怎样完成网页上的每一项操作，本机控制面为什么不设鉴权？ | [MCP 功能对等与去鉴权](07-mcp-parity-and-no-auth.md) |

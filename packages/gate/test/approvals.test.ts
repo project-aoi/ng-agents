@@ -108,10 +108,10 @@ describe("approve — version-bound confirmation", () => {
 
 });
 
-describe("approve — an external main agent (agent:*) orchestrates but is never the owner (docs/05 guard 3)", () => {
+describe("approve — an external main agent (agent:*) decides with the owner's rights (proposal 07)", () => {
   const AGENT = "agent:ops";
 
-  it("may approve custom actions and blocked / retry_limit / waiting_timeout escalations, but NOT project.start cards (BUG-020)", () => {
+  it("may approve project.start cards, custom actions and blocked / retry_limit / waiting_timeout escalations; a cell or an outsider still may not", () => {
     const f = setup();
     const project = expectType(
       f.gate.authorizeSync(
@@ -120,11 +120,13 @@ describe("approve — an external main agent (agent:*) orchestrates but is never
       ),
       "defer",
     );
-    expect(refusal(() => f.gate.approveSync(project.actionId, AGENT))).toMatch(/needs the owner \(it starts a new project\); agent:ops may not/);
-    expect(f.gate.getApprovalSync(project.actionId)).toMatchObject({ status: "pending", approverId: null });
-    expect(f.gate.approveSync(project.actionId, "owner")).toBe("approved");
+    for (const who of ["cell:desk", "external:mail:someone"]) {
+      expect(refusal(() => f.gate.approveSync(project.actionId, who)), who).toMatch(/needs the owner or an agent on the control plane/);
+      expect(f.gate.getApprovalSync(project.actionId)).toMatchObject({ status: "pending", approverId: null });
+    }
 
     const cards = [
+      project.actionId,
       expectType(f.gate.authorizeSync(custom("merge"), meta("desk")), "defer").actionId,
       expectType(f.gate.authorizeSync(custom("escalation.blocked", { card: escalationCard("blocked") }), meta("desk")), "defer").actionId,
       expectType(f.gate.authorizeSync(custom("escalation.waiting_timeout"), meta("desk")), "defer").actionId,
@@ -139,7 +141,7 @@ describe("approve — an external main agent (agent:*) orchestrates but is never
     }
   });
 
-  it("may deny and snooze any card, owner-only ones included", () => {
+  it("may deny and snooze any card", () => {
     const f = setup();
     const a = expectType(f.gate.authorizeSync(proposal({ subjectKey: "a" }), meta("desk")), "defer");
     const b = expectType(f.gate.authorizeSync(proposal({ subjectKey: "b" }), meta("desk")), "defer");

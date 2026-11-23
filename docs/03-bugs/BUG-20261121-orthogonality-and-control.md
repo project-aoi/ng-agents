@@ -4,7 +4,9 @@
 
 ## BUG-020　控制入口尊重身份和版本
 
-总助理不可被项目操作关闭。提交决定必须提供读到的事项及相关文稿修订；项目确认卡的执行选项仅限主人。
+总助理不可被项目操作关闭。提交决定必须提供读到的事项及相关文稿修订。
+
+当时的修复还规定项目确认卡的执行选项仅限主人，这条限制已由[提案 07](../05-proposals/07-mcp-parity-and-no-auth.md) 废止：外部主代理与网页同权处理立项卡，后台节点仍不能批准。
 
 [内核运行测试](../../packages/cell/test/phase0.test.ts) [人工事项测试](../../packages/cell/test/human-items.test.ts) [外部主代理测试](../../apps/gtd-desk/test/agent.test.ts)
 

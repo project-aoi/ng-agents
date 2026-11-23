@@ -77,7 +77,6 @@ function card(id: string, title: string, draft: ArtifactDTO | null = null): Huma
     project: null,
     proposal: null,
     closeTargets: {},
-    ownerOnly: false,
     action: null,
     options: [{ id: "reply", label: "回复", effect: "reply", input: { mode: "optional" } }],
   };
@@ -255,7 +254,7 @@ it("requires review after the open decision changes and sends only the reviewed 
         items = [other, current];
         return Response.json({ error: { code: "conflict", message: "事项已变动" } }, { status: 409 });
       }
-      if (attempts === 2) return Response.json({ error: { code: "bounds_violation", message: "仅主人可确认" } }, { status: 403 });
+      if (attempts === 2) return Response.json({ error: { code: "bounds_violation", message: "此身份不能操作工作台" } }, { status: 403 });
       if (attempts === 3) return Response.json({ error: { code: "conflict", message: "待关闭的任务清单已变动" } }, { status: 409 });
       items = [other];
       return Response.json({ status: "resolved", deskStatus: { marker: "完成" } });
@@ -284,7 +283,7 @@ it("requires review after the open decision changes and sends only the reviewed 
   expect(writes()).toHaveLength(1);
   await click("已核对最新事项");
   await submit(form);
-  expect(document.querySelector(".inbox-actions [role=alert]")?.textContent).toMatch(/主人/);
+  expect(document.querySelector(".inbox-actions [role=alert]")?.textContent).toContain("没有权限执行这项操作");
   await submit(form);
   expect(document.querySelector(".inbox-actions [role=alert]")?.textContent).toContain("待关闭的任务清单已变动");
   await submit(form);

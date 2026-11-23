@@ -19,18 +19,37 @@ import {
   type SendToCellResult,
   type RunnerSelection,
 } from "@ng/protocol";
-import type { ProjectRowDTO, SendCellMessageRequest, TimelineItemDTO } from "../shared/api";
+import type {
+  ActivityKind,
+  ArtifactDTO,
+  ArtifactSaveRequest,
+  CaptureRequest,
+  CellRoleDTO,
+  CreateSourceRequest,
+  Effort,
+  ModelChoiceDTO,
+  ModelSelectionDTO,
+  ModelsDTO,
+  PlanSaveRequest,
+  ProjectRowDTO,
+  RunnerDTO,
+  SendCellMessageRequest,
+  TimelineItemDTO,
+  UpdateModelsRequest,
+} from "../shared/api";
 import type { Delivery } from "../server/agents";
 import { DeskError, type Desk, type DeskActor, type ProjectOp } from "../server/desk";
-import { isLeafCell, unpulledOf } from "../server/projections/agents";
-import { projectOfAction, readActions, readProjects, type Located } from "../server/projections/common";
+import { isLeafCell, notesOf, unpulledOf } from "../server/projections/agents";
+import { projectOfAction, readActions, readProjects, SKILL_SUGGESTION_PREFIX, type Located, type SkillSuggestion } from "../server/projections/common";
+import { parseDecisions } from "../server/projections/format";
 import { AGENT_TOOLS, type AgentToolDoc } from "./guide";
 import type { AgentControlPlane, AgentToolResult } from "./routes";
 
 // docs/05 §5.3 — the external main agent's control plane: every tool of guide.ts, run as the caller's `agent:<id>`
 // principal. Reads go through the same projections as the web client; changes go through the same Desk functions as
 // the workbench buttons (parameterised by the principal) or straight to the kernel as that principal.
-// The kernel and the Gate decide what an agent may do; this file only turns their answers into plain text.
+// The rights are the owner's (proposal 07); the principal records the entrance. The kernel and the Gate check state,
+// versions and concurrency; this file only turns their answers into plain text.
 
 export interface AgentControlPlaneDeps {
   kernel: Kernel;
@@ -41,7 +60,7 @@ type Args = Record<string, unknown>;
 type Principal = `agent:${string}`;
 type Handler = (args: Args, principalId: Principal) => Promise<AgentToolResult> | AgentToolResult;
 
-/** The `text` an agent reads for an owner-only card (project approval). */
+/** Who has the ball, as the agent reads it. */
 const OWNER_TEXT: Readonly<Record<BallOwner, string>> = { human: "主人", agent: "agent", waiting: "等待外部" };
 
 const ok = (text: string, data?: unknown): AgentToolResult => ({ text, ...(data !== undefined ? { data } : {}) });
@@ -67,11 +86,19 @@ function runnerSelection(args: Args): RunnerSelection {
 // ==================== argument validation (against the schemas in guide.ts) ====================
 
 interface PropSchema {
-  type?: string;
+  type?: string | readonly string[];
   enum?: readonly unknown[];
-  items?: { type?: string };
+  items?: PropSchema;
+  properties?: Record<string, PropSchema>;
+  required?: readonly string[];
+  additionalProperties?: unknown;
+  /** Strings: blank counts as missing unless this is 0. */
   minLength?: number;
 }
+
+const typesOf = (p: PropSchema): readonly string[] => (p.type === undefined ? [] : typeof p.type === "string" ? [p.type] : p.type);
+const isRecord = (v: unknown): v is Args => v !== null && typeof v === "object" && !Array.isArray(v);
+const schemaOf = (doc: AgentToolDoc) => doc.inputSchema as PropSchema;
 
 /**
  * Near-miss argument names an agent calling from the tool's name alone tends to use (some clients show a tool's
@@ -105,7 +132,7 @@ export function normalizeArgs(doc: AgentToolDoc, args: Args): Args {
   }
   // A bare "id" on a tool that takes projectId/actionId: the id's own prefix says which one was meant.
   if (out["id"] !== undefined && !("id" in props)) {
-    const target = typeof out["id"] === "string" && out["id"].startsWith("act_") ? "actionId" : "projectId";
+    const target = "sensorId" in props ? "sensorId" : typeof out["id"] === "string" && out["id"].startsWith("act_") ? "actionId" : "projectId";
     if (target in props && out[target] === undefined) {
       out[target] = out["id"];
       delete out["id"];
@@ -114,36 +141,84 @@ export function normalizeArgs(doc: AgentToolDoc, args: Args): Args {
   return out;
 }
 
-/** null when `args` fits the tool's input schema; otherwise what is wrong, for the agent to fix. */
-export function validateArgs(doc: AgentToolDoc, args: Args): string | null {
-  const schema = doc.inputSchema as { properties?: Record<string, PropSchema>; required?: string[] };
+/** Clients send null for an argument they leave out; it stays only where the schema gives null a meaning. */
+export function dropNulls(value: unknown, schema: PropSchema | undefined): unknown {
+  if (Array.isArray(value)) return schema?.items ? value.map((v) => dropNulls(v, schema.items)) : value;
+  if (!isRecord(value) || !schema?.properties) return value;
+  const out: Args = {};
+  for (const [k, v] of Object.entries(value)) {
+    const p = schema.properties[k];
+    if (v === undefined || (v === null && !(p && typesOf(p).includes("null")))) continue;
+    out[k] = dropNulls(v, p);
+  }
+  return out;
+}
+
+function fitsType(type: string, v: unknown): boolean {
+  switch (type) {
+    case "null":
+      return v === null;
+    case "array":
+      return Array.isArray(v);
+    case "object":
+      return isRecord(v);
+    case "number":
+      return typeof v === "number" && Number.isFinite(v);
+    default:
+      return typeof v === type;
+  }
+}
+
+function typeText(p: PropSchema): string {
+  return typesOf(p)
+    .map((t) => {
+      const items = p.items ? typesOf(p.items)[0] : undefined;
+      return t === "null" ? "null" : t === "array" ? `an array${items ? ` of ${items}s` : ""}` : `${t === "object" ? "an" : "a"} ${t}`;
+    })
+    .join(" or ");
+}
+
+function checkProps(schema: PropSchema, args: Args, at: string, problems: string[]): void {
   const props = schema.properties ?? {};
-  const problems: string[] = [];
-  for (const k of Object.keys(args)) if (!(k in props)) problems.push(`unknown argument "${k}"`);
+  if (schema.additionalProperties === false) {
+    for (const k of Object.keys(args)) if (!(k in props)) problems.push(`unknown argument "${at}${k}"`);
+  }
   for (const r of schema.required ?? []) {
     const v = args[r];
-    if (v === undefined || v === null || (typeof v === "string" && !v.trim())) problems.push(`"${r}" is required`);
+    if (v === undefined || v === null || (typeof v === "string" && !v.trim() && props[r]?.minLength !== 0)) problems.push(`"${at}${r}" is required`);
   }
   for (const [k, v] of Object.entries(args)) {
     const p = props[k];
-    if (!p || v === undefined || v === null) continue;
-    const typeOk =
-      p.type === "string"
-        ? typeof v === "string"
-        : p.type === "number"
-          ? typeof v === "number" && Number.isFinite(v)
-          : p.type === "boolean"
-            ? typeof v === "boolean"
-            : p.type === "array"
-              ? Array.isArray(v) && (p.items?.type !== "string" || v.every((x) => typeof x === "string"))
-              : true;
-    if (!typeOk) problems.push(`"${k}" must be ${p.type === "array" ? `an array${p.items?.type ? ` of ${p.items.type}s` : ""}` : `a ${p.type}`}`);
-    else if (p.minLength !== undefined && typeof v === "string" && v.trim().length < p.minLength) problems.push(`"${k}" must not be blank`);
-    else if (p.enum && !p.enum.includes(v)) problems.push(`"${k}" must be one of ${p.enum.map((e) => JSON.stringify(e)).join(", ")}`);
+    if (p && v !== undefined) checkValue(p, v, `${at}${k}`, problems);
   }
+}
+
+function checkValue(p: PropSchema, v: unknown, name: string, problems: string[]): void {
+  const types = typesOf(p);
+  if (types.length > 0 && !types.some((t) => fitsType(t, v))) {
+    problems.push(`"${name}" must be ${typeText(p)}`);
+    return;
+  }
+  if (Array.isArray(v) && p.items) {
+    const item = p.items;
+    // A list of plain values is named once; a list of objects says which entry and field is wrong.
+    if (item.properties) v.forEach((x, i) => checkValue(item, x, `${name}[${i}]`, problems));
+    else if (typesOf(item).length > 0 && !v.every((x) => typesOf(item).some((t) => fitsType(t, x)))) problems.push(`"${name}" must be ${typeText(p)}`);
+    return;
+  }
+  if (isRecord(v) && p.properties) return checkProps(p, v, `${name}.`, problems);
+  if (p.minLength && typeof v === "string" && v.trim().length < p.minLength) problems.push(`"${name}" must not be blank`);
+  else if (p.enum && !p.enum.includes(v)) problems.push(`"${name}" must be one of ${p.enum.map((e) => JSON.stringify(e)).join(", ")}`);
+}
+
+/** null when `args` fits the tool's input schema; otherwise what is wrong, for the agent to fix. */
+export function validateArgs(doc: AgentToolDoc, args: Args): string | null {
+  const schema = schemaOf(doc);
+  const problems: string[] = [];
+  checkProps({ ...schema, additionalProperties: false }, args, "", problems);
   if (problems.length === 0) return null;
   const required = schema.required?.length ? ` Required: ${schema.required.join(", ")}.` : "";
-  return `Invalid arguments for ${doc.name}: ${problems.join("; ")}.${required} Allowed: ${Object.keys(props).join(", ") || "none"}.`;
+  return `Invalid arguments for ${doc.name}: ${problems.join("; ")}.${required} Allowed: ${Object.keys(schema.properties ?? {}).join(", ") || "none"}.`;
 }
 
 // ==================== the control plane ====================
@@ -184,7 +259,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
 
   function cardLine(item: ReturnType<typeof desk.listHumanItems>[number]) {
     const parts = [`rev=${item.itemRevision}`, item.artifactVersion !== null && `草稿 v${item.artifactVersion}`,
-      item.project?.title, item.ownerOnly && "[ownerOnly]"].filter(Boolean);
+      item.project?.title].filter(Boolean);
     return `- ${item.id}「${item.title}」 ${parts.join(" · ")}`;
   }
 
@@ -275,6 +350,127 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
     return { lines, data: out };
   }
 
+  // ---------- commands, documents and settings as text ----------
+
+  interface JobLine {
+    jobId: string;
+    command: string;
+    startedAt: number;
+    tail: string | null;
+    cellId?: string;
+  }
+
+  /** Background commands running right now in any of these cells. */
+  function jobsOf(cellIds: readonly string[]): JobLine[] {
+    const ids = new Set(cellIds);
+    return kernel.workspace
+      .listJobsSync({ state: ["running"] })
+      .filter((j) => ids.has(j.cellId))
+      .map((j) => {
+        let tail: string | null = null;
+        try {
+          tail = kernel.workspace.observeJobSync(j.jobId)?.tail.slice(-2_000) || null;
+        } catch {
+          // the log is not readable (yet); the command itself is still worth showing
+        }
+        return { jobId: j.jobId, cellId: j.cellId, command: j.command, startedAt: j.startedAt, tail };
+      });
+  }
+
+  function jobLine(j: JobLine, withCell: boolean): string {
+    const tail = j.tail?.trim().split("\n").slice(-5).map((l) => `\n    ${l}`).join("") ?? "";
+    return `- ${j.jobId}${withCell && j.cellId ? `（${j.cellId}）` : ""} 自 ${isoMin(j.startedAt)}：${oneLine(j.command, 200)}${tail}`;
+  }
+
+  const parkedData = (parked: ArtifactDTO["parked"]) => parked.map(({ dismiss: _, ...p }) => p);
+
+  const PARKED_INLINE = 2_000;
+  function parkedSection(artifactId: string, parked: ArtifactDTO["parked"]): string[] {
+    if (parked.length === 0) return [];
+    const lines = parked.map((p) => {
+      const cut = p.body.length > PARKED_INLINE ? `…（共 ${p.body.length} 字符；全文：read_artifact { id: "${artifactId}", parkedId: "${p.id}" }）` : "";
+      return `- ${p.id}（基于 v${p.basedOnVersion}，${isoMin(p.createdAt)}${p.title ? `，「${p.title}」` : ""}${p.note ? `，${oneLine(p.note, 160)}` : ""}）\n${p.body.slice(0, PARKED_INLINE).split("\n").map((l) => `    ${l}`).join("\n")}${cut}`;
+    });
+    return [`${section("后台基于旧版本写的、还没合并的内容（合并后 dismiss_parked）", lines)}`];
+  }
+
+  function artifactData(a: ArtifactDTO): Record<string, unknown> {
+    return { id: a.artifactId, version: a.version, title: a.title ?? null, format: a.format, updatedBy: a.updatedBy, updatedAt: a.updatedAt, versions: a.versions, parked: parkedData(a.parked), decisions: a.decisions };
+  }
+
+  /** A version conflict: nothing was written, and here is what to merge into. */
+  function conflictOf(what: string, a: ArtifactDTO, outcome: string): AgentToolResult {
+    const page = a.body.slice(0, MAX_RESOURCE_PAGE_CHARS);
+    const rest = page.length < a.body.length ? `\n（后面还有：read_artifact { id: "${a.artifactId}", offset: ${page.length} }）` : "";
+    return fail(
+      [
+        `${what}; nothing was written. It is now v${a.version}（${a.updatedBy} 更新于 ${isoMin(a.updatedAt)}）. Merge your change into the current text below and save again with expectedVersion ${a.version}.`,
+        ...parkedSection(a.artifactId, a.parked),
+        "---",
+        page + rest,
+      ].join("\n"),
+      { outcome, ...artifactData(a), body: a.body },
+    );
+  }
+
+  /** A suggestion is stored under a slug that need not be the playbook's own name; the agent may give either. */
+  function skillSlug(name: string): string {
+    const all = context.listStateSync(deskId, SKILL_SUGGESTION_PREFIX).map((e) => ({ slug: e.key.slice(SKILL_SUGGESTION_PREFIX.length), name: (e.value as Partial<SkillSuggestion> | null)?.name }));
+    return (all.find((s) => s.slug === name) ?? all.find((s) => s.name === name))?.slug ?? name;
+  }
+
+  const choiceText = (c: ModelChoiceDTO | null | undefined) => (c ? `${c.model}${c.effort ? ` · ${c.effort}` : ""}` : "CLI 自己的默认");
+  const selectionText = (s: ModelSelectionDTO) => (s.mode === "auto" ? "auto" : `fixed ${s.model}${s.effort ? ` · ${s.effort}` : ""}`);
+
+  function modelsText(m: ModelsDTO): string {
+    if (!m.available) return "当前不是由 CLI Agent 驱动，没有可切换的模型。";
+    const catalogs = Object.values(m.catalogs).filter((c) => c !== undefined);
+    return [
+      `默认 runner：${m.engine ?? "—"}；已启用：${m.runners.join("、")}`,
+      ...catalogs.map((c) =>
+        [
+          `${c.engine}${c.engine === m.engine ? "（默认）" : ""} — 列表更新于 ${isoMin(c.fetchedAt)}${c.error ? `；⚠ 上次读取失败：${oneLine(c.error, 200)}` : ""}`,
+          `  strong：${selectionText(c.selection.strong)} → ${choiceText(c.effective.strong)}；fast：${selectionText(c.selection.fast)} → ${choiceText(c.effective.fast)}`,
+          ...c.models.map((x) => `  - ${x.id}「${x.label}」推理强度：${x.efforts.join("、") || "无"}${x.description ? ` — ${oneLine(x.description, 120)}` : ""}`),
+        ].join("\n"),
+      ),
+      section(
+        "各层级",
+        Object.entries(m.roles).map(([role, sel]) => {
+          const eff = m.effectiveRoles[role as keyof ModelsDTO["effectiveRoles"]];
+          return `- ${role}：${sel.mode === "inherit" ? "inherit" : `custom ${[sel.runner, sel.model, sel.effort].filter(Boolean).join(" · ")}`} → ${eff ? `${eff.runner} · ${choiceText(eff.choice)}` : "—"}`;
+        }),
+      ),
+    ].join("\n\n");
+  }
+
+  /** configure_models' flat arguments as the settings request, or what is missing. */
+  function modelsRequest(args: Args): UpdateModelsRequest | string {
+    const runner = args["runner"] as RunnerDTO;
+    const model = str(args["model"]);
+    const effort = str(args["effort"]);
+    const mode = args["mode"];
+    switch (args["target"]) {
+      case "runner":
+        return args["runner"] === undefined ? "target runner needs runner: the new default." : { runner };
+      case "tier": {
+        const tier = args["tier"] as "strong" | "fast" | undefined;
+        const engine = args["engine"] as RunnerDTO | undefined;
+        if (!tier) return 'target tier needs tier: "strong" or "fast".';
+        if (mode === "auto") return model || effort ? "mode auto takes no model or effort; use fixed to pin them." : { tier, mode, ...(engine ? { engine } : {}) };
+        if (mode !== "fixed") return 'target tier needs mode: "auto" or "fixed".';
+        return model ? { tier, mode, model, ...(effort ? { effort } : {}), ...(engine ? { engine } : {}) } : "mode fixed needs model: an id from get_models.";
+      }
+      default: {
+        const role = args["role"] as CellRoleDTO | undefined;
+        if (!role) return "target role needs role.";
+        if (mode === "inherit") return args["runner"] !== undefined || model || effort ? "mode inherit takes no runner, model or effort; use custom to pin them." : { role, mode };
+        if (mode !== "custom") return 'target role needs mode: "inherit" or "custom".';
+        return args["runner"] === undefined ? "mode custom needs runner." : { role, mode, runner, ...(model ? { model } : {}), ...(effort ? { effort } : {}) };
+      }
+    }
+  }
+
   // ---------- refusals turned into plain answers ----------
 
   function sendFailure(id: string, r: Exclude<SendToCellResult, { status: "delivered" }>, isProject: boolean): AgentToolResult {
@@ -320,19 +516,22 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const radar = desk.radar();
       const running = runningLines();
       const ws = workspaceLines();
+      const { today, backend, model } = desk.status();
       const parts = [
         section("待我处理", items.map(cardLine)),
         section("进行中的项目", radar.projects.map(projectLine)),
         section("已停靠", radar.someday.map((p) => `- ${p.id}「${p.title}」— 以后再说${p.summary ? `；摘要：${oneLine(p.summary, 120)}` : ""}${p.cwd ? `；目录 ${p.cwd}` : ""}`)),
         section("正在运行", running.lines),
         section("工作目录占用", ws.lines),
+        `今日（自 ${isoMin(today.since)}）：静默归档通知 ${today.archivedNotifications}，存笔记 ${today.notesSaved}，设提醒 ${today.remindersSet}，撤卡 ${today.cardsWithdrawn}（list_activity 看明细）`,
+        `执行后端：${backend}${model ? ` · ${model}` : ""}`,
       ];
       let finished: unknown[] | undefined;
       if (args["includeFinished"] === true) {
         const recent = readProjects(kernel)
           .filter((p) => p.record.lifecycle === "completed" || p.record.lifecycle === "cancelled")
           .sort((a, b) => (b.record.completedAt ?? b.record.updatedAt) - (a.record.completedAt ?? a.record.updatedAt))
-          .slice(0, 15);
+          .slice(0, 30);
         parts.push(
           section(
             "最近结束的项目",
@@ -352,13 +551,22 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         running: running.data,
         workspaces: ws.data,
         snoozedCards: snoozed,
+        today,
+        backend,
+        model: model ?? null,
         ...(finished ? { finished } : {}),
       });
     },
 
     async capture(args,principalId) {
       const clientId=str(args["clientId"]);
-      const receipt=await desk.ingest({ ...(args.threads !== undefined && {threads: args.threads as string[]}),text:str(args["text"])!,...(clientId ? {clientId} : {})},{principalId});
+      const receipt=await desk.ingest({
+        text:str(args["text"]) ?? "",
+        ...(args.threads !== undefined && {threads: args.threads as string[]}),
+        ...(args.attachments !== undefined && {attachments: args.attachments as NonNullable<CaptureRequest["attachments"]>}),
+        ...(args.voice === true && {voice: true}),
+        ...(clientId ? {clientId} : {}),
+      },{principalId});
       return ok(`Captured message ${receipt.id}. The workbench routes it to the matching subscriber or the desk.`,{envelopeId:receipt.id});
     },
 
@@ -487,6 +695,8 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const waits = kernel.listWaits(ids.filter((cid) => kernel.getCell(cid)?.status !== "closed"));
       const running = new Set(kernel.activeRuns().map((r) => r.cellId));
       const artifacts = ids.flatMap((cid) => context.listArtifactsSync(cid)).sort((a, b) => b.updatedAt - a.updatedAt);
+      const notes = notesOf(kernel, id);
+      const jobs = jobsOf(ids);
       const cards = desk.listHumanItems(true).filter(r => r.category === "decision" &&
         ((r.cellId && ids.includes(r.cellId)) || r.relatedProjectIds.includes(id) || r.subjectKey === `project:${id}`));
       const anchors = cell && cell.status !== "closed" ? kernel.anchorsOf(id) : null;
@@ -540,6 +750,8 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         section("未完成的动作", open.map(actionLine)),
         ...(closed.length ? [section("最近完成/取消的动作", closed.map(actionLine))] : []),
         section("它的分身（运行中 / 等待中 / 待命可唤醒 / 已归档）", cellLines),
+        ...(jobs.length ? [section("在途后台命令", jobs.map((j) => jobLine(j, true)))] : []),
+        ...(notes ? [`项目白板\n${notes}`] : []),
         ...(unpulled.length ? [section("尚未汇总至项目的 Worker 最新动态", unpulled.map((u) => `- ${u.cellId}：${u.count} 条新记录\n${u.text.split("\n").map((l) => `  ${l}`).join("\n")}`))] : []),
         section("报告与草稿", artifacts.map((a) => `- ${a.artifactId} v${a.version}${a.content.title ? `「${a.content.title}」` : ""}（${a.content.format}，${a.updatedBy} 更新于 ${isoMin(a.updatedAt)}）`)),
         section("等你决定", cards.map(cardLine)),
@@ -561,6 +773,8 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
             carriedBy: record.cellId ?? null, ...(item ? { itemRevision: item.itemRevision } : {}) };
         }),
         cells: below.map((c) => ({ id: c.id, title: c.title, preset: c.preset, status: c.status, state: cellStateText(c), running: running.has(c.id), waitingFor: waits.filter((w) => w.cellId === c.id).map((w) => w.waitingFor), statusLine: statusLineOf(c.id) })),
+        notes,
+        jobs,
         unpulled: unpulled.map((u) => ({ cellId: u.cellId, count: u.count })),
         waits: waits.map((w) => ({ cellId: w.cellId, waitingFor: w.waitingFor, reason: w.reason })),
         artifacts: artifacts.map((a) => ({ id: a.artifactId, title: a.content.title ?? null, version: a.version, cellId: a.cellId, updatedAt: a.updatedAt })),
@@ -596,15 +810,16 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       if (!projectRecordOf(projectId)) return noProject(projectId);
       const owner = args["owner"] as "human" | "waiting";
       const nextStep = str(args["nextStep"]);
-      const r = await desk.addProjectAction(projectId, { title: str(args["title"])!, owner, ...(nextStep ? { nextStep } : {}) }, as(principalId));
+      const effort = args["effort"] as Effort | undefined;
+      const r = await desk.addProjectAction(projectId, { title: str(args["title"])!, owner, ...(nextStep ? { nextStep } : {}), ...(effort ? { effort } : {}) }, as(principalId));
       return ok(
         `Recorded action ${r.actionId}「${str(args["title"])}」 on project ${projectId} (${owner === "human" ? "the owner's to-do" : "waiting"}); the project was told. ${owner === "human" ? "When the owner has done it, decide_human_item with the current option and revision." : ""}`.trim(),
         { actionId: r.actionId },
       );
     },
 
-    list_human_items() {
-      const items = desk.listHumanItems();
+    list_human_items(args) {
+      const items = desk.listHumanItems(args["includeSnoozed"] === true);
       return ok(`待处理 ${items.length} 项\n${JSON.stringify(items, null, 2)}`, {items});
     },
     async decide_human_item(args,principalId) {
@@ -634,17 +849,33 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const wanted = typeof args["version"] === "number" ? Math.floor(args["version"]) : null;
       const ver = wanted !== null && wanted !== a.version ? context.getArtifactVersionSync(id, wanted) : null;
       if (wanted !== null && wanted !== a.version && !ver) return fail(`Artifact ${id} has no version ${wanted}; its current version is v${a.version}.`);
+      const { versions, parked } = desk.artifact(id);
+      const parkedId = str(args["parkedId"]);
+      const aside = parkedId ? parked.find((p) => p.id === parkedId) : undefined;
+      if (parkedId && !aside) return fail(`Artifact ${id} has no parked addition "${parkedId}"${parked.length ? `; it has ${parked.map((p) => p.id).join(", ")}` : ""}.`);
       const content = ver?.content ?? a.content;
       const version = ver?.version ?? a.version;
-      const body = content.body;
+      const body = aside?.body ?? content.body;
+      const decisions = !ver && (content.format === "markdown" || content.format === "text") ? parseDecisions(content.body) : [];
       const offset = typeof args["offset"] === "number" ? Math.max(0, Math.floor(args["offset"])) : 0;
       const limit = typeof args["limit"] === "number" ? Math.max(1, Math.min(MAX_RESOURCE_PAGE_CHARS, Math.floor(args["limit"]))) : 16_000;
       const page = body.slice(offset, offset + limit);
       const end = offset + page.length;
       const hasMore = end < body.length;
       const head = `artifact ${a.artifactId} v${version}${content.title ? `「${content.title}」` : ""} — ${content.format}，${(ver?.updatedBy ?? a.updatedBy)} 更新于 ${isoMin(ver?.createdAt ?? a.updatedAt)}，属于 ${a.cellId}${ver ? `（当前版本是 v${a.version}）` : ""}`;
-      const paging = offset > 0 || hasMore ? `\ncharacters ${offset}–${end} of ${body.length}${hasMore ? `; the rest: read_artifact { id: "${id}"${ver ? `, version: ${version}` : ""}, offset: ${end} }` : " (to the end)"}` : "";
-      return ok(`${head}${paging}\n---\n${page}`, {
+      const paging = offset > 0 || hasMore ? `\ncharacters ${offset}–${end} of ${body.length}${hasMore ? `; the rest: read_artifact { id: "${id}"${aside ? `, parkedId: "${aside.id}"` : ver ? `, version: ${version}` : ""}, offset: ${end} }` : " (to the end)"}` : "";
+      if (aside) {
+        return ok(`parked addition ${aside.id} of ${id}（基于 v${aside.basedOnVersion}，文稿现在是 v${a.version}）${paging}\n---\n${page}`, {
+          id, parkedId: aside.id, basedOnVersion: aside.basedOnVersion, currentVersion: a.version, body: page, offset, totalChars: body.length, hasMore,
+        });
+      }
+      // What goes with the text is said once, on its first page.
+      const extras = offset > 0 ? [] : [
+        ...(versions.length > 1 ? [`版本：${versions.slice(-20).map((v) => `v${v.version} ${v.updatedBy} ${isoMin(v.createdAt)}`).join("；")}`] : []),
+        ...(decisions.length ? [section("需要主人拍板的段落", decisions.map((x) => `- 第 ${x.startLine + 1}–${x.endLine + 1} 行「${x.label}」：${oneLine(x.text, 200)}`))] : []),
+        ...parkedSection(id, parked),
+      ];
+      return ok(`${head}${paging}${extras.map((e) => `\n${e}`).join("")}\n---\n${page}`, {
         id: a.artifactId,
         version,
         currentVersion: a.version,
@@ -657,6 +888,9 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         offset,
         totalChars: body.length,
         hasMore,
+        versions,
+        decisions,
+        parked: parkedData(parked),
       });
     },
 
@@ -742,6 +976,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const cards = desk.listHumanItems(true).filter(r => r.category === "decision" && r.cellId === id);
       const project = projectRecordOf(id);
       const tail = n > 0 ? evidenceTail(id, n) : [];
+      const { branch, notes, jobs, pendingQuestion } = desk.timeline(id, { limit: 1 });
       const effRunner = c.spec.processor.kind === "llm" ? (kernel.effectiveRunnerFor?.(c.spec) ?? null) : null;
       const runnerText = c.spec.processor.kind === "code"
         ? "零算力脚本"
@@ -750,11 +985,14 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
           : (c.spec.processor.engine ?? kernel.agentBackend ?? "—");
       const head = [
         `cell ${id}${c.title ? `「${c.title}」` : ""} — ${c.preset ?? "cell"}，${cellStateText(c)}（${c.status}${c.closeReason ? `, ${c.closeReason}` : ""}${activity ? `; ${activity.why}` : ""}）`,
-        `父节点：${c.parentId ?? "—"}；目录：${c.spec.cwd ?? "（默认）"}；执行：${runnerText}；${isLeafCell(c) ? "叶节点：一轮做完待命，发消息即唤醒" : "常驻"}${chats ? `；主人直接和它说过 ${chats} 次话` : ""}`,
+        `父节点：${c.parentId ?? "—"}；目录：${c.spec.cwd ?? "（默认）"}${branch ? `（分支 ${branch}）` : ""}；执行：${runnerText}；${isLeafCell(c) ? "叶节点：一轮做完待命，发消息即唤醒" : "常驻"}${chats ? `；主人直接和它说过 ${chats} 次话` : ""}`,
         `状态行：${statusLineOf(id) ?? "—"}`,
         `在等：${waits.length ? waits.map((w) => `${w.waitingFor}（${oneLine(w.reason, 80)}${w.timeoutAt ? `，${isoMin(w.timeoutAt)} 超时` : ""}）`).join("；") : "—"}`,
         ...(project ? [`持有项目记录：${project.lifecycle}「${project.title}」`] : []),
         ...(cards.length ? [`等你决定：${cards.map(cardLine).join(", ")}`] : []),
+        ...(pendingQuestion ? [`在问主人（${pendingQuestion.id}，用 ${id === deskId ? "chat_with_desk" : "message_cell"} 带 replyToId 回答）：${oneLine(pendingQuestion.text, 600)}`] : []),
+        ...(jobs.length ? [section("在途后台命令", jobs.map((j) => jobLine(j, false)))] : []),
+        ...(notes ? [`白板\n${notes}`] : []),
         `子节点：${children.length ? children.map((x) => `${x.id}（${x.preset ?? "cell"}，${x.status}）`).join("、") : "—"}`,
       ];
       return ok(`${head.join("\n")}\n\n${section("最近记录", tail.map((t) => `- ${t.line}`))}`, {
@@ -770,6 +1008,10 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         effort: effRunner?.choice?.effort ?? (c.spec.processor.kind === "llm" ? (c.spec.processor.effort ?? null) : null),
         state: activity?.state ?? "closed",
         directChats: chats, cards,
+        branch,
+        notes,
+        jobs,
+        pendingQuestion,
         running,
         waits: waits.map((w) => ({ waitingFor: w.waitingFor, reason: w.reason, timeoutAt: w.timeoutAt })),
         children: children.map((x) => ({ id: x.id, preset: x.preset, status: x.status, title: x.title })),
@@ -820,7 +1062,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
 
     async control_cell(args, principalId) {
       const id = str(args["id"])!;
-      const action = args["action"] as "message" | "steer" | "pause" | "resume" | "cancel";
+      const action = args["action"] as "message" | "steer" | "pause" | "resume" | "cancel" | "trigger";
       const text = str(args["text"]);
       const isProject = projectRecordOf(id) !== null;
       if ((action === "message" || action === "steer") && !text) return fail(`control_cell ${action} needs text: what to tell the cell.`);
@@ -830,6 +1072,11 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       }
       const cell = kernel.getCell(id);
       if (!cell) return sendFailure(id, { status: "not_found" }, isProject);
+      if (action === "trigger") {
+        const r = desk.cellTrigger(id, as(principalId));
+        const data = { applied: r.ok, outcome: r.outcome };
+        return r.ok ? ok(`trigger applied to ${id}: its check runs now（${r.message}）. Look with get_cell ${id}.`, data) : fail(`Not applied: ${r.message}`, data);
+      }
       if (cell.status === "closed") {
         if (action === "cancel") return ok(`${id} had already closed (${cell.closeReason ?? "?"}); nothing to cancel.`, { applied: false, reason: "closed" });
         return sendFailure(id, { status: "closed", closeReason: cell.closeReason }, isProject);
@@ -844,6 +1091,208 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       };
       const epoch = kernel.getCell(id)?.epoch;
       return ok(`${action} applied to ${id}: ${what[action]}（${r.message}）.`, { applied: true, outcome: r.outcome, ...(epoch !== undefined ? { epoch } : {}) });
+    },
+
+    // ---------- documents and plans ----------
+
+    save_artifact(args, principalId) {
+      const id = str(args["id"])!;
+      const title = str(args["title"]);
+      const req: ArtifactSaveRequest = {
+        expectedVersion: args["expectedVersion"] as number,
+        body: args["body"] as string,
+        ...(title ? { title } : {}),
+        ...(args["format"] !== undefined ? { format: args["format"] as NonNullable<ArtifactSaveRequest["format"]> } : {}),
+        ...(args["data"] !== undefined ? { data: args["data"] } : {}),
+      };
+      const r = desk.saveArtifact(id, req, as(principalId));
+      if (!r.ok) return conflictOf(`Not saved: ${id} has moved on since v${req.expectedVersion}`, r.artifact, r.outcome);
+      const left = r.artifact.parked.length ? ` It has ${r.artifact.parked.length} parked addition(s): read_artifact ${id}, merge what is useful, then dismiss_parked.` : "";
+      return ok(`Saved ${id} as v${r.artifact.version}.${left}`, { outcome: r.outcome, ...artifactData(r.artifact) });
+    },
+
+    dismiss_parked(args, principalId) {
+      const id = str(args["artifactId"])!;
+      const a = desk.dismissParked(id, str(args["parkedId"])!, as(principalId));
+      return ok(`Removed it. ${id} (v${a.version}) has ${a.parked.length} parked addition(s) left.`, artifactData(a));
+    },
+
+    async save_plan(args, principalId) {
+      const id = str(args["id"])!;
+      const title = str(args["title"]);
+      const req: PlanSaveRequest = {
+        expectedVersion: args["expectedVersion"] as number,
+        proposal: {
+          ...(title ? { title } : {}),
+          outcome: str(args["outcome"])!,
+          ...(args["background"] !== undefined ? { background: args["background"] as string } : {}),
+          ...(args["runnerOverride"] !== undefined ? { runnerOverride: args["runnerOverride"] as NonNullable<PlanSaveRequest["proposal"]["runnerOverride"]> | null } : {}),
+          actions: args["actions"] as PlanSaveRequest["proposal"]["actions"],
+        },
+      };
+      const r = await desk.savePlan(id, req, as(principalId));
+      if (!r.ok) return conflictOf(`Not saved: the plan of ${id} has moved on since v${req.expectedVersion}`, r.current, r.outcome);
+      const item = desk.listHumanItems(true).find((i) => i.id === id);
+      return ok(`Saved the plan of ${id} as v${r.artifact.version}. To approve it: decide_human_item with seenArtifactVersion ${r.artifact.version}${item ? ` and seenItemRevision ${item.itemRevision}` : ""}.`, {
+        outcome: r.outcome, itemRevision: item?.itemRevision ?? null, ...artifactData(r.artifact),
+      });
+    },
+
+    // ---------- scheduled sources ----------
+
+    list_sources() {
+      const { sensors } = desk.sources();
+      const lines = sensors.map((s) =>
+        [
+          `- ${s.id}「${s.title}」`,
+          ` ${s.scheduleText}；${s.processorLabel}；${s.modeLabel}；${s.statusLabel}；跑了 ${s.runCount} 次，命中 ${s.hitCount} 次；上次运行 ${isoMin(s.lastRunAt)}，上次命中 ${isoMin(s.lastHitAt)}`,
+          s.description ? `；${oneLine(s.description, 200)}` : "",
+          s.lastError ? `；⚠ 最近错误：${oneLine(s.lastError, 300)}` : "",
+        ].join(""),
+      );
+      return ok(section("信源", lines), { sensors: sensors.map(({ buttons: _, ...s }) => s) });
+    },
+
+    create_source(args, principalId) {
+      const title = str(args["title"])!;
+      const cron = str(args["cron"]);
+      const tz = str(args["tz"]);
+      const every = args["everyMinutes"] as number | undefined;
+      if ((cron === undefined) === (every === undefined)) return fail("Give exactly one of cron and everyMinutes: when the check runs.");
+      if (tz && !cron) return fail("tz belongs to a cron expression: give cron instead of everyMinutes.");
+      const kind = args["checkKind"] as CreateSourceRequest["check"]["kind"];
+      const field = { script: "scriptPath", code: "codeEntry", llm: "instruction" }[kind];
+      const value = str(args[field]);
+      if (!value) return fail(`checkKind "${kind}" needs ${field}.`);
+      const description = str(args["description"]);
+      const r = desk.createSource(
+        {
+          title,
+          ...(description ? { description } : {}),
+          schedule: cron ? { cron, ...(tz ? { tz } : {}) } : { everyMinutes: every! },
+          check: kind === "script" ? { kind, path: value } : kind === "code" ? { kind, entry: value } : { kind, instruction: value },
+          ...(args["mode"] !== undefined ? { mode: args["mode"] as "active" | "observe" } : {}),
+        },
+        as(principalId),
+      );
+      const s = r.view.sensors.find((x) => x.id === r.sensorId);
+      return ok(`Added source ${r.sensorId}「${title}」${s ? `: ${s.scheduleText}；${s.processorLabel}；${s.modeLabel}` : ""}.`, { outcome: r.outcome, sensorId: r.sensorId });
+    },
+
+    async manage_source(args, principalId) {
+      const id = str(args["sensorId"])!;
+      const actor = as(principalId);
+      const action = args["action"] as "pause" | "resume" | "set_mode" | "delete";
+      const mode = args["mode"] as "active" | "observe" | undefined;
+      if (action === "set_mode" && !mode) return fail('set_mode needs mode: "active" or "observe".');
+      const r =
+        action === "set_mode" ? desk.setSourceMode(id, { mode: mode! }, actor)
+        : action === "delete" ? await desk.deleteSource(id, actor)
+        : desk.pauseSource(id, action === "pause", actor);
+      return ok(r.message, { outcome: r.outcome, sensorId: id });
+    },
+
+    // ---------- weekly review ----------
+
+    get_review() {
+      const r = desk.review();
+      const text = [
+        `周回顾（本周自 ${isoMin(r.weekStart)}；下次 ${isoMin(r.nextReviewAt)}）`,
+        section("本周完结", r.completed.map((c) => `- ${c.kind === "project" ? "项目" : c.kind === "action" ? "我办的" : "回复"}「${c.title}」${c.project ? `（${c.project}）` : ""} ${isoMin(c.at)}`)),
+        section("超期等待", r.overdueWaits.map((w) => `- ${w.actionId}「${w.title}」${w.project ? `（${w.project}）` : ""} ${w.text}，到期 ${isoMin(w.dueAt)}`)),
+        `批准前改过的草稿：${r.editedDrafts} 份`,
+        section("建议存成技能（resolve_review_suggestion accept_skill / dismiss_skill）", r.skillSuggestions.map((s) => `- ${s.name}：${s.description}${s.reason ? `（${s.reason}）` : ""}\n${s.body.trim().split("\n").map((l) => `    ${l}`).join("\n")}`)),
+        section("建议改成脚本检查的信源（resolve_review_suggestion sensor_to_code）", r.sensorSuggestions.map((s) => `- ${s.sensorId}「${s.title}」：${s.reason}${s.entry ? `；已备好 ${s.entry}` : "；需要给出 entry"}`)),
+      ];
+      return ok(text.join("\n\n"), {
+        ...r,
+        skillSuggestions: r.skillSuggestions.map(({ buttons: _, ...s }) => s),
+        sensorSuggestions: r.sensorSuggestions.map(({ buttons: _, ...s }) => s),
+      });
+    },
+
+    resolve_review_suggestion(args, principalId) {
+      const actor = as(principalId);
+      const action = args["action"] as "accept_skill" | "dismiss_skill" | "sensor_to_code";
+      if (action === "sensor_to_code") {
+        const sensorId = str(args["sensorId"]);
+        if (!sensorId) return fail("sensor_to_code needs sensorId.");
+        const entry = str(args["entry"]) ?? desk.review().sensorSuggestions.find((s) => s.sensorId === sensorId)?.entry;
+        if (!entry) return fail(`sensor_to_code needs entry: "script:<path>" or the name of a registered check (the review prepared none for ${sensorId}).`);
+        const r = desk.sensorToCode(sensorId, { entry }, actor);
+        return ok(r.message, { outcome: r.outcome });
+      }
+      const name = str(args["name"]);
+      if (!name) return fail(`${action} needs name: the suggestion's name from get_review.`);
+      const slug = skillSlug(name);
+      const r = action === "accept_skill" ? desk.acceptSkill(slug, actor) : desk.dismissSkill(slug, actor);
+      return ok(r.message, { outcome: r.outcome });
+    },
+
+    // ---------- what was filed away ----------
+
+    list_activity(args) {
+      const { items, counts } = desk.activity(args["kind"] as ActivityKind | undefined);
+      const back = (i: (typeof items)[number]) =>
+        i.restoredAt ? `；已移回 ${isoMin(i.restoredAt)}`
+        : !i.restorable ? ""
+        : i.buttons.some((b) => b.id === "undo") ? "；可撤销：undo_human_decision"
+        : "；可移回：restore_activity";
+      const lines = items.map((i) => `- ${i.id}（cellId ${i.cellId}）${isoMin(i.at)} ${i.kindLabel}「${i.title}」${i.detail ? ` — ${oneLine(i.detail, 160)}` : ""}${i.source ? `；来源 ${i.source.label}` : ""}${i.remindAt ? `；提醒 ${isoMin(i.remindAt)}` : ""}${back(i)}`);
+      return ok(
+        `静默归档 ${counts.notification_archived}，笔记 ${counts.note_saved}，提醒 ${counts.reminder_set}，撤卡 ${counts.card_withdrawn}，办完 ${counts.action_completed}\n\n${section("活动记录", lines)}`,
+        { counts, items: items.map(({ buttons, ...i }) => ({ ...i, undo: buttons.some((b) => b.id === "undo") })) },
+      );
+    },
+
+    async restore_activity(args, principalId) {
+      const id = str(args["activityId"])!;
+      const r = await desk.restoreActivity(str(args["cellId"])!, id, as(principalId));
+      return r.ok ? ok(r.message, { outcome: r.outcome }) : fail(`Not restored: ${r.message}`, { outcome: r.outcome });
+    },
+
+    // ---------- runners and models ----------
+
+    async get_models(args) {
+      const m = await desk.models(args["refresh"] === true);
+      return ok(modelsText(m), m);
+    },
+
+    async configure_models(args, principalId) {
+      const req = modelsRequest(args);
+      if (typeof req === "string") return fail(req);
+      const m = await desk.setModel(req, as(principalId));
+      return ok(`Saved; it applies from the next run on.\n\n${modelsText(m)}`, m);
+    },
+
+    // ---------- who works for whom ----------
+
+    get_topology(args) {
+      const t = desk.topology({ includeArchived: args["includeArchived"] === true, projectId: str(args["projectId"]) ?? null });
+      const depth = new Map<string, number>();
+      const lines = t.nodes.map((n) => {
+        const d = n.parentId !== null && depth.has(n.parentId) ? depth.get(n.parentId)! + 1 : 0;
+        depth.set(n.cellId, d);
+        const runner = n.processorType === "code" ? "零算力脚本" : [n.engine, n.effectiveModel?.model, n.effectiveModel?.effort].filter(Boolean).join(" · ");
+        const parts = [
+          `${n.roleLabel}，${n.stateLabel}${n.stateDetail ? `：${oneLine(n.stateDetail, 100)}` : ""}`,
+          runner,
+          n.cwd && `目录 ${n.cwd}`,
+          n.statusLine && oneLine(n.statusLine, 100),
+          n.unpulledCount > 0 && `未汇总 +${n.unpulledCount}`,
+          n.hadDirectUserChat && "主人直接说过话",
+          n.humanItemId ? `待处理 ${n.humanItemId}` : n.pendingCardId && `待处理 ${n.pendingCardId}`,
+          n.archivedChildren > 0 && `另有 ${n.archivedChildren} 个已归档`,
+        ].filter(Boolean);
+        return `${"  ".repeat(d)}- ${n.cellId}「${n.title}」${parts.join("；")}`;
+      });
+      const text = [
+        `运行 ${t.counts.running}，等待 ${t.counts.waiting}，待命 ${t.counts.dormant}，归档 ${t.counts.archived}`,
+        section("分身", lines),
+        section("谁在等谁", t.waits.map((w) => `- ${w.fromCellId} → ${w.targetCellId ?? w.targetLabel}：${oneLine(w.description, 160)}（自 ${isoMin(w.since)}）`)),
+        section("同目录协作", t.workspaces.map((w) => `- ${w.gitRoot}：${w.activeCellIds.join("、")}`)),
+      ];
+      return ok(text.join("\n\n"), t);
     },
   };
 
@@ -940,9 +1389,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       if (!doc || !handler) {
         return fail(`Unknown tool "${name}". Available: ${AGENT_TOOLS.map((t) => t.name).join(", ")}.`);
       }
-      const given: Args = {};
-      for (const [k, v] of Object.entries(rawArgs ?? {})) if (v !== null && v !== undefined) given[k] = v;
-      const args = normalizeArgs(doc, given);
+      const args = normalizeArgs(doc, dropNulls(rawArgs ?? {}, schemaOf(doc)) as Args);
       const invalid = validateArgs(doc, args);
       if (invalid) return fail(invalid);
       try {
@@ -950,7 +1397,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       } catch (err) {
         // Caller mistakes and refusals are answers, not server errors.
         if (err instanceof DeskError) return fail(`${err.status === 404 ? "Not found" : err.status === 409 ? "Not possible now" : "Not accepted"}: ${err.message}`, { code: err.code });
-        if (isNgError(err, "bounds_violation")) return fail(`Not allowed for an agent: ${err.message}. If the owner wants this, they do it themselves in the workbench UI.`, { code: err.code });
+        if (isNgError(err, "bounds_violation")) return fail(`Not allowed: ${err.message}`, { code: err.code });
         if (isNgError(err, "not_found")) return fail(`Not found: ${err.message}`, { code: err.code });
         if (isNgError(err, "invalid_argument") || isNgError(err, "conflict") || isNgError(err, "duplicate") || isNgError(err, "stale_epoch") || isNgError(err, "unsupported")) {
           return fail(`Not done: ${err.message}`, { code: err.code });

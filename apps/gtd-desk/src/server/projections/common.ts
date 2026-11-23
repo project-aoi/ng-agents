@@ -33,14 +33,12 @@ export type DeskKernel = Pick<
 
 export interface DeskSettings {
   backend: string;
-  tokenRequired: boolean;
   /** Weekly review slot in local time: weekday 0 = Sunday … 5 = Friday. */
   weeklyReview: { weekday: number; hour: number };
 }
 
 export const DEFAULT_SETTINGS: DeskSettings = {
   backend: "unknown",
-  tokenRequired: false,
   weeklyReview: { weekday: 5, hour: 16 },
 };
 

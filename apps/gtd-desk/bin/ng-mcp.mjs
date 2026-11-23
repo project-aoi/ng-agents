@@ -4,8 +4,8 @@
 // server instructions and every call are served by the workbench's own agent API (`/api/agent/tools`), so this file
 // never goes out of date with the server it talks to.
 //
-//   NG_DESK_URL     base URL of the workbench            (default http://127.0.0.1:8790)
-//   NG_AGENT_TOKEN  the agent's bearer token             (optional with the default loopback agent identity)
+//   NG_DESK_URL        base URL of the workbench   (default http://127.0.0.1:8790)
+//   NG_MCP_TIMEOUT_MS  how long one call may take  (default 120000)
 //
 // Plain ESM without dependencies: any Node >= 18 runs it straight from the source tree, e.g.
 //   claude mcp add ng-desk -- node /path/to/ng-agents/apps/gtd-desk/bin/ng-mcp.mjs
@@ -13,17 +13,14 @@
 import { createInterface } from "node:readline";
 
 const base = (process.env.NG_DESK_URL || "http://127.0.0.1:8790").replace(/\/+$/, "");
-const token = process.env.NG_AGENT_TOKEN || "";
 const SUPPORTED = ["2025-06-18", "2025-03-26", "2024-11-05"];
 const CALL_TIMEOUT_MS = Number(process.env.NG_MCP_TIMEOUT_MS) || 120_000;
-
-const headers = () => ({ "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}) });
 
 async function http(method, path, body) {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), CALL_TIMEOUT_MS);
   try {
-    const res = await fetch(`${base}${path}`, { method, headers: headers(), ...(body !== undefined ? { body: JSON.stringify(body) } : {}), signal: ctl.signal });
+    const res = await fetch(`${base}${path}`, { method, headers: { "content-type": "application/json" }, ...(body !== undefined ? { body: JSON.stringify(body) } : {}), signal: ctl.signal });
     const text = await res.text();
     let json;
     try {
@@ -51,7 +48,6 @@ async function loadCatalog() {
   } catch (err) {
     throw new Error(unreachable(err));
   }
-  if (r.status === 401) throw new Error(`the workbench refused this agent (${r.json?.error?.message ?? "unauthorized"}): set NG_AGENT_TOKEN to the agent token configured on the workbench`);
   if (r.status !== 200 || !Array.isArray(r.json?.tools)) throw new Error(`unexpected answer from ${base}/api/agent/tools (HTTP ${r.status})`);
   catalog = r.json;
   return catalog;
@@ -105,7 +101,6 @@ async function handle(msg) {
       if (typeof name !== "string" || !name) return fail(id, -32602, "tools/call needs a tool name");
       try {
         const r = await http("POST", `/api/agent/tools/${encodeURIComponent(name)}`, params?.arguments ?? {});
-        if (r.status === 401) return reply(id, { content: [{ type: "text", text: `Not authorised: ${r.json?.error?.message ?? "the workbench refused this agent"}. Set NG_AGENT_TOKEN for this MCP server.` }], isError: true });
         const text = typeof r.json?.text === "string" ? r.json.text : (r.json?.error?.message ?? `HTTP ${r.status}`);
         reply(id, { content: [{ type: "text", text }], ...(r.json?.isError || r.status >= 400 ? { isError: true } : {}) });
       } catch (err) {

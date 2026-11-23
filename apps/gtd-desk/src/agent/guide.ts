@@ -1,8 +1,8 @@
-import { runnerSelectionProperties } from "@ng/protocol";
+import { CELL_ROLES, CLI_ENGINES, runnerSelectionProperties } from "@ng/protocol";
 
 // docs/05 principle 1 — the second entrance. An external "main agent" (Claude Code, Codex CLI, Antigravity… whatever
-// the owner chats with) drives the workbench through these tools, with its own `agent:<id>` identity: it may
-// orchestrate like the owner, but it is never the owner. This file is the whole of what such an agent is told —
+// the owner chats with) drives the workbench through these tools with the owner's rights (proposal 07); its own
+// `agent:local` identity only records the entrance. This file is the whole of what such an agent is told —
 // the server instructions and every tool's description and input schema — so it is written as carefully as a prompt:
 // an agent that has never seen this system must be able to act correctly from this text alone.
 
@@ -15,7 +15,7 @@ export interface AgentToolDoc {
 
 export const AGENT_SERVER_NAME = "ng-desk";
 
-export const AGENT_INSTRUCTIONS = `This server is the owner's GTD workbench ("ng-agents"): a background system that keeps their work moving while they do something else. You are one of the owner's two ways in — they talk to you here, and they also talk to the workbench's own resident assistant, the desk, in its web view. You act through these tools under your own identity (agent:…), never as the owner; what you pass on is marked as the owner's words passed on by you.
+export const AGENT_INSTRUCTIONS = `This server is the owner's GTD workbench ("ng-agents"): a background system that keeps their work moving while they do something else. You are one of the owner's two ways in — they talk to you here, and they also talk to the workbench's own resident assistant, the desk, in its web view. Everything the owner can do in the web view you can do here: same rights, same checks. What you do is recorded as done by you (agent:local) on the owner's behalf, so act on what the owner told you — a decision the owner has not made is theirs to make: show it to them and ask.
 
 ## Who does what inside (three layers)
 - **The desk** — the workbench's resident main assistant. Triage is its job: before anything new starts it looks for an existing project, parked idea or report on the same subject, decides where a thing belongs (a note, a reminder, a decision for the owner, more work for an existing project, a new project), asks what is missing, remembers the owner's standing preferences and coordinates across projects. It keeps one continuous conversation with the owner.
@@ -29,14 +29,16 @@ export const AGENT_INSTRUCTIONS = `This server is the owner's GTD workbench ("ng
 3. **Anything new, vague, or that might duplicate existing work → \`chat_with_desk\`** with the owner's words unedited. The desk finds what exists, asks what is missing (for code: the absolute path of the repository on this machine) and puts the work in the right place. It answers in the background: read its replies with \`chat_with_desk\` and \`since\` when the owner asks or you have a reason — never in a loop. Relay its questions to the owner, and send the owner's answer with \`replyToId\` = the id of the question it answers (so it lands on the right matter even when several are open).
    When the owner has already given you everything (outcome, complete brief, the absolute path) and \`search\` shows nothing on the subject, you may \`create_project\` yourself — never a second project for the same outcome. An idea only to remember: \`create_project\` with mode "research_then_park". Omit \`runner\`, \`model\` and \`effort\` by default so the workbench's role defaults apply; pass them (including \`effort\` alone) when the owner asks for a specific runner, model or reasoning effort, and write any per-stage runner/model preferences into \`brief\` so the project dispatches each stage accordingly.
 4. **Work is asynchronous.** Everything returns at once; results arrive minutes later. Tell the owner it is under way and what will happen; do not poll.
-5. Read \`list_human_items\` for BOTH open human actions (owner to-dos) and pending decision cards (snoozed items are hidden until they resurface). To tick off a human action or submit a card decision, call \`decide_human_item\` with the displayed \`optionId\`, \`seenItemRevision\`, and any conditional fields required by the chosen option (\`seenArtifactVersion\`, \`note\`, \`until\`, \`resumeProjectId\`, \`confirmedTargets\`, \`confirmedClosure\`). Use \`undo_human_decision\` with the activity ID to undo a reversible decision, and \`reopen_project\` to resume a closed project. For a direct question, send the answer with \`message_cell\` or \`chat_with_desk\` and its \`replyToId\`.
-6. Project confirmation cards require the owner to approve execution in the workbench. On the owner's instruction you can still defer, decline or request revisions using the displayed options. To add or manage scheduled sources or review weekly suggestions, talk to the desk via \`chat_with_desk\` (or direct the owner to the web UI).
-7. **Never do the workbench's work around it.** Nothing locks a directory: several cells may work in one repository at once, and \`list_workspaces\` shows which cells are active where right now. Before you change files yourself in such a directory, tell its project (\`message_project\`) or pause it, so nobody's work is overwritten.
+5. Read \`list_human_items\` for BOTH open human actions (owner to-dos) and pending decision cards (snoozed items are hidden until they resurface; includeSnoozed shows them). To tick off a human action or submit a card decision, call \`decide_human_item\` with the displayed \`optionId\`, \`seenItemRevision\`, and any conditional fields required by the chosen option (\`seenArtifactVersion\`, \`note\`, \`until\`, \`resumeProjectId\`, \`confirmedTargets\`, \`confirmedClosure\`). Use \`undo_human_decision\` with the activity ID to undo a reversible decision, and \`reopen_project\` to resume a closed project. For a direct question, send the answer with \`message_cell\` or \`chat_with_desk\` and its \`replyToId\`.
+6. A project confirmation card is decided like any other: show the owner its plan, then submit their choice — \`system.execute\` starts the project, \`system.someday\` parks it. They want the plan changed first → \`save_plan\`; a report or draft changed → \`save_artifact\` (the whole new text, on the version you read). Every save and decision carries the version you read (\`expectedVersion\`, \`seenItemRevision\`, \`seenArtifactVersion\`); when something moved meanwhile nothing is written and the answer holds the current content: merge, and show the owner what changed before you submit again. Text a background worker wrote against an older version is kept aside with the document ("parked"): work what is still right into the text, then \`dismiss_parked\`.
+7. Standing arrangements: scheduled checks → \`list_sources\`, \`create_source\`, \`manage_source\`; the week → \`get_review\` and \`resolve_review_suggestion\`; what the workbench filed away by itself → \`list_activity\`, and \`restore_activity\` when something was filed wrongly; which model runs what → \`get_models\`, \`configure_models\`; who works for whom right now → \`get_topology\`.
+8. **Never do the workbench's work around it.** Nothing locks a directory: several cells may work in one repository at once, and \`list_workspaces\` shows which cells are active where right now. Before you change files yourself in such a directory, tell its project (\`message_project\`) or pause it, so nobody's work is overwritten.
 
 ## Answering the owner
 - "What's on my plate?" → the overview's human actions and cards, most urgent first; then one line per active project (who has the ball).
 - "How is X going?" → \`get_project\`: its one-line summary, open actions, what its cells are doing, what is new from its workers, the latest report (\`read_artifact\` for the full text).
 - "Did we look into X before?" → \`search\`.
+- "How was my week?" → \`get_review\`. "What did you put away today?" → \`list_activity\`.
 - "What standing habits have I given you?" → \`list_preferences\`.
 Give ids only when the owner needs them; talk about projects by their titles.
 
@@ -45,12 +47,15 @@ No force-push, no deleting or rewriting protected branches, remote branches, tag
 
 const str = (description: string, extra: Record<string, unknown> = {}) => ({ type: "string", description, ...extra });
 const obj = (properties: Record<string, unknown>, required: string[] = []) => ({ type: "object", properties, required, additionalProperties: false });
+const num = (description: string) => ({ type: "number", description });
+const oneOf = (values: readonly string[], description: string) => ({ type: "string", enum: values, description });
+const EFFORT = oneOf(["15m", "45m", "low_energy"], "the kind of time it takes: 15m (a spare moment), 45m (a stretch of focus), low_energy (a chore)");
 
 export const AGENT_TOOLS: readonly AgentToolDoc[] = [
   {
     name: "workbench_overview",
     description:
-      "The whole workbench at a glance: what the owner must do themselves (open human actions), cards waiting for their decision, every project that is active or parked with who has the ball and whether it is stalled, what is running right now, and which work trees cells are active in. Call this first when the owner asks about their work, and before creating anything.",
+      "The whole workbench at a glance: what the owner must do themselves (open human actions), cards waiting for their decision, every project that is active or parked with who has the ball and whether it is stalled, what is running right now, which work trees cells are active in, what was filed away today, and the runner and model in use. Call this first when the owner asks about their work, and before creating anything.",
     inputSchema: obj({ includeFinished: { type: "boolean", description: "also list recently completed/cancelled projects (default false)" } }),
   },
   {
@@ -68,7 +73,13 @@ export const AGENT_TOOLS: readonly AgentToolDoc[] = [
     name: "capture",
     description:
       "Drop something into the desk's inbox exactly as 随手记 does (a note, a link, a reminder, or an idea to triage) for silent triage, without a conversation. Prefer chat_with_desk when the owner expects an answer or the desk may need to ask something.",
-    inputSchema: obj({ threads: {type: "array", items: {type:"string"}, description: "Workbench topics, e.g. ui:reviews"}, clientId:str("optional stable id for a retried capture"),text: str("the owner's words, unedited; add context after them only if it is needed to understand them") }, ["text"]),
+    inputSchema: obj({
+      text: str("the owner's words, unedited; add context after them only if it is needed to understand them. May be omitted when attachments say it all"),
+      attachments: { type: "array", items: obj({ label: str("what to call it"), uri: str("the link or path") }, ["label", "uri"]), description: "links or files that go with it" },
+      voice: { type: "boolean", description: "the text is a voice transcript (it may contain mis-heard words)" },
+      threads: { type: "array", items: { type: "string" }, description: "Workbench topics, e.g. ui:reviews" },
+      clientId: str("optional stable id for a retried capture"),
+    }),
   },
   {
     name: "create_project",
@@ -90,7 +101,7 @@ export const AGENT_TOOLS: readonly AgentToolDoc[] = [
   {
     name: "get_project",
     description:
-      "One project in detail: its state and one-line summary, the directory it works in, every action (who has the ball, next step), all its cells — at work, waiting, dormant (wakeable) or archived — with what they are doing, what its workers did or were told that the project has not taken in yet (read live, including the owner's direct words to them), its reports (artifact ids and titles), pending cards, and whether it is stalled.",
+      "One project in detail: its state and one-line summary, the directory it works in, every action (who has the ball, next step), all its cells — at work, waiting, dormant (wakeable) or archived — with what they are doing, what its workers did or were told that the project has not taken in yet (read live, including the owner's direct words to them), its own notes (the project's whiteboard), the background commands running for it, its reports (artifact ids and titles), pending cards, and whether it is stalled.",
     inputSchema: obj({ id: str("project id from workbench_overview / create_project") }, ["id"]),
   },
   {
@@ -112,20 +123,20 @@ export const AGENT_TOOLS: readonly AgentToolDoc[] = [
     name: "add_action",
     description: 'Add an open item to a project: something the owner will do themselves ("human" — it appears on their to-do list; give a concrete next step) or something to wait for ("waiting").',
     inputSchema: obj(
-      { projectId: str("project id"), title: str("what it is"), owner: { type: "string", enum: ["human", "waiting"] }, nextStep: str("the concrete next physical step — give one for human, so the owner knows what to do") },
+      { projectId: str("project id"), title: str("what it is"), owner: { type: "string", enum: ["human", "waiting"] }, nextStep: str("the concrete next physical step — give one for human, so the owner knows what to do"), effort: EFFORT },
       ["projectId", "title", "owner"],
     ),
   },
   {
     name: "list_human_items",
     description:
-      'List every active item waiting on the owner in 待我处理 — BOTH open human actions (owner to-dos, completed via decide_human_item using their "done" option) and pending decision cards — together with their options, itemRevision, artifactVersion, resumeTarget, closureTargets and ownerOnly flags. Snoozed items are omitted until they resurface.',
-    inputSchema: obj({}),
+      'List every active item waiting on the owner in 待我处理 — BOTH open human actions (owner to-dos, completed via decide_human_item using their "done" option) and pending decision cards — together with their options, itemRevision, artifactVersion, the plan of a project confirmation card (proposal), resumeTarget and closeTargets (what each closing option would close, by option id). Snoozed items are omitted until they resurface, unless includeSnoozed.',
+    inputSchema: obj({ includeSnoozed: { type: "boolean", description: "also list items put off until later (default false)" } }),
   },
   {
     name: "decide_human_item",
     description:
-      "Complete an open human action or submit a decision on a pending card using the exact option and versions returned by list_human_items. Execution options on ownerOnly cards (such as project confirmation cards) must be approved by the owner in the web UI; you may still submit defer, decline, revision or non-owner-only reply/done options on the owner's instruction.",
+      "Complete an open human action or submit a decision on a pending card using the exact option and versions returned by list_human_items. Every option shown is available to you, project confirmation included (system.execute starts the project, system.someday parks it as an idea for later): submit the one the owner chose.",
     inputSchema: obj({
       id: str("human item id from list_human_items"),
       optionId: str('chosen option id from item.options (e.g. "done" to tick off a human action)'),
@@ -135,7 +146,7 @@ export const AGENT_TOOLS: readonly AgentToolDoc[] = [
       note: str('reply text, revision instructions, or completion context (required when option.input.mode is "required")'),
       resumeProjectId: str("required when the item carries resumeTarget: pass resumeTarget.id to confirm resuming that paused project or cell"),
       confirmedTargets: { type: "array", items: { type: "string" }, description: 'required when the chosen option has terminateMode "cancel_task": pass [targetCellId] matching option.targetCellIds' },
-      confirmedClosure: { type: "array", items: { type: "string" }, description: "required when item.closureTargets is non-empty for a closing option: pass all target ids in the exact order shown" },
+      confirmedClosure: { type: "array", items: { type: "string" }, description: "required when item.closeTargets[optionId] is non-empty: pass all its ids in the exact order shown" },
     }, ["id", "optionId", "seenItemRevision"]),
   },
   {
@@ -151,11 +162,12 @@ export const AGENT_TOOLS: readonly AgentToolDoc[] = [
   {
     name: "read_artifact",
     description:
-      "Read a report, draft or plan saved by the workbench (artifact id from get_project or search): the current version, or an older one. Long ones come a page at a time — the result says where the next page starts.",
+      "Read a report, draft or plan saved by the workbench (artifact id from get_project or search): the current version, or an older one, with its version history, the passages marked for the owner to decide, and the background additions kept aside (parked) because someone edited it meanwhile. Long ones come a page at a time — the result says where the next page starts.",
     inputSchema: obj(
       {
         id: str("artifact id"),
         version: { type: "number", description: "an older version (default: the current one)" },
+        parkedId: str("read this parked addition in full instead of the document"),
         offset: { type: "number", description: "first character to return (default 0)" },
         limit: { type: "number", description: "characters to return (default 16000, at most 64000)" },
       },
@@ -214,7 +226,7 @@ export const AGENT_TOOLS: readonly AgentToolDoc[] = [
   {
     name: "get_cell",
     description:
-      "Low-level: one background cell (a project, worker, checker, sensor, hub or the desk) — its state (at work, waiting, dormant and wakeable, paused, archived), directory, what it waits for, and the tail of what it did. Use it to see why something is stuck when get_project is not enough; inspect_cell reads a longer stretch.",
+      "Low-level: one background cell (a project, worker, checker, sensor, hub or the desk) — its state (at work, waiting, dormant and wakeable, paused, archived), directory and branch, what it waits for, its notes, its running commands, a question it has asked the owner, and the tail of what it did. Use it to see why something is stuck when get_project is not enough; inspect_cell reads a longer stretch.",
     inputSchema: obj({ id: str("cell id"), tail: { type: "number", description: "how many recent records to include (default 12)" } }, ["id"]),
   },
   {
@@ -264,10 +276,171 @@ export const AGENT_TOOLS: readonly AgentToolDoc[] = [
   },
   {
     name: "control_cell",
-    description: "Low-level: pause, resume or cancel one background cell (cancel stops it and everything below it; files and branches stay). message / steer are the same as message_cell.",
+    description: "Low-level: pause, resume or cancel one background cell (cancel stops it and everything below it; files and branches stay), or trigger a script probe's check now. message / steer are the same as message_cell. A scheduled source is deleted with manage_source, not cancelled here.",
     inputSchema: obj(
-      { id: str("cell id"), action: { type: "string", enum: ["message", "steer", "pause", "resume", "cancel"] }, text: str("for message / steer") },
+      { id: str("cell id"), action: { type: "string", enum: ["message", "steer", "pause", "resume", "cancel", "trigger"] }, text: str("for message / steer") },
       ["id", "action"],
     ),
+  },
+
+  // ---------- documents and plans ----------
+  {
+    name: "save_artifact",
+    description:
+      "Save a new version of a report or draft on the owner's instruction (they dictated a change, or asked you to revise it). Pass the complete new text and the version you read it at. If it has moved on since, nothing is written: the answer holds the current text to merge your change into. What you save counts as the owner's edit — a background worker that was still editing the older version has its text kept aside instead of overwriting yours.",
+    inputSchema: obj(
+      {
+        id: str("artifact id"),
+        expectedVersion: num("the version you read (read_artifact currentVersion) and changed"),
+        body: str("the complete new text, not a diff", { minLength: 0 }),
+        title: str("a new title (default: keep it)"),
+        format: oneOf(["text", "markdown", "json"], "default: keep it"),
+        data: { type: "object", description: "for a json document: its value, when you have it as an object (default: parsed from body)" },
+      },
+      ["id", "expectedVersion", "body"],
+    ),
+  },
+  {
+    name: "dismiss_parked",
+    description: "Remove one parked addition of a document (listed by read_artifact) once what is useful in it has been merged, or the owner does not want it.",
+    inputSchema: obj({ artifactId: str("artifact id"), parkedId: str("id of the parked addition") }, ["artifactId", "parkedId"]),
+  },
+  {
+    name: "save_plan",
+    description:
+      "Change the plan on a pending project confirmation card before it is approved: title, goal, background, the steps and who does them, which runner does the work. Pass the complete list of steps (it replaces the old one) and the draft version you read (item.artifactVersion). The directory and stages stay as proposed. If the plan has moved on since, nothing is written and the answer holds the current one. Approve it afterwards with decide_human_item, on the new itemRevision and artifactVersion.",
+    inputSchema: obj(
+      {
+        id: str("id of the project confirmation card, from list_human_items"),
+        expectedVersion: num("item.artifactVersion as you read it"),
+        title: str("project title (default: keep it)"),
+        outcome: str("what done looks like, concretely"),
+        background: str("context and constraints (default: keep it)", { minLength: 0 }),
+        runnerOverride: {
+          type: ["object", "null"],
+          properties: { engine: oneOf(CLI_ENGINES, "runner"), model: str("model id from get_models (required with effort)"), effort: str("reasoning effort the model offers") },
+          required: ["engine"],
+          additionalProperties: false,
+          description: "run this project on a specific runner. null: back to the workbench's default. Omit to keep what the plan says",
+        },
+        actions: {
+          type: "array",
+          items: obj(
+            {
+              title: str("the step"),
+              owner: oneOf(["human", "agent", "waiting"], "who does it: the owner, a background worker, or an outside event to wait for"),
+              effort: EFFORT,
+              nextStep: str("the concrete next step"),
+            },
+            ["title", "owner"],
+          ),
+          description: "all the steps, in order",
+        },
+      },
+      ["id", "expectedVersion", "outcome", "actions"],
+    ),
+  },
+  // ---------- scheduled sources ----------
+  {
+    name: "list_sources",
+    description:
+      "The workbench's sources — the checks that run on a schedule or on a condition and report what they find: how often each runs, how it checks, whether its hits reach the inbox or only become notes, how often it ran and hit, and its last error.",
+    inputSchema: obj({}),
+  },
+  {
+    name: "create_source",
+    description:
+      "Add a scheduled check. Give when it runs (cron, or everyMinutes) and how it checks: a script on this machine (no model cost — best when the check is fixed), a registered check by name, or instructions a model follows each time.",
+    inputSchema: obj(
+      {
+        title: str("short name the owner will recognise"),
+        description: str("what it is for"),
+        cron: str("5-field cron expression, e.g. \"0 9 * * 1\" (this or everyMinutes)"),
+        tz: str("time zone of the cron expression, e.g. Asia/Shanghai (default: the workbench's)"),
+        everyMinutes: num("interval in minutes: under 60, or whole hours up to a day (this or cron)"),
+        checkKind: oneOf(["script", "code", "llm"], "script: run scriptPath. code: a registered check, codeEntry. llm: a model follows instruction"),
+        scriptPath: str("for script: path of the script"),
+        codeEntry: str("for code: name of the registered check"),
+        instruction: str("for llm: what to check and what counts as a hit"),
+        mode: oneOf(["active", "observe"], "active (default): hits are posted to the inbox. observe: only notes are kept"),
+      },
+      ["title", "checkKind"],
+    ),
+  },
+  {
+    name: "manage_source",
+    description: "Pause, resume or delete a source, or change whether its hits are posted to the inbox (active) or only kept as notes (observe). Deleting ends it for good: only when the owner asked for it.",
+    inputSchema: obj(
+      {
+        sensorId: str("source id from list_sources"),
+        action: { type: "string", enum: ["pause", "resume", "set_mode", "delete"] },
+        mode: oneOf(["active", "observe"], "for set_mode"),
+      },
+      ["sensorId", "action"],
+    ),
+  },
+  // ---------- weekly review ----------
+  {
+    name: "get_review",
+    description:
+      "The weekly review: what was finished this week, waits that are overdue, how many drafts the owner edited before approving, playbooks (skills) the workbench suggests saving, and sources that could run as a script instead of a model.",
+    inputSchema: obj({}),
+  },
+  {
+    name: "resolve_review_suggestion",
+    description:
+      "Act on a suggestion of the weekly review: save a suggested playbook so every background agent follows it (accept_skill), drop it (dismiss_skill), or make a source run a script or registered check instead of a model (sensor_to_code).",
+    inputSchema: obj(
+      {
+        action: { type: "string", enum: ["accept_skill", "dismiss_skill", "sensor_to_code"] },
+        name: str("for accept_skill / dismiss_skill: the suggestion's name"),
+        sensorId: str("for sensor_to_code: source id"),
+        entry: str('for sensor_to_code: "script:<path>" or the name of a registered check (default: the one the review prepared, when it has one)'),
+      },
+      ["action"],
+    ),
+  },
+  // ---------- what was filed away ----------
+  {
+    name: "list_activity",
+    description:
+      "What the workbench did by itself or closed recently: notifications it archived, notes it saved, reminders it set, cards that were withdrawn, things that were completed — newest first, with how many there are of each kind and which can be taken back.",
+    inputSchema: obj({ kind: oneOf(["notification_archived", "note_saved", "reminder_set", "card_withdrawn", "action_completed"], "only this kind") }),
+  },
+  {
+    name: "restore_activity",
+    description: "Hand something the workbench filed away back to the desk, which triages it again (the owner says it should not have been archived). A decision is taken back with undo_human_decision instead; list_activity says which one applies.",
+    inputSchema: obj({ cellId: str("cellId of the entry"), activityId: str("id of the entry") }, ["cellId", "activityId"]),
+  },
+  // ---------- runners and models ----------
+  {
+    name: "get_models",
+    description: "Which agent CLIs (runners) are enabled, the models and reasoning efforts each offers, what is selected for the strong and fast tiers and for each role, and what the next run of each will really use.",
+    inputSchema: obj({ refresh: { type: "boolean", description: "ask the CLIs again instead of using the remembered lists (slower; default false)" } }),
+  },
+  {
+    name: "configure_models",
+    description:
+      "Change what background agents run on, when the owner asks for it. target runner: the default runner. target tier: the default runner's model for the strong tier (desk, projects, workers, hubs) or the fast one (checkers, sources) — mode auto follows the CLI's own choice, fixed pins model and effort. target role: one role's own runner and model — mode inherit follows the defaults, custom pins runner, model and effort. Takes effect from the next run. Model ids and efforts come from get_models.",
+    inputSchema: obj(
+      {
+        target: { type: "string", enum: ["runner", "tier", "role"] },
+        runner: oneOf(CLI_ENGINES, "for target runner, and for target role with mode custom"),
+        tier: oneOf(["strong", "fast"], "for target tier"),
+        engine: oneOf(CLI_ENGINES, "for target tier: the runner you believe is the default; refused if it has changed"),
+        role: oneOf(CELL_ROLES, "for target role"),
+        mode: oneOf(["auto", "fixed", "inherit", "custom"], "for target tier: auto or fixed. For target role: inherit or custom"),
+        model: str("model id (required for fixed)"),
+        effort: str("reasoning effort the model offers"),
+      },
+      ["target"],
+    ),
+  },
+  // ---------- who works for whom ----------
+  {
+    name: "get_topology",
+    description:
+      "How the background agents are connected: every cell with its role, state, parent, project, directory, runner and model, who waits for whom, which work trees several cells share, and how many records of each worker its project has not taken in yet.",
+    inputSchema: obj({ includeArchived: { type: "boolean", description: "also list closed cells (default false)" }, projectId: str("only this project's part") }),
   },
 ];

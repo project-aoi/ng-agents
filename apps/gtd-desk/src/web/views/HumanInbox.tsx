@@ -245,7 +245,7 @@ function Detail({
     } catch (err) {
       const failure = toFailure(err);
       const text = failure.code === "bounds_violation"
-        ? "此操作需要主人确认"
+        ? "没有权限执行这项操作"
         : failure.status === 404 ? "事项已移除"
         : failure.status === 409 && failure.message === "事项已变动" ? "事项已经更新，请核对最新选项后重新提交。"
         : /[㐀-鿿]/.test(failure.message) ? failure.message

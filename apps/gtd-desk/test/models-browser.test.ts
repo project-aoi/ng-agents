@@ -27,7 +27,6 @@ const STATUS: StatusDTO = {
   generatedAt: 1_700_000_000_000,
   backend: "claude",
   model: "Opus 5.5 · xhigh",
-  auth: { tokenRequired: false },
   background: { running: 0, jobs: 0, waiting: 0, total: 0, paused: 0 },
   today: { archivedNotifications: 0, notesSaved: 0, remindersSet: 0, cardsWithdrawn: 0, since: 1_700_000_000_000 },
   radar: { activeProjects: 0, stalledProjects: 0, somedayProjects: 0, nextReviewAt: 1_700_000_000_000 },

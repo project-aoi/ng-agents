@@ -14,55 +14,82 @@ import type {
 } from "../src/shared/api";
 import { createDeskServer } from "../src/server/boot";
 import { createEventHub, viewsForBusEvent } from "../src/server/events";
-import { SecurityConfigError, isLoopbackHost } from "../src/server/security";
+import { isLoopbackHost } from "../src/server/security";
 import { SKILL_SUGGESTION_PREFIX } from "../src/server/projections";
 import { BUILTIN_SKILLS } from "@ng/presets";
 import { bootDesk, bootRealDesk, cellMessages, cleanupAll, makeProject, makeReviewCard, requestText, tempDir } from "./helpers";
 
 afterEach(cleanupAll);
 
-const TOKEN = "t0ken-for-tests-0123456789";
+/** Who signed each message captured into the desk's inbox, oldest first. */
+const capturedBy = (kernel: Kernel) => kernel.inbox.listMessagesSync({ cellId: "desk", type: "user.message" }).map((m) => m.envelope.principalId);
 
-describe("the bearer-token rule (docs/01 坑 1)", () => {
-  it("refuses to start on a non-loopback host without a token, or with a weak one", async () => {
-    await expect(bootDesk({ host: "0.0.0.0", token: null })).rejects.toBeInstanceOf(SecurityConfigError);
-    await expect(bootDesk({ host: "192.168.1.20", token: "short" })).rejects.toThrow(/too short/);
-    await expect(createDeskServer({ env: { NG_DESK_HOST: "::" }, dataDir: tempDir("refuse"), webDir: null, log: () => undefined })).rejects.toBeInstanceOf(
-      SecurityConfigError,
-    );
+describe("no accounts and no tokens: whoever reaches the port operates the workbench (proposal 07)", () => {
+  it("answers every surface on loopback without credentials; a stray Authorization header changes nothing", async () => {
+    const d = await bootDesk();
+    for (const headers of [{}, { authorization: "Bearer t0ken-for-tests-0123456789" }, { authorization: "Basic b3duZXI6eA==" }] as Array<Record<string, string>>) {
+      const status = await d.req<StatusDTO>("GET", "/api/status", undefined, headers);
+      expect(status).toMatchObject({ status: 200, json: { humanPending: 0, backend: d.server.settings.backend } });
+      expect(status.headers.get("www-authenticate")).toBeNull();
+      expect((await d.req("GET", "/api/agent/tools", undefined, headers)).status).toBe(200);
+      const sse = await d.server.app.request("/api/events", { headers });
+      expect(sse.status).toBe(200);
+      expect(sse.headers.get("content-type")).toContain("text/event-stream");
+      await sse.body!.cancel();
+      expect((await d.req("POST", "/api/capture", { text: "记一下" }, headers)).status).toBe(200);
+      expect((await d.req("POST", "/api/agent/tools/capture", { text: "记一下" }, headers)).json).not.toHaveProperty("isError");
+    }
+    // The entrance decides who a write is recorded as, whatever the request presents.
+    expect(d.kernel.ownerPrincipal).toBe("owner");
+    expect(capturedBy(d.kernel)).toEqual(["owner", "agent:local", "owner", "agent:local", "owner", "agent:local"]);
+  });
+
+  it("boots on a non-loopback host without a token, says who can operate it, and serves any Host", async () => {
+    for (const opts of [{ host: "0.0.0.0" }, { host: "192.168.1.20" }, { env: { NG_DESK_HOST: "::" } }]) {
+      const lines: string[] = [];
+      const d = await bootDesk({ ...opts, log: (line) => lines.push(line) });
+      expect(d.server.security).toEqual({ allowedHosts: null, loopback: false });
+      expect(lines.filter((l) => l.includes("everyone who can reach it operates this workbench"))).toEqual([expect.stringContaining(d.server.host)]);
+      expect((await d.server.app.request("/api/status", { headers: { host: "desk.lan:8790" } })).status).toBe(200);
+      await d.post("/api/capture", { text: "记一下" });
+      expect((await d.req("POST", "/api/agent/tools/capture", { text: "记一下" })).status).toBe(200);
+      expect(capturedBy(d.kernel)).toEqual(["owner", "agent:local"]);
+    }
+    const local: string[] = [];
+    await bootDesk({ log: (line) => local.push(line) });
+    expect(local.join("\n")).not.toContain("everyone who can reach it");
     expect(["127.0.0.1", "127.8.0.1", "::1", "[::1]", "localhost"].every(isLoopbackHost)).toBe(true);
     expect(["0.0.0.0", "::", "10.0.0.2", "example.com"].some(isLoopbackHost)).toBe(false);
   });
 
-  it("enforces the token on /api/* when set", async () => {
-    const d = await bootDesk({ host: "0.0.0.0", token: TOKEN });
-    const none = await d.req("GET", "/api/status");
-    expect(none.status).toBe(401);
-    expect(none.headers.get("www-authenticate")).toContain("Bearer");
-    expect((await d.req("GET", "/api/status", undefined, { authorization: "Bearer wrong-token-0123456789" })).status).toBe(401);
-    const ok = await d.req<StatusDTO>("GET", "/api/status", undefined, { authorization: `Bearer ${TOKEN}` });
-    expect(ok.status).toBe(200);
-    expect(ok.json.auth).toEqual({ tokenRequired: true });
-    expect((await d.req("POST", "/api/capture", { text: "hi" })).status).toBe(401);
-    // ?token= is only for the SSE stream (EventSource cannot send headers)
-    expect((await d.req("GET", `/api/status?token=${TOKEN}`)).status).toBe(401);
-    const sse = await d.server.app.request(`/api/events?token=${TOKEN}`);
-    expect(sse.status).toBe(200);
-    expect(sse.headers.get("content-type")).toContain("text/event-stream");
-    await sse.body!.cancel();
-  });
-
-  it("requires the generated owner credential on loopback and rejects foreign origins", async () => {
+  it("rejects foreign origins, non-JSON writes and foreign Hosts on loopback, on both entrances", async () => {
     const d = await bootDesk();
-    expect(d.server.security.generatedOwnerToken).toBe(true);
-    expect((await d.server.app.request("/api/status")).status).toBe(401);
-    const cap = (headers: Record<string, string>, body = JSON.stringify({ text: "x" })) => d.server.app.request("/api/capture", { method: "POST", body, headers: { authorization: `Bearer ${d.server.security.token}`, ...headers } });
-    expect((await cap({ "content-type": "application/json", origin: "https://evil.example" })).status).toBe(403);
-    expect((await cap({ "content-type": "application/json", "sec-fetch-site": "cross-site" })).status).toBe(403);
-    expect((await cap({ "content-type": "text/plain", "content-length": "12" })).status).toBe(415);
+    for (const path of ["/api/capture", "/api/agent/tools/capture"]) {
+      const cap = (headers: Record<string, string>, body = JSON.stringify({ text: "x" }), base = "") => d.server.app.request(`${base}${path}`, { method: "POST", body, headers });
+      expect((await cap({ "content-type": "application/json", origin: "https://evil.example" })).status).toBe(403);
+      expect((await cap({ "content-type": "application/json", origin: "null" })).status).toBe(403);
+      expect((await cap({ "content-type": "application/json", "sec-fetch-site": "cross-site" })).status).toBe(403);
+      expect((await cap({ "content-type": "text/plain", "content-length": "12" })).status).toBe(415);
+      expect((await cap({ "content-type": "application/json" }, undefined, "http://evil.example")).status).toBe(403);
+      expect((await cap({ "content-type": "application/json", host: "rebound.example:8790" })).status).toBe(403);
+    }
     expect((await d.server.app.request("http://evil.example/api/status")).status).toBe(403);
     expect((await d.server.app.request("/api/status", { headers: { host: "rebound.example:8790" } })).status).toBe(403);
-    expect((await cap({ "content-type": "application/json", origin: "http://localhost:5173" })).status).toBe(200);
+    expect(capturedBy(d.kernel)).toEqual([]);
+    const own = await d.server.app.request("/api/capture", { method: "POST", body: JSON.stringify({ text: "x" }), headers: { "content-type": "application/json", origin: "http://localhost:5173" } });
+    expect(own.status).toBe(200);
+    expect(capturedBy(d.kernel)).toEqual(["owner"]);
+  });
+
+  it("keeps the cross-site guard on a non-loopback host, and the Host guard once the accepted names are configured", async () => {
+    const d = await bootDesk({ host: "0.0.0.0", env: { NG_DESK_ALLOWED_HOSTS: "desk.lan" } });
+    const cap = (headers: Record<string, string>) => d.server.app.request("http://desk.lan:8790/api/capture", { method: "POST", body: JSON.stringify({ text: "x" }), headers: { "content-type": "application/json", ...headers } });
+    expect((await cap({ origin: "https://evil.example" })).status).toBe(403);
+    expect((await cap({ "sec-fetch-site": "cross-site" })).status).toBe(403);
+    expect((await cap({ host: "rebound.example:8790" })).status).toBe(403);
+    expect(capturedBy(d.kernel)).toEqual([]);
+    expect((await cap({ origin: "http://desk.lan:8790" })).status).toBe(200);
+    expect(capturedBy(d.kernel)).toEqual(["owner"]);
   });
 });
 
@@ -125,7 +152,7 @@ describe("live updates", () => {
 
   it("streams hello, then refresh events after a change", async () => {
     const d = await bootDesk();
-    const res = await d.server.app.request("/api/events", { headers: {authorization: `Bearer ${d.server.security.token}`} });
+    const res = await d.server.app.request("/api/events");
     const reader = res.body!.getReader();
     const decoder = new TextDecoder();
     let text = "";
@@ -305,7 +332,7 @@ describe("escalations and completion", () => {
     const choice = { optionId: "system.reply", seenArtifactVersion: 1, seenItemRevision: 1 };
     await d.post(`/api/human-items/${actionId}/decide`, choice);
     expect((await d.req("POST", `/api/human-items/${actionId}/decide`, choice)).status).toBe(409);
-    const malformed = await d.server.app.request("/api/capture", { method: "POST", body: "{not json", headers: { authorization: `Bearer ${d.server.security.token}`, "content-type": "application/json" } });
+    const malformed = await d.server.app.request("/api/capture", { method: "POST", body: "{not json", headers: { "content-type": "application/json" } });
     expect(malformed.status).toBe(400);
     expect(await malformed.json()).toEqual({ error: { code: "invalid_json", message: "请求体不是合法的 JSON" } });
   });

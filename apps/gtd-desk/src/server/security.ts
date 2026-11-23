@@ -1,13 +1,9 @@
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { isIP } from "node:net";
 
-// docs/01 §四 坑 1: a control plane reachable without authentication is a remote-execution hole. The desk binds to
-// loopback by default, refuses any other bind without a bearer token, and even on loopback rejects requests a
-// web page in the owner's browser could forge (cross-site writes, DNS-rebinding Host headers).
-
-export class SecurityConfigError extends Error {
-  override name = "SecurityConfigError";
-}
+// The desk has no accounts and no tokens: whoever reaches the port operates the workbench (proposal 07). It binds to
+// loopback by default, and the guards here only keep web pages in the owner's browser from driving it: cross-site
+// writes are rejected, and so are foreign Host headers (DNS rebinding) on a loopback bind or wherever
+// NG_DESK_ALLOWED_HOSTS names the accepted ones.
 
 export function isLoopbackHost(host: string): boolean {
   const h = host.trim().toLowerCase().replace(/^\[|\]$/g, "");
@@ -18,97 +14,18 @@ export function isLoopbackHost(host: string): boolean {
 }
 
 export interface SecurityPolicy {
-  /** Required on every /api/* request when set (`Authorization: Bearer <token>`; `?token=` only on the SSE stream). */
-  token: string;
-  generatedOwnerToken: boolean;
-  /** Host header names accepted (lowercase, no port). null = any (the token is the guard). */
+  /** Host header names accepted (lowercase, no port). null = any. */
   allowedHosts: ReadonlySet<string> | null;
-  /** Each external agent authenticates with its own token and acts as agent:<id>. */
-  agentTokens: ReadonlyMap<string, string>;
   /** The desk is bound to a loopback address. */
   loopback: boolean;
 }
 
-const AGENT_ID = /^[a-z0-9][a-z0-9_-]{0,31}$/;
-
-/** `NG_AGENT_TOKEN` (agent id "main") and `NG_AGENT_TOKENS` ("id:token,id2:token2"). */
-export function agentTokensFromEnv(env: Record<string, string | undefined>): Record<string, string> {
-  const out: Record<string, string> = {};
-  const single = env["NG_AGENT_TOKEN"]?.trim();
-  if (single) out["main"] = single;
-  for (const part of (env["NG_AGENT_TOKENS"] ?? "").split(",").map((p) => p.trim()).filter(Boolean)) {
-    const i = part.indexOf(":");
-    if (i <= 0) throw new SecurityConfigError(`NG_AGENT_TOKENS: "${part.slice(0, 12)}…" is not of the form id:token`);
-    out[part.slice(0, i).trim()] = part.slice(i + 1).trim();
-  }
-  return out;
-}
-
-export type AgentAuth = { ok: true; principalId: `agent:${string}`; agentId: string } | { ok: false; reason: string };
-
-/**
- * Who is calling the agent API.
- * - A presented agent token → that agent.
- * - No agent token configured, loopback bind, and an automatically issued owner credential (default local setup): `agent:local` — still an agent, never the owner.
- * - Anything else is refused; in particular the owner's token does not open the agent API (two separate credentials).
- */
-export function agentAuthFor(policy: SecurityPolicy, presented: string | null): AgentAuth {
-  if (presented) {
-    for (const [agentId, token] of policy.agentTokens) {
-      if (tokenMatches(presented, token)) return { ok: true, principalId: `agent:${agentId}`, agentId };
-    }
-    if (policy.token && tokenMatches(presented, policy.token)) {
-      return { ok: false, reason: "the owner's token is not accepted on the agent API: configure NG_AGENT_TOKEN for the agent" };
-    }
-    return { ok: false, reason: "unknown agent token" };
-  }
-  if (policy.agentTokens.size === 0 && policy.loopback && policy.generatedOwnerToken) return { ok: true, principalId: "agent:local", agentId: "local" };
-  return { ok: false, reason: "an agent token is required (Authorization: Bearer <NG_AGENT_TOKEN>)" };
-}
-
-/** Throws unless the bind is safe: non-loopback hosts need a token of reasonable strength. */
-export function securityPolicyFor(
-  bindHost: string,
-  token: string | null | undefined,
-  extraHosts: readonly string[] = [],
-  agents: Readonly<Record<string, string>> = {},
-): SecurityPolicy {
-  const t = token ? token.trim() : "";
-  const agentTokens = new Map<string, string>();
-  for (const [id, raw] of Object.entries(agents)) {
-    const at = raw.trim();
-    if (!AGENT_ID.test(id)) throw new SecurityConfigError(`agent id "${id}" is invalid: use lowercase letters, digits, "-" or "_" (it becomes the principal agent:${id}).`);
-    if (at.length < 16) throw new SecurityConfigError(`the token of agent "${id}" is too short: use at least 16 random characters (e.g. \`openssl rand -hex 24\`).`);
-    if (t && at === t) throw new SecurityConfigError(`agent "${id}" must not share the owner's token: the two credentials carry different rights.`);
-    if ([...agentTokens.values()].includes(at)) throw new SecurityConfigError(`agent "${id}" shares its token with another agent: each agent needs its own.`);
-    agentTokens.set(id, at);
-  }
-  if (t && t.length < 16) throw new SecurityConfigError("NG_DESK_TOKEN is too short: use at least 16 random characters (e.g. `openssl rand -hex 24`).");
-  if (agentTokens.size && !t) throw new SecurityConfigError("配置助手令牌时必须同时设置独立的 NG_DESK_TOKEN");
+/** A loopback bind accepts its own names and `extraHosts`; any other bind accepts every Host unless `extraHosts` names the accepted ones. */
+export function securityPolicyFor(bindHost: string, extraHosts: readonly string[] = []): SecurityPolicy {
   const loopback = isLoopbackHost(bindHost);
-  if (!loopback && !t) {
-    throw new SecurityConfigError(
-      `Refusing to listen on ${bindHost}: a non-loopback address exposes the desk to the network. Set NG_DESK_TOKEN (bearer token) or bind 127.0.0.1.`,
-    );
-  }
   const hosts = new Set(["localhost", "127.0.0.1", "::1", ...extraHosts.map((h) => h.trim().toLowerCase()).filter(Boolean)]);
   if (loopback && !["localhost", "127.0.0.1", "::1"].includes(bindHost.toLowerCase())) hosts.add(bindHost.toLowerCase());
-  return { token: t || randomBytes(32).toString("base64url"), generatedOwnerToken: !t, allowedHosts: loopback ? hosts : extraHosts.length ? hosts : null, agentTokens, loopback };
-}
-
-function digest(s: string): Buffer {
-  return createHash("sha256").update(s, "utf8").digest();
-}
-
-export function tokenMatches(presented: string | null | undefined, expected: string): boolean {
-  if (!presented) return false;
-  return timingSafeEqual(digest(presented), digest(expected));
-}
-
-export function bearerOf(authorization: string | undefined | null): string | null {
-  if (!authorization) return null;
-  const m = /^Bearer\s+(.+)$/i.exec(authorization.trim());
-  return m ? m[1]!.trim() : null;
+  return { allowedHosts: loopback ? hosts : extraHosts.length ? hosts : null, loopback };
 }
 
 /** Host header without the port, lowercase, IPv6 brackets removed. */

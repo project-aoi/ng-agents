@@ -89,7 +89,6 @@ export function projectStatus(input: ProjectionInput): StatusDTO {
     humanSnoozed: counts.snoozed,
     generatedAt: now,
     backend: settings.backend,
-    auth: { tokenRequired: settings.tokenRequired },
     background: {
       running: stats.busyCells,
       jobs: stats.runningJobs,

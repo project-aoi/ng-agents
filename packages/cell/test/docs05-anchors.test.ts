@@ -268,11 +268,11 @@ describe("hub: operator watches, coalescing, absorption", () => {
   });
 });
 
-// docs/05 §5.3 — the external main agent orchestrates like the owner but is never the owner.
+// docs/05 §5.3, proposal 07 — the external main agent operates the control plane as the owner does.
 describe("agent principal on the control plane", () => {
   const AGENT = "agent:main";
 
-  it("may spawn, message, steer, pause/resume and close any cell; may not create roots or widen bounds", async () => {
+  it("may spawn, message, steer, pause/resume and close any cell and create roots, which cells and outsiders may not; narrows bounds like an ancestor", async () => {
     const h = await boot();
     h.kernel.spawnCell("desk", { id: "proj", preset: "project", title: "改 TUI 表格复制", meta: { role: "proj" } }, "coordinate", { principalId: AGENT });
     expect(h.kernel.getCell("proj")!.principalId).toBe(AGENT);
@@ -287,7 +287,15 @@ describe("agent principal on the control plane", () => {
     const before = h.kernel.getCell("proj")!.bounds.maxConcurrentChildren;
     h.kernel.updateCell("proj", { bounds: { maxConcurrentChildren: before * 10 } }, { principalId: AGENT });
     expect(h.kernel.getCell("proj")!.bounds.maxConcurrentChildren).toBe(before);
-    expect(() => h.kernel.createRootCell({ id: "desk2", preset: "inline" }, { principalId: AGENT })).toThrow(/only the owner/);
+    for (const principalId of ["cell:desk", "cell:proj", "external:mail:someone", "mail:someone"]) {
+      for (const create of [h.kernel.createRootCell, h.kernel.ensureRootCell]) {
+        expect(() => create({ id: "desk2", preset: "inline" }, { principalId }), principalId).toThrow(expect.objectContaining({ code: "bounds_violation" }));
+      }
+    }
+    expect(h.kernel.getCell("desk2")).toBeUndefined();
+    expect(h.kernel.createRootCell({ id: "desk2", preset: "inline" }, { principalId: AGENT })).toMatchObject({ id: "desk2", parentId: null, principalId: AGENT });
+    expect(h.kernel.ensureRootCell({ id: "desk2", preset: "inline" }, { principalId: AGENT }).id).toBe("desk2");
+    expect(h.kernel.ensureRootCell({ id: "desk3", preset: "inline" }, { principalId: AGENT })).toMatchObject({ id: "desk3", principalId: AGENT });
     expect((await h.kernel.closeCell("proj", "cancelled", { principalId: AGENT })).closed).toEqual(["proj"]);
   });
 

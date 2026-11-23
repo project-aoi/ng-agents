@@ -16,7 +16,7 @@
 | B15 | 脚本信源 | 运行真实临时脚本读取触发信封；沿用同一信封重试时，观察与计数只写入一次。 | [api.test.ts](../../apps/gtd-desk/test/api.test.ts)、[script-sensor.test.ts](../../presets/test/script-sensor.test.ts)、[sources-and-quick-items.test.ts](../../presets/test/sources-and-quick-items.test.ts) |
 | C10、B16 | 工作台焦点、版本与实时状态 | 收到新卡时保留正在填写的内容。冲突后用远端最新版核对；撤销和重开返回最新状态，并通知订阅视图。 | [human-inbox-browser.test.ts](../../apps/gtd-desk/test/human-inbox-browser.test.ts)、[api.test.ts](../../apps/gtd-desk/test/api.test.ts)、[server.test.ts](../../apps/gtd-desk/test/server.test.ts) |
 | 探针排空 | 一次性结算 | 失败报告在第二个回合重新绑定，父项目只收到一次失败和原始检查结果。 | [probe.test.ts](../../presets/test/probe.test.ts) |
-| 主人与助手 | 本机身份 | 回环访问也核对主人凭据。独立助手令牌需要配对的主人令牌。 | [agent.test.ts](../../apps/gtd-desk/test/agent.test.ts)、[server.test.ts](../../apps/gtd-desk/test/server.test.ts) |
+| 主人与助手 | 本机身份 | 不设凭据。`/api/*` 记录为主人，`/api/agent/*` 记录为 `agent:local`，两者权限相同。Host 与跨站检查拦截网页来源的请求。 | [agent.test.ts](../../apps/gtd-desk/test/agent.test.ts)、[agent-parity.test.ts](../../apps/gtd-desk/test/agent-parity.test.ts)、[server.test.ts](../../apps/gtd-desk/test/server.test.ts) |
 | 信源与内部定时 | 批量与失败恢复 | 每个脚本触发独立结算。内部提醒失败后退避重试；无需唤醒模型。 | [api.test.ts](../../apps/gtd-desk/test/api.test.ts)、[human-items.test.ts](../../packages/cell/test/human-items.test.ts) |
 | 分身与文稿归属 | 项目协作 | 同项目可接力编辑，无关项目写入和非发起节点修改待批方案会被拒绝。 | [human-items.test.ts](../../packages/cell/test/human-items.test.ts)、[scenario-human-step.test.ts](../../presets/test/scenario-human-step.test.ts) |
 | 仲裁与暂停 | 自查结算 | 自身停靠后不产生新卡。已有仲裁持有相同等待时，项目自查等待该次仲裁结算。 | [docs05-anchors.test.ts](../../packages/cell/test/docs05-anchors.test.ts) |

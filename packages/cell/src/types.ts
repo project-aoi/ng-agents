@@ -113,8 +113,8 @@ export interface KernelOptions {
 
 /**
  * Who is asking. All entry points require an explicit principal. Cells act as `cell:<id>` and may only touch their own descendants (and, for
- * watches/schedules/title/meta, themselves). An external main agent acts as `agent:<id>`: it may orchestrate any cell
- * but never widens bounds or approves a project proposal (docs/05 §5.3).
+ * watches/schedules/title/meta, themselves). An external main agent acts as `agent:<id>`: it operates the workbench as
+ * the owner does (docs/05 §5.3, proposal 07), and narrows a cell's bounds like an ancestor would.
  */
 export interface ActorOptions {
   principalId: string;

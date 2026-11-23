@@ -2,16 +2,13 @@
 
 import { createDeskServer } from "./boot";
 import { BackendConfigError } from "./backend";
-import { SecurityConfigError } from "./security";
 
 if (process.env["NG_DESK_TZ"]) process.env["TZ"] = process.env["NG_DESK_TZ"];
 
 async function main(): Promise<void> {
   const server = await createDeskServer();
   const { url } = await server.listen();
-  console.log(`[desk] GTD 工作台 ${url} · ${server.settings.backend}${server.security.token ? " · bearer token required" : ""}`);
-
-  if (server.security.generatedOwnerToken) console.log(`本次工作台登录链接 ${url}/#token=${server.security.token}`);
+  console.log(`[desk] GTD 工作台 ${url} · ${server.settings.backend}`);
 
   let stopping = false;
   const stop = (signal: string) => {
@@ -36,6 +33,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((err: unknown) => {
-  console.error(err instanceof SecurityConfigError || err instanceof BackendConfigError ? `[desk] ${err.message}` : err);
+  console.error(err instanceof BackendConfigError ? `[desk] ${err.message}` : err);
   process.exit(1);
 });

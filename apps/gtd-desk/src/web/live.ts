@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from "react";
 import type { NotificationDTO, StatusDTO, ViewName } from "../shared/api";
-import { eventsUrl } from "./api";
 import type { ArtifactEvent, CellTailEvent } from "./state";
 
 export interface DeskEventHandlers {
@@ -25,7 +24,7 @@ function parse<T>(e: Event): T | null {
 }
 
 /**
- * Subscribes to /api/events. EventSource gives up for good on an HTTP error (e.g. 401) and retries a dropped stream on
+ * Subscribes to /api/events. EventSource gives up for good on an HTTP error (e.g. 403) and retries a dropped stream on
  * its own fixed schedule, so the stream is always closed on error and reopened here with jittered exponential backoff.
  * Returns whether the stream is currently open.
  */
@@ -43,7 +42,7 @@ export function useDeskEvents(handlers: DeskEventHandlers): boolean {
 
     const connect = () => {
       if (stopped) return;
-      const source = new EventSource(eventsUrl());
+      const source = new EventSource("/api/events");
       es = source;
       timer = null;
       es.addEventListener("hello", (e) => {

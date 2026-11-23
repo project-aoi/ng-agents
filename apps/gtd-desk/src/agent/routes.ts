@@ -1,11 +1,13 @@
-import type { Context, Hono } from "hono";
+import type { Hono } from "hono";
 import { AGENT_INSTRUCTIONS, AGENT_SERVER_NAME, AGENT_TOOLS, type AgentToolDoc } from "./guide";
 
 // The external main agent's control plane (docs/05 §5.3). One tool registry, two transports:
 //   GET  /api/agent/tools            → { server, instructions, tools }   (what the MCP stdio server lists)
 //   POST /api/agent/tools/:name      → { text, isError?, data? }         (what it calls; also plain REST for scripts)
-// Authentication and the caller's `agent:<id>` principal are resolved by the app's guard (security.ts agentAuthFor);
-// every handler acts as that principal, so the kernel's own rules — not this file — decide what an agent may do.
+// Every call acts as AGENT_PRINCIPAL: it carries the owner's rights, and the separate identity only records which
+// entrance an operation came through.
+
+export const AGENT_PRINCIPAL = "agent:local";
 
 export interface AgentToolResult {
   /** What the agent reads. Plain text, complete on its own. */
@@ -22,11 +24,9 @@ export interface AgentControlPlane {
   tools?(): readonly AgentToolDoc[] | Promise<readonly AgentToolDoc[]>;
 }
 
-export function mountAgentApi(app: Hono, plane: AgentControlPlane, principalOf: (c: Context) => `agent:${string}` | null): void {
+export function mountAgentApi(app: Hono, plane: AgentControlPlane): void {
   app.get("/api/agent/tools", async (c) => c.json({ server: AGENT_SERVER_NAME, instructions: AGENT_INSTRUCTIONS, tools: await (plane.tools?.() ?? AGENT_TOOLS) }));
   app.post("/api/agent/tools/:name", async (c) => {
-    const principalId = principalOf(c);
-    if (!principalId) return c.json({ error: { code: "unauthorized", message: "no agent identity" } }, 401);
     let args: Record<string, unknown> = {};
     const raw = await c.req.text();
     if (raw.trim()) {
@@ -38,7 +38,7 @@ export function mountAgentApi(app: Hono, plane: AgentControlPlane, principalOf: 
         return c.json({ text: "The request body must be a JSON object with the tool's arguments.", isError: true } satisfies AgentToolResult, 400);
       }
     }
-    const result = await plane.call(c.req.param("name"), args, principalId);
+    const result = await plane.call(c.req.param("name"), args, AGENT_PRINCIPAL);
     return c.json(result, 200);
   });
 }

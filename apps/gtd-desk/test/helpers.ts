@@ -140,7 +140,7 @@ export async function bootDesk(opts: Partial<DeskServerOptions> & { clock?: Manu
   script.kernel = server.kernel;
   cleanups.push(() => server.close());
   async function req<T>(method: string, path: string, body?: unknown, headers: Record<string, string> = {}) {
-    const init: RequestInit = { method, headers: { ...(body !== undefined ? { "content-type": "application/json" } : {}), ...(server.security.generatedOwnerToken && !path.startsWith('/api/agent/') ? {authorization: `Bearer ${server.security.token}`} : {}), ...headers } };
+    const init: RequestInit = { method, headers: { ...(body !== undefined ? { "content-type": "application/json" } : {}), ...headers } };
     if (body !== undefined) init.body = JSON.stringify(body);
     const res = await server.app.request(path, init);
     const text = await res.text();
@@ -154,12 +154,12 @@ export async function bootDesk(opts: Partial<DeskServerOptions> & { clock?: Manu
     memory,
     req,
     async get<T>(path: string) {
-      const r = await req<T>("GET", path, undefined, { authorization: `Bearer ${server.security.token}` });
+      const r = await req<T>("GET", path);
       if (r.status !== 200) throw new Error(`GET ${path} → ${r.status} ${JSON.stringify(r.json)}`);
       return r.json;
     },
     async post<T>(path: string, body: unknown = {}) {
-      const r = await req<T>("POST", path, body, { authorization: `Bearer ${server.security.token}` });
+      const r = await req<T>("POST", path, body);
       if (r.status !== 200) throw new Error(`POST ${path} → ${r.status} ${JSON.stringify(r.json)}`);
       return r.json;
     },
