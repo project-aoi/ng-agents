@@ -1,3 +1,4 @@
+import { CaptureAttachments } from "../capture-images";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { relativeTimeZh, type CellJobDTO, type TimelineItemDTO, type ToolStepDTO, type TopologyNodeDTO } from "../../../shared/api";
 import { api } from "../../api";
@@ -124,6 +125,7 @@ function Item(props: { it: TimelineItemDTO; node: TopologyNodeDTO; now: number; 
             {it.mode === "steer" ? " · 立即打断" : ""} · {at}
           </p>
           <div className="tl-bubble">{it.text}</div>
+          <CaptureAttachments items={it.attachments} />
           {it.syncedTo && <p className="tl-sync">已同步给所属项目「{it.syncedTo}」</p>}
         </div>
       );

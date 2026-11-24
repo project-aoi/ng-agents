@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ArtifactRefDTO, StatusDTO, ViewName } from "../shared/api";
 import { api } from "./api";
 import { COMPOSER_INPUT_ID } from "./components/agents/composer";
@@ -29,6 +29,7 @@ import {
 import { AgentsView } from "./views/Agents";
 import { HumanInbox } from "./views/HumanInbox";
 import { RadarView } from "./views/Radar";
+import { t } from "./i18n";
 
 const ALL_VIEWS: ViewName[] = ["inbox", "radar", "agents", "review", "status", "sources", "activity"];
 
@@ -52,6 +53,9 @@ function Shell() {
   const toast = useToast();
   const quickRef = useRef<HTMLInputElement>(null);
   const mainRef = useRef<HTMLElement>(null);
+  useLayoutEffect(() => {
+    mainRef.current?.scrollTo({ top: 0 });
+  }, [route.view]);
 
   const status = statusRes.data;
   const newestStatus = useRef(status?.generatedAt ?? -Infinity);
@@ -78,7 +82,6 @@ function Shell() {
     setPanelOpen(false);
     setDrawer((d) => (d.open ? { ...d, open: false } : d));
     setReport(null);
-    mainRef.current?.scrollTo({ top: 0 });
   }, []);
   const goView = useCallback((v: ViewKey) => navigate({ view: v }), [navigate]);
 
@@ -106,7 +109,8 @@ function Shell() {
 
   useEffect(() => {
     const n = status?.humanPending ?? 0;
-    document.title = n > 0 ? `(${n}) GTD 工作台` : "GTD 工作台";
+    const title = t("GTD 工作台", "GTD Workbench");
+    document.title = n > 0 ? `(${n}) ${title}` : title;
   }, [status?.humanPending]);
 
   const closePanel = useCallback(() => setPanelOpen(false), []);

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { transformSync } from "esbuild";
+import { CLI_ENGINES } from "@ng/protocol";
 import { cliAdapterFor, kernelSystem, RUN_ENDED_NOTICE, RUN_ALREADY_ENDED } from "@ng/loop";
 import { fileURLToPath } from "node:url";
 
@@ -26,7 +27,7 @@ export function runtimeVersion(): string {
     hash.update(template).update("\0").update(code).update("\0");
   }
   // Hash what each CLI is actually told, including capability-specific wording.
-  for (const engine of ["claude", "codex", "agy"] as const) {
+  for (const engine of CLI_ENGINES) {
     const adapter = cliAdapterFor(engine);
     for (let mask = 0; mask < 16; mask++) {
       const caps = {root: "/", write: !!(mask & 1), edit: !!(mask & 2), bash: !!(mask & 4), web: !!(mask & 8), readOnly: (mask & 7) === 0};

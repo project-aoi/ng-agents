@@ -1,4 +1,5 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { CaptureAttachments } from "../components/capture-images";
+import { Component, useEffect, useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from "react";
 import type { CardOption } from "@ng/protocol";
 import { EFFORT_LABELS, type Effort, type HumanItemDTO as Item, type StatusDTO } from "../../shared/api";
 import { References } from "../components/bits";
@@ -12,6 +13,34 @@ import { serverTimeForLocalDate, toFailure, useNavigate, useNow, useResource, us
 
 const pool = api.humanItems;
 
+type ScrollSnapshot = { stage: HTMLElement; list: HTMLElement; scroller: HTMLElement; top: number; listTop: number; selected: { row: HTMLElement; top: number } | null };
+
+// React restores focus after moving keyed rows. Capture before that DOM update so a background reorder
+// keeps the visible selected row in place, or preserves the reader's position when it is off screen.
+class InboxScroll extends Component<{ data: unknown; listRef: RefObject<HTMLElement | null>; children: ReactNode }, {}, ScrollSnapshot | null> {
+  override getSnapshotBeforeUpdate(previous: Readonly<typeof this.props>): ScrollSnapshot | null {
+    if (previous.data === this.props.data) return null;
+    const list = this.props.listRef.current;
+    const stage = list?.closest<HTMLElement>(".stage");
+    if (!list || !stage) return null;
+    const scroller = /^(auto|scroll)$/.test(getComputedStyle(list).overflowY) ? list : stage;
+    const row = list.querySelector<HTMLElement>('.inbox-row[aria-current="true"]');
+    const box = row?.getBoundingClientRect();
+    const pane = scroller.getBoundingClientRect();
+    const outer = stage.getBoundingClientRect();
+    const visible = box && box.top >= Math.max(pane.top, outer.top) && box.bottom <= Math.min(pane.bottom, outer.bottom);
+    return { stage, list, scroller, top: stage.scrollTop, listTop: list.scrollTop, selected: row && visible ? { row, top: box.top } : null };
+  }
+  override componentDidUpdate(_previous: Readonly<typeof this.props>, _state: {}, snapshot: ScrollSnapshot | null) {
+    if (!snapshot) return;
+    snapshot.stage.scrollTop = snapshot.top;
+    snapshot.list.scrollTop = snapshot.listTop;
+    const row = this.props.listRef.current?.querySelector<HTMLElement>('.inbox-row[aria-current="true"]');
+    if (snapshot.selected && snapshot.selected.row === row) snapshot.scroller.scrollTop += row.getBoundingClientRect().top - snapshot.selected.top;
+  }
+  override render() { return this.props.children; }
+}
+
 export function HumanInbox({ cardId }: { cardId?: string | undefined }) {
   const res = useResource("human-inbox", pool, ["inbox", "radar", "status"]);
   const navigate = useNavigate();
@@ -19,6 +48,7 @@ export function HumanInbox({ cardId }: { cardId?: string | undefined }) {
   const [editing, setEditing] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(cardId ?? null);
   const editingItem = useRef<Item | null>(null);
+  const listRef = useRef<HTMLElement>(null);
   useLayoutEffect(() => {
     if (cardId) setSelectedId(cardId);
   }, [cardId]);
@@ -28,6 +58,9 @@ export function HumanInbox({ cardId }: { cardId?: string | undefined }) {
   const editingFallback = editing && editingItem.current?.proposal && editingItem.current.id === editing ? editingItem.current : undefined;
   const item = items.find(i => i.id === selectedId) ?? editingFallback ?? items[0];
   useLayoutEffect(() => { if (item) setSelectedId(item.id); }, [item?.id]);
+  useLayoutEffect(() => {
+    listRef.current?.querySelector<HTMLElement>('.inbox-row[aria-current="true"]')?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [item?.id]);
   useEffect(() => {
     if (res.data) {
       retainUnsaved(res.data.openArtifactIds);
@@ -55,9 +88,10 @@ export function HumanInbox({ cardId }: { cardId?: string | undefined }) {
     return res.error ? <ErrorState title="待办未能载入" error={res.error} onRetry={res.reload} /> : <Loading label="正在载入待办" />;
   const { questions } = res.data;
   return (
+    <InboxScroll data={res.data} listRef={listRef}>
     <div className={focused ? "human-inbox editing" : "human-inbox"}>
       {!focused && (
-        <aside className="human-list">
+        <aside className="human-list" ref={listRef}>
           <div className="section-head">
             <h2>待我处理</h2>
             <select aria-label="筛选事项" value={filter} onChange={e => {
@@ -89,6 +123,7 @@ export function HumanInbox({ cardId }: { cardId?: string | undefined }) {
                   {group.map((i) => (
                     <button type="button" className="inbox-row" key={i.id} aria-current={i.id === item?.id} onClick={() => choose(i.id)}>
                       <strong>{i.title}</strong>
+                      <CaptureAttachments items={i.attachments} compact />
                       {i.project && (
                         <small>
                           {i.project.title}
@@ -125,6 +160,7 @@ export function HumanInbox({ cardId }: { cardId?: string | undefined }) {
         </Empty>
       )}
     </div>
+    </InboxScroll>
   );
 }
 
@@ -325,7 +361,7 @@ function Detail({
     </div>
   );
   const reference = (
-    <>
+    <div className="inbox-reference">
       {item.source && (
         <p>
           来源 ·{" "}
@@ -333,6 +369,7 @@ function Detail({
         </p>
       )}
       {item.rawInput?.text && <blockquote>{item.rawInput.text}</blockquote>}
+      <CaptureAttachments items={item.attachments} />
       {item.prep && (item.prep.summary || item.prep.checked.length > 0) && (
         <>
           {item.prep.summary && <p>{item.prep.summary}</p>}
@@ -341,7 +378,7 @@ function Detail({
       )}
       {item.dueAt && <p>到期 · {dueText(item.dueAt, now)}</p>}
       {item.effort && <p>预计投入 · {EFFORT_LABELS[item.effort as Effort] ?? item.effort}</p>}
-    </>
+    </div>
   );
   return (
     <article className={focused ? "inbox-detail split split-8-4" : "inbox-detail"}>
@@ -372,7 +409,7 @@ function Detail({
           ))}
         {item.description && item.description !== item.title && <p className="preserve-lines">{item.description}</p>}
         {plan && (
-          <section>
+          <section className="inbox-plan-summary">
             <p>{plan.outcome}</p>
             {plan.background && <p>{plan.background}</p>}
             {plan.runnerOverride && <p>项目 Runner <code>{[plan.runnerOverride.engine, plan.runnerOverride.model, plan.runnerOverride.effort].filter(Boolean).join(" · ")}</code></p>}

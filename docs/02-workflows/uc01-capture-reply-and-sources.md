@@ -16,6 +16,8 @@
 
 脚本每次收到一个触发信封。脚本从 `NG_TRIGGER_JSON` 读取内容。转义后超过 64 KiB 的信封通过 `NG_TRIGGER_FILE` 提供，文件在本次检查结束后回收。
 
+**`INV-UC01-05`**　随手记可粘贴最多5张PNG/JPEG/WebP/GIF；单张输入不超过10 MiB，转换后不超过180 KiB、最长边2048像素，GIF动画不保留。图片保存在工作台自有数据目录，信封仅带label/短URI。移除不删除已发布的共享图片；提交失败保留草稿，原内容显式重试沿用clientId且不重复压缩，修改后显式提交使用新ID并提示原未知提交可能已保存。相同ID的不同持久内容返回冲突，不得假成功清空草稿。卡片和主台原始来信可回看附件，大图尺寸独立于缩略图，关闭弹层后恢复实际触发按钮焦点。是否创建卡片仍由原业务决定。当前模型只获得附件文本引用，不自动收到图像或继承给Worker。
+
 ## 端到端步骤
 
 1. 主人：“周五提醒我联系牙医。另外今天 HH:MM 提醒我给绿植浇水。” → 两条提醒，浇水到点进入待我处理，办完可勾。
@@ -38,3 +40,4 @@
 ## 回归入口
 
 [sources-and-quick-items.test.ts](../../presets/test/sources-and-quick-items.test.ts)、[script-sensor.test.ts](../../presets/test/script-sensor.test.ts)、[tools.test.ts](../../presets/test/tools.test.ts)、[human-items.test.ts](../../packages/cell/test/human-items.test.ts)、[agent-relay.test.ts](../../apps/gtd-desk/test/agent-relay.test.ts)。
+图片回归：[capture-assets.test.ts](../../apps/gtd-desk/test/capture-assets.test.ts)、[capture-image-api.test.ts](../../apps/gtd-desk/test/capture-image-api.test.ts)、[capture-panel-browser.test.tsx](../../apps/gtd-desk/test/capture-panel-browser.test.tsx)。

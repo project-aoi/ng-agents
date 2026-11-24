@@ -15,6 +15,7 @@
 | B9、B10 | 进程与后台任务 | 按实例和进程身份处理残留；核实整个进程组退出后结算，回收期间禁止重复启动。 | [cli-orphans.test.ts](../../packages/loop/test/cli-orphans.test.ts)、[jobs.test.ts](../../packages/workspace/test/jobs.test.ts) |
 | B15 | 脚本信源 | 运行真实临时脚本读取触发信封；沿用同一信封重试时，观察与计数只写入一次。 | [api.test.ts](../../apps/gtd-desk/test/api.test.ts)、[script-sensor.test.ts](../../presets/test/script-sensor.test.ts)、[sources-and-quick-items.test.ts](../../presets/test/sources-and-quick-items.test.ts) |
 | C10、B16 | 工作台焦点、版本与实时状态 | 收到新卡时保留正在填写的内容。冲突后用远端最新版核对；撤销和重开返回最新状态，并通知订阅视图。 | [human-inbox-browser.test.ts](../../apps/gtd-desk/test/human-inbox-browser.test.ts)、[api.test.ts](../../apps/gtd-desk/test/api.test.ts)、[server.test.ts](../../apps/gtd-desk/test/server.test.ts) |
+| 列表切换跳顶 | 工作台滚动与导航 | 待办鼠标切换和 n 键仅就近显示选中行；视图切换回顶，深链接及前后退保留选择。项目动作展开和分身树窗格滚动不回归。 | [scroll-desk.ts](../../apps/gtd-desk/test/fixtures/scroll-desk.ts) |
 | 探针排空 | 一次性结算 | 失败报告在第二个回合重新绑定，父项目只收到一次失败和原始检查结果。 | [probe.test.ts](../../presets/test/probe.test.ts) |
 | 主人与助手 | 本机身份 | 不设凭据。`/api/*` 记录为主人，`/api/agent/*` 记录为 `agent:local`，两者权限相同。Host 与跨站检查拦截网页来源的请求。 | [agent.test.ts](../../apps/gtd-desk/test/agent.test.ts)、[agent-parity.test.ts](../../apps/gtd-desk/test/agent-parity.test.ts)、[server.test.ts](../../apps/gtd-desk/test/server.test.ts) |
 | 信源与内部定时 | 批量与失败恢复 | 每个脚本触发独立结算。内部提醒失败后退避重试；无需唤醒模型。 | [api.test.ts](../../apps/gtd-desk/test/api.test.ts)、[human-items.test.ts](../../packages/cell/test/human-items.test.ts) |
@@ -67,3 +68,5 @@
 | 11 月 18 日 | [宿主运行](BUG-20261118-runtime.md)、[执行与探针](BUG-20261118-execution.md)、[上下文与提示词](BUG-20261118-context-and-prompt.md)、[工作台与控制面](BUG-20261118-ui-and-control.md)、[实机记录](audits/2026-11-18-traex-live-e2e.md) |
 | 11 月 19 日 | [人工事项与协调](BUG-20261119-cards-and-coordination.md) |
 | 11 月 21 日 | [上下文可见性](BUG-20261121-context-and-visibility.md)、[生命周期与恢复](BUG-20261121-lifecycle-and-resilience.md)、[状态归属与控制](BUG-20261121-orthogonality-and-control.md) |
+| 2026-11-23 | 随手记图片：新增本地图片/短URI链路，覆盖格式与180 KiB边界、clientId、移除晚回执、持久回看及原生JSON字段完整性；真实TRAE剪贴板和最终原生产物由后续验收。入口：[capture-assets.test.ts](../../apps/gtd-desk/test/capture-assets.test.ts)、[capture-panel-browser.test.tsx](../../apps/gtd-desk/test/capture-panel-browser.test.tsx)、[capture-image-api.test.ts](../../apps/gtd-desk/test/capture-image-api.test.ts)。 |
+| 2026-11-23 | 随手记图片独立浏览器发现响应丢失后编辑假成功、Viewer继承缩略图高度及关闭丢焦点，隔离存储发现目录替换竞态。修复以提交快照/实际持久内容校验、独立Viewer尺寸和卸载后焦点恢复为准；目录I/O前后按fd的inode/dev校验，检测到替换即拒绝，不能承诺隔离同用户完整写权限进程。回归：[capture-assets.test.ts](../../apps/gtd-desk/test/capture-assets.test.ts)、[capture-panel-browser.test.tsx](../../apps/gtd-desk/test/capture-panel-browser.test.tsx)；真实浏览器同场景由独立复验确认。 |

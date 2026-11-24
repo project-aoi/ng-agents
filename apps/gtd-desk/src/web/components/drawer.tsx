@@ -1,4 +1,6 @@
-import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { t } from "../i18n";
+import { useCaptureImages, clipboardImages, CaptureImageGrid, CaptureAttachments } from "./capture-images";
+import { useLayoutEffect, useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import type { ButtonDTO, CreateSourceRequest, SensorSourceDTO, SourcesDTO, SourcesMutationResponse } from "../../shared/api";
 import { api, callButton } from "../api";
 import { toFailure, useNow, useResource, useStatus, useToast } from "../state";
@@ -49,38 +51,57 @@ export function Drawer(props: { open: boolean; tab: DrawerTab; onTab(t: DrawerTa
 
 // ==================== 随手记 ====================
 
-function CapturePanel() {
+export function CapturePanel() {
+  const images = useCaptureImages();
+  const pasteCursor = useRef<number | null>(null);
   const [text, setText] = useState("");
   const [link, setLink] = useState("");
   const [busy, setBusy] = useState(false);
-  const [sent, setSent] = useState<Array<{ id: string; text: string }>>([]);
+  const [sent, setSent] = useState<Array<{ id: string; text: string; attachments: Array<{label:string;uri:string}> }>>([]);
   const id = useRef(clientId());
+  const submitting = useRef(false);
+  const lastAttempt = useRef<{key:string;clientId:string} | null>(null);
+  const [unconfirmed, setUnconfirmed] = useState(false);
   const ref = useRef<HTMLTextAreaElement>(null);
   const toast = useToast();
   const { setStatus } = useStatus();
   useEffect(() => ref.current?.focus(), []);
+  useLayoutEffect(() => { if(pasteCursor.current!==null) {ref.current?.setSelectionRange(pasteCursor.current,pasteCursor.current);pasteCursor.current=null;} },[text]);
 
+  const draftAttachments = [...images.attachments, ...(link.trim() ? [{label:link.trim(),uri:link.trim()}] : [])];
+  const draftKey = JSON.stringify({text:text.trim(),attachments:draftAttachments});
+  const editedAfterFailure = unconfirmed && lastAttempt.current?.key !== draftKey;
   const submit = async () => {
-    const value = text.trim();
-    const uri = link.trim();
-    if ((!value && !uri) || busy) return;
-    setBusy(true);
+    const value = text.trim(), uri=link.trim();
+    if ((!value && !uri && !images.images.length) || submitting.current || !images.ready) return;
+    const attachments=draftAttachments.map(a=>({...a}));
+    const key=JSON.stringify({text:value,attachments});
+    const changed=lastAttempt.current !== null && lastAttempt.current.key !== key;
+    if(changed) id.current=clientId();
+    const submittedId=id.current;
+    lastAttempt.current={key,clientId:submittedId};
+    submitting.current=true;setBusy(true);
     try {
-      const r = await api.capture({ text: value, clientId: id.current, ...(uri ? { attachments: [{ label: uri, uri }] } : {}) });
+      const r = await api.capture({text:value,clientId:submittedId,...(attachments.length ? {attachments}:{})});
       setStatus(r.status);
-      toast({ tone: "success", text: r.message });
-      setSent((l) => [{ id: r.id, text: value || uri }, ...l].slice(0, 5));
-      setText("");
-      setLink("");
-      id.current = clientId();
-      ref.current?.focus();
+      toast({tone:"success",text:changed ? `${r.message} · ${t("上次未确认的提交可能也已保存，请核对信箱", "The previous unconfirmed note may also have been saved; check the inbox")}` : r.message});
+      setSent(l=>[{id:r.id,text:value || uri,attachments},...l].slice(0,5));
+      images.clear();setText("");setLink("");setUnconfirmed(false);lastAttempt.current=null;
+      id.current=clientId();ref.current?.focus();
     } catch (err) {
-      toast({ tone: "error", text: `没收进去：${toFailure(err).message}` });
-    } finally {
-      setBusy(false);
-    }
+      setUnconfirmed(true);
+      toast({tone:"error",text:`${t("没收进去", "Could not save")}: ${toFailure(err).message}`});
+    } finally {submitting.current=false;setBusy(false);}
   };
 
+  const paste = (e: import("react").ClipboardEvent<HTMLTextAreaElement>) => {
+    const files=clipboardImages(e); if(!files.length || busy) return;
+    e.preventDefault();
+    const pasted=e.clipboardData.getData("text/plain");
+    if(pasted) { const start=e.currentTarget.selectionStart,end=e.currentTarget.selectionEnd;
+      setText(v=>v.slice(0,start)+pasted+v.slice(end)); pasteCursor.current=start+pasted.length; }
+    images.add(files);
+  };
   const onKey = (e: ReactKeyboardEvent) => {
     if (e.nativeEvent.isComposing || e.keyCode === 229) return;
     if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
@@ -91,21 +112,25 @@ function CapturePanel() {
 
   return (
     <div className="capture">
-      <p className="drawer-note">随手敲一句丢进信箱，不用选分类、填日期。纯收藏和个人提醒会直接办好，只在顶栏轻提示一句；需要你拍板的事，主台会准备好材料。</p>
-      <textarea ref={ref} rows={5} value={text} onChange={(e) => setText(e.target.value)} onKeyDown={onKey} placeholder="比如：周五下午 3 点提醒我给牙医打电话" aria-label="随手记内容" />
-      <input type="url" value={link} onChange={(e) => setLink(e.target.value)} onKeyDown={onKey} placeholder="附一个链接（可选）" aria-label="附带链接" />
+      <p className="drawer-note">{t("随手敲一句丢进信箱，不用选分类、填日期。纯收藏和个人提醒会直接办好，只在顶栏轻提示一句；需要你拍板的事，主台会准备好材料。", "Drop a note into the inbox without categories or dates. Notes and reminders are handled directly; decisions are prepared for your review.")}</p>
+      <textarea ref={ref} disabled={busy} onPaste={paste} rows={5} value={text} onChange={(e) => setText(e.target.value)} onKeyDown={onKey} placeholder={t("比如：周五下午 3 点提醒我给牙医打电话", "For example: remind me to call the dentist on Friday at 3 PM")} aria-label={t("随手记内容", "Note content")} />
+      <p className="drawer-note">{t("可粘贴最多5张图片，单张输入不超过10MB。图片会缩小并转换保存，GIF动画不保留。", "Paste up to 5 images, at most 10 MB each. Images are resized and converted; GIF animation is not preserved.")}</p>
+      <CaptureImageGrid images={images.images} disabled={busy} remove={images.remove} retry={images.retry} />
+      {images.error && <p className="draft-message error" role="alert">{images.error}</p>}
+      <input disabled={busy} type="url" value={link} onChange={(e) => setLink(e.target.value)} onKeyDown={onKey} placeholder={t("附一个链接（可选）", "Add a link (optional)")} aria-label={t("附带链接", "Attached link")} />
+      {unconfirmed && <p className="draft-message" role="status">{t("上次提交结果未确认，可能已收进信箱。原内容可按同一请求重试；修改后再次提交会新建一条，请先核对原记录。", "The last result is unconfirmed and the note may already be saved. Retry unchanged content with the same request; submitting edited content creates a new note. Check the previous record first.")}</p>}
       <div className="capture-foot">
-        <span className="kbd-hint">Ctrl / ⌘ + Enter 收进信箱</span>
-        <button type="button" className="btn primary" disabled={busy || (!text.trim() && !link.trim())} onClick={() => void submit()}>
-          {busy && <Spinner />}收进信箱
+        <span className="kbd-hint">Ctrl / ⌘ + Enter · {t("收进信箱", "Save note")}</span>
+        <button type="button" className="btn primary" disabled={busy || !images.ready || (!text.trim() && !link.trim() && !images.images.length)} onClick={() => void submit()}>
+          {busy && <Spinner />}{editedAfterFailure ? t("提交修改后的随手记", "Save edited note") : t("收进信箱", "Save note")}
         </button>
       </div>
       {sent.length > 0 && (
         <div className="capture-sent">
-          <h4>刚收进去的</h4>
+          <h4>{t("刚收进去的", "Recently saved")}</h4>
           <ul>
             {sent.map((s) => (
-              <li key={s.id}>{s.text}</li>
+              <li key={s.id}>{s.text}<CaptureAttachments items={s.attachments} /></li>
             ))}
           </ul>
         </div>

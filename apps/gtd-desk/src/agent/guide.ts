@@ -1,4 +1,5 @@
 import { CELL_ROLES, CLI_ENGINES, runnerSelectionProperties } from "@ng/protocol";
+import { IMAGE_TYPES, MAX_IMAGE_EDGE, MAX_SAVED_IMAGE_BYTES } from "../shared/capture-assets";
 
 // docs/05 principle 1 — the second entrance. An external "main agent" (Claude Code, Codex CLI, Antigravity… whatever
 // the owner chats with) drives the workbench through these tools with the owner's rights (proposal 07); its own
@@ -66,6 +67,26 @@ export const AGENT_TOOLS: readonly AgentToolDoc[] = [
       threads: { type: "array", items: { type: "string" }, description: "the topic(s) it is for, e.g. [\"ui:reviews\"] (workbench_overview shows which each hub watches). Omit for the desk's own inbox" },
       clientId: str("optional stable id for a retried capture"),
     }),
+  },
+  {
+    name: "save_capture_image",
+    description:
+      "Save one already converted capture image in the workbench's own asset store. PNG/JPEG/WebP/GIF only, at most 180 KiB and 2048 pixels per edge. Use the returned label/uri in capture.attachments; do not embed the image bytes in the note. This stores an attachment and does not inject image input into the desk or a worker.",
+    inputSchema: obj({
+      dataBase64: str("strict base64 of the converted image bytes", { maxLength: Math.ceil(MAX_SAVED_IMAGE_BYTES / 3) * 4 }),
+      contentType: oneOf(IMAGE_TYPES, "the actual encoded image format"),
+      width: { type: "number", multipleOf: 1, minimum: 1, maximum: MAX_IMAGE_EDGE, description: "actual encoded integer width" },
+      height: { type: "number", multipleOf: 1, minimum: 1, maximum: MAX_IMAGE_EDGE, description: "actual encoded integer height" },
+      label: str("original filename or a short label, without path separators", { minLength: 1, maxLength: 160 }),
+    }, ["dataBase64", "contentType", "width", "height", "label"]),
+  },
+  {
+    name: "read_capture_image",
+    description:
+      "Read one saved capture image as bounded base64 and its format, dimensions and byte count. assetId is the final hash segment of a capture attachment URI; arbitrary paths are rejected. The returned text data is not automatically delivered as image input to the desk or a worker.",
+    inputSchema: obj({
+      assetId: str("64 lowercase hexadecimal characters from the saved image URI", { minLength: 64, maxLength: 64, pattern: "^[a-f0-9]{64}$" }),
+    }, ["assetId"]),
   },
   {
     name: "create_project",

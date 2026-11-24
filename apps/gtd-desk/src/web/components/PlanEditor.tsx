@@ -308,7 +308,7 @@ export function PlanEditor(props: {
       <fieldset disabled={saving} className="plan-edit-actions">
         <legend>推进安排</legend>
         {form.actions.map((a, i) => (
-          <div className="plan-edit-row" key={i}>
+          <div className="plan-edit-row" data-owner={a.owner} key={i}>
             <input
               aria-label={`动作 ${i + 1}`}
               placeholder="要做的事"

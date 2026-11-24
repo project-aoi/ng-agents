@@ -307,7 +307,7 @@ export function DraftEditor(props: {
                 <button type="button" className="btn sm ghost" onClick={draft.revert} disabled={draft.saving}>
                   撤销修改
                 </button>
-                <button type="button" className="btn sm" onClick={() => void draft.save()} disabled={draft.saving} title="Ctrl / ⌘ + S">
+                <button type="button" className="btn sm primary" onClick={() => void draft.save()} disabled={draft.saving} title="Ctrl / ⌘ + S">
                   保存为 v{draft.base.version + 1}
                 </button>
               </>

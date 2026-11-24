@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
 import type { ButtonDTO, ProjectMutationResponse, ProjectRowDTO, RadarDTO, ReviewMutationResponse, StatusDTO, WeeklyReviewDTO } from "../../shared/api";
+import { t } from "../i18n";
 import { api, callButton, request } from "../api";
 import { BallChip, ButtonRow, Chevron, ProgressBar } from "../components/controls";
 import { Empty, ErrorState, Loading } from "../components/states";
-import { parseRoute, syncServerClock, toFailure, useNavigate, useNow, useOpenReport, useResource, useStatus, useToast } from "../state";
+import { parseRoute, routeHash, syncServerClock, toFailure, useNavigate, useNow, useOpenReport, useResource, useStatus, useToast } from "../state";
 import { dueText, whenText } from "../text";
 
 export function RadarView() {
@@ -110,6 +111,23 @@ export function RadarView() {
 
 // ==================== a project row ====================
 
+function ActionConversation({ projectId, cellId, text, agent }: { projectId: string; cellId?: string | undefined; text: string; agent: boolean }) {
+  const navigate = useNavigate();
+  if (!cellId || cellId === projectId) {
+    return <>{text}{agent && <small className="action-session-note">{t("暂无分身会话", "No worker conversation yet")}</small>}</>;
+  }
+  const route = { view: "agents", projectId, cellId } as const;
+  return (
+    <a className="link-btn action-session-link" href={routeHash(route)} onClick={event => {
+      if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+      event.preventDefault();
+      navigate(route);
+    }}>
+      {text}
+    </a>
+  );
+}
+
 function ProjectRow({ row, now, onRun }: { row: ProjectRowDTO; now: number; onRun(b: ButtonDTO, input?: Record<string, unknown>): Promise<void> }) {
   const navigate = useNavigate();
   const openReport = useOpenReport();
@@ -141,7 +159,9 @@ function ProjectRow({ row, now, onRun }: { row: ProjectRowDTO; now: number; onRu
       {ball ? (
         <div className="ball-line">
           <BallChip owner={ball.owner} label={ball.label} />
-          <span className="ball-text">{ball.text}</span>
+          <span className="ball-text">
+            <ActionConversation projectId={row.id} cellId={ball.targetCellId} text={ball.text} agent={ball.owner === "agent"} />
+          </span>
           {ball.cardId && (
             <button type="button" className="link-btn" onClick={() => navigate({ view: "inbox", cardId: ball.cardId! })}>
               去处理 →
@@ -188,10 +208,10 @@ function ProjectRow({ row, now, onRun }: { row: ProjectRowDTO; now: number; onRu
       )}
 
       <div className="project-foot">
-        {hiddenActions > 1 ? (
+        {hiddenActions > 1 || (row.openActions[0]?.owner === "agent" && ball?.owner !== "agent") ? (
           <button type="button" className="disclosure small" aria-expanded={open} onClick={() => setOpen((o) => !o)}>
             <Chevron dir="right" open={open} />
-            {hiddenActions} 个并行动作
+            {hiddenActions === 1 ? t("查看动作", "View action") : t(`${hiddenActions} 个并行动作`, `${hiddenActions} parallel actions`)}
           </button>
         ) : (
           <span className="muted small">{row.pendingCardId && !ball?.cardId ? "有一件事在「待我处理」" : ""}</span>
@@ -210,7 +230,7 @@ function ProjectRow({ row, now, onRun }: { row: ProjectRowDTO; now: number; onRu
                     {a.text}
                   </button>
                 ) : (
-                  a.text
+                  <ActionConversation projectId={row.id} cellId={a.targetCellId} text={a.text} agent={a.owner === "agent"} />
                 )}
               </span>
               {a.progress && <ProgressBar done={a.progress.done} total={a.progress.total} label={a.progress.text} />}

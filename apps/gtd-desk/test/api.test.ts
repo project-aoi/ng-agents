@@ -310,7 +310,7 @@ describe("Radar", () => {
 
     const radar = await d.get<RadarDTO>("/api/radar");
     const row = radar.projects.find((x) => x.id === p)!;
-    expect(row.ball).toMatchObject({ owner: "agent", label: "🟢 Agent 处理中", text: "正在并发整理竞品资料 3/15" });
+    expect(row.ball).toMatchObject({ owner: "agent", label: "🟢 Agent 处理中", text: "正在并发整理竞品资料 3/15", targetCellId: "w1" });
     const cancel = row.buttons.find((b) => b.id === "cancel")!;
     expect(cancel.confirm).toBeTruthy();
 

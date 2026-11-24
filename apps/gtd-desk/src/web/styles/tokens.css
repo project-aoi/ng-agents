@@ -1,36 +1,48 @@
-/* Design tokens. Color is restrained on purpose: neutrals carry the interface; the three ball owners
-   (🔵 我来处理 · 🟢 Agent 处理中 · 🟡 等待外部) and the stalled red are the only strong signals. */
+/* Design tokens. Actions and selection use blue; human / agent / waiting retain their business meaning.
+   Host variables inherit through the embedded Shadow host, with standalone light/dark fallbacks. */
 
 :root {
   color-scheme: light dark;
 
-  /* neutrals — warm paper and ink */
-  --bg: #f6f5f2;
-  --surface: #ffffff;
-  --surface-2: #f0eee9;
-  --surface-3: #e8e5df;
-  --border: #e2dfd8;
-  --border-strong: #cfcbc2;
-  --text: #1f1e1c;
-  --text-2: #57534d;
-  --text-3: #8b867d;
-  --ink: #1f1e1c;
-  --on-ink: #fbfaf7;
-  --scrim: rgb(28 27 25 / 0.28);
-  --shadow-1: 0 1px 2px rgb(28 27 25 / 0.05), 0 1px 1px rgb(28 27 25 / 0.03);
-  --shadow-2: 0 10px 30px -12px rgb(28 27 25 / 0.18), 0 2px 6px rgb(28 27 25 / 0.05);
-  --shadow-3: 0 24px 60px -20px rgb(28 27 25 / 0.35);
+  /* neutrals — white canvas, cool grey secondary surfaces */
+  --bg: var(--color-background-primary, light-dark(#fff, #1e1e20));
+  --surface: var(--bg);
+  --surface-2: var(--color-background-secondary, light-dark(#f9f9fa, #252528));
+  --surface-3: var(--color-background-tertiary, light-dark(#f1f3f5, #303034));
+  --border: var(--color-border-secondary, light-dark(#edeff2, #34343a));
+  --border-strong: var(--color-border-primary, light-dark(#e2e5e9, #494950));
+  --text: var(--color-text-primary, light-dark(#1f2329, #ededf0));
+  --text-2: var(--color-text-secondary, light-dark(#495261, #c1c1ca));
+  /* Darker than the old muted grey so small hints and placeholders remain readable. */
+  --text-3: var(--color-text-tertiary, light-dark(#697382, #a3a3af));
+  --ink: var(--text);
+  --on-ink: var(--color-text-inverse, light-dark(#fff, #1e1e20));
+  --disabled-bg: var(--color-background-disabled, light-dark(#f4f5f6, #303034));
+  --text-disabled: var(--color-text-disabled, light-dark(#a1a8b2, #747480));
+  --hover: color-mix(in srgb, var(--text) 5%, var(--bg));
+  --selected: var(--color-background-info, light-dark(#edf3fc, color-mix(in srgb, var(--primary) 12%, var(--bg))));
+  --scrim: light-dark(rgb(30 40 55 / 0.08), rgb(0 0 0 / 0.5));
+  --scrim-dialog: light-dark(rgb(0 0 0 / 0.33), rgb(0 0 0 / 0.5));
+  --shadow-1: 0 4px 18px light-dark(rgb(30 45 70 / 0.05), rgb(0 0 0 / 0.2));
+  --shadow-2: 0 12px 36px light-dark(rgb(38 51 75 / 0.125), rgb(0 0 0 / 0.4));
+  --shadow-3: 0 24px 60px light-dark(rgb(30 45 70 / 0.18), rgb(0 0 0 / 0.5));
+  --shadow-drawer: -12px 0 40px light-dark(rgb(30 45 70 / 0.08), rgb(0 0 0 / 0.4));
+  --toast-bg: light-dark(#2b3340, #ededf0);
+  --toast-text: light-dark(#fff, #1f2329);
 
   /* signals */
-  --human: #2f66d0;
-  --agent: #23864f;
-  --waiting: #a87508;
-  --danger: #c5362d;
-  --human-soft: color-mix(in srgb, var(--human) 11%, transparent);
-  --agent-soft: color-mix(in srgb, var(--agent) 11%, transparent);
-  --waiting-soft: color-mix(in srgb, var(--waiting) 13%, transparent);
-  --danger-soft: color-mix(in srgb, var(--danger) 10%, transparent);
-  --focus: #3b73e6;
+  --primary: var(--color-text-info, light-dark(#3f73d8, #91b5ff));
+  --on-primary: var(--color-text-inverse, light-dark(#fff, #1e1e20));
+  --human: var(--primary);
+  --agent: var(--color-text-success, light-dark(#2f7a55, #7cc99f));
+  --waiting: var(--color-text-warning, light-dark(#986414, #e9b666));
+  --danger: var(--color-text-danger, light-dark(#b2443c, #ef9690));
+  --on-danger: var(--color-text-inverse, light-dark(#fff, #1e1e20));
+  --human-soft: var(--selected);
+  --agent-soft: var(--color-background-success, color-mix(in srgb, var(--agent) 12%, var(--bg)));
+  --waiting-soft: var(--color-background-warning, color-mix(in srgb, var(--waiting) 12%, var(--bg)));
+  --danger-soft: var(--color-background-danger, color-mix(in srgb, var(--danger) 12%, var(--bg)));
+  --focus: var(--primary);
 
   /* type */
   --font-sans: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei",
@@ -41,13 +53,13 @@
     monospace;
   --fs-xs: 0.75rem;
   --fs-sm: 0.8125rem;
-  --fs-md: 0.9375rem;
+  --fs-md: 0.875rem;
   --fs-lg: 1.125rem;
   --fs-xl: 1.375rem;
-  --fs-2xl: 1.75rem;
+  --fs-2xl: 1.625rem;
   --lh-tight: 1.35;
-  --lh-body: 1.65;
-  --lh-loose: 1.75;
+  --lh-body: 1.5;
+  --lh-loose: 1.65;
   --fw-medium: 500;
   --fw-bold: 600;
 
@@ -65,47 +77,22 @@
   /* shape */
   --r-xs: 4px;
   --r-sm: 6px;
-  --r-md: 10px;
-  --r-lg: 14px;
+  --r-md: 8px;
+  --r-lg: 12px;
+  --r-tag: 5px;
+  --r-dialog: 16px;
   --r-pill: 999px;
 
   /* motion */
   --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
-  --t-fast: 120ms;
-  --t-med: 200ms;
+  --t-fast: 80ms;
+  --t-med: 120ms;
 
   /* layout */
   --w-narrow: 720px;
   --w-wide: 1240px;
-  --bar-h: 56px;
+  --bar-h: 48px;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #161615;
-    --surface: #1e1e1c;
-    --surface-2: #272725;
-    --surface-3: #31302d;
-    --border: #33322e;
-    --border-strong: #46443f;
-    --text: #ebe9e4;
-    --text-2: #b0aca4;
-    --text-3: #817d75;
-    --ink: #ebe9e4;
-    --on-ink: #161615;
-    --scrim: rgb(0 0 0 / 0.5);
-    --shadow-1: 0 1px 2px rgb(0 0 0 / 0.4);
-    --shadow-2: 0 12px 32px -12px rgb(0 0 0 / 0.6), 0 2px 6px rgb(0 0 0 / 0.3);
-    --shadow-3: 0 24px 60px -20px rgb(0 0 0 / 0.75);
-
-    --human: #79a5f7;
-    --agent: #5cc58a;
-    --waiting: #e2b44a;
-    --danger: #f06a5f;
-    --human-soft: color-mix(in srgb, var(--human) 16%, transparent);
-    --agent-soft: color-mix(in srgb, var(--agent) 15%, transparent);
-    --waiting-soft: color-mix(in srgb, var(--waiting) 16%, transparent);
-    --danger-soft: color-mix(in srgb, var(--danger) 15%, transparent);
-    --focus: #8ab2ff;
-  }
-}
+:root[data-theme="light"] { color-scheme: light; }
+:root[data-theme="dark"] { color-scheme: dark; }

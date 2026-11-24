@@ -131,6 +131,7 @@ describe.each(ENGINES)("CLI loop with a fake %s", (engine) => {
         ],
       },
     ]);
+    Object.assign(s.fake.env, { NG_DESK_TOKEN: "fixture", ANTHROPIC_API_KEY: "fixture", CLAUDECODE: "1" });
     const r = s.run();
     expect(await runOf(s, r)).toBe("completed");
 

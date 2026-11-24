@@ -1,7 +1,7 @@
 import { execFile, spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import type { CliEngine } from "@ng/protocol";
-import { cliEnvironment } from "./env";
+import { cliEnvironment, DEFAULT_CLI_BINS } from "./env";
 
 /**
  * The models a CLI agent offers, asked from the CLI itself — never a list kept in this repository: the catalogue and
@@ -213,8 +213,6 @@ export interface ListCliModelsOptions {
   now?: () => number;
 }
 
-const DEFAULT_BIN: Record<CliEngine, string> = { claude: "claude", codex: "codex", agy: "agy" };
-
 function run(bin: string, args: string[], env: Record<string, string>, timeoutMs: number): Promise<string> {
   return new Promise((resolve, reject) => {
     execFile(bin, args, { env, cwd: tmpdir(), timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024 }, (err, stdout, stderr) => {
@@ -268,7 +266,7 @@ function claudeInitialize(bin: string, env: Record<string, string>, timeoutMs: n
 
 /** Ask the CLI for its models. Rejects when the CLI cannot be run or answers nothing usable. */
 export async function listCliModels(engine: CliEngine, opts: ListCliModelsOptions = {}): Promise<CliModelCatalog> {
-  const bin = opts.bin ?? DEFAULT_BIN[engine];
+  const bin = opts.bin ?? DEFAULT_CLI_BINS[engine];
   const env = cliEnvironment(opts.env ?? process.env);
   const timeoutMs = opts.timeoutMs ?? 45_000;
   let list: ParsedModels;

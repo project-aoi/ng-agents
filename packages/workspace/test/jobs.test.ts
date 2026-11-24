@@ -112,10 +112,11 @@ describe("jobs", () => {
     const b = await p1.startJob({ command: "sleep 30" });
     const c = await p2.startJob({ command: "sleep 30" });
     expect(await h.mgr.cancelJobsForCell("w1")).toBe(2);
-    expect(h.inbox.list("w1").map((e) => [e.id, e.delivery, (e.payload as JobResultPayload).state])).toEqual([
-      [`${a.jobId}:result`, "wakeup", "cancelled"],
-      [`${b.jobId}:result`, "wakeup", "cancelled"],
-    ]);
+    const results = h.inbox.list("w1").map(e => [e.id, e.delivery, (e.payload as JobResultPayload).state]);
+    expect(results).toHaveLength(2);
+    for (const job of [a, b]) {
+      expect(results).toContainEqual([`${job.jobId}:result`, "wakeup", "cancelled"]);
+    }
     expect(h.mgr.getJobSync(a.jobId)!.state).toBe("cancelled");
     expect(h.mgr.getJobSync(b.jobId)!.state).toBe("cancelled");
     expect(h.mgr.getJobSync(c.jobId)!.state).toBe("running");
@@ -228,11 +229,13 @@ describe("jobs", () => {
   it("recover() marks a job whose process died with the old kernel as failed", async () => {
     const h = harness();
     const port = await h.mgr.acquire("w1");
-    const { jobId } = await port.startJob({ command: "sleep 30" });
+    const { jobId } = await port.startJob({ command: "echo ready > job-ready; exec sleep 30" });
     const pid = h.mgr.getJobSync(jobId)!.pid!;
+    // Wait until the wrapper has spawned the command before killing their process group.
+    await waitFor(() => existsSync(join(port.root, "job-ready")));
     h.mgr.close();
     process.kill(-pid, "SIGKILL");
-    await waitFor(() => pidGone(pid));
+    await waitFor(() => !groupAlive(pid));
     const next = h.restart();
     await next.recover();
     expect(next.getJobSync(jobId)).toMatchObject({ state: "failed", exitCode: null });

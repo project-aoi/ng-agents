@@ -64,7 +64,7 @@ function inboundItem(ctx: BuildCtx, seq: number, at: number, env: Envelope): Tim
       const p = payloadOf<UserMessagePayload & { replyToId?: string }>(env);
       if (person) {
         const direct = env.from === KERNEL_FROM.control || env.from === "channel:ui:owner";
-        return { ...base, id: env.id, kind: "user_chat", text: p.text, senderLabel: personLabel(kernel, env.principalId, p.sender), direct, mode: "enqueue", syncedTo, replyToId: p.replyToId ?? null };
+        return { ...base, id: env.id, kind: "user_chat", ...(p.attachments?.length ? { attachments: p.attachments.map(({ label, uri }) => ({ label, uri })) } : {}), text: p.text, senderLabel: personLabel(kernel, env.principalId, p.sender), direct, mode: "enqueue", syncedTo, replyToId: p.replyToId ?? null };
       }
       const who = p.sender?.displayName ?? p.sender?.id;
       return { ...base, id: e, kind: "peer_message", fromLabel: `${channelLabelOfAddress(env.from)}${who ? ` · ${who}` : ""}`, text: p.text };

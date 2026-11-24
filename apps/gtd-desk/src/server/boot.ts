@@ -1,3 +1,4 @@
+import { createCaptureAssetStore } from "./capture-assets";
 import { mkdirSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import { dirname, resolve } from "node:path";
@@ -103,7 +104,7 @@ export async function createDeskServer(opts: DeskServerOptions = {}): Promise<De
       engineOpts.onDebug = (e) => {
         if (e.type === "notice") log(`${engine} [${e.cellId}] ${e.text}`);
         else if (e.type === "exit" && ((e.code !== 0 && !e.stopped) || verbose)) log(`${engine} [${e.cellId}] exited ${e.code ?? e.signal}${e.stderr.trim() ? `: ${e.stderr.trim().slice(-500)}` : ""}`);
-        else if (e.type === "launch" && verbose) log(`${engine} [${e.cellId}] ${e.argv.join(" ")} (cwd ${e.cwd}) — ${e.permissions}`);
+        else if (e.type === "launch" && verbose) log(`${engine} [${e.cellId}] ${e.argv.slice(0, 2).join(" ")} (run ${e.runId}, ${e.session?.mode ?? "fresh"}) (cwd ${e.cwd}) — ${e.permissions}`);
       };
     }
   }
@@ -142,7 +143,7 @@ export async function createDeskServer(opts: DeskServerOptions = {}): Promise<De
       ...opts.settings,
       backend: kernel.agentBackend ?? choice.engine,
     };
-    const desk = createDesk({ kernel, ui, settings, onError });
+    const desk = createDesk({ kernel, ui, settings, onError, assets: createCaptureAssetStore(dataDir) });
     events = createEventHub(kernel);
     const webDir = opts.webDir === undefined ? resolve(APP_ROOT, "dist/web") : opts.webDir;
     const agent = createAgentControlPlane({ kernel, desk });

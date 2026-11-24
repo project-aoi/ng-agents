@@ -39,7 +39,7 @@ interface Activity {
   running: number;
   waiting: number;
   /** First status line of a busy cell (what the agent is doing right now). */
-  busyLine: string | null;
+  busy: { cellId: string; statusLine: string | null } | null;
   /** What the first waiting cell waits for ("「等 CI」下次检查 今天 14:32"). */
   waitLine: string | null;
 }
@@ -76,13 +76,13 @@ function waitLineOf(n: CellNode, now: number): string {
 }
 
 function subtreeActivity(node: CellNode | undefined, activity: KernelActivity, now: number): Activity {
-  const a: Activity = { running: 0, waiting: 0, busyLine: null, waitLine: null };
+  const a: Activity = { running: 0, waiting: 0, busy: null, waitLine: null };
   const walk = (n: CellNode) => {
     if (n.status !== "closed") {
       const s = nodeState(n, activity);
       if (s === "running") {
         a.running++;
-        a.busyLine ??= n.statusLine;
+        if (!a.busy || (!a.busy.statusLine && n.statusLine)) a.busy = { cellId: n.cellId, statusLine: n.statusLine };
       } else if (s === "waiting") {
         a.waiting++;
         a.waitLine ??= waitLineOf(n, now);
@@ -231,14 +231,25 @@ export function radarProjects(input: ProjectionInput): Omit<RadarDTO, "review"> 
     // looks like a timer to the cell tree, so its activity is not counted.
     const stalledSince = cell?.status === "active" ? stalls.get(p.cellId) ?? null : null;
     const stalled = stalledSince !== null;
-    const act = stalled ? { running: 0, waiting: 0, busyLine: null, waitLine: null } : subtreeActivity(nodes.get(p.cellId), activity, now);
+    const act = stalled ? { running: 0, waiting: 0, busy: null, waitLine: null } : subtreeActivity(nodes.get(p.cellId), activity, now);
     const subtree = subtreeIds(p.cellId, byParent);
     const open = (actionsByProject.get(p.cellId) ?? []).filter((a) => a.record.status === "open");
     open.sort((a, b) => compareBallOwner(a.record.owner, b.record.owner) || (a.record.dueAt ?? Infinity) - (b.record.dueAt ?? Infinity) || a.record.createdAt - b.record.createdAt);
+    const projectCellIds = new Set(subtree);
+    // Dispatch also records the action ID on the child. Recover an omitted carrier only for a unique match.
+    const dispatched = new Map<string, string | null>();
+    for (const child of byParent.get(p.cellId) ?? []) {
+      const gtd = child.spec.meta?.["gtd"] as { actionId?: unknown } | undefined;
+      if (typeof gtd?.actionId === "string") {
+        dispatched.set(gtd.actionId, dispatched.has(gtd.actionId) ? null : child.id);
+      }
+    }
     const openActions: ProjectActionDTO[] = open.map((a) => {
       const t = actionText(a.record, now);
+      const carrier = a.record.cellId ?? (a.cellId === p.cellId ? dispatched.get(a.record.id) : a.cellId);
       return {
         cellId: a.cellId,
+        ...(a.record.owner !== "human" && carrier && carrier !== p.cellId && projectCellIds.has(carrier) ? { targetCellId: carrier } : {}),
         actionId: a.record.id,
         title: a.record.title,
         owner: a.record.owner,
@@ -268,11 +279,13 @@ export function radarProjects(input: ProjectionInput): Omit<RadarDTO, "review"> 
     } else if (card) {
       ball = { owner: "human", label: BALL_LABEL.human, text: `有一张卡等你确认：${card.title}`, cardId: card.id };
     } else if (top === "agent") {
-      ball = { owner: "agent", label: BALL_LABEL.agent, text: first("agent")!.text };
-    } else if (act.running > 0) {
-      ball = { owner: "agent", label: BALL_LABEL.agent, text: act.busyLine ?? "后台处理中" };
+      const action = first("agent")!;
+      ball = { owner: "agent", label: BALL_LABEL.agent, text: action.text, ...(action.targetCellId && { targetCellId: action.targetCellId }) };
+    } else if (act.busy) {
+      ball = { owner: "agent", label: BALL_LABEL.agent, text: act.busy.statusLine ?? "后台处理中", targetCellId: act.busy.cellId };
     } else if (top === "waiting") {
-      ball = { owner: "waiting", label: BALL_LABEL.waiting, text: first("waiting")!.text };
+      const action = first("waiting")!;
+      ball = { owner: "waiting", label: BALL_LABEL.waiting, text: action.text, ...(action.targetCellId && { targetCellId: action.targetCellId }) };
     } else if (act.waiting > 0) {
       ball = { owner: "waiting", label: BALL_LABEL.waiting, text: act.waitLine ?? "后台在等外部条件" };
     }

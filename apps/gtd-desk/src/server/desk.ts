@@ -1,6 +1,8 @@
 import { statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
+import type { CaptureAssetStore } from "./capture-assets";
+import { captureAssetId, CAPTURE_ASSET_PREFIX, MAX_CAPTURE_IMAGES, type CaptureImageUpload } from "../shared/capture-assets";
 import { createModelSwitch } from "./models";
 import type { UpdateModelsRequest } from "../shared/api";
 import { isRunnerOverride, type HumanDecision, type HumanItem, type CardOption, type RunnerOverride } from "@ng/protocol";
@@ -34,6 +36,7 @@ import {
   projectCellIdOf,
   parsePrincipal,
   subjectKeys,
+  stableStringify,
   withTx,
   type ActionRecord,
   type ApprovalRecord,
@@ -112,6 +115,7 @@ const wrongState = (message: string) => new DeskError(409, "conflict", message);
 export interface DeskDeps {
   kernel: Kernel;
   ui: UiChannel;
+  assets?: CaptureAssetStore;
   settings: DeskSettings;
   /** Background follow-ups that failed after the owner's action itself succeeded. Default: console.error. */
   onError?: (err: unknown, where: string) => void;
@@ -140,7 +144,7 @@ export type Desk = ReturnType<typeof createDesk>;
  * Approvals the kernel hands back to a cell are the kernel's business. The project and card operations take a
  * DeskActor: the external main agent's control plane calls them as `agent:<id>`.
  */
-export function createDesk({ kernel, ui, settings, onError = (err, where) => console.error(`[desk] ${where}:`, err) }: DeskDeps) {
+export function createDesk({ kernel, ui, assets, settings, onError = (err, where) => console.error(`[desk] ${where}:`, err) }: DeskDeps) {
   const { context, gate, clock } = kernel;
   const owner = kernel.ownerPrincipal;
   const desk = kernel.deskCellId;
@@ -260,26 +264,69 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     return isEnvelopeOfType(m.envelope, "handback") ? m.envelope.payload.original : m.envelope;
   }
 
+  function itemAttachments(item: HumanItem) {
+    if (!item.source?.envelopeId) return undefined;
+    const id = item.source.envelopeId;
+    const [message] = item.cellId ? kernel.inbox.listMessagesSync({cellId:item.cellId, envelopeId:id, limit:1}) : [];
+    const original = message ?? (item.cellId !== desk ? kernel.inbox.listMessagesSync({cellId:desk, envelopeId:id, limit:1})[0] : undefined);
+    if (!original) return undefined;
+    const env = isEnvelopeOfType(original.envelope, "handback") ? original.envelope.payload.original : original.envelope;
+    if (!isEnvelopeOfType(env, "user.message")) return undefined;
+    return env.payload.attachments?.map(({label,uri}) => ({label,uri}));
+  }
+
   // ==================== top bar ====================
 
+  function captureRecord(id:string): Envelope | undefined {
+    // The normal UI path uses the existing (cell_id,envelope_id) index. Watched ingress can route away from Desk.
+    return kernel.inbox.listMessagesSync({cellId:desk,envelopeId:id,limit:1})[0]?.envelope ??
+      kernel.inbox.listMessagesSync({envelopeId:id,limit:1})[0]?.envelope;
+  }
+  function sameCapture(requested: Omit<Envelope,"to">, recorded: Envelope) {
+    const content=(env:Omit<Envelope,"to">)=>({type:env.type,from:env.from,principalId:env.principalId,payload:env.payload,threads:env.threads ?? []});
+    if (stableStringify(content(requested)) !== stableStringify(content(recorded)))
+      throw new DeskError(409,"capture_conflict","此提交标识已用于其他内容，请核对上次提交并为修改后的内容新建请求");
+  }
+  function captureAccepted(env:Omit<Envelope,"to">):CaptureResponse {
+    return {ok:true,id:env.id,acceptedAt:env.createdAt,message:"已收进信箱",status:status()};
+  }
   async function ingest(req: CaptureRequest, as:DeskActor): Promise<CaptureResponse> {
-    const text = typeof req?.text === "string" ? req.text : "";
-    const attachments = Array.isArray(req?.attachments)
-      ? req.attachments.filter((a) => a && typeof a.label === "string" && typeof a.uri === "string").map((a) => ({ label: a.label, uri: a.uri }))
-      : undefined;
+    if(!req || typeof req!=="object" || Array.isArray(req)) throw bad("随手记参数格式不对");
+    if (req?.text !== undefined && typeof req.text !== "string") throw bad("随手记正文格式不对");
+    const text = req?.text ?? "";
+    if (req?.attachments !== undefined && (!Array.isArray(req.attachments) || req.attachments.some(a=>!a || typeof a.label!=="string" || typeof a.uri!=="string")))
+      throw bad("附件格式不对");
+    const attachments = req?.attachments?.map(({label,uri})=>({label,uri}));
     if (!text.trim() && !attachments?.length) throw bad("随手记不能为空");
     if (req.clientId !== undefined && (typeof req.clientId !== "string" || !/^[\w.:-]{1,80}$/.test(req.clientId))) throw bad("clientId 格式不对");
     if (req.threads !== undefined && (!Array.isArray(req.threads) || req.threads.length > 16 ||
         req.threads.some(t => typeof t !== "string" || !t.startsWith("ui:") || !t.slice(3).trim() || t.length > 160)))
       throw bad("请提供有效的工作台专题");
-    const env = await ui.capture({
-      ...(req.threads && { threads: [...new Set(req.threads)] }),
-      text,
-      ...(attachments?.length ? { attachments } : {}),
-      ...(req.voice ? { voice: true } : {}),
-      ...(req.clientId ? { clientId: req.clientId } : {}),
-    },principalOf(as));
-    return { ok: true, id: env.id, acceptedAt: env.createdAt, message: "已收进信箱", status: status() };
+    const principal=principalOf(as);
+    const input={...(req.threads && {threads:[...new Set(req.threads)]}),text,
+      ...(attachments?.length ? {attachments}:{}),...(req.voice ? {voice:true}:{}),...(req.clientId ? {clientId:req.clientId}:{})};
+    if(req.clientId) {
+      const candidate=ui.captureEnvelope(input,principal), prior=captureRecord(candidate.id);
+      if(prior) {sameCapture(candidate,prior);return captureAccepted(prior);}
+    }
+    const images = attachments?.filter(a => a.uri.startsWith(CAPTURE_ASSET_PREFIX)) ?? [];
+    if (images.length > MAX_CAPTURE_IMAGES) throw bad("每条随手记最多5张图片");
+    if (attachments?.some(a => /^data:image\//i.test(a.uri))) throw bad("图片请先保存为本地附件");
+    for (const image of images) {
+      const id = captureAssetId(image.uri);
+      if (!id || !assets) throw bad("图片标识无效");
+      await assets.read(id);
+    }
+    if(req.clientId) {
+      // Asset reads awaited above. Recheck immediately before routing.ts's synchronous withTx enqueue begins.
+      const candidate=ui.captureEnvelope(input,principal), prior=captureRecord(candidate.id);
+      if(prior) {sameCapture(candidate,prior);return captureAccepted(prior);}
+    }
+    const sent=await ui.capture(input,principal), recorded=captureRecord(sent.id);
+    if(!recorded) throw new DeskError(409,"capture_unconfirmed","提交尚未得到持久回执，请保留原内容后重试");
+    // Check the actual inserted row too: concurrent requests may both pass the earlier lookup before ON CONFLICT.
+    sameCapture(sent,recorded);
+    return captureAccepted(recorded);
   }
 
   function approval(cardId: string): ApprovalRecord {
@@ -958,6 +1005,14 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
       SELECT DISTINCT artifact_id FROM human_items
       WHERE status IN ('pending','snoozed') AND artifact_id IS NOT NULL
     `).map(row => row.artifact_id),
+    saveCaptureImage: (value:CaptureImageUpload, check?:()=>void) => {
+      if (!assets) throw missing("图片存储尚未配置");
+      return assets.save(value,check);
+    },
+    readCaptureImage: (id:string) => {
+      if (!assets) throw missing("图片存储尚未配置");
+      return assets.read(id);
+    },
     listHumanItems: (includeSnoozed = false) => kernel.humanItems.list(includeSnoozed).map(item => {
       const {project, paused} = decisionCells(item.cellId);
       const closeTargets: Record<string,ReturnType<typeof closureMembers>> = {};
@@ -974,7 +1029,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
             // The desk's preparatory note was written for its own draft; a plan changed since may no longer fit it.
             ...(item.prep && planArtifact?.updatedBy === "human" ? { prep: { ...item.prep, summary: "" } } : {}) }
         : {};
-      return {...item, ...current, options:deskOptions(item), resumeTarget:paused ? {id:paused.id, title:paused.title?.trim() || "未命名任务"} : null, proposal:isProjectProposal(plan) ? plan : null, projects, closeTargets, artifact:item.artifactId ? artifactDTO(kernel,item.artifactId,now()) : null,
+      return {...item, ...current, attachments:itemAttachments(item), options:deskOptions(item), resumeTarget:paused ? {id:paused.id, title:paused.title?.trim() || "未命名任务"} : null, proposal:isProjectProposal(plan) ? plan : null, projects, closeTargets, artifact:item.artifactId ? artifactDTO(kernel,item.artifactId,now()) : null,
         project:project ? {id:project.id,title:project.title?.trim() || "未命名项目",paused:project.status==="paused",parked:project.pauseReason==="parked"} : null,
       };
     }),

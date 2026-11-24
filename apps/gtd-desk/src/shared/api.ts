@@ -36,6 +36,7 @@ export interface UndoResponse { message: string; deskStatus: StatusDTO }
 export interface ClosedProjectsResponse { projects: Array<{id: string; title: string}> }
 
 export interface HumanItemDTO extends HumanItem {
+  attachments?: Array<{ label: string; uri: string }>;
   resumeTarget: {id:string; title:string} | null;
   proposal: ProjectProposal | null;
   projects: Array<{id:string; title:string}>;
@@ -364,7 +365,10 @@ export interface ArtifactSaveResponse {
 // ==================== 🧭 Radar (GET /api/radar) ====================
 
 export interface ProjectActionDTO {
+  /** The cell that stores the action. */
   cellId: string;
+  /** The cell carrying the action, when known. */
+  targetCellId?: string;
   actionId: string;
   title: string;
   owner: BallOwner;
@@ -400,7 +404,7 @@ export interface ProjectRowDTO {
   /** Who paused or parked it, when and with what words ("主人于 11月23日 23:36 放进以后再说，当时的话：「…」"); null when it runs. */
   pausedText: string | null;
   /** The single ball label the row shows (🔵 > 🟢 > 🟡); null when nothing is open. */
-  ball: { owner: BallOwner; label: string; text: string; cardId?: string } | null;
+  ball: { owner: BallOwner; label: string; text: string; cardId?: string; targetCellId?: string } | null;
   /** Aggregated progress ("11/15", "已回 2/3"). */
   progress: ProgressDTO | null;
   waiting: WaitingDTO | null;
@@ -562,7 +566,7 @@ export type TimelineItemDTO =
    * Something a person said to this cell. `direct`: typed in this view or passed on by the owner's agent (right-hand
    * bubble); `syncedTo`: the project that was given a copy ("已同步给所属项目「…」"), null when there is none.
    */
-  | (TimelineItemBase & { kind: "user_chat"; text: string; senderLabel: string; direct: boolean; mode: "enqueue" | "steer"; syncedTo: string | null; replyToId: string | null })
+  | (TimelineItemBase & { kind: "user_chat"; attachments?: Array<{ label: string; uri: string }>; text: string; senderLabel: string; direct: boolean; mode: "enqueue" | "steer"; syncedTo: string | null; replyToId: string | null })
   /** What another cell or the system told it (a project's follow-up, the desk's ruling, a job's result), one block. */
   | (TimelineItemBase & { kind: "peer_message"; fromLabel: string; text: string })
   /** What the cell said (Markdown). `toOwner`: it was sent to the owner as a message, not only said in the turn. `question`: it ends in a question the owner can answer here. */

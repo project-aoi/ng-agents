@@ -3,6 +3,7 @@
 // older tools gained, and a check that no human HTTP route is left without a tool.
 
 import { writeFileSync } from "node:fs";
+import { readdir } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { join } from "node:path";
@@ -18,6 +19,8 @@ import { dropNulls, normalizeArgs, validateArgs } from "../src/agent/tools";
 import { SENSOR_SUGGESTION_PREFIX, SKILL_SUGGESTION_PREFIX } from "../src/server/projections";
 import type { ActivityListDTO, HumanItemDTO, ModelsDTO, SourcesDTO, TopologyDTO } from "../src/shared/api";
 import { agentRedraft, bootDesk, bootRealDesk, cleanupAll, inboundEnvelope, makeProject, makeReviewCard, T0, tempDir, tool, writeActivity, type TestDesk } from "./helpers";
+import { captureAssetId, MAX_SAVED_IMAGE_BYTES, type SavedCaptureImage, type CaptureImageData } from "../src/shared/capture-assets";
+import { images } from "./fixtures/capture-images";
 
 afterEach(cleanupAll);
 
@@ -48,6 +51,8 @@ describe("parity", () => {
     "GET /api/models": "get_models",
     "PUT /api/models": "configure_models",
     "POST /api/capture": "capture",
+    "POST /api/capture-assets": "save_capture_image",
+    "GET /api/capture-assets/:assetId": "read_capture_image",
     "GET /api/projects/closed": "workbench_overview",
     "GET /api/human-items": "list_human_items",
     "POST /api/human-items/:id/decide": "decide_human_item",
@@ -88,8 +93,36 @@ describe("parity", () => {
     expect([...new Set(routes)].sort()).toEqual(Object.keys(TOOL_FOR).sort());
     const names = AGENT_TOOLS.map((t) => t.name);
     expect(names).toEqual(expect.arrayContaining([...new Set(Object.values(TOOL_FOR))]));
-    expect(new Set(names).size).toBe(36);
+    expect(new Set(names).size).toBe(38);
     for (const name of names) expect((await call(d, name, { "no-such-argument": 1 })).text, name).toContain('unknown argument "no-such-argument"');
+  });
+});
+
+describe("capture image parity", () => {
+  it("shares the bounded image store, short-URI capture and idempotency with the human routes", async () => {
+    const dataDir=tempDir("capture-image-parity"), d=await bootDesk({dataDir}), image=images[0]!;
+    const saved=(await ok<SavedCaptureImage>(d,"save_capture_image",{...image})).data;
+    const assetId=captureAssetId(saved.uri)!;
+    const web=await d.get<CaptureImageData>(saved.uri);
+    const agent=JSON.parse((await ok(d,"read_capture_image",{assetId})).text) as CaptureImageData;
+    expect(web).toEqual(agent);expect(agent.dataBase64).toBe(image.dataBase64);
+    const attachments=[{label:saved.label,uri:saved.uri},{label:"reference",uri:"https://example.com"}];
+    const args={text:"capture through MCP",clientId:"image-parity",attachments};
+    const first=(await ok<{envelopeId:string}>(d,"capture",args)).data;
+    const retry=(await ok<{envelopeId:string}>(d,"capture",args)).data;
+    expect(retry.envelopeId).toBe(first.envelopeId);
+    const conflict=await refused(d,"capture",{...args,text:"changed content"});
+    expect(conflict.data).toMatchObject({code:"capture_conflict"});
+    const records=d.kernel.inbox.listMessagesSync({envelopeId:first.envelopeId});
+    expect(records).toHaveLength(1);
+    expect(records[0]!.envelope.payload).toMatchObject({text:args.text,attachments});
+    const oversized=await refused(d,"save_capture_image",{...image,dataBase64:Buffer.alloc(MAX_SAVED_IMAGE_BYTES+1).toString("base64")});
+    expect(oversized.data).toMatchObject({code:"invalid_argument"});
+    expect((await refused(d,"save_capture_image",{...image,width:image.width+0.5})).data).toMatchObject({code:"invalid_argument"});
+    expect((await refused(d,"read_capture_image",{assetId:"../outside"})).text).toContain("at least 64 characters");
+    expect((await d.req("GET",saved.uri,undefined,{host:"foreign.test"})).status).toBe(403);
+    expect((await d.req("POST","/api/agent/tools/save_capture_image",image,{origin:"https://foreign.test"})).status).toBe(403);
+    expect(await readdir(join(dataDir,"capture-assets"))).toHaveLength(1);
   });
 });
 
@@ -526,7 +559,7 @@ describe("topology, cells and projects", () => {
   });
 });
 
-it("the MCP server needs no credential and passes structured arguments and conflicts through", async () => {
+it("the MCP server needs no credential and passes structured arguments, conflicts and bounded images through", async () => {
   const d = await bootDesk({ port: 0 });
   d.kernel.context.commitSync("desk", { artifact: { artifactId: "art_m", content: { format: "text", body: "v1" }, updatedBy: "agent" } });
   const { url } = await d.server.listen();
@@ -555,6 +588,36 @@ it("the MCP server needs no credential and passes structured arguments and confl
     const bad = await use("save_plan", { id: "c", expectedVersion: 1, outcome: "o", actions: [{ title: "a" }] });
     expect(bad.content[0]!.text).toContain('"actions[0].owner" is required');
     expect(d.kernel.context.getArtifactSync("art_m")).toMatchObject({ version: 2, updatedBy: "human" });
+    // A CRC-valid ancillary PNG chunk makes a decodable image exactly fill the saved-image budget.
+    const image=images[0]!, png=Buffer.from(image.dataBase64,"base64");
+    const padding=Buffer.alloc(MAX_SAVED_IMAGE_BYTES-png.length-12), kind=Buffer.from("npAD");
+    const header=Buffer.alloc(4);header.writeUInt32BE(padding.length);
+    let checksum=0xffffffff;
+    for(const byte of Buffer.concat([kind,padding])) {
+      checksum^=byte;
+      for(let bit=0;bit<8;bit++) checksum=(checksum>>>1)^((checksum&1) ? 0xedb88320 : 0);
+    }
+    const crc=Buffer.alloc(4);crc.writeUInt32BE((checksum^0xffffffff)>>>0);
+    const bytes=Buffer.concat([png.subarray(0,png.length-12),header,kind,padding,crc,png.subarray(png.length-12)]);
+    expect(bytes.length).toBe(MAX_SAVED_IMAGE_BYTES);
+    const encoded=bytes.toString("base64");expect(encoded.length).toBe(245760);
+    const upload=await use("save_capture_image",{...image,dataBase64:encoded});
+    expect(upload.isError).toBeFalsy();
+    const saved=JSON.parse(upload.content[0]!.text) as SavedCaptureImage;
+    expect(saved.bytes).toBe(MAX_SAVED_IMAGE_BYTES);
+    const fetched=await use("read_capture_image",{assetId:captureAssetId(saved.uri)});
+    expect(fetched.isError).toBeFalsy();
+    const roundtrip=JSON.parse(fetched.content[0]!.text) as CaptureImageData;
+    expect(roundtrip).toMatchObject({bytes:MAX_SAVED_IMAGE_BYTES,width:image.width,height:image.height,contentType:image.contentType});
+    expect(roundtrip.dataBase64).toBe(encoded);
+    const tooLarge=await use("save_capture_image",{...image,dataBase64:Buffer.concat([bytes,Buffer.from([0])]).toString("base64")});
+    expect(tooLarge.isError).toBe(true);
+    const attachments=[{label:saved.label,uri:saved.uri}];
+    expect((await use("capture",{attachments,clientId:"stdio-image-boundary"})).isError).toBeFalsy();
+    const captured=d.kernel.inbox.listMessagesSync({cellId:"desk",type:PAYLOAD.userMessage});
+    expect(captured).toHaveLength(1);
+    expect(captured[0]!.envelope.payload).toMatchObject({attachments});
+    expect(captured[0]!.envelope.payload).not.toHaveProperty("dataBase64");
   } finally {
     child.kill();
   }

@@ -108,6 +108,10 @@ export function createDeskApp(deps: DeskAppDeps): Hono {
   app.get("/api/status", c => c.json(desk.status()));
   app.get("/api/models", async c => c.json(await desk.models(c.req.query("refresh") === "1")));
   app.put("/api/models", async c => c.json(await desk.setModel(await body<UpdateModelsRequest>(c), ownerActor)));
+  app.post("/api/capture-assets", async c => c.json(await desk.saveCaptureImage(await body(c), () => {
+    if (c.req.raw.signal.aborted) throw new DeskError(400,"invalid_argument","图片保存已取消");
+  })));
+  app.get("/api/capture-assets/:assetId", async c => c.json(await desk.readCaptureImage(c.req.param("assetId"))));
   app.post("/api/capture", async (c) => c.json(await desk.ingest(await body(c),ownerActor)));
 
   app.get("/api/projects/closed", c => c.json({projects:desk.recentlyClosedProjects()}));
@@ -213,6 +217,10 @@ export function createDeskApp(deps: DeskAppDeps): Hono {
 
   // ---------- web client ----------
   const webDir = deps.webDir && existsSync(join(deps.webDir, "index.html")) ? deps.webDir : null;
+  app.use("/*", async (c, next) => {
+    c.header("Content-Security-Policy", "frame-ancestors 'none'");
+    await next();
+  });
   if (webDir) {
     app.use("/*", serveStatic({ root: webDir }));
     const index = () => readFileSync(join(webDir, "index.html"), "utf8");

@@ -75,8 +75,8 @@ describe("the owner's words and the agent's own note travel apart (E02)", () => 
     expect(AGENT_INSTRUCTIONS).toContain("ng-desk skill");
     expect(AGENT_INSTRUCTIONS).toContain("never answer, approve, restart or choose for them");
     expect(AGENT_INSTRUCTIONS).toContain("`context`");
-    // What a client lists: 36 tools without the instructions repeated under each.
-    expect(AGENT_TOOLS).toHaveLength(36);
+    // What a client lists: 38 tools without the instructions repeated under each.
+    expect(AGENT_TOOLS).toHaveLength(38);
     expect(JSON.stringify(AGENT_TOOLS).length).toBeLessThan(36_000);
   });
 

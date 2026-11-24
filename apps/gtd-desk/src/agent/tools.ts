@@ -47,6 +47,7 @@ import { isLeafCell, notesOf, unpulledOf } from "../server/projections/agents";
 import { projectOfAction, readActions, readProjects, SKILL_SUGGESTION_PREFIX, type Located, type SkillSuggestion } from "../server/projections/common";
 import { parseDecisions, planDecisions } from "../server/projections/format";
 import { AGENT_TOOLS, type AgentToolDoc } from "./guide";
+import type { CaptureImageUpload } from "../shared/capture-assets";
 import type { AgentCallContext, AgentControlPlane, AgentToolResult } from "./routes";
 
 // docs/05 §5.3 — the external main agent's control plane: every tool of guide.ts, run as the caller's `agent:<id>`
@@ -217,8 +218,11 @@ function checkValue(p: PropSchema, v: unknown, name: string, problems: string[])
     return;
   }
   if (isRecord(v) && p.properties) return checkProps(p, v, `${name}.`, problems);
-  if (p.minLength && typeof v === "string" && v.trim().length < p.minLength) problems.push(`"${name}" must not be blank`);
-  else if (p.enum && !p.enum.includes(v)) problems.push(`"${name}" must be one of ${p.enum.map((e) => JSON.stringify(e)).join(", ")}`);
+  if (typeof p.minLength === "number" && p.minLength > 0 && typeof v === "string" && (v.trim() === "" || (p.minLength > 1 && v.length < p.minLength))) {
+    problems.push(v.trim() === "" || p.minLength === 1 ? `"${name}" must not be blank` : `"${name}" must be at least ${p.minLength} characters`);
+  } else if (p.enum && !p.enum.includes(v)) {
+    problems.push(`"${name}" must be one of ${p.enum.map((e) => JSON.stringify(e)).join(", ")}`);
+  }
 }
 
 /** null when `args` fits the tool's input schema; otherwise what is wrong, for the agent to fix. */
@@ -868,6 +872,16 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         model: model ?? null,
         ...(finished ? { finished } : {}),
       });
+    },
+
+    async save_capture_image(args) {
+      const saved=await desk.saveCaptureImage(args as unknown as CaptureImageUpload);
+      return ok(JSON.stringify(saved),saved);
+    },
+
+    async read_capture_image(args) {
+      const image=await desk.readCaptureImage(args.assetId as string);
+      return ok(JSON.stringify(image));
     },
 
     async capture(args,principalId) {

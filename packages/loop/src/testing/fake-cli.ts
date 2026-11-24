@@ -42,7 +42,7 @@ export interface FakeCli {
   engine: CliEngine;
   /** Executable to hand the CLI loop as `bin`. */
   bin: string;
-  /** Environment for the CLI loop (`env`): the kernel's plus the scenario pointer. */
+  /** Environment for the CLI loop (`env`): controlled process environment, plus the scenario pointer. */
   env: Record<string, string | undefined>;
   dir: string;
   /** Replace the scripted turns (the turn counter is kept). */
@@ -76,7 +76,7 @@ export function installFakeCli(dir: string, engine: CliEngine, turns: FakeCliTur
   return {
     engine,
     bin,
-    env: { ...process.env, FAKECLI_SCENARIO: scenarioFile },
+    env: { PATH: process.env.PATH, HOME: dir, FAKECLI_SCENARIO: scenarioFile },
     dir,
     setTurns,
     log,

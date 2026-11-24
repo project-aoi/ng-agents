@@ -14,7 +14,7 @@
 
 **`INV-UC03-04`**　主人要先看方案时出方案卡，批准后才立项。阶段交付按主人批准的计划推进。主人亲自做的阶段不再要求批准进入。调整计划时收回已经废弃的动作和卡片，项目记录里的目标、步骤和阶段同步。助手或主台的补充与主人原话分开，不写成主人的要求。
 
-**`INV-UC03-05`**　新卡到达不抢焦点。决定始终基于当前卡片和明确审阅过的文稿。直接打开事项链接时优先显示该卡，方案仍有未保存修改时阻止确认。
+**`INV-UC03-05`**　新卡到达不抢焦点。决定始终基于当前卡片和明确审阅过的文稿。直接打开事项链接时优先显示该卡，方案仍有未保存修改时阻止确认。同一视图切换事项保留页面滚动，选中行离开视野时就近滚动；切换视图回到顶部。
 
 ## 端到端步骤
 
@@ -37,4 +37,4 @@
 
 ## 回归入口
 
-[scenario-human-step.test.ts](../../presets/test/scenario-human-step.test.ts)、[human-inbox-browser.test.ts](../../apps/gtd-desk/test/human-inbox-browser.test.ts)、[agent-relay.test.ts](../../apps/gtd-desk/test/agent-relay.test.ts)、[artifacts.test.ts](../../packages/context/test/artifacts.test.ts)、[tools.test.ts](../../packages/loop/test/tools.test.ts)。
+[scenario-human-step.test.ts](../../presets/test/scenario-human-step.test.ts)、[human-inbox-browser.test.ts](../../apps/gtd-desk/test/human-inbox-browser.test.ts)、[agent-relay.test.ts](../../apps/gtd-desk/test/agent-relay.test.ts)、[artifacts.test.ts](../../packages/context/test/artifacts.test.ts)、[tools.test.ts](../../packages/loop/test/tools.test.ts)、[scroll-desk.ts](../../apps/gtd-desk/test/fixtures/scroll-desk.ts)。
