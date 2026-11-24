@@ -16,6 +16,7 @@ import {
   NgError,
   OWNER_PRINCIPAL,
   parsePrincipal,
+  DRAINED_MID_RUN,
   PAYLOAD,
   run,
   systemClock,
@@ -514,11 +515,11 @@ export function createInbox(opts: InboxOptions): InboxService {
       const now = clock.now();
       const rows = all<{ seq: number; envelope: string }>(
         db,
-        `UPDATE inbox_messages SET status = 'claimed', claim_id = ?, status_reason = 'drained mid-run', updated_at = ?
+        `UPDATE inbox_messages SET status = 'claimed', claim_id = ?, status_reason = ?, updated_at = ?
          WHERE cell_id = ? AND status = 'pending' AND type = ? AND deliver_at <= ?
            AND (expected_epoch IS NULL OR expected_epoch = ?)
          RETURNING seq, envelope`,
-        [claim.claim_id, now, cellId, PAYLOAD.controlSteer, now, cell.epoch],
+        [claim.claim_id, DRAINED_MID_RUN, now, cellId, PAYLOAD.controlSteer, now, cell.epoch],
       );
       rows.sort((a, b) => a.seq - b.seq);
       return rows.map((r) => {

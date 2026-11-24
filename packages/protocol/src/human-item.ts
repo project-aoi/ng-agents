@@ -41,6 +41,8 @@ export interface HumanItem extends Omit<HumanItemDraft, "artifactId"> {
   epoch: number | null;
   status: HumanItemStatus;
   itemRevision: number;
+  /** When it was first raised (later changes to it do not move this). */
+  createdAt: number;
   relatedProjectIds: string[];
   snoozedUntil: number | null;
   artifactId: string | null;

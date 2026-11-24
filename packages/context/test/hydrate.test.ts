@@ -746,3 +746,45 @@ it("refreshTailSync reads the notes again and keeps the original task apart from
   expect(again.history).toBe(snap.history);
   expect(again.system).toBe(snap.system);
 });
+
+// Audit 2026-11-23 rerun M01: the Run that received its task saw it twice — in full in its batch and again as the
+// "[original task] … later messages may have changed it" reminder. The reminder is read from the records, and the tail
+// is read again (refreshTailSync) after the Run's start and its batch are on record.
+it("leaves the original-task reminder out of the turn that receives the task, also when the tail is read again", () => {
+  const h = deskHarness();
+  const task: Envelope = { ...userEnvelope(h.clock, ""), type: "cell.task", payload: { parentCellId: "lead", instruction: "重试五次" } };
+  const batch = batchOf("desk", [task], 0, h.clock);
+  const snap = h.store.hydrateSync("desk", batch, "isolated");
+  // The kernel's order: the Run's start and its batch go on record first, then the tail is read again.
+  h.store.appendEvidenceSync("desk", { kind: "run_boundary", phase: "start", epoch: 0, runId: batch.claimId, at: h.clock.now() });
+  h.store.appendEvidenceSync("desk", { kind: "inbound", envelope: task, runId: batch.claimId, at: h.clock.now() });
+  const again = h.store.refreshTailSync(snap);
+  for (const s of [snap, again]) {
+    expect(s.tail.originalTask).toBeUndefined();
+    expect(json(s.tail.messages)).not.toContain("[original task]");
+    expect(s.tail.notes ?? []).toEqual([]);
+    expect(json(s.tail.messages.at(-1))).toContain("重试五次"); // the task itself, in the batch
+  }
+  h.store.appendEvidenceSync("desk", { kind: "assistant_text", text: "开始", runId: batch.claimId, at: h.clock.now() });
+  h.store.appendEvidenceSync("desk", { kind: "run_boundary", phase: "end", epoch: 0, outcome: "completed", runId: batch.claimId, at: h.clock.now() });
+
+  // A later turn (a message from the parent) still gets the reminder.
+  const message: Envelope = { ...userEnvelope(h.clock, ""), from: "inbox:lead", type: "cell.message", payload: { fromCellId: "lead", text: "改成三次" } };
+  const later = h.store.hydrateSync("desk", batchOf("desk", [message], 0, h.clock), "isolated");
+  expect(later.tail.originalTask).toMatch(/^\[original task\] .*parent=lead 重试五次/);
+  expect(later.tail.notes?.[0]).toBe(later.tail.originalTask);
+  expect(h.store.refreshTailSync(later).tail.originalTask).toBe(later.tail.originalTask);
+});
+
+// Audit 2026-11-23 rerun R05: the notes are read again after the Run's own start is on record; the provider gets the Run's
+// id so that "since your last turn" can leave this Run's start out.
+it("hands the tail-notes provider the Run's id (the batch's claim) on the first read and when the tail is read again", () => {
+  const calls: Array<{ cellId: string; incoming: readonly Envelope[] | undefined; runId: string | undefined }> = [];
+  const h = deskHarness({ store: { tailNotesProvider: (cellId, incoming, runId) => (calls.push({ cellId, incoming, runId }), []) } });
+  const batch = batchOf("desk", [userEnvelope(h.clock, "进度如何？")], 0, h.clock);
+  const snap = h.store.hydrateSync("desk", batch, "isolated");
+  expect(calls).toHaveLength(1);
+  h.store.refreshTailSync(snap, ["[extra]"]);
+  expect(calls).toHaveLength(2);
+  for (const c of calls) expect(c).toEqual({ cellId: "desk", incoming: batch.envelopes, runId: batch.claimId });
+});

@@ -59,9 +59,9 @@ export interface Lifecycle {
    * archived with a finished project stays archived (false). Watches and timers are not restored: the message that
    * prompted this is what wakes it. Call inside the transaction that enqueues that message.
    */
-  reopenProject(cellId: string, principalId: string): Promise<string[]>;
+  reopenProject(cellId: string, principalId: string, words?: ReopenWords): Promise<string[]>;
   waitForClosedProject(id:string):Promise<number>;
-  reopenProjectSync(id:string,principalId:string,epoch:number):string[];
+  reopenProjectSync(id:string,principalId:string,epoch:number,words?:ReopenWords):string[];
   reopenLeafSync(cellId: string): boolean;
 }
 
@@ -545,9 +545,9 @@ export function createLifecycle(core: KernelCore): Lifecycle {
     return project.epoch;
   }
 
-  async function reopenProject(id:string, principalId:string) {
+  async function reopenProject(id:string, principalId:string, words?: ReopenWords) {
     const epoch = await waitForClosedProject(id);
-    return reopenProjectSync(id,principalId,epoch);
+    return reopenProjectSync(id,principalId,epoch,words);
   }
 
   function restoreBounds(cell: CellRecord): boolean {
@@ -566,7 +566,7 @@ export function createLifecycle(core: KernelCore): Lifecycle {
     return true;
   }
 
-  function reopenProjectSync(id: string, principalId: string, expectedEpoch:number): string[] {
+  function reopenProjectSync(id: string, principalId: string, expectedEpoch:number, words?: ReopenWords): string[] {
     if (typeof principalId !== "string" || !principalId.trim()) throw new NgError("invalid_argument","explicit actor required");
     const actor = parsePrincipal(principalId, core.ownerPrincipal);
     if (actor.kind !== "owner" && actor.kind !== "agent") throw new NgError("bounds_violation","only a workbench actor may reopen a project");
@@ -602,7 +602,7 @@ export function createLifecycle(core: KernelCore): Lifecycle {
       }
       const delivered = inbox.enqueueSync(id,createEnvelope({id:`${id}:reopened:${cells.require(id).epoch}`,from:KERNEL_FROM.control,
         principalId,kind:"event",type:PAYLOAD.cellMessage,expectedEpoch:cells.require(id).epoch,
-        payload:{fromCellId:core.deskCellId,text:"主人重新打开了这个项目。请核对当前状态，确认下一步。"}},clock));
+        payload:{fromCellId:principalId,text:reopenText(actor.kind === "agent", words?.text),...(words?.agentContext?.trim() ? {agentContext:words.agentContext.trim()} : {})}},clock));
       if (delivered !== "accepted") throw new NgError("conflict","project wakeup was not queued");
       return restored;
     });
@@ -627,6 +627,19 @@ export function createLifecycle(core: KernelCore): Lifecycle {
   }
 
   return { createRootCell, ensureRootCell, spawnCell, updateCell, closeCellSync, closeCell, cleanupPaused, cleaningUp: id => cleanups.has(id) || pausedCleanups.has(id), cleanupClosed, deactivateWatches, reopenProject, waitForClosedProject, reopenProjectSync, reopenLeafSync };
+}
+
+/** What the owner said when they reopened a project, and what their coding agent added of its own. */
+export interface ReopenWords {
+  text?: string;
+  agentContext?: string;
+}
+
+/** The message a reopened project wakes with: the owner's words, or the fact that none came with it (audit R03). */
+function reopenText(byAgent: boolean, text: string | undefined): string {
+  const who = byAgent ? "主人（经其编码助手）" : "主人";
+  const said = text?.trim();
+  return said ? `${who}重新打开了这个项目，并说：\n${said}` : `${who}重新打开了这个项目，没有附带新的要求。`;
 }
 
 /** Active watches as rows (for routing and read models). */

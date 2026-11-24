@@ -136,6 +136,13 @@ export interface RunPorts extends CellPorts {
   createHumanItem?(draft: HumanItemDraft): { id: string; itemRevision: number };
   /** Take back a card or human action that this cell (or a cell below it) raised and the owner has not decided yet. */
   withdrawHumanItem?(id: string, reason: string): "withdrawn" | "not_pending" | "not_found";
+  /**
+   * Close an open item of this cell (or of a cell below it; for the desk also the owner's personal reminders) because
+   * the owner settled it in conversation. Checked against the item revision and the document version the owner was
+   * talking about, like a decision on the card ("stale" names the current ones). A card with an option that executes
+   * something (an outward action, a project start) is approved on the card only ("needs_owner").
+   */
+  settleHumanItem?(id: string, request: SettleItemRequest): SettleItemResult;
 
   readonly self: RunSelf;
   /** Gate.authorize bound to self (cellId, epoch, principal). */
@@ -168,7 +175,8 @@ export interface RunPorts extends CellPorts {
   /** Enqueue to this cell's own inbox (reminders, timeout nudges with cancelGroup, cron); expectedEpoch = self.epoch. */
   scheduleSelf(env: EnvelopeDraft, rule: ScheduleRule): Promise<EnqueueResult>;
   /** Inbox.control on a descendant as principal `cell:<selfId>` (steer a child, pause/cancel it). */
-  controlCell(cellId: string, cmd: { action: ControlAction; steerMessage?: string }): Promise<ControlResult>;
+  /** `note`: for pause/resume, the words that come with it (kept on the cell's pause record and quoted to it). */
+  controlCell(cellId: string, cmd: { action: ControlAction; steerMessage?: string; note?: string }): Promise<ControlResult>;
   /**
    * [ext] Inbox.handback for an envelope of this Run's batch (claim = runId): the row ends `handed_back` and the desk
    * receives a `handback` envelope. Optional in the type only so hand-written fakes stay valid; the kernel always
@@ -258,6 +266,17 @@ export interface CellMessageDraft {
   /** Idempotency id (default derived from the Run and a counter). */
   id?: string;
   threads?: string[];
+  /**
+   * The id of the owner's message whose words this passes on (the desk relaying "行了，继续" to a project). A cell that
+   * waits for the owner has its answer with it, exactly as if the owner had written to it directly. It must name a
+   * message from the owner (or their agent) that the sending cell received; anything else is refused.
+   */
+  ownerMessageId?: string;
+  /**
+   * A fact for the receiver's record, not something to act on now: delivered as background (it reads it at its next
+   * turn and is not woken for it). Never an answer somebody waits for — a background message answers no wait.
+   */
+  quiet?: boolean;
 }
 export type SendToCellResult =
   | { status: "delivered"; envelopeId: string; targetStatus: "active" | "paused" }
@@ -285,6 +304,12 @@ export interface SelfSettleRequest {
   /** Final text for the parent's `cell.result` when the cell closes without a stashed candidate. */
   summary?: string;
   force?: boolean;
+  /**
+   * A notice for the owner, sent only if the requested transition is actually carried out when the Run settles (a
+   * follow-up that beat the close, a child still at work or open actions leave the cell as it was — and the owner
+   * must not be told it finished) and only for a cell that may notify the owner.
+   */
+  ownerNotice?: { body: string; key: string };
 }
 
 /**
@@ -319,6 +344,8 @@ export interface CellTurnState {
   settledSeq: number;
   settledAt: number;
   notices: number;
+  /** The last inbox row (any cell's) when that turn settled: what the cell sent its parent after it belongs to the next turn. */
+  inboxSeq?: number;
 }
 
 /**
@@ -414,8 +441,22 @@ export interface PresetDef {
    * retried batch runs it again) and quick. `"handled"` = nothing in this batch needs the Loop: the Run completes
    * without it. A thrown error is reported through the kernel's onError and the Loop runs anyway.
    */
-  prepareRun?(input: PrepareRunInput): Promise<"handled" | void> | "handled" | void;
+  prepareRun?(input: PrepareRunInput): Promise<PrepareRunResult> | PrepareRunResult;
 }
+
+/** What a cell states when it closes an item on the owner's word (P-SAFE-5): their words, and the versions they were about. */
+export interface SettleItemRequest {
+  ownerWords: string;
+  seenItemRevision: number;
+  /** Required when the item is bound to a document. */
+  seenArtifactVersion?: number;
+}
+export type SettleItemResult =
+  | { status: "settled" | "needs_owner" | "not_pending" | "not_found" }
+  | { status: "stale"; itemRevision: number; artifactVersion: number | null };
+
+/** "handled": the batch needed no model. `notes`: facts about the bookkeeping the Run should see before its batch. */
+export type PrepareRunResult = "handled" | void | { notes: string[] };
 
 /** [ext] See PresetDef.prepareRun. */
 export interface PrepareRunInput {

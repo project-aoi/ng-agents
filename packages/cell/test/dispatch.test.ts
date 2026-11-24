@@ -194,7 +194,9 @@ describe("dispatcher", () => {
         return tool("set_state", { patches: { plan: "A" } });
       },
       (req) => {
-        expect(requestText(req)).toContain(steerNoteText("改成方案 B"));
+        // The interrupted cell is told who interrupts (live rerun, uc08: the line carried no sender).
+        expect(requestText(req)).toContain(steerNoteText("改成方案 B", h.kernel.ownerPrincipal));
+        expect(requestText(req)).toContain("[steer from the owner while you were working] 改成方案 B");
         return tool("set_state", { patches: { plan: "B" } });
       },
       { text: "switched" },

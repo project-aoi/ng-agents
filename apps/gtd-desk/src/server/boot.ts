@@ -14,6 +14,7 @@ import { selectBackend, type Env } from "./backend";
 import { createDesk, type Desk } from "./desk";
 import { createEventHub, type EventHub } from "./events";
 import { DEFAULT_SETTINGS, type DeskSettings } from "./projections/common";
+import { ARTIFACT_EDITOR_PREFIX } from "./projections/format";
 import { securityPolicyFor, type SecurityPolicy } from "./security";
 
 export const DEFAULT_PORT = 8790;
@@ -101,13 +102,15 @@ export async function createDeskServer(opts: DeskServerOptions = {}): Promise<De
     for (const [engine, engineOpts] of Object.entries(choice.kernelOptions.cli ?? {})) {
       engineOpts.onDebug = (e) => {
         if (e.type === "notice") log(`${engine} [${e.cellId}] ${e.text}`);
-        else if (e.type === "exit" && (e.code !== 0 || verbose)) log(`${engine} [${e.cellId}] exited ${e.code ?? e.signal}${e.stderr.trim() ? `: ${e.stderr.trim().slice(-500)}` : ""}`);
+        else if (e.type === "exit" && ((e.code !== 0 && !e.stopped) || verbose)) log(`${engine} [${e.cellId}] exited ${e.code ?? e.signal}${e.stderr.trim() ? `: ${e.stderr.trim().slice(-500)}` : ""}`);
         else if (e.type === "launch" && verbose) log(`${engine} [${e.cellId}] ${e.argv.join(" ")} (cwd ${e.cwd}) — ${e.permissions}`);
       };
     }
   }
   const registry = opts.kernel?.registry ?? createRegistry();
   (opts.registerPresets ?? (registerPresets as NonNullable<DeskServerOptions["registerPresets"]>))(registry, { deskCellId, timeZone });
+  // Who saved a document's current version is the app's record (format.ts), not something a cell may write.
+  registry.reserveState([], [ARTIFACT_EDITOR_PREFIX]);
 
   const ui = new UiChannel({ clock, ownerPrincipal });
   const kernel = createKernel({
@@ -135,6 +138,7 @@ export async function createDeskServer(opts: DeskServerOptions = {}): Promise<De
     await kernel.start();
     const settings: DeskSettings = {
       ...DEFAULT_SETTINGS,
+      timeZone,
       ...opts.settings,
       backend: kernel.agentBackend ?? choice.engine,
     };

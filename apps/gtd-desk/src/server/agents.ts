@@ -18,7 +18,7 @@ import type {
 import { inputOf, type DeskSettings } from "./projections/common";
 import {
   isLeafCell,
-  pendingQuestions,
+  ownerQuestions,
   projectNode,
   projectTimeline,
   projectTopology,
@@ -105,7 +105,7 @@ export function createAgentsApi({ requireActor, commands, kernel, settings, stat
   }
 
   /** The unanswered question each of these cells is asking, if any (get_cell's pendingQuestion, for many at once). */
-  const questions = (cellIds: readonly string[]) => pendingQuestions(input(), cellIds);
+  const questions = () => ownerQuestions(input());
 
   /**
    * One page of stored text: a spilled output (`res://…`, readable from anywhere), or a cell's note
@@ -184,12 +184,14 @@ export function createAgentsApi({ requireActor, commands, kernel, settings, stat
       case "delivered": {
         if (r.duplicate) return { ...no, id: r.envelopeId, outcome: "duplicate", ok: true, message: "这条消息已经发过了，不会重复发送" };
         const cc = r.ccTo ? kernel.getCell(r.ccTo) : undefined;
-        const ccTitle = cc ? (kernel.context.readStateSync<{ title?: string }>(cc.id, gtdKeys.project)?.title ?? cc.title ?? "所属项目") : null;
-        const synced = ccTitle ? `；已同步给所属项目「${ccTitle}」${req.notifyParent === "wakeup" ? "，并唤醒了项目协调" : ""}` : "";
+        const above = cc && isProjectRoot(kernel.registry, cc) ? "所属项目" : "它的上级";
+        const ccTitle = cc ? (kernel.context.readStateSync<{ title?: string }>(cc.id, gtdKeys.project)?.title ?? cc.title ?? (above === "所属项目" ? "所属项目" : "上级协调")) : null;
+        const synced = ccTitle ? `；已同步给${above}「${ccTitle}」${req.notifyParent === "wakeup" ? `，并唤醒了${above === "所属项目" ? "项目" : "上级"}协调` : ""}` : "";
         const done = { id: r.envelopeId, before, ccTo: r.ccTo, ccTitle };
         if (r.reopened) return { ...done, outcome: "reopened", ok: true, message: `分身已重新打开，会沿原上下文接着做${synced}` };
         let message: string;
-        if (mode === "steer") message = "已打断插话，它马上就会看到";
+        if (mode === "steer" && before.state === "running") message = "已打断插话，它马上就会看到";
+        else if (mode === "steer") message = isLeafCell(cell) ? "它这一轮已经结束，没有可打断的；消息已送达，会唤醒它处理" : "它当时没有在运行，没有可打断的；消息已送达，下一轮处理";
         else if (r.targetStatus === "paused") message = "已送达；它暂停中，继续之后再处理";
         else if (before.state === "running") message = isLeafCell(cell) ? "已顺手补充，本轮收尾时处理" : "已顺手补充，它这一步做完就看";
         else if (cell.parentId === null) message = "已发给总助理";

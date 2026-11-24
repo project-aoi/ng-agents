@@ -23,6 +23,7 @@ afterEach(async () => {
 
 const STATUS: StatusDTO = {
   humanPending: 0,
+  humanQuestions: 0,
   humanSnoozed: 0,
   generatedAt: 1_700_000_000_000,
   backend: "claude",

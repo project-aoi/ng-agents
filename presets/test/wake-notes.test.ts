@@ -55,7 +55,7 @@ it("a worker's result: the notes show its actions closed, the answered wait gone
   expect(open).not.toContain("改代码");
   expect(open).not.toContain("补测试");
   // The wait this result answers is not shown as open any more.
-  expect(seen).toContain("[waits answered by this wake-up");
+  expect(seen).toContain("[waits closed by this wake-up");
   expect(seen).not.toContain("[your open waits]");
   expect(h.kernel.listWaits([projectId])).toEqual([]);
   // The owner's action appears under the actions only — not a second time as a card.

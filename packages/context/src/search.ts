@@ -1,6 +1,6 @@
 import { all, type EvidenceKind, type KnowledgeKind, type SearchScope, type Snippet, type SqlParam } from "@ng/protocol";
 import type { Deps } from "./deps";
-import { charCount, excerpt, ftsPhrase, likePattern } from "./text";
+import { charCount, excerpt, excerptSpan, formatExcerpt, ftsPhrase, likePattern } from "./text";
 
 /** Evidence a cell's history draws on: its own log, plus (fork_prefix) each fork source's log up to the fork point. */
 export function historySources(deps: Deps, cellId: string): Array<{ cellId: string; uptoSeq: number }> {
@@ -91,6 +91,8 @@ interface Clause {
 
 interface Terms {
   words: string[];
+  /** The query, whitespace-normalised: an excerpt prefers where it occurs whole. */
+  phrase: string;
   long: string[];
   short: string[];
   /** FTS5 expression over the long terms. */
@@ -168,7 +170,13 @@ export function searchHistory(
   if (words.length === 0 || limit <= 0) return [];
   // The trigram tokenizer needs >= 3 characters per term; shorter terms fall back to a substring LIKE.
   const long = words.filter((w) => charCount(w) >= 3);
-  const t: Terms = { words, long, short: words.filter((w) => charCount(w) < 3), match: long.map(ftsPhrase).join(" ") };
+  const t: Terms = {
+    words,
+    phrase: words.join(" "),
+    long,
+    short: words.filter((w) => charCount(w) < 3),
+    match: long.map(ftsPhrase).join(" "),
+  };
   const filter = scopeFilter(deps, chain, cellId, opts.scope);
 
   const hits: Snippet[] = [
@@ -190,6 +198,21 @@ export function searchHistory(
   return merged.slice(0, limit);
 }
 
+/** A hit's excerpt (text.ts excerpt): on the whole query first, then on the densest cluster of its words. */
+function excerptOf(t: Terms, text: string, origin: number | false = 0): string {
+  return excerpt(text, t.words, undefined, { phrase: t.phrase, origin });
+}
+
+/**
+ * A spilled record keeps only the head and tail of its output, so it is excerpted from the full text: the match can be
+ * anywhere in it, and the offset is one read_resource(spillUri) understands. Words found only in the record's own text
+ * (the tool's name, an external record's title) give an excerpt of that text, without an offset into the resource.
+ */
+function spilledExcerpt(t: Terms, recordText: string, full: string | undefined): string {
+  const span = full === undefined ? null : excerptSpan(full, t.words, undefined, t.phrase);
+  return span ? formatExcerpt(full!, span) : excerptOf(t, recordText, false);
+}
+
 function searchEvidence(deps: Deps, t: Terms, limit: number, scope: Clause): Snippet[] {
   const rows = runSource<EvidenceHit>(deps, t, limit, {
     select: "e.seq, e.cell_id, e.run_id, e.kind, e.text, e.at, e.spill_uri, e.content",
@@ -201,13 +224,19 @@ function searchEvidence(deps: Deps, t: Terms, limit: number, scope: Clause): Sni
     params: scope.params,
     recency: "e.seq DESC",
   });
+  const spillUris = rows.flatMap((r) => (r.spill_uri ? [r.spill_uri] : []));
+  const spilled = new Map<string, string>();
+  if (spillUris.length > 0) {
+    const sql = `SELECT uri, content FROM resources WHERE uri ${IN_JSON}`;
+    for (const x of all<{ uri: string; content: string }>(deps.db, sql, [JSON.stringify(spillUris)])) spilled.set(x.uri, x.content);
+  }
   return rows.map((r) => {
     const s: Snippet = {
       seq: r.seq,
       cellId: r.cell_id,
       runId: r.run_id,
       kind: r.kind,
-      text: excerpt(r.text, t.words),
+      text: r.spill_uri ? spilledExcerpt(t, r.text, spilled.get(r.spill_uri)) : excerptOf(t, r.text),
       at: r.at,
       source: "evidence",
     };
@@ -240,7 +269,8 @@ function searchKnowledge(deps: Deps, t: Terms, limit: number, scope: Clause): Sn
       cellId: r.cell_id,
       runId: null,
       kind: r.kind,
-      text: excerpt(`${r.description}\n${r.body}`, t.words),
+      // The URI reads the body: the offset counts from there.
+      text: excerptOf(t, `${r.description}\n${r.body}`, r.description.length + 1),
       at: r.updated_at,
       source: "knowledge",
       uri: `${r.kind}://${r.name}`,
@@ -270,7 +300,7 @@ function searchArtifacts(deps: Deps, t: Terms, limit: number, scope: Clause): Sn
       cellId: r.cell_id,
       runId: null,
       kind: "artifact",
-      text: excerpt(r.body ?? "", t.words),
+      text: excerptOf(t, r.body ?? ""),
       at: r.updated_at,
       source: "artifact",
       uri: `artifact://${r.artifact_id}`,
@@ -300,7 +330,7 @@ function searchState(deps: Deps, t: Terms, limit: number, scope: Clause): Snippe
       runId: null,
       kind: "state",
       // A value without string leaves (numbers, booleans) is shown as its JSON.
-      text: excerpt(r.text || r.value, t.words),
+      text: excerptOf(t, r.text || r.value),
       at: r.updated_at,
       source: "state",
       title: r.key,
@@ -327,7 +357,7 @@ function searchResources(deps: Deps, t: Terms, limit: number, scope: Clause): Sn
       cellId: r.cell_id,
       runId: r.run_id,
       kind: "resource",
-      text: excerpt(r.content, t.words),
+      text: excerptOf(t, r.content),
       at: r.created_at,
       source: "resource",
       uri: r.uri,

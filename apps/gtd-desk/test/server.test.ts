@@ -298,13 +298,14 @@ describe("project proposal card", () => {
     expect(a).toMatchObject({ outcome: "activated", view: { someday: [] } });
     expect(a.view.projects.map((p) => p.id)).toEqual([projectId]);
     expect(d.kernel.getCell(projectId)!.status).toBe("active");
-    expect(cellMessages(d.kernel, projectId).map((e) => (e.payload as { text: string }).text)).toEqual([expect.stringContaining("主人点了启动")]);
+    // Audit 2026-11-23 rerun R01: who brought it back is said as it was — the owner, in the workbench.
+    expect(cellMessages(d.kernel, projectId).map((e) => (e.payload as { text: string }).text)).toEqual([expect.stringContaining("主人在工作台里把「官网改版」从以后再说里拿了出来")]);
     await d.kernel.idle();
     // it ran once, with its brief (the plan the owner saw) and the owner's go-ahead in the same wake-up
     const runs = d.script.requests.filter((r) => r.cellId === projectId);
     expect(runs).toHaveLength(1);
     expect(requestText(runs[0]!.req)).toContain("约设计师");
-    expect(requestText(runs[0]!.req)).toContain("主人点了启动");
+    expect(requestText(runs[0]!.req)).toContain("主人在工作台里把「官网改版」从以后再说里拿了出来");
     expect(d.kernel.context.readStateSync<ProjectRecord>(projectId, gtdKeys.project)).toMatchObject({ lifecycle: "active", title: "官网改版" });
   });
 });

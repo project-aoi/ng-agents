@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { PAYLOAD, selectRunTools, type Envelope } from "@ng/protocol";
-import { BUILTIN_SKILLS, PROMPTS, startProjectSync } from "../src";
+import { BUILTIN_SKILLS, PROMPTS, startProjectSync, TOOLSETS } from "../src";
 import { RESTORE_REASON, resolveConfig } from "../src/shared/config";
-import { promptDefs } from "../src/shared/prompts";
+import { COMMON, promptDefs } from "../src/shared/prompts";
 import { SKILL_DOMAIN_HUB, SKILL_HABIT_DISCOVERY, SKILL_PROJECT_RELAY, SKILL_WORKSPACE_ARBITRATION } from "../src/shared/skills";
 import { boot, childrenOf, cleanupAll, lastToolResult, projects, tool, type Harness } from "./helpers";
 
@@ -158,6 +158,24 @@ it("protects preset records from model writes while leaving its own topic notes 
   expect(h.kernel.context.readStateSync("desk", "hub:topics")).toEqual(["weekly"]);
 });
 
+/** The playbooks a role works by: inlined for the project and the hub, read on demand by the desk. */
+const PLAYBOOKS: Readonly<Record<string, readonly string[]>> = {
+  [PROMPTS.desk]: [SKILL_WORKSPACE_ARBITRATION, SKILL_HABIT_DISCOVERY],
+  [PROMPTS.project]: [SKILL_PROJECT_RELAY],
+  [PROMPTS.hub]: [SKILL_DOMAIN_HUB],
+};
+const playbook = (name: string) => BUILTIN_SKILLS.find((s) => s.name === name)!.body;
+
+/** A role's prompt with its playbooks. */
+function textOf(prompt: string): string {
+  return [promptDefs(resolveConfig()).find((p) => p.name === prompt)!.text, ...(PLAYBOOKS[prompt] ?? []).map(playbook)].join("\n");
+}
+
+/** Every model-facing text of the presets, by name. */
+function everyText(): Array<[string, string]> {
+  return [["common", COMMON], ...promptDefs(resolveConfig()).map((p): [string, string] => [p.name, p.text]), ...BUILTIN_SKILLS.map((s): [string, string] => [s.name, s.body])];
+}
+
 describe("conventions: every prompt names only tools its role has", () => {
   it("role prompts and the playbooks they rely on", async () => {
     const h = await boot();
@@ -207,60 +225,82 @@ describe("conventions: every prompt names only tools its role has", () => {
     expect(defs[PROMPTS.worker]).toContain("Asia/Shanghai");
   });
 
-  it("audit 2026-11-23: the contracts the prompts state, each said once and to the roles that need it", async () => {
-    const defs = Object.fromEntries(promptDefs(resolveConfig()).map((p) => [p.name, p.text]));
-    const roles = [PROMPTS.desk, PROMPTS.project, PROMPTS.worker, PROMPTS.checker, PROMPTS.hub];
-    const count = (text: string, needle: string) => text.split(needle).length - 1;
-    for (const name of roles) {
-      const text = defs[name]!;
-      // E20: what "reading" covers is shared, so the hub and the desk read it too — and nobody gets it twice.
-      expect(count(text, "`git fetch`")).toBe(1);
-      // E09: write first, then call the tool that ends the turn.
-      expect(text).toContain("A tool that ends the turn (wait, request_approval, and any tool whose description says so) ends it at once");
-      // E02: the owner's agent's own note is not the owner's words.
-      expect(text).toContain("`[note added by the owner's coding agent — not the owner's words]` is that agent's own background");
-      // E37: ids stay out of what a person reads; E14: a leaf's closing account reaches its parent.
-      expect(text).toContain("instead of giving its id (art_…, act_…, a cell id)");
-      expect(text).toContain("the account a worker or checker ends its turn with is delivered to the cell that started it");
+  // What the 2026-11-23 audits fixed with prompt text (docs/03-bugs/audits). Wording is free to change; what must stay
+  // reachable is listed here: the tools, parameters, note heads and values a role needs to follow a rule at all.
+  it("a role's prompt and its playbooks name what its rules depend on", () => {
+    const needs: Record<string, readonly string[]> = {
+      [PROMPTS.desk]: [
+        "settle_item", "withdraw_card", "[your open cards]", "[your timers that have not fired yet]", "cancel_scheduled", "cancelGroup",
+        "[in-flight child cells]", "[cells waiting on you]", "propose_project", "start_project", "itemId", "fromOwner", "reactivate_item", "source.hit",
+        "approval.revise", "subjectKey", "humanEdited", "artifactId", "定稿", "09:00", "主台补充", "> [!DECISION]", 'waitingFor "human"',
+        "kernel.arbitration_unanswered", "relatedProjectIds", "refId", "close_cell", "quiet: true", "worktree add",
+      ],
+      [PROMPTS.project]: [
+        "dispatch", "finish_project", "update_project", "track_action", "settle_item", "withdraw_card", "inspect_cell", "artifactId", "[your open actions]",
+        "[back from a pause", 'waitingFor "human"', 'kind "escalation"', 'effect "reply"', 'action {name: "phase.advance"}', "cell.direct_chat",
+        "kernel.stalled_check", "不属于本项目的新需求", "git worktree add", "__pycache__", "在独立工作树里做", "main 没有改动", "`check`", "everySec",
+        "deadlineHours", 'echo "state=$s"; test "$s" = MERGED -o "$s" = CLOSED',
+      ],
+      [PROMPTS.worker]: [
+        "git status --short --branch", "__pycache__", "parentCellId", "工作区冲突/公共受阻，请指示", "[steer from", "save_artifact", "patch_artifact",
+        "job_start", "job_observe", "report_to_parent", "request_approval",
+      ],
+      [PROMPTS.checker]: ["report_to_parent", "set_reminder", 'waitingFor "external"', "[your active watches & schedules]"],
+      [PROMPTS.hub]: ["hub:topics", "handback", "spawn_cell", "inspect_cell", "patch_artifact", "superseded", 'waitingFor "human"', "channel:ui:owner", "只做查阅"],
+      [PROMPTS.sensor]: ["no_hit", "report_hit", "artifactId"],
+    };
+    const shared = ["principal owner", "principal agent:…", "[note added by the owner's coding agent — not the owner's words]", "主人要求…", "只做查阅", "inbox:desk", "channel:ui:owner", "request_approval"];
+    for (const [prompt, names] of Object.entries(needs)) {
+      const text = textOf(prompt);
+      for (const name of [...names, ...(prompt === PROMPTS.sensor ? [] : shared)]) expect(text, `${prompt}: ${name}`).toContain(name);
     }
-    for (const name of [PROMPTS.project, PROMPTS.worker]) expect(defs[name]).not.toMatch(/Reading is not dangerous|Reading includes everything/);
-    expect(defs[PROMPTS.desk]).not.toContain("write your chat reply (or send_message when woken asynchronously) **before** calling wait");
-    // E14
-    expect(defs[PROMPTS.worker]).toContain("do not also send it with send_message (that wakes it twice)");
-    // E07, E13, E21, E39, E12 (desk)
-    const desk = defs[PROMPTS.desk]!;
-    expect(desk).toContain("put on a card with its artifactId (present_to_owner or request_approval)");
-    expect(desk).toContain("unless that source already has an open card or project for the same condition: then it is not new");
-    expect(desk).toContain("start_project's itemId");
-    expect(desk).toContain("An errand in the world that no tool here can carry out");
-    expect(desk).toContain("is taken as it is: do not send finished work back to run again");
-    expect(desk).toContain("who merges it (the repository's README or owner rules decide");
-    expect(desk).toContain("Close the fixer (close_cell) once nothing more is expected from it.");
-    // E16, E17, E21, E38 (project)
-    const project = defs[PROMPTS.project]!;
-    expect(project).toContain("**One review action per deliverable.**");
-    expect(project).toContain("A review the owner did not do is never marked done by you");
-    expect(project).toContain("A project is staged only when the owner wants to look at each stage before the next starts");
-    expect(project).toContain("A phase that is the owner's own to do needs no such card");
-    expect(project).toContain("withdraw_card for a card of yours that no longer applies");
-    expect(project).toContain("findings beyond the requested scope are notes, not blockers");
-    expect(project).toContain("rename it (update_cell with its cellId and title)");
-    // E38 (hub)
-    expect(defs[PROMPTS.hub]).toContain("the earlier report is superseded");
-    // E12, E16, E17, E20, E38 in the playbooks
-    const skill = (name: string) => BUILTIN_SKILLS.find((s) => s.name === name)!.body;
-    expect(skill(SKILL_WORKSPACE_ARBITRATION)).toContain("who merges it: the repository's own rules decide");
-    expect(skill(SKILL_WORKSPACE_ARBITRATION)).toContain("Close the fixer (close_cell)");
-    expect(skill(SKILL_PROJECT_RELAY)).toContain("is cancelled, not done, and finish_project's summary says they did not review it");
-    expect(skill(SKILL_PROJECT_RELAY)).toContain("A phase that is the owner's own work needs no such card");
-    expect(skill(SKILL_DOMAIN_HUB)).toContain("a worker that ran `git fetch` to see the new commits did nothing wrong");
-    expect(skill(SKILL_DOMAIN_HUB)).toContain("superseded");
-    // E09: every desk tool that ends the run says so.
+  });
+
+  it("phrases that caused a defect, or came from a test fixture, stay out of every prompt and playbook", () => {
+    const banned: readonly RegExp[] = [
+      /等待上级指示/, // L07: copied into every wait, whatever it was for
+      /grep -qx MERGED/, // M04: a check that is silent about an MR closed without a merge
+      /（或另行 clone）/, // M08: a fix that exists in a throw-away clone only
+      /合并由你决定/, // R10, uc42: copied into deliveries whose README names a maintainer
+      /harness-[ab]\b|录音在哪台机器|MAX_RETRY|改成 3 次|3 samples|ci-shared|to_json|保留现有 parse/,
+    ];
+    for (const [name, text] of everyText()) for (const phrase of banned) expect(text, `${name}: ${phrase}`).not.toMatch(phrase);
+    // M20, uc46, uc56: tool names in the hub's text are copied into review tasks of repositories that do not use them.
+    expect(textOf(PROMPTS.hub)).not.toMatch(/\b(?:gh|glab)\b/);
+  });
+
+  it("what every role shares is said once, in the common part", () => {
+    const count = (text: string, needle: string) => text.split(needle).length - 1;
+    for (const p of promptDefs(resolveConfig())) {
+      if (p.name === PROMPTS.sensor) continue;
+      for (const needle of ["## How this workbench works", "`git fetch`", "`[note added by", "A tool that ends the turn", "主人要求…", "art_…, act_…", "待核实"]) {
+        expect(count(textOf(p.name), needle), `${p.name}: ${needle}`).toBe(1);
+      }
+    }
+  });
+
+  // About 6% above their size after the 2026-11-24 condensation, in bytes. A new rule replaces or qualifies a sentence;
+  // raise a budget only when a role really has more to do.
+  it("prompts and playbooks stay within their size budget", () => {
+    const budget: Record<string, number> = {
+      common: 4_200,
+      [PROMPTS.desk]: 23_100, [PROMPTS.project]: 26_500, [PROMPTS.worker]: 14_600, [PROMPTS.checker]: 8_000, [PROMPTS.hub]: 9_700, [PROMPTS.sensor]: 2_200,
+      [SKILL_PROJECT_RELAY]: 9_700, [SKILL_DOMAIN_HUB]: 3_850, [SKILL_WORKSPACE_ARBITRATION]: 8_100, [SKILL_HABIT_DISCOVERY]: 2_600,
+    };
+    for (const [name, text] of everyText()) expect(Buffer.byteLength(text), name).toBeLessThanOrEqual(budget[name]!);
+  });
+
+  // E09, M14, R08: the tools say what the prompts rely on.
+  it("the desk's card tools say that they end the run; the project's tools take the changed plan and send the closing notice", async () => {
     const h = await boot();
-    const deskTools = h.registry.resolveTools(["gtd.desk", "kernel.comms"]);
+    const deskTools = h.registry.resolveTools([TOOLSETS.desk, "kernel.comms"]);
     for (const name of ["present_to_owner", "propose_project", "request_approval"]) {
       expect(deskTools.find((t) => t.name === name)!.description).toContain("ends your run");
     }
+    const projectTools = h.registry.resolveTools([TOOLSETS.project]);
+    expect(projectTools.find((t) => t.name === "finish_project")!.description).toContain("closing notice");
+    const updateProject = projectTools.find((t) => t.name === "update_project")!;
+    expect(Object.keys((updateProject.inputSchema as { properties: Record<string, unknown> }).properties)).toEqual(expect.arrayContaining(["outcome", "plan", "phases"]));
   });
 
   it("includes deterministic seeded actionIds in the project brief and open human actions in project wake-up tail notes", async () => {

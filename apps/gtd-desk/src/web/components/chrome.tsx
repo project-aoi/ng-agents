@@ -1,4 +1,5 @@
 import { useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type RefObject } from "react";
+import { plainLinks } from "./markdown";
 import { BALL_LABEL, relativeTimeZh, type ActivityKind, type ActivityListDTO, type StatusDTO } from "../../shared/api";
 import { api, callButton } from "../api";
 import { routeHash, toFailure, useDeskId, useNavigate, useNow, useResource, useStatus, useToast, useToasts, type ViewKey } from "../state";
@@ -147,7 +148,7 @@ function StatusPanel({ view, status }: { view: ViewKey; status: StatusDTO }) {
             {delivered.slice(0, 5).map((n) => (
               <li key={n.id}>
                 {n.title && <strong>{n.title} </strong>}
-                <span>{n.text}</span>
+                <span>{plainLinks(n.text)}</span>
                 <span className="muted small"> · {relativeTimeZh(n.at, now)}</span>
               </li>
             ))}

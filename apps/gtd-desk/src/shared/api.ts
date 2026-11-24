@@ -16,7 +16,21 @@
 import type { HumanItem, ProjectProposal, HumanDecision } from "@ng/protocol";
 
 export type HumanDecisionRequest = HumanDecision;
-export interface HumanItemsResponse { items: HumanItemDTO[]; openArtifactIds: string[] }
+export interface HumanItemsResponse {
+  items: HumanItemDTO[];
+  openArtifactIds: string[];
+  /** Questions the background is asking the owner in words (no card); answered in that cell's chat. */
+  questions: OwnerQuestionDTO[];
+}
+export interface OwnerQuestionDTO {
+  cellId: string;
+  /** Who asks, as the owner knows it: "主台", or the project's / worker's title. */
+  from: string;
+  text: string;
+  at: number;
+  /** The asking project is paused or parked: no need to answer until it is brought back. */
+  stopped: boolean;
+}
 export interface HumanDecisionResponse { status: string; activityId?: string; deskStatus: StatusDTO }
 export interface UndoResponse { message: string; deskStatus: StatusDTO }
 export interface ClosedProjectsResponse { projects: Array<{id: string; title: string}> }
@@ -238,7 +252,10 @@ export type SetRoleModelRequest =
 export type UpdateModelsRequest = SetModelRequest | SetRunnerRequest | SetRoleModelRequest;
 
 export interface StatusDTO {
+  /** What waits for the owner: open items that are due, plus the questions cells are asking them in words. */
   humanPending: number;
+  /** Of those, the questions asked in words (no card), answered in the asking cell's chat. Paused and parked cells' are not counted. */
+  humanQuestions: number;
   humanSnoozed: number;
   generatedAt: number;
   backend: string;
@@ -303,6 +320,8 @@ export interface PlanSaveRequest {
     title?: string;
     outcome: string;
     background?: string;
+    /** The external agent's own note on the plan (not the owner's words); null or "" removes it. Omitted: keep it. */
+    agentContext?: string | null;
     runnerOverride?: { engine: RunnerDTO; model?: string; effort?: string } | null;
     actions: Array<{ title: string; owner: BallOwner; effort?: Effort; nextStep?: string }>;
     /** The stages in order, replacing the old ones; [] = not staged. Omitted: keep what the plan says. */
@@ -378,6 +397,8 @@ export interface ProjectRowDTO {
   cwd: string | null;
   lifecycle: "active" | "completed" | "cancelled" | "someday";
   paused: boolean;
+  /** Who paused or parked it, when and with what words ("主人于 11月23日 23:36 放进以后再说，当时的话：「…」"); null when it runs. */
+  pausedText: string | null;
   /** The single ball label the row shows (🔵 > 🟢 > 🟡); null when nothing is open. */
   ball: { owner: BallOwner; label: string; text: string; cardId?: string } | null;
   /** Aggregated progress ("11/15", "已回 2/3"). */
@@ -421,6 +442,8 @@ export type ProjectOutcome = "paused" | "resumed" | "cancelled" | "completed" | 
 export interface ProjectMutationResponse extends MutationResult<RadarDTO, ProjectOutcome> {
   /** action_added: the new action. */
   actionId?: string;
+  /** paused / someday: where the project's work trees were left, one clause each. */
+  workTrees?: string[];
 }
 
 /** POST /api/projects/:projectId/actions — "补上下一步" */
@@ -743,7 +766,14 @@ export interface SensorSourceDTO {
   lastHitAt: number | null;
   lastError: string | null;
   runCount: number;
+  /** How many different results it reported (an unchanged result is reported once). */
   hitCount: number;
+  /** The latest check still found what it last reported (the condition has not gone away). */
+  stillHitting: boolean;
+  /** How many later checks found that same result again without reporting it a second time. */
+  repeats: number;
+  /** "上次检查仍然命中（同样的结果又出现 2 次，没有重复上报）" / "上次检查没有命中" / null before the first run. */
+  lastCheckText: string | null;
   buttons: ButtonDTO[];
 }
 

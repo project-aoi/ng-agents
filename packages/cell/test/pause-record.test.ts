@@ -75,7 +75,11 @@ it("after a resume the coordinator runs first, and an instruction from before th
   // (The worker's result then wakes the project once more.)
   expect(h.of("run.started").map((e) => e.cellId).slice(0, 2)).toEqual(["proj", "w"]);
   // The worker's task predates the pause: it is told so. The project's message came after it: no such note.
-  expect(seen["w"]).toContain("[from before a pause — the owner parked proj (above you, and you with it) at 2026-11-17T01:01:00Z: \"先停一下\"; resumed at 2026-11-17T01:02:00Z.");
+  expect(seen["w"]).toContain("[from before a pause — the owner parked proj (above you, and you with it) at 2026-11-17T01:01:00Z: \"先停一下\"; the owner resumed it at 2026-11-17T01:02:00Z.");
+  // Round 7 (uc74): who resumed it tells the worker what the old instruction is worth — the owner's own restart is
+  // their go-ahead, and the project (which ran first) would have sent a newer message if anything changed.
+  expect(seen["w"]).toContain("The owner resumed it themselves");
+  expect(seen["w"]).toContain("a newer message wins; with none, these stand.");
   expect(seen["w"]).toMatch(/- \S+ \(cell\.task, sent 2026-11-17T01:00:00Z\)/);
   expect(seen["proj"]).not.toContain("[from before a pause");
 });

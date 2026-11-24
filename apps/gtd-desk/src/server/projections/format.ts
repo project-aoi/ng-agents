@@ -1,8 +1,39 @@
 import { BALL_LABEL } from "../../shared/api";
-import { CHANNEL_LABELS, parseAddress, type ItemSource, type Progress, type WaitingSet } from "@ng/protocol";
+import { CELL_PAUSE_KEY, type CellPauseState } from "@ng/cell";
+import { CHANNEL_LABELS, parseAddress, parsePrincipal, type ItemSource, type Progress, type WaitingSet } from "@ng/protocol";
 import { relativeTimeZh, type ArtifactDTO, type ButtonDTO, type DecisionDTO, type ProgressDTO, type SourceInfoDTO, type WaitingDTO } from "../../shared/api";
 import type { DeskKernel } from "./common";
 import { dueText } from "./time";
+
+/** A moment as the owner reads it: their own clock, not UTC ("11月23日 23:36"). */
+export function localTime(ms: number, timeZone?: string): string {
+  const parts = new Intl.DateTimeFormat("zh-CN", { ...(timeZone ? { timeZone } : {}), month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false }).formatToParts(new Date(ms));
+  const get = (t: string) => parts.find((x) => x.type === t)?.value ?? "";
+  return `${get("month")}月${get("day")}日 ${get("hour")}:${get("minute")}`;
+}
+
+export interface PauseInfo {
+  text: string;
+  by: string;
+  at: number;
+  note: string | null;
+  parked: boolean;
+}
+
+/**
+ * Who paused or parked a cell, when and with what words (audit E05) — in plain Chinese, for everyone who looks at it
+ * from outside: the overview, get_project, the answer to "activate", the project list. null when it is not paused.
+ */
+export function pauseInfoOf(kernel: DeskKernel, cellId: string, timeZone?: string): PauseInfo | null {
+  const cell = kernel.getCell(cellId);
+  const p = kernel.context.readStateSync<CellPauseState>(cellId, CELL_PAUSE_KEY);
+  if (!cell || cell.status !== "paused" || !p || p.resumedAt !== undefined) return null;
+  const who = parsePrincipal(p.by, kernel.ownerPrincipal);
+  const by = who.kind === "owner" ? "主人" : who.kind === "agent" ? "主人的编码助手" : p.by === `cell:${cellId}` ? "项目自己" : who.kind === "cell" ? `后台（${who.cellId}）` : p.by;
+  const note = p.note?.trim() ? p.note.trim() : null;
+  const parked = p.reason === "parked";
+  return { by, at: p.pausedAt, note, parked, text: `${by}于 ${localTime(p.pausedAt, timeZone)} ${parked ? "放进以后再说" : "暂停"}${note ? `，当时的话：「${note.length > 200 ? `${note.slice(0, 200)}…` : note}」` : "，没有留话"}` };
+}
 
 export function channelLabel(channelId: string): string {
   return CHANNEL_LABELS[channelId] ?? channelId;
@@ -111,10 +142,25 @@ export function post(path: string, body?: Record<string, unknown>): NonNullable<
 
 const enc = encodeURIComponent;
 
+export const ARTIFACT_EDITOR_PREFIX = "desk:artifact-editor:";
+/** Desk-cell state: which control-plane entrance saved the current version of a document (only when it was the owner's agent). */
+export const artifactEditorKey = (artifactId: string) => `${ARTIFACT_EDITOR_PREFIX}${artifactId}`;
+
+/**
+ * The passages of a project plan (a json document) that are marked for the owner to decide: the same `> [!DECISION]`
+ * convention, looked for in the plan's free text. Line numbers are those of the background text.
+ */
+export function planDecisions(data: unknown): DecisionDTO[] {
+  if (!data || typeof data !== "object") return [];
+  const p = data as { background?: unknown; outcome?: unknown; agentContext?: unknown };
+  return [p.background, p.outcome, p.agentContext].flatMap((t) => (typeof t === "string" ? parseDecisions(t) : []));
+}
+
 export function artifactDTO(kernel: DeskKernel, artifactId: string, now: number): ArtifactDTO | null {
   const a = kernel.context.getArtifactSync(artifactId);
   if (!a) return null;
-  const who = a.updatedBy === "human" ? "你" : "Agent";
+  const editor = a.updatedBy === "human" ? kernel.context.readStateSync<{ version: number; principalId: string }>(kernel.deskCellId, artifactEditorKey(artifactId)) : null;
+  const who = a.updatedBy !== "human" ? "后台" : editor?.version === a.version ? "你的编码助手（按你的意思）" : "你";
   const verb = a.updatedBy === "human" ? "修改" : a.version === 1 ? "起草" : "更新";
   const body = a.content.body;
   return {
@@ -139,7 +185,7 @@ export function artifactDTO(kernel: DeskKernel, artifactId: string, now: number)
       createdAt: p.createdAt,
       dismiss: button({ id: "dismiss_parked", label: "已合并，移除", endpoint: post(`/api/artifacts/${enc(artifactId)}/parked/${enc(p.id)}/dismiss`) }),
     })),
-    decisions: a.content.format === "markdown" || a.content.format === "text" ? parseDecisions(body) : [],
+    decisions: a.content.format === "markdown" || a.content.format === "text" ? parseDecisions(body) : a.content.format === "json" ? planDecisions(a.content.data) : [],
     save: { method: "PUT", path: `/api/artifacts/${enc(artifactId)}` },
   };
 }

@@ -92,8 +92,8 @@ export function createScriptedLoop(opts: ScriptedLoopOptions): AgentLoop {
     const injectSteer = async (): Promise<number> => {
       const messages = ports.drainSteer();
       for (const m of messages) {
-        const text = steerNoteText(m.message);
-        await append({ kind: "system_note", text });
+        const text = steerNoteText(m.message, m.envelope?.principalId);
+        await append({ kind: "system_note", text, envelopeId: m.envelopeId });
         conv.appendUserText(text);
       }
       return messages.length;

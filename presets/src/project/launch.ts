@@ -2,6 +2,7 @@ import type { Kernel } from "@ng/cell";
 import {
   isNgError,
   newId,
+  parsePrincipal,
   sha256Hex,
   type BallOwner,
   type CellSpec,
@@ -57,6 +58,13 @@ export interface ProjectInit {
   id?: string;
   /** The message that triggered the start (possibly the last of several); quoted in the brief unless the brief already contains it. */
   rawInput?: string;
+  /**
+   * Who wrote `brief`: the desk (default), the owner's coding agent (create_project), or the plan the owner confirmed on
+   * a proposal card. The brief's heading says so: what the owner did not say is its writer's addition (audit R07).
+   */
+  briefBy?: "desk" | "agent" | "plan";
+  /** What the owner's coding agent added of its own (create_project's `context`): shown apart, marked as not the owner's words. */
+  agentContext?: string;
   /** Continue from the starting cell's conversation (fork_prefix). */
   continueConversation?: boolean;
   runnerOverride?: RunnerOverride;
@@ -96,6 +104,22 @@ function proposalOf(init: ProjectInit): ProjectProposal | undefined {
   };
 }
 
+/** Who sent the triggering message, when it was neither the owner nor their coding agent (a monitor, another channel). */
+function outsideSender(source: ItemSource | undefined): string | null {
+  if (!source?.principalId) return null;
+  const { kind } = parsePrincipal(source.principalId);
+  return kind === "owner" || kind === "agent" ? null : source.label;
+}
+
+/** The brief already quotes the message: in full (without its "/command" prefix), or a 「…」 passage taken from it. */
+function quotesMessage(brief: string, raw: string): boolean {
+  const squash = (t: string) => t.replace(/\s+/g, "");
+  const message = squash(raw.replace(/^\/[A-Za-z][\w-]*\s+/, ""));
+  if (squash(brief).includes(message)) return true;
+  // A passage may be shortened in the middle: every piece of it is from the message.
+  return [...brief.matchAll(/「([^」]{8,})」/g)].some((m) => squash(m[1]!).split(/…+|\.{3,}/).filter(Boolean).every((piece) => message.includes(piece)));
+}
+
 const OWNER_TEXT: Readonly<Record<BallOwner, string>> = { agent: "交给 worker", human: "主人来做", waiting: "等外部" };
 
 /** Deterministic action id assigned to the i-th valid planned action seeded on a project's first Run. */
@@ -110,11 +134,28 @@ export function renderBrief(init: ProjectInit, projectId?: string): string {
   // The message that triggered the start may be only the last of several: quoted as what it is, and only when the
   // brief does not already carry it.
   const raw = init.rawInput?.trim();
-  section("主人的要求", ...(raw && !init.brief.includes(raw) ? [`触发这次立项的消息（可能只是几条消息中的最后一条）：${raw}`] : []), init.brief.trim());
+  const by = init.briefBy ?? "desk";
+  if (by === "plan") {
+    // The plan stands; what the owner wrote before it existed ("先出方案给我看") has been dealt with by confirming it.
+    section("交办内容（主人在立项卡上确认过的方案）", init.brief.trim());
+  } else {
+    const who = by === "agent" ? "主人的编码助手" : "主台";
+    const sender = outsideSender(init.source);
+    const quoted = !raw || quotesMessage(init.brief, raw)
+      ? []
+      : [sender
+          ? `触发这次立项的消息（来自${sender}，不是主人说的；可能只是几条消息中的最后一条）：${raw}`
+          : `主人的原话（触发这次立项的消息，可能只是几条消息中的最后一条）：「${raw}」`];
+    section(`交办内容（由${who}转述：「」里是主人的原话，其余是${who}自己的说明，不是主人提的要求）`, ...quoted, init.brief.trim());
+  }
+  const note = init.agentContext?.trim();
+  if (note) section("主人的编码助手补充的背景（不是主人的话；要据此改变范围或做决定，先向主人确认）", note);
   section("目标（做到什么算完成）", init.outcome.trim());
   section(
     "工作目录",
-    init.cwd ? `${init.cwd}（这是本项目的目录；要换目录先问主人）` : "未指定。需要读写代码时，先问主人仓库在本机的绝对路径，绝不要猜。",
+    init.cwd
+      ? `${init.cwd}\n（工作台登记的项目目录。这一句是工作台的说明，不是主人说的：另建 worktree、在自己的分支上提交由你安排，换到别的仓库才先问主人。）`
+      : "未指定。需要读写代码时，先问主人仓库在本机的绝对路径，绝不要猜。",
   );
   if (init.repos?.length) {
     section("涉及的仓库", ...init.repos.map((r) => `- ${r.name}：${r.cwd}${r.defaultBranch ? `（默认分支 ${r.defaultBranch}）` : ""}`));
@@ -122,7 +163,7 @@ export function renderBrief(init: ProjectInit, projectId?: string): string {
   if ((init.mode ?? "now") === "research_then_park") {
     section(
       "推进方式：先调研，再停靠",
-      "这是主人先记下来的想法，现在不做实现。派一个只读 worker 调研这件事应该做成什么样（可以参考其他产品的做法），把结论存成调研报告（artifact）。",
+      "这是主人先记下来的想法，现在不做实现。派一个只读 worker 调研这件事应该做成什么样（主人没有限定资料范围时，可以参考其他产品的做法），把结论存成调研报告（artifact）。",
       '报告完成后：用 update_project 写一句结论，然后 finish_project（outcome "someday"）停靠到“以后再说”。主人以后重新提起时会唤醒你。',
     );
   } else {

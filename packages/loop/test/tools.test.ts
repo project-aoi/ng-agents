@@ -15,6 +15,7 @@ import {
   type SendToCellResult,
   type ToolContext,
   type ToolDef,
+  type SettleItemResult,
 } from "@ng/protocol";
 import { createFakeRun, fakeInspection, type FakeRun, type FakeRunOptions } from "../src/testing";
 import { clock, makeRegistry } from "./helpers";
@@ -183,6 +184,55 @@ describe("kernel.comms request_approval / report_to_parent / handback / wait", (
     expect(calls).toEqual([["act_open", "已由项目接手"], ["act_done", "x"], ["act_other", "x"]]);
   });
 
+  // Audit 2026-11-23 rerun R09: the owner settled an open item in conversation ("浇水浇过了") and nothing could close it
+  // on their word — it stayed on their list.
+  it("settle_item closes an item on the owner's word through the kernel and says what happened", async () => {
+    const run = fakeRun();
+    const calls: unknown[] = [];
+    const answers: Record<string, SettleItemResult> = {
+      act_water: { status: "settled" }, act_merge: { status: "needs_owner" }, act_done: { status: "not_pending" },
+      act_manual: { status: "stale", itemRevision: 3, artifactVersion: 2 },
+    };
+    run.ports.settleHumanItem = (id, request) => (calls.push([id, request]), answers[id] ?? { status: "not_found" });
+
+    const settled = await invoke(run, "settle_item", { id: " act_water ", ownerWords: "浇水浇过了", itemRevision: 1 });
+    expect(settled).toMatchObject({ output: expect.stringMatching(/^Recorded: act_water/), data: { id: "act_water", status: "settled" } });
+    expect(settled.isError).toBeFalsy();
+
+    // A card the Gate holds (an outward action, a project start) is settled only by the owner's decision on it.
+    const gated = await invoke(run, "settle_item", { id: "act_merge", ownerWords: "合并吧", itemRevision: 2 });
+    expect(gated).toMatchObject({ isError: true, output: expect.stringContaining("approves an action"), data: { status: "needs_owner" } });
+
+    // The owner was talking about an older version: the refusal names the current ones.
+    const stale = await invoke(run, "settle_item", { id: "act_manual", ownerWords: "手册行了", itemRevision: 2, artifactVersion: 1 });
+    expect(stale).toMatchObject({ isError: true, output: expect.stringMatching(/now rev 3, about v2 of its document/), data: { itemRevision: 3, artifactVersion: 2 } });
+
+    const closed = await invoke(run, "settle_item", { id: "act_done", ownerWords: "行了", itemRevision: 1 });
+    expect(closed).toMatchObject({ output: expect.stringContaining("is no longer open"), data: { status: "not_pending" } });
+    expect(closed.isError).toBeFalsy();
+
+    const missing = await invoke(run, "settle_item", { id: "act_other", ownerWords: "好", itemRevision: 1 });
+    expect(missing).toMatchObject({ isError: true, output: expect.stringMatching(/^There is no open item act_other/) });
+
+    expect(calls).toEqual([
+      ["act_water", { ownerWords: "浇水浇过了", seenItemRevision: 1 }],
+      ["act_merge", { ownerWords: "合并吧", seenItemRevision: 2 }],
+      ["act_manual", { ownerWords: "手册行了", seenItemRevision: 2, seenArtifactVersion: 1 }],
+      ["act_done", { ownerWords: "行了", seenItemRevision: 1 }],
+      ["act_other", { ownerWords: "好", seenItemRevision: 1 }],
+    ]);
+  });
+
+  it("settle_item changes nothing without the owner's words or without the kernel port", async () => {
+    const run = fakeRun();
+    const calls: string[] = [];
+    run.ports.settleHumanItem = (id) => (calls.push(id), { status: "settled" });
+    expect(await invoke(run, "settle_item", { id: "act_water", ownerWords: "   ", itemRevision: 1 })).toMatchObject({ isError: true, output: expect.stringContaining("Invalid input") });
+    expect(calls).toEqual([]);
+    const bare = await invoke(fakeRun(), "settle_item", { id: "act_water", ownerWords: "浇水浇过了", itemRevision: 1 });
+    expect(bare).toMatchObject({ isError: true, output: expect.stringContaining("cannot be settled") });
+  });
+
   it("reports results and silent progress to the parent and updates the roster status line", async () => {
     const run = fakeRun({ cellId: "w1" });
     await invoke(run, "report_to_parent", { kind: "progress", text: "报价已回 2/3", progress: { done: 2, total: 3 } });
@@ -223,6 +273,7 @@ describe("kernel.comms request_approval / report_to_parent / handback / wait", (
       output: "Result recorded. Your run ends now and your parent is told. If a follow-up message reached you first, you are woken with it instead — handle it, then report the updated result.",
       endRun: "completed",
       data: { staged: true },
+      sent: { to: "inbox:desk", text: "失败：上游接口 502" },
     });
     expect(run.ports.log.emitted).toEqual([]);
     expect(run.ports.state.get(CELL_RESULT_CANDIDATE_KEY)).toEqual({ runId: run.snapshot.runId, status: "failed", summary: "失败：上游接口 502", artifactId: "art_log", at: c.now() });
@@ -604,6 +655,26 @@ describe("kernel.context", () => {
       expect(human.output).toContain("at v3 (last edited by human). Your text was kept beside it as a suggestion");
       expect(run.ports.log.parked).toHaveLength(1);
       expect(bodyOf(run, id)).toBe("人工 v3");
+    });
+
+    // Live rerun round 3: renaming a report needed a dummy edit — `edits` had to hold at least one.
+    it("title without edits renames it (a new version, the body unchanged); neither edits nor title is refused", async () => {
+      for (const edits of [undefined, []]) {
+        const { run, id } = await withReport();
+        const r = await invoke(run, "patch_artifact", { artifactId: id, expectedVersion: 1, title: "Harness 对比（终稿）", ...(edits ? { edits } : {}) });
+        expect(r.isError).toBeFalsy();
+        expect(r).toMatchObject({ output: `Saved ${id} v2 (${REPORT.length} chars, 0 edits applied; title now "Harness 对比（终稿）").`, data: { artifactId: id, version: 2, edits: 0 } });
+        expect(run.ports.artifacts.get(id)!.content).toEqual({ format: "markdown", title: "Harness 对比（终稿）", body: REPORT });
+      }
+
+      const { run, id } = await withReport();
+      const commits = run.ports.log.commits.length;
+      for (const args of [{}, { edits: [] }, { edits: [], title: "  " }]) {
+        const r = await invoke(run, "patch_artifact", { artifactId: id, expectedVersion: 1, ...args });
+        expect(r).toMatchObject({ isError: true, output: `Nothing to do: pass at least one edit, or a new title. ${id} stays at v1.`, data: { artifactId: id, version: 1 } });
+      }
+      expect(run.ports.log.commits.length).toBe(commits);
+      expect(run.ports.artifacts.get(id)!.version).toBe(1);
     });
 
     it("refuses a missing artifact and non-text formats", async () => {

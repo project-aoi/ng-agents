@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { Clock } from "../clock";
+import type { Address } from "./envelope";
 import { NgError } from "../errors";
 import type { CellSpec, RunPorts } from "./cell";
 import type { PromptSnapshot } from "./context";
@@ -122,6 +123,11 @@ export interface ToolResult {
    * end `completed` it reports `yielded_waiting` instead.
    */
   awaitsWakeup?: boolean;
+  /**
+   * [ext] This call put words of the cell's before somebody (a message, a closing notice): the address and the text.
+   * What a Run has sent is said — its closing words need not say it again.
+   */
+  sent?: { to: Address; text: string };
 }
 
 export type ToolHandlerReturn = ToolResult | string | Promise<ToolResult | string>;

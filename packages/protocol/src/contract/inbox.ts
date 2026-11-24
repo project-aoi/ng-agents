@@ -220,6 +220,9 @@ export interface InboxMessageFilter {
   deliverAfter?: number;                // [ext] deliver_at > this (e.g. clock.now() → scheduled future rows)
 }
 
+/** `statusReason` of a steer that was taken into a Run under way (one that only woke a resting cell does not have it). */
+export const DRAINED_MID_RUN = "drained mid-run";
+
 /** [ext] One steer message drained mid-run into an active claim. */
 export interface DrainedSteer {
   envelope: Envelope;

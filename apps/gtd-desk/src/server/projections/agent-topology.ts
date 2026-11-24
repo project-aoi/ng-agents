@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
-import { isProjectRoot, workTreeKey, type WaitRecord } from "@ng/cell";
+import { isProjectRoot, workTreeKey, type CellActivity, type WaitRecord } from "@ng/cell";
 import type { ProjectRecord } from "@ng/presets/records";
 import { all, CELL_DIRECT_CHAT_KEY, CELL_STATUS_KEY, get, isLeafLifetime, parsePrincipal, PAYLOAD, pullCursorKey, type CellDirectChatState, type CellRecord, type CellStatusLine, type EvidenceEntry, type JobRecord } from "@ng/protocol";
 import type { AgentVisualState, TopologyDTO, TopologyNodeDTO } from "../../shared/api";
@@ -13,7 +13,6 @@ import { oneLine, callBrief } from "./agent-tool-summaries";
 // What a person reads is plain Chinese — a state is "待命可唤醒", never the machinery behind it — while what a cell
 // touched (paths, commands, outputs, branch names) passes through verbatim.
 
-type Activity = { state: "working" | "waiting" | "dormant" | "idle" | "paused" | "closed"; why: string };
 
 export interface Facts {
   statusLine: string | null;
@@ -34,7 +33,7 @@ export interface AgentsView {
   cells: Map<string, CellRecord>;
   /** By parent id, in creation order. */
   children: Map<string, CellRecord[]>;
-  activity: Map<string, Activity>;
+  activity: Map<string, CellActivity>;
   facts: Map<string, Facts>;
   waits: Map<string, WaitRecord[]>;
   projects: Map<string, ProjectRecord>;
@@ -99,7 +98,7 @@ export function agentsView(input: ProjectionInput, focus?: readonly string[]): A
   for (const l of children.values()) l.sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id));
 
   const open = (focus ? focus.flatMap((id) => cells.get(id) ?? []) : list).filter((c) => c.status !== "closed").map((c) => c.id);
-  const activity = new Map<string, Activity>(kernel.activityOf(open));
+  const activity = new Map<string, CellActivity>(kernel.activityOf(open));
   let facts: Map<string, Facts>;
   if (focus) {
     facts = factsOf(kernel, open, now);
@@ -116,7 +115,7 @@ export function agentsView(input: ProjectionInput, focus?: readonly string[]): A
     walk(kernel.tree());
   }
   const waits = new Map<string, WaitRecord[]>();
-  for (const w of kernel.listWaits(focus ? open : undefined)) waits.set(w.cellId, [...(waits.get(w.cellId) ?? []), w]);
+  for (const w of kernel.listOpenWaits(focus ? open : undefined)) waits.set(w.cellId, [...(waits.get(w.cellId) ?? []), w]);
 
   const projects = new Map(readProjects(kernel).map((p) => [p.cellId, p.record]));
   const cards = new Map<string, Ref>();
@@ -211,11 +210,11 @@ export function isPerson(kernel: DeskKernel, principalId: string): boolean {
 
 const AGENT_NAMES: Readonly<Record<string, string>> = { claude: "Claude Code", codex: "Codex", agy: "Antigravity", antigravity: "Antigravity" };
 
-/** "你" · "你（经主 Agent）" · "你（经 Claude Code）" */
+/** "你" · "你（经编码助手）" · "你（经 Claude Code）" */
 export function personLabel(kernel: DeskKernel, principalId: string, sender?: { id?: string; displayName?: string }): string {
   const p = parsePrincipal(principalId, kernel.ownerPrincipal);
   if (p.kind !== "agent") return "你";
-  const name = (sender?.displayName && sender.displayName !== principalId ? sender.displayName : null) ?? AGENT_NAMES[p.agentId.toLowerCase()] ?? "主 Agent";
+  const name = (sender?.displayName && sender.displayName !== principalId ? sender.displayName : null) ?? AGENT_NAMES[p.agentId.toLowerCase()] ?? "编码助手";
   return `你（经${/^[\x20-\x7e]/.test(name) ? " " : ""}${name}）`;
 }
 
@@ -303,11 +302,11 @@ export function isParked(v: AgentsView, c: CellRecord): boolean {
 function stateOf(v: AgentsView, c: CellRecord): { state: AgentVisualState; stateLabel: string; stateDetail: string | null } {
   const { now, kernel } = v.input;
   if (c.status === "closed") return { state: "archived", stateLabel: "已归档", stateDetail: c.closeReason === "cancelled" ? "已取消" : null };
-  const act = v.activity.get(c.id) ?? { state: c.status === "paused" ? "paused" : "idle", why: "" };
+  const act: CellActivity = v.activity.get(c.id) ?? { state: c.status === "paused" ? "paused" : "idle", why: "" };
   const facts = v.facts.get(c.id);
   if (act.state === "working") {
     const job = facts?.jobs[0];
-    const detail = job ? `后台命令：${oneLine(job.command, 120)}` : act.why.startsWith("a message is waiting") ? "收到新消息，马上开始处理" : runningStep(kernel, c.id);
+    const detail = job ? `后台命令：${oneLine(job.command, 120)}` : act.cause === "message" ? "收到新消息，马上开始处理" : runningStep(kernel, c.id);
     return { state: "running", stateLabel: "运行中", stateDetail: detail };
   }
   if (act.state === "paused") {

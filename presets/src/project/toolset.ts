@@ -58,9 +58,9 @@ const checkInput = z
       .string()
       .min(1)
       .describe(
-        'a shell command run in the checker\'s directory (the project\'s) whose exit status says yes or no, e.g. "gh pr view 142 --json state -q .state | grep -qx MERGED", "test -d /abs/path/to/dir", "glab ci status --branch feat/x | grep -q success"',
+        'a shell command run in the checker\'s directory (the project\'s) whose exit status says yes or no. It prints the state it saw (that is what you are told) and succeeds on every state that ends the waiting, the bad one included: \'s=$(gh pr view 142 --json state -q .state); echo "state=$s"; test "$s" = MERGED -o "$s" = CLOSED\', "ls -d /abs/path 2>&1; test -d /abs/path"',
       ),
-    everySec: z.number().int().min(PROBE.minEverySec).optional().describe(`seconds between checks (default ${PROBE.everySec}, at least ${PROBE.minEverySec})`),
+    everySec: z.number().int().min(PROBE.minEverySec).optional().describe(`seconds between checks (default ${PROBE.everySec}, at least ${PROBE.minEverySec}); 60–120 for a cheap command`),
     until: z
       .enum(["exit_zero", "output_changes"])
       .optional()
@@ -204,7 +204,7 @@ export function projectToolset(): Toolset {
       status: z.enum(["open", "done", "cancelled"]).optional(),
       nextStep: z.string().min(1).optional().describe('the next physical step, e.g. "向张三要 Doubao work 的代码，放到 ~/code/doubao"'),
       phase: z.number().int().min(1).optional(),
-      artifactId: z.string().optional(),
+      artifactId: z.string().optional().describe("the document this action is about (a review of a report or draft has one): the owner's item shows it, and their decision is bound to the version they saw"),
       effort: effort.optional(),
       dueAt: z.string().optional().describe("ISO 8601 with offset"),
       cellId: z
@@ -230,6 +230,7 @@ export function projectToolset(): Toolset {
         ...(args.cellId ? { cellId: args.cellId } : {}),
       };
       let action: ActionRecord;
+      let onOwnersList = false;
       if (args.id === undefined) {
         if (!args.title || !args.owner) return { output: "A new action needs title and owner.", isError: true };
         action = newAction(
@@ -247,6 +248,7 @@ export function projectToolset(): Toolset {
             isError: true,
           };
         }
+        onOwnersList = cur.owner === "human" && cur.status === "open";
         action = patchAction(cur, { ...fields, ...(args.status ? { status: args.status } : {}), ...(args.status === "open" ? { completedAt: null } : {}) }, now);
       }
       if (action.owner === "human") delete action.cellId;
@@ -255,7 +257,7 @@ export function projectToolset(): Toolset {
         action.status !== "open"
           ? "It is closed."
           : action.owner === "human"
-            ? `${action.nextStep ? "" : "It has no nextStep yet: the owner sees it on their list without knowing what to do — add the concrete step. "}Tell the owner once (send_message), then wait with waitingFor "human"; you are woken when they tick it off or answer.`
+            ? `${action.nextStep ? "" : "It has no nextStep yet: the owner sees it on their list without knowing what to do — add the concrete step. "}${onOwnersList ? "The owner's list shows the change." : 'Tell the owner once (send_message), then wait with waitingFor "human"; you are woken when they tick it off or answer.'}`
             : action.owner === "agent" && !action.cellId
               ? "Nobody is on it yet: dispatch it with this actionId when it is time — or, when a worker that already knows the work takes it (send_message), record that worker here with cellId."
               : "";
@@ -265,12 +267,18 @@ export function projectToolset(): Toolset {
 
   const updateProject = tool({
     name: "update_project",
-    description: "Keep the project's record current: the one-line summary on the owner's board (where things stand), and if they changed, its title, outcome or directory.",
+    description:
+      "Keep the project's record current: the one-line summary on the owner's board (where things stand), and — when the owner changed them — its title, outcome, directory, and the plan they approved (its steps and stages): a step the owner dropped must not stay in it.",
     input: z.object({
       summary: z.string().min(1).optional().describe("one line in Chinese: where things stand"),
-      outcome: z.string().min(1).optional().describe("what done looks like"),
+      outcome: z.string().min(1).optional().describe("what done looks like now — rewrite it when the owner changed the scope"),
       title: z.string().min(1).optional(),
       cwd: z.string().optional().describe("absolute path where the project's work happens now"),
+      plan: z
+        .array(z.object({ title: z.string().min(1), owner: z.enum(["agent", "human", "waiting"]), nextStep: z.string().optional() }))
+        .optional()
+        .describe("the plan's steps as they stand after the owner's change — the complete list, replacing the recorded one (the open actions themselves you change with track_action)"),
+      phases: z.array(z.string().min(1)).optional().describe("the stages as the owner now wants them, in order; [] = no longer staged"),
     }),
     async run(args, ctx) {
       const cwd = args.cwd !== undefined ? normalizeCwd(args.cwd) : undefined;
@@ -280,25 +288,43 @@ export function projectToolset(): Toolset {
         ...(args.outcome ? { outcome: args.outcome } : {}),
         ...(args.title ? { title: args.title } : {}),
       };
-      if (Object.keys(patch).length === 0 && !cwd) return { output: "Nothing to update.", isError: true };
+      const replan = args.plan !== undefined || args.phases !== undefined;
+      if (Object.keys(patch).length === 0 && !cwd && !replan) return { output: "Nothing to update.", isError: true };
       if (args.title || args.cwd) await ctx.ports.updateCell(self(ctx),{...(args.title ? {title:args.title} : {}),...(cwd ? {cwd} : {})});
-      const next = patchProject(await projectOf(ctx), patch, now);
+      const current = await projectOf(ctx);
+      // The plan on the record follows the goal: its outcome and title are the project's, its steps and stages the ones given.
+      if (current.proposal || replan) {
+        const base = current.proposal ?? { title: args.title ?? current.title, outcome: args.outcome ?? current.outcome ?? current.title, actions: [] };
+        const { phases: oldPhases, ...rest } = base;
+        const phases = args.phases !== undefined ? (args.phases.length ? args.phases : undefined) : oldPhases;
+        patch.proposal = {
+          ...rest,
+          ...(args.title ? { title: args.title } : {}),
+          ...(args.outcome ? { outcome: args.outcome } : {}),
+          ...(args.plan ? { actions: args.plan.map((a) => ({ title: a.title, owner: a.owner, ...(a.nextStep ? { nextStep: a.nextStep } : {}) })) } : {}),
+          ...(phases ? { phases } : {}),
+        };
+      }
+      const next = patchProject(current, patch, now);
       await save(ctx, { [gtdKeys.project]: next, ...(args.summary ? { [CELL_STATUS_KEY]: statusLine(clip(args.summary, 200), now) } : {}) });
 
-      return `Project record updated${args.summary ? "; the owner's board shows the new summary" : ""}.`;
+      return `Project record updated${args.summary ? "; the owner's board shows the new summary" : ""}${replan ? "; the recorded plan now has the steps and stages you gave" : ""}.`;
     },
   });
 
   const finishProject = tool({
     name: "finish_project",
     description: [
-      "Record the project's end on the owner's board and close (or park) the project cell in one step. It ends your run: tell the owner first.",
+      "Record the project's end on the owner's board and close (or park) the project cell in one step. It ends your run, and your summary is sent to the owner as the closing notice, in full — do not send the same account with send_message first.",
       '"completed": done and accepted. "someday": parked with everything kept, to be brought back later. "cancelled": stopped; what is still running under the project is stopped with it.',
-      'For outcome "completed", every open action (including a human review action that the owner accepted verbally in chat without ticking it off) must be closed with track_action first — otherwise settlement is refused with a conflict listing the unfinished work. Children still at work also block settlement unless closeChildren is true (for cancelled, open work is stopped automatically).',
+      'For outcome "completed", every open action must be closed first (track_action; settle_item for a review the owner accepted in conversation) — otherwise settlement is refused with a conflict listing the unfinished work. Children still at work also block settlement unless closeChildren is true (for cancelled, open work is stopped automatically).',
     ].join(" "),
     input: z.object({
       outcome: z.enum(["completed", "cancelled", "someday"]),
-      summary: z.string().min(1).describe("what was delivered and where it is (artifact, MR link), or why it stops — plain Chinese"),
+      summary: z
+        .string()
+        .min(1)
+        .describe("the closing notice the owner reads, plain Chinese, two or three sentences that do not repeat your delivery notice: what is new since, where the work finally sits (branch, whether main has it, who merges) and what is left for them. Without a delivery notice before it, the whole account: what was delivered and where, what was not verified or decided — or why it stops"),
       retro: z.string().optional().describe("names of confirmed owner preferences you reported to the desk for reuse"),
       closeChildren: z
         .boolean()
@@ -319,21 +345,26 @@ export function projectToolset(): Toolset {
       if (args.retro) record.retro = args.retro;
       patches[gtdKeys.project] = record;
       const label = args.outcome === "completed" ? "已完成" : args.outcome === "cancelled" ? "已停止" : "已放进以后再说";
-      patches[CELL_STATUS_KEY] = statusLine(`${label}：${clip(args.summary.split("\n")[0]!, 150)}`, now);
+      // A summary that itself opens with the label and a break ("已完成：…", "已完成。…") is not labelled twice;
+      // "已完成并验收…" is a sentence of its own and stays whole.
+      const unlabelled = (text: string) => text.replace(new RegExp(`^${label}[：:，,。\\s]+`), "");
+      patches[CELL_STATUS_KEY] = statusLine(`${label}：${clip(unlabelled(args.summary.trim()).split("\n")[0]!, 150)}`, now);
       try {
         if (!ports.settleSelf) return { output: "Project settlement is unavailable.", isError: true };
-        await ports.settleSelf({ action: args.outcome === "completed" ? "complete" : args.outcome === "cancelled" ? "cancel" : "pause", summary: args.summary, ...(args.outcome==="someday" ? {pauseReason:"parked" as const} : {}), statePatches: patches, ...(force ? { force: true } : {}) });
+        // The owner hears it when the project really closes or parks: the kernel may still decline at settlement.
+        const ownerNotice = { body: `「${project.title}」${label}：${unlabelled(args.summary.trim())}`, key: `finish:${self(ctx)}:${ctx.snapshot.runId}` };
+        await ports.settleSelf({ action: args.outcome === "completed" ? "complete" : args.outcome === "cancelled" ? "cancel" : "pause", summary: args.summary, ...(args.outcome==="someday" ? {pauseReason:"parked" as const} : {}), statePatches: patches, ...(force ? { force: true } : {}), ownerNotice });
       } catch (err) {
         if (isNgError(err, "conflict")) return { output: `Nothing was recorded or closed: ${errorText(err)}`, isError: true };
         throw err;
       }
-      const what = "Requested project settlement after this run drains";
+      const what = "Requested project settlement after this run drains; when it is carried out the owner is sent your summary as the closing notice";
       const children =
         args.outcome === "someday" && args.closeChildren
           ? " Child cells still at work are paused with the project, not closed: their running turns and jobs stop, and they come back when it is resumed."
           : "";
       const left = args.outcome !== "cancelled" && open.length > 0 ? ` Note: these actions were still open on the books — ${open.map(describe).join("; ")}.` : "";
-      return { output: `${what}; stop here.${children}${left}`, endRun: "completed" };
+      return { output: `${what}; stop here.${children}${left}`, endRun: "completed", sent: { to: "channel:ui:owner", text: args.summary } };
     },
   });
 

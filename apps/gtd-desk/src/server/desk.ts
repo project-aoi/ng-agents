@@ -80,13 +80,15 @@ import {
   type Located,
   type SkillSuggestion,
 } from "./projections/common";
-import { artifactDTO } from "./projections/format";
+import { artifactDTO, artifactEditorKey, localTime as localTimeOf, pauseInfoOf } from "./projections/format";
 import { projectRadar } from "./projections/radar";
 import { projectReview } from "./projections/review";
 import { projectStatus } from "./projections/status";
+import { unpromptedDeskWords } from "./projections/desk-words";
 import { projectSources } from "./projections/sources";
 import { projectActivity } from "./projections/activity";
 import { createAgentsApi } from "./agents";
+import { workTreeText } from "./work-trees";
 
 
 /** An HTTP-mappable failure: bad input (400), unknown id (404), wrong state (409). */
@@ -218,8 +220,28 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     notifyProjectOfOwnerChangeSync(kernel, projectCellId, text, { principalId: principalOf(as), id: newId("own", clock) });
   }
 
-  /** The words a project hears: "主人…" from the UI, "主人（经主 Agent）…" from the control plane. */
-  const whoText = (as: DeskActor) => (byAgent(as) ? "主人（经主 Agent）" : "主人");
+  /** The words a project hears: "主人…" from the UI, "主人（经编码助手）…" from the control plane. */
+  const whoText = (as: DeskActor) => (byAgent(as) ? "主人（经编码助手）" : "主人");
+
+  const localTime = (ms: number) => localTimeOf(ms, settings.timeZone);
+
+  /** The directories a project and its open cells work in. */
+  function projectDirs(projectId: string): string[] {
+    const ids = [projectId];
+    for (let i = 0; i < ids.length; i++) for (const c of kernel.listCells({ parentId: ids[i]! })) if (c.status !== "closed") ids.push(c.id);
+    return [...new Set(ids.flatMap((id) => kernel.getCell(id)?.spec.cwd ?? []))];
+  }
+
+  /**
+   * Where a project that is stopped part-way leaves its work trees: the owner's repository may sit on a feature branch
+   * with half-done changes, and nothing else tells them.
+   */
+  async function stopped(projectId: string, outcome: ProjectOutcome, message: string): Promise<ProjectMutationResponse> {
+    const workTrees = (await Promise.all(projectDirs(projectId).map(workTreeText))).filter((t) => t !== null);
+    return projectResult(outcome, true, `${message}${workTrees.length ? `。仓库留在原样：${workTrees.join("；")}` : ""}`, { workTrees });
+  }
+
+  const pauseInfo = (cellId: string) => pauseInfoOf(kernel, cellId, settings.timeZone);
 
   /** The GTD records changed here: re-run the kernel's stall check now, so the view answered with is current. */
   function restamp(): void {
@@ -305,6 +327,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
       title: proposal.title,
       outcome: proposal.outcome,
       brief: parkedBrief(proposal, as, note),
+      briefBy: "plan",
       proposal,
       plan: proposal.actions,
       source,
@@ -344,7 +367,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
   function parkedBrief(proposal: ProjectProposal, as: DeskActor, note?: string): string {
     const owners: Record<BallOwner, string> = { agent: "交给 worker", human: "主人来做", waiting: "等外部" };
     return [
-      `${whoText(as)}在立项卡上点了“先放进以后再说”：这个项目先停着，什么都不做。你读到这条消息时，主人已经把它重新启动了——按下面的方案开始推进（方案也在你的项目记录里，proposal 字段）。`,
+      `${whoText(as)}在立项卡上选了“先放进以后再说”：这个项目先停着，什么都不做。你读到这条消息时它已经被重新启动——谁启动的、带了什么话，见本轮开头的说明和后面的消息；确认是主人要现在开始，再按下面的方案推进（方案也在你的项目记录里，proposal 字段）。`,
       note ? `放进以后再说时${whoText(as)}的话：${note}` : "",
       proposal.background ?? "",
       proposal.actions.length ? ["方案里的步骤（启动时自动记入行动记录）：", ...proposal.actions.map((a) => `- [${owners[a.owner]}] ${a.title}${a.nextStep ? `：${a.nextStep}` : ""}`)].join("\n") : "",
@@ -395,7 +418,9 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
         }
         nextRunnerOverride = candidate;
       }
-      const { runnerOverride: _oldRunner, phases: oldPhases, cwd: oldCwd, repos: oldRepos, ...restProposal } = baseProposal;
+      const { runnerOverride: _oldRunner, phases: oldPhases, cwd: oldCwd, repos: oldRepos, agentContext: oldNote, ...restProposal } = baseProposal;
+      if (p.agentContext !== undefined && p.agentContext !== null && typeof p.agentContext !== "string") throw bad("补充说明必须是文字");
+      const agentNote = p.agentContext === undefined ? oldNote : p.agentContext?.trim() ? p.agentContext.trim() : undefined;
       // E17: the stages and directories are part of the plan the owner approves, so they can be changed with it.
       let phases = oldPhases;
       if (p.phases !== undefined) {
@@ -420,6 +445,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
         title: typeof p.title === "string" && p.title.trim() ? p.title.trim() : baseProposal.title,
         outcome: p.outcome.trim(),
         ...(p.background !== undefined ? { background: p.background } : {}),
+        ...(agentNote ? { agentContext: agentNote } : {}),
         ...(nextRunnerOverride ? { runnerOverride: nextRunnerOverride } : {}),
         ...(cwd ? { cwd } : {}),
         ...(repos ? { repos } : {}),
@@ -438,8 +464,18 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
       if (!r.ok) {
         return { ok: false, outcome: "conflict", message: "方案在你编辑时被更新了，请看一下最新版本再保存", current: artifact(art.artifactId) };
       }
+      recordEditor(art.artifactId, r.artifactVersion, as);
       return { ok: true, outcome: "saved", message: `已保存方案 v${r.artifactVersion}`, artifact: artifact(art.artifactId), deskStatus: status() };
     });
+  }
+
+  /**
+   * A document's version saved from the control plane counts as the owner's edit ("human"); that their coding agent
+   * saved it is kept beside it, so that the owner is not told "由你修改" (audit M18).
+   */
+  function recordEditor(artifactId: string, version: number | undefined, as: DeskActor): void {
+    if (version === undefined) return;
+    commitState(desk, { [artifactEditorKey(artifactId)]: byAgent(as) ? { version, principalId: principalOf(as) } : null });
   }
 
   /** A directory the owner named: absolute (or ~/…) and existing on this machine — never guessed. */
@@ -504,6 +540,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
           artifact: artifact(artifactId),
         };
       }
+      recordEditor(artifactId, r.artifactVersion, as);
       return { ok: true, outcome: "saved", message: `已保存 v${r.artifactVersion}`, artifact: artifact(artifactId) };
     });
   }
@@ -548,13 +585,13 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     const open = cell !== undefined && cell.status !== "closed";
     // E05: the words that came with a pause or a parking ("先停一下，我还没想好") are kept on the cell's record.
     const note = as.note?.trim();
-    const control = (action: "pause" | "resume") => kernel.control(projectId, { action, ...(action === "pause" && note ? { note } : {}) }, actorOf(as));
+    const control = (action: "pause" | "resume") => kernel.control(projectId, { action, ...(note ? { note } : {}) }, actorOf(as));
     switch (op) {
       case "pause": {
         if (!open) return projectResult("not_applied", false, "这个项目没有在运行的任务");
         if (cell.status === "paused") return projectResult("paused", true, `「${record.title}」已经暂停了`);
-        const r = control("pause");
-        return r.applied ? projectResult("paused", true, `已暂停「${record.title}」`) : projectResult("not_applied", false, "暂停没有生效");
+        if (!control("pause").applied) return projectResult("not_applied", false, "暂停没有生效");
+        return stopped(projectId, "paused", `已暂停「${record.title}」`);
       }
       case "resume": {
         if (!open) return projectResult("not_applied", false, "这个项目没有可以继续的任务");
@@ -586,26 +623,42 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
           const r = kernel.control(projectId,{action:"pause",pauseReason:"parked",...(note ? {note} : {})},actorOf(as));
           if (!r.applied) return projectResult("not_applied", false, "暂停没有生效");
         }
-        return projectResult("someday", true, `「${record.title}」已移进以后再说，后台任务已暂停，记录和报告都留着`);
+        return stopped(projectId, "someday", `「${record.title}」已移进以后再说，后台任务已暂停，记录和报告都留着`);
       }
       case "activate": {
         if (cell?.pauseReason !== "parked") return projectResult("not_applied", false, "这个项目不在以后再说里");
         if (!open) return projectResult("not_applied", false, "这个项目已结束");
+        const parked = pauseInfo(projectId);
         withTx(kernel.db, () => {
           if (cell.status === "paused") {
             const r = control("resume");
             if (!r.applied) throw wrongState("继续没有生效");
           }
-          tellProject(projectId, activateText(record, as), as);
+          tellProject(projectId, activateText(record, as, parked), as);
         });
-        return projectResult("activated", true, `「${record.title}」重新开始推进，接着之前的记录和报告做`);
+        // Whoever activated it is told what it was parked with.
+        const was = parked ? `（此前${parked.text}）` : "";
+        const words = note ? `，带去的话：「${note}」` : byAgent(as) ? "；这次启动没有带主人的话，项目会先向主人确认再动手" : "";
+        return projectResult("activated", true, `「${record.title}」已从以后再说里拿出来${was}，接着之前的记录和报告做${words}`);
       }
     }
   }
 
-  function activateText(record: ProjectRecord, as: DeskActor): string {
-    const lines = [`${whoText(as)}点了启动：「${record.title}」从以后再说里拿出来了，现在开始推进。先看你的记录和已有报告（read_artifact），从那里接着做，不要从头再来；范围有变化先和主人确认。`];
-    if (as.note?.trim()) lines.push(`${whoText(as)}的话：${as.note.trim()}`);
+  /**
+   * What a parked project hears when it is brought back: who did it — from the control plane that is the owner's coding
+   * agent, not the owner pressing a button — and the owner's words apart from it (audit R01). What to make of them is
+   * in the project's prompt; only what it cannot know is added (from the list the owner sees no chat of its).
+   */
+  function activateText(record: ProjectRecord, as: DeskActor, parked: ReturnType<typeof pauseInfo>): string {
+    const said = as.note?.trim();
+    const lines = [
+      byAgent(as)
+        ? `主人的编码助手把「${record.title}」从以后再说里拿了出来。`
+        : `主人在工作台里把「${record.title}」从以后再说里拿了出来。`,
+    ];
+    if (parked) lines.push(`停靠时的情况：${parked.text}。`);
+    lines.push(said ? `这次带来的主人的话：「${said}」` : "这次没有带来主人的话。");
+    if (!byAgent(as)) lines.push("主人是在项目列表里点的，不在看你的对话：没有能推进的就用 send_message（channel:ui:owner）告诉主人停在哪、需要什么。");
     return lines.join("\n");
   }
 
@@ -632,7 +685,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
       ...(owner === "human" ? { nextStep: nextStep ?? title } : nextStep ? { nextStep } : {}),
       ...(owner === "waiting" ? { waiting: { description: title, parties: [], join: "all" as const } } : {}),
       ...(req.effort ? { effort: req.effort } : {}),
-      source: { label: byAgent(as) ? "主 Agent" : "项目全局", principalId: actorPrincipal, at: t },
+      source: { label: byAgent(as) ? "编码助手" : "项目全局", principalId: actorPrincipal, at: t },
       createdAt: t,
       updatedAt: t,
     };
@@ -807,11 +860,18 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
     principalOf(as);
     if (req?.mode !== "active" && req?.mode !== "observe") throw bad("mode 必须是 active 或 observe");
     const src = sourceRecord(sensorId);
-    commitState(sensorId, { [gtdKeys.source]: { ...src, mode: req.mode, updatedAt: now() } });
+    // A hit that was only noted while observing has not been reported to anyone: marked so, a condition that still holds
+    // is reported at the next check instead of being taken for a repeat (audit R04).
+    const ongoing = req.mode === "active" && src.mode !== "active" && src.lastHitDigest !== undefined;
+    const { lastHitRepeats: _repeats, ...rest } = src;
+    const next: SourceState = ongoing ? { ...rest, lastHitUnreported: true } : src;
+    commitState(sensorId, { [gtdKeys.source]: { ...next, mode: req.mode, updatedAt: now() } });
     return sourcesResult(
       "mode_changed",
       true,
-      req.mode === "observe" ? `「${src.title}」改为只记观察笔记，不再弹卡` : `「${src.title}」命中时会投进信箱`,
+      req.mode === "observe"
+        ? `「${src.title}」改为只记观察笔记，不再弹卡`
+        : `「${src.title}」命中时会投进信箱${ongoing ? "；观察期间记下的命中还没有报给任何人，如果下次检查时仍然命中，会当作新命中报出来" : "；现在仍有问题的话，下次检查就会报"}`,
       sensorId,
     );
   }
@@ -904,8 +964,17 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
       for (const o of item.options) if (o.terminateMode==="cancel_task") closeTargets[o.id]=closureMembers(o.targetCellIds![0]!);
       const projects=item.relatedProjectIds.map(id=>kernel.getCell(id)).filter(p=>p!==undefined)
         .map(p=>({id:p.id,title:p.title?.trim() || "未命名项目"}));
-      const plan=item.action?.type==="project.start" ? (item.artifactId ? context.getArtifactSync(item.artifactId)?.content.data : item.action.proposal) : undefined;
-      return {...item, options:deskOptions(item), resumeTarget:paused ? {id:paused.id, title:paused.title?.trim() || "未命名任务"} : null, proposal:isProjectProposal(plan) ? plan : null, projects, closeTargets, artifact:item.artifactId ? artifactDTO(kernel,item.artifactId,now()) : null,
+      const planArtifact=item.action?.type==="project.start" && item.artifactId ? context.getArtifactSync(item.artifactId) : undefined;
+      const plan=item.action?.type==="project.start" ? (item.artifactId ? planArtifact?.content.data : item.action.proposal) : undefined;
+      // The card row keeps the first draft's title, description and plan; what the owner decides on is the current
+      // version of the plan document, so that is what is shown (audit M18).
+      const stepBy = { human: "主人来做", waiting: "等外部", agent: "交给后台" };
+      const current = isProjectProposal(plan) && item.action?.type === "project.start"
+        ? { title: plan.title, description: [plan.outcome, ...plan.actions.map(a => `- [${stepBy[a.owner]}] ${a.title}`)].join("\n"), action: { ...item.action, proposal: plan },
+            // The desk's preparatory note was written for its own draft; a plan changed since may no longer fit it.
+            ...(item.prep && planArtifact?.updatedBy === "human" ? { prep: { ...item.prep, summary: "" } } : {}) }
+        : {};
+      return {...item, ...current, options:deskOptions(item), resumeTarget:paused ? {id:paused.id, title:paused.title?.trim() || "未命名任务"} : null, proposal:isProjectProposal(plan) ? plan : null, projects, closeTargets, artifact:item.artifactId ? artifactDTO(kernel,item.artifactId,now()) : null,
         project:project ? {id:project.id,title:project.title?.trim() || "未命名项目",paused:project.status==="paused",parked:project.pauseReason==="parked"} : null,
       };
     }),
@@ -915,7 +984,7 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
         return withTx(kernel.db, () => {
           const item = kernel.humanItems.get(id);
           if (!item) throw missing("找不到这件事项");
-          if (!deskOptions(item).some(o => o.id === decision.optionId)) throw wrongState("选项已变更");
+          if (!deskOptions(item).some(o => o.id === decision.optionId)) throw wrongState(`选项已变动：现在可选 ${deskOptions(item).map(o => o.id).join("、")}`);
           return parkProposal(id, decision, as);
         });
       }
@@ -939,7 +1008,10 @@ export function createDesk({ kernel, ui, settings, onError = (err, where) => con
       }
     },
     undoHumanDecision: (activityId: string, as: DeskActor) => kernel.humanItems.undo(activityId,principalOf(as)),
-    reopenProject: async (projectId: string, as: DeskActor) => ({restored:await kernel.reopenProject(projectId,principalOf(as))}),
+    localTime,
+    unpromptedWords: (since: number) => unpromptedDeskWords(input(), since),
+    reopenProject: async (projectId: string, as: DeskActor, words?: { text?: string; agentContext?: string }) => ({restored:await kernel.reopenProject(projectId,principalOf(as),words)}),
+    pauseInfo,
     radar,
     review,
     sources,

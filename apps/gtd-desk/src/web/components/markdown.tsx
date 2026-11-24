@@ -1,4 +1,5 @@
 import { Fragment, useMemo, type ReactNode } from "react";
+import { useOpenReport } from "../state";
 
 // Read-only Markdown for reports, replies and project notes. Builds React elements (never HTML strings), so nothing in
 // the text can inject markup. Covers what agents actually write: headings, paragraphs, lists (nested, tasks), fenced
@@ -190,6 +191,21 @@ function safeHref(url: string): string | null {
   return /^(?:https?:\/\/|mailto:)/i.test(url) ? url : null;
 }
 
+/** A report or draft of the workbench named in a text (`[标题](artifact://…)`): opens it, never shows its address. */
+function ReportLink({ artifactId, title }: { artifactId: string; title: string }) {
+  const openReport = useOpenReport();
+  return (
+    <button type="button" className="link-btn" onClick={() => openReport({ artifactId, title, version: 0, updatedAt: 0 })}>
+      {title}
+    </button>
+  );
+}
+
+/** A text with its links reduced to their words — for one-line places that render no Markdown. */
+export function plainLinks(text: string): string {
+  return text.replace(/\[([^\]]+)\]\(\s*[a-z][a-z0-9+.-]*:\/\/[^)\s]*\s*\)/gi, "《$1》");
+}
+
 function ExternalLink({ href, children }: { href: string; children: ReactNode }) {
   return (
     <a href={href} target="_blank" rel="noreferrer noopener">
@@ -211,8 +227,11 @@ export function renderInline(text: string, key = "i"): ReactNode[] {
     else if (m[3] !== undefined) out.push(<code key={k}>{m[3].replace(/^ (.+) $/, "$1")}</code>);
     else if (m[4] !== undefined) {
       const href = safeHref(m[5]!);
+      const report = /^artifact:\/\/([A-Za-z0-9_-]+)/.exec(m[5]!);
       out.push(
-        href ? (
+        report ? (
+          <ReportLink key={k} artifactId={report[1]!} title={m[4]} />
+        ) : href ? (
           <ExternalLink key={k} href={href}>
             {renderInline(m[4], k)}
           </ExternalLink>

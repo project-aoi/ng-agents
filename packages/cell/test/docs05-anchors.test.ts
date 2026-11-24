@@ -409,7 +409,7 @@ it("shows a coordinator a human edit on a descendant's shared artifact", async (
   h.kernel.sendToCell("proj",{text:"查看共享文档"}, { principalId: h.kernel.ownerPrincipal });
   await h.kernel.idle();
   const prompt = requestText(h.script.callsOf("proj").at(-1)!);
-  expect(prompt).toContain("[human-edited artifacts]");
+  expect(prompt).toContain("[human-edited artifacts");
   expect(prompt).toContain("art_report v2");
 });
 
@@ -549,9 +549,13 @@ it("grounds waits on the desk while a related fixer's result is pending or claim
   h.kernel.inbox.cancelScheduledSync({ cellId: "fixer" });
   for (const m of h.kernel.inbox.listMessagesSync({ cellId: "fixer", status: ["pending"] })) h.kernel.inbox.consumePendingSync("fixer", m.envelope.id, h.kernel.getCell("fixer")!.epoch);
   expect(h.kernel.anchorsOf("proj")).toMatchObject({ internal: false, stalled: true });
-  h.kernel.inbox.enqueueSync("desk", createEnvelope({ from: "inbox:fixer", to: "inbox:desk", principalId: "cell:fixer", kind: "result", type: PAYLOAD.cellResult,
-    payload: { childCellId: "fixer", status: "completed", summary: "ci 已修复", childState: "dormant" } }, h.clock));
+  const result = createEnvelope({ from: "inbox:fixer", to: "inbox:desk", principalId: "cell:fixer", kind: "result", type: PAYLOAD.cellResult,
+    payload: { childCellId: "fixer", status: "completed", summary: "ci 已修复", childState: "dormant" } }, h.clock);
+  h.kernel.inbox.enqueueSync("desk", result);
   expect(h.kernel.anchorsOf("proj")).toMatchObject({ internal: true, stalled: false });
-  // The fixer was started for "proj" only: its result says nothing about "other".
+  // The fixer was started for "proj" only: its result says nothing about "other". But the desk has not read its mail
+  // yet, and whether it answers "other" is known when it has (audit 2026-11-23 rerun R02) — not before.
+  expect(h.kernel.anchorsOf("other")).toMatchObject({ internal: true, stalled: false });
+  h.kernel.inbox.consumePendingSync("desk", result.id, h.kernel.getCell("desk")!.epoch);
   expect(h.kernel.anchorsOf("other")).toMatchObject({ internal: false, stalled: true });
 });

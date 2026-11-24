@@ -2,7 +2,7 @@ import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { createEnvelope, createRegistry, makeBounds, TOOL_KINDS, type Address, type CliEngine, type PolicyBounds, type Registry, type RunOutcome } from "@ng/protocol";
+import { createEnvelope, createRegistry, makeBounds, TOOL_KINDS, type Address, type CliEngine, type PolicyBounds, type Registry, type RunOutcome, type Envelope } from "@ng/protocol";
 import {
   CLI_FORK_SESSION_KEY,
   CLI_SESSION_KEY,
@@ -474,6 +474,98 @@ describe.each(ENGINES)("CLI loop with a fake %s", (engine) => {
     const r = s.run();
     expect(await runOf(s, r)).toBe("yielded_waiting");
     expect(r.ports.log.evidence.filter((e) => e.kind === "assistant_text").map((e) => e.text)).toEqual(["方案已提交到待我处理，等你确认后开始。"]);
+  });
+
+  // Audit 2026-11-23 rerun M15: with nothing left to say, the model answered the notice with "OK" (or repeated what it
+  // had already sent) — and that became the turn's last words on the record the owner reads.
+  it("does not keep a bare acknowledgement after the tool that ended the run, and tells the model not to repeat itself", async () => {
+    // The acknowledgement the notice asks for, however it is dressed; a sentence that starts with it is still kept.
+    const closings: Array<[string, boolean]> = [
+      ["OK", false],
+      ['"OK."', false],
+      ["**OK**", false],
+      ["OK，方案已提交到待我处理。", true],
+    ];
+    for (const [closing, kept] of closings) {
+      const s = setup(engine, [{ actions: [{ mcp: "wait", args: { reason: "等主人确认", waitingFor: "human" } }, { text: closing }] }]);
+      const r = s.run();
+      expect(await runOf(s, r)).toBe("yielded_waiting");
+      const said = r.ports.log.evidence.filter((e) => e.kind === "assistant_text").map((e) => e.text);
+      expect(said, closing).toEqual(kept ? [closing] : []);
+      // What the model read in the result of the tool that ended its run.
+      const notice = String(s.fake.log().find((e) => e.type === "mcp_result")?.["text"]);
+      expect(notice).toContain("do not repeat");
+      expect(notice).toContain('nothing but "OK"');
+    }
+  });
+
+  // Live rerun (uc23, uc06): a project woken by a worker's result said what it did, called wait from a script that
+  // swallowed the tool result (so it never read the request to keep quiet), and then wrote the same account again —
+  // on the record the owner reads, every turn. Words after the end are an answer only when a person is being
+  // answered, or when they are the only thing the turn said.
+  it("keeps closing words for a person or when nothing was said before; drops a recap in a turn nobody is talking in", async () => {
+    const fromWorker = () => createEnvelope({ id: "res_1", from: "inbox:w1", to: "inbox:cell_1", principalId: "cell:w1", kind: "result", type: "cell.result",
+      payload: { childCellId: "w1", status: "completed", summary: "改好了", childState: "dormant" } });
+    const turn = [{ actions: [{ text: "分身交付了，我去通知主人并等验收。" }, { mcp: "wait", args: { reason: "等主人验收", waitingFor: "human" } }, { text: "已通知主人，现在等待验收：改动在 feat/x。" }] }];
+    const said = (r: ReturnType<ReturnType<typeof setup>["run"]>) => r.ports.log.evidence.filter((e) => e.kind === "assistant_text").map((e) => e.text);
+
+    // Woken by a cell: the recap after the end is not kept.
+    const quiet = setup(engine, turn);
+    const r1 = quiet.run({ batch: [fromWorker()] });
+    expect(await runOf(quiet, r1)).toBe("yielded_waiting");
+    expect(said(r1)).toEqual(["分身交付了，我去通知主人并等验收。"]);
+
+    // The same turn in answer to the owner: what it says after the end is their answer.
+    const chat = setup(engine, turn);
+    const r2 = chat.run({ batch: ["验收前先说说现在到哪了"] });
+    expect(await runOf(chat, r2)).toBe("yielded_waiting");
+    expect(said(r2)).toEqual(["分身交付了，我去通知主人并等验收。", "已通知主人，现在等待验收：改动在 feat/x。"]);
+
+    // Woken by a cell and silent until the end: the closing words are all there is, and they are kept.
+    const only = setup(engine, [{ actions: [{ mcp: "wait", args: { reason: "等主人验收", waitingFor: "human" } }, { text: "已通知主人，等验收。" }] }]);
+    const r3 = only.run({ batch: [fromWorker()] });
+    expect(await runOf(only, r3)).toBe("yielded_waiting");
+    expect(said(r3)).toEqual(["已通知主人，等验收。"]);
+  });
+
+  // Live rerun round 7 (uc73): the desk asked its question, called wait, and said the question again as its closing
+  // words — both were on its record and both went to the owner's agent.
+  it("does not record closing words that only repeat what the turn already said, also when a person is listening", async () => {
+    const said = (r: ReturnType<ReturnType<typeof setup>["run"]>) => r.ports.log.evidence.filter((e) => e.kind === "assistant_text").map((e) => e.text);
+    const asked = setup(engine, [{ actions: [{ text: "这份手册要针对 harness-a、harness-b，还是两者都包括？" }, { mcp: "wait", args: { reason: "等主人确认范围", waitingFor: "human" } }, { text: "这份手册要针对 harness-a、harness-b,还是两者都包括?" }] }]);
+    const r1 = asked.run({ batch: ["先出方案：写一份权限上线手册"] });
+    expect(await runOf(asked, r1)).toBe("yielded_waiting");
+    expect(said(r1)).toEqual(["这份手册要针对 harness-a、harness-b，还是两者都包括？"]);
+
+    // New words after it are kept.
+    const added = setup(engine, [{ actions: [{ text: "已交给分身。" }, { mcp: "wait", args: { reason: "等结果", waitingFor: "external" } }, { text: "大约十分钟有结果。" }] }]);
+    const r2 = added.run({ batch: ["手册进展如何"] });
+    expect(await runOf(added, r2)).toBe("yielded_waiting");
+    expect(said(r2)).toEqual(["已交给分身。", "大约十分钟有结果。"]);
+  });
+
+  // Live round 11 (uc02): woken by a worker's result, the project sent the owner a notice, waited, and said it again — in
+  // every turn. What a tool reports as sent (ToolResult.sent) counts as said.
+  it("what the turn sent counts as said: a recap of it is not recorded, unless a person is still waiting for an answer", async () => {
+    const said = (r: ReturnType<ReturnType<typeof setup>["run"]>) => r.ports.log.evidence.filter((e) => e.kind === "assistant_text").map((e) => e.text);
+    const result = () => createEnvelope({ id: "res_1", from: "inbox:w1", to: "inbox:cell_1", principalId: "cell:w1", kind: "result", type: "cell.result",
+      payload: { childCellId: "w1", status: "completed", summary: "改好了", childState: "dormant" } });
+    const send = (to: string) => ({ mcp: "send_message", args: { to, text: "修复已提交 MR !1，main 没有改动。", summary: "交付" } });
+    const wait = { mcp: "wait", args: { reason: "等验收", waitingFor: "human" } };
+    const closing = { text: "修复已提交，等待验收和维护者合并。" };
+    const outcome = async (actions: object[], batch: Array<string | Envelope>) => {
+      const s = setup(engine, [{ actions: actions as never }]);
+      const r = s.run({ batch });
+      expect(await runOf(s, r)).toBe("yielded_waiting");
+      return said(r);
+    };
+    // Nobody is talking: whatever was sent, to the owner or to a cell, the closing words recap it.
+    expect(await outcome([send("channel:ui:owner"), wait, closing], [result()])).toEqual([]);
+    expect(await outcome([send("inbox:w1"), wait, closing], [result()])).toEqual([]);
+    // A person spoke and was answered by the notice: the same.
+    expect(await outcome([send("channel:ui:owner"), wait, closing], ["现在到哪了"])).toEqual([]);
+    // A person spoke and only a worker was written to: these words are their answer.
+    expect(await outcome([send("inbox:w1"), wait, closing], ["现在到哪了"])).toEqual([closing.text]);
   });
 
   // Audit 2026-11-23 E33: a kernel killed in the middle of a cell's first turn lost the CLI session (it was put on

@@ -105,7 +105,11 @@ export interface JobResultPayload {
   exitCode: number | null;
   tail: string;                         // last lines of output
   logUri?: string;                      // res:// URI of the full log, if stored
-  durationMs?: number;
+  durationMs?: number;                  // wall time from start to end
+  /** How much of `durationMs` the host stood still (asleep, suspended): the job did not run then, and that time is not counted against its time limit. */
+  standstillMs?: number;
+  /** Said in words when there was a standstill, so that nobody reads "ran longer than its limit" into the wall time. */
+  note?: string;
   error?: string;                       // infrastructure or timeout error reason, if any
 }
 
@@ -131,6 +135,11 @@ export interface CellResultPayload {
   data?: unknown;
   /** Where the child is after this: "dormant" = still there, any message wakes it on its session; "closed" = gone. */
   childState?: "dormant" | "closed";
+  /**
+   * The account the child had ended on when somebody then spoke to it. `summary` is what it said after that — often only
+   * a short answer to the newcomer — so the account of the work may be here. Absent when nobody did.
+   */
+  saidBefore?: string;
   /** Facts about the settled turn, gathered by the kernel without a model (wakeable children only). */
   turn?: SettledTurn;
 }
@@ -150,6 +159,8 @@ export interface SettledTurn {
   outcome: "completed" | "failed" | "refused";
   /** The last thing the child said, shortened; null when it said nothing. */
   preview: string | null;
+  /** How many messages the child sent its parent since its previous settled turn (questions it stopped for), if any. */
+  messagesToParent?: number;
 }
 
 /** Intermediate report (e.g. "2/3 quotes back"); parents usually take it silently (delivery silent_inject). */
@@ -220,6 +231,8 @@ export interface CellMessagePayload {
   conversationId?: string;
   /** The owner's coding agent's own note on the owner's words (see UserMessagePayload.agentContext). */
   agentContext?: string;
+  /** Another cell passes the owner's words on: the id of the owner's message they come from. */
+  ownerMessageId?: string;
 }
 
 /**
@@ -357,6 +370,7 @@ export const kernelPayloadSchemas = {
     artifactId: z.string().optional(),
     data: z.unknown().optional(),
     childState: z.enum(["dormant", "closed"]).optional(),
+    saidBefore: z.string().optional(),
     turn: z
       .looseObject({
         runId: z.string(),
@@ -368,6 +382,7 @@ export const kernelPayloadSchemas = {
         steps: z.number().int(),
         outcome: z.enum(["completed", "failed", "refused"]),
         preview: z.string().nullable(),
+        messagesToParent: z.number().optional(),
       })
       .optional(),
   }),

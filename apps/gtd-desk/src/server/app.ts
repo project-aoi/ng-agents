@@ -111,7 +111,7 @@ export function createDeskApp(deps: DeskAppDeps): Hono {
   app.post("/api/capture", async (c) => c.json(await desk.ingest(await body(c),ownerActor)));
 
   app.get("/api/projects/closed", c => c.json({projects:desk.recentlyClosedProjects()}));
-  app.get("/api/human-items", c => c.json({ items: desk.listHumanItems(), openArtifactIds: desk.openArtifactIds() }));
+  app.get("/api/human-items", c => c.json({ items: desk.listHumanItems(), openArtifactIds: desk.openArtifactIds(), questions: desk.questions().map((q) => ({ cellId: q.cellId, from: q.desk ? "主台" : (q.title ?? q.cellId), text: q.text, at: q.at, stopped: q.stopped })) }));
   app.post("/api/human-items/:id/decide", async (c) => {
     const result = await desk.decideHumanItem(c.req.param("id"), await body(c), ownerActor);
     return c.json({ ...result, deskStatus: desk.status() });

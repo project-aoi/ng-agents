@@ -10,7 +10,7 @@ const jobStart = defineTool({
     "Start a long-running command (build, test suite, migration) as a background job that outlives this run. You are woken with a job.result message when it ends, so you can finish your turn instead of waiting.",
   input: z.object({
     command: z.string().min(1),
-    timeoutMs: z.number().int().min(1_000).optional().describe("max runtime in ms (clamped to the workspace ceiling; defaults to workspace job timeout)"),
+    timeoutMs: z.number().int().min(1_000).optional().describe("max run time in ms. Default 30 minutes — give more for anything that may run longer (a soak test, a long build); clamped to the workspace ceiling. Time the machine was asleep does not count"),
   }),
   async handler(args, ctx) {
     const spec: { command: string; timeoutMs?: number } = { command: args.command };

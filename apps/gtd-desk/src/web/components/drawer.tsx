@@ -186,7 +186,7 @@ function SensorRow({ s, now, onRun }: { s: SensorSourceDTO; now: number; onRun(b
         {s.scheduleText} · {s.processorLabel} · {s.modeLabel}
       </p>
       <p className="muted small">
-        上次运行 {ago(s.lastRunAt, now)} · 上次命中 {ago(s.lastHitAt, now)} · 共运行 {s.runCount} 次，命中 {s.hitCount} 次
+        上次运行 {ago(s.lastRunAt, now)} · 上次命中 {ago(s.lastHitAt, now)} · 共运行 {s.runCount} 次，{s.mode === "observe" ? "记下" : "记下或报出"} {s.hitCount} 次{s.lastCheckText ? ` · ${s.lastCheckText}` : ""}
       </p>
       {s.lastError && <p className="src-error">{s.lastError}</p>}
       <ButtonRow buttons={s.buttons} onRun={onRun} size="sm" />

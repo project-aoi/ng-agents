@@ -133,7 +133,7 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     dataDir,
     registry,
     rosterProvider: (cellId) => core.readModel.childSummaries(cellId),
-    tailNotesProvider: (cellId, incoming) => core.readModel.tailNotes(cellId, incoming),
+    tailNotesProvider: (cellId, incoming, runId) => core.readModel.tailNotes(cellId, incoming, runId),
     ...opts.context,
   });
   const workspace = createWorkspaceManager({
@@ -467,6 +467,7 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
     inspectCell: (cellId, o) => inspectCell(core, cellId, o),
     anchorsOf: (cellId) => core.readModel.anchorsOf(cellId),
     listWaits: (cellIds) => core.waits.list(cellIds),
+    listOpenWaits: (cellIds) => core.readModel.openWaits(cellIds),
     sendToCell: (cellId, message, o) => {
       const principalId = requirePrincipalId(o?.principalId);
       return sendCellMessage(core, { from: KERNEL_FROM.control, principalId, sender: principalId, toCellId: cellId, id: message.id ?? newId("msg", clock), message });

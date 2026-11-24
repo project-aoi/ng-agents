@@ -1,6 +1,7 @@
 import { gtdKeys } from "@ng/presets";
+import { MESSAGE_ARRIVED, NOT_CARRIED_OUT, WAIT_HUMAN } from "@ng/cell";
 import { join } from "node:path";
-import { CELL_DIRECT_CHAT_KEY, get, KERNEL_FROM, parsePrincipal, PAYLOAD, steerNoteText, type ApprovalResolvedPayload, type CellDirectChatPayload, type CellDirectChatState, type CellMessagePayload, type CellProgressPayload, type CellRecord, type CellResultPayload, type CellTaskPayload, type ControlSteerPayload, type Envelope, type EvidenceEntry, type HandbackPayload, type JobResultPayload, type SourceHitPayload, type StepOrExternalEvidence, type TimerFiredPayload, type UserMessagePayload, type WaitTimeoutPayload } from "@ng/protocol";
+import { all, CELL_DIRECT_CHAT_KEY, DRAINED_MID_RUN, get, KERNEL_FROM, parsePrincipal, PAYLOAD, speaks, STEER_NOTE_HEAD, type ApprovalResolvedPayload, type CellDirectChatPayload, type CellDirectChatState, type CellMessagePayload, type CellProgressPayload, type CellRecord, type CellResultPayload, type CellTaskPayload, type ControlSteerPayload, type Envelope, type EvidenceEntry, type HandbackPayload, type JobResultPayload, type SourceHitPayload, type StepOrExternalEvidence, type TimerFiredPayload, type UserMessagePayload, type WaitTimeoutPayload } from "@ng/protocol";
 import type { ArtifactRefDTO, ButtonDTO, CellJobDTO, CellTimelineDTO, ComposerDTO, ResourcePageDTO, TimelineItemDTO, ToolStepDTO, TopologyNodeDTO } from "../../shared/api";
 import { type DeskKernel, type ProjectionInput } from "./common";
 import { button, channelLabelOfAddress, enc, post } from "./format";
@@ -70,6 +71,8 @@ function inboundItem(ctx: BuildCtx, seq: number, at: number, env: Envelope): Tim
     }
     case PAYLOAD.cellMessage: {
       const p = payloadOf<CellMessagePayload>(env);
+      // Sent on a person's doing (they undid something), not spoken by them: what they said is from themselves.
+      if (person && !speaks(env)) return { ...base, id: e, kind: "system_event", text: p.text };
       if (person && env.from === KERNEL_FROM.control) {
         return { ...base, id: env.id, kind: "user_chat", text: p.text, senderLabel: personLabel(kernel, env.principalId), direct: true, mode: "enqueue", syncedTo, replyToId: p.replyToId ?? null };
       }
@@ -77,7 +80,8 @@ function inboundItem(ctx: BuildCtx, seq: number, at: number, env: Envelope): Tim
     }
     case PAYLOAD.controlSteer: {
       const p = payloadOf<ControlSteerPayload>(env);
-      if (person) return { ...base, id: env.id, kind: "user_chat", text: p.message, senderLabel: personLabel(kernel, env.principalId), direct: true, mode: "steer", syncedTo, replyToId: null };
+      // "立即打断" only when it did interrupt a turn; a steer to a cell at rest simply woke it.
+      if (person) return { ...base, id: env.id, kind: "user_chat", text: p.message, senderLabel: personLabel(kernel, env.principalId), direct: true, mode: interrupted(kernel, ctx.cell.id, env.id) ? "steer" : "enqueue", syncedTo, replyToId: null };
       const from = parsePrincipal(env.principalId, kernel.ownerPrincipal);
       return { ...base, id: e, kind: "peer_message", fromLabel: `${from.kind === "cell" ? cellLabel(v, from.cellId) : "上级"}（插话）`, text: p.message };
     }
@@ -85,8 +89,9 @@ function inboundItem(ctx: BuildCtx, seq: number, at: number, env: Envelope): Tim
       const p = payloadOf<CellResultPayload>(env);
       const child = v.cells.get(p.childCellId);
       const name = child ? titleOf(v, child) : "分身";
+      // The turn's result is its last words; what it had reported before it was spoken to again is named as that.
       const said = reportText(p.summary);
-      const summary = said ? `：${clip(said, 300)}` : "";
+      const summary = `${said ? `：${clip(said, 300)}` : ""}${said && p.saidBefore ? `（再次收到消息之前报告过：${clip(p.saidBefore, 200)}）` : ""}`;
       if ((p.data as { synthetic?: unknown } | undefined)?.synthetic === true) {
         const by = (p.data as { closedBy?: unknown }).closedBy;
         const who = typeof by === "string" && isPerson(kernel, by) ? personLabel(kernel, by) : null;
@@ -114,7 +119,8 @@ function inboundItem(ctx: BuildCtx, seq: number, at: number, env: Envelope): Tim
       const p = payloadOf<CellDirectChatPayload>(env);
       const who = personLabel(kernel, env.principalId);
       const child = p.childTitle ?? (v.cells.get(p.childCellId)?.title ?? "分身");
-      return { ...base, id: e, kind: "system_event", text: p.mode === "steer" ? `${who}打断了分身「${child}」：${p.text}` : `${who}直接对分身「${child}」说：${p.text}` };
+      const cut = p.mode === "steer" && interrupted(kernel, p.childCellId, p.messageId);
+      return { ...base, id: e, kind: "system_event", text: cut ? `${who}打断了分身「${child}」：${p.text}` : `${who}直接对分身「${child}」说：${p.text}` };
     }
     case PAYLOAD.jobResult: {
       const p = payloadOf<JobResultPayload>(env);
@@ -134,7 +140,7 @@ function inboundItem(ctx: BuildCtx, seq: number, at: number, env: Envelope): Tim
       return { ...base, id: e, kind: "system_event", text: `等待超时：${payloadOf<WaitTimeoutPayload>(env).reason}` };
     case PAYLOAD.approvalResolved: {
       const p = payloadOf<ApprovalResolvedPayload>(env);
-      const who = p.approverId && p.approverId !== kernel.ownerPrincipal && isPerson(kernel, p.approverId) ? "主 Agent 代你" : "你";
+      const who = p.approverId && p.approverId !== kernel.ownerPrincipal && isPerson(kernel, p.approverId) ? "编码助手代你" : "你";
       const what = p.action?.summary ?? "一张卡";
       const text =
         p.status === "approved"
@@ -171,14 +177,13 @@ function reportText(summary: string | undefined): string | null {
   return t;
 }
 
-const STEER_PREFIX = steerNoteText("");
 const SCRIPT_FAILED = /^\[script (.+?) exited with code (-?\d+)\]\n?([\s\S]*)$/;
 
 function noteItem(ctx: BuildCtx, seq: number, at: number, text: string): TimelineItemDTO | null {
   const { v, syncedTo } = ctx;
   const { kernel } = v.input;
-  if (text.startsWith(STEER_PREFIX)) {
-    const message = text.slice(STEER_PREFIX.length);
+  if (STEER_NOTE_HEAD.test(text)) {
+    const message = text.replace(STEER_NOTE_HEAD, "");
     const origin = steerOrigin(ctx, message);
     if (origin && !isPerson(kernel, origin.principalId)) {
       const from = parsePrincipal(origin.principalId, kernel.ownerPrincipal);
@@ -191,19 +196,23 @@ function noteItem(ctx: BuildCtx, seq: number, at: number, text: string): Timelin
     const tail = script[3]!.trim();
     return { seq, at, id: `e${seq}`, kind: "system_event", text: `脚本 ${script[1]} 运行失败（退出码 ${script[2]}）${tail ? `\n${clip(tail.slice(-600), 600)}` : ""}` };
   }
-  if (/^\[(closing|cancelling) this cell was not carried out/.test(text)) {
-    return { seq, at, id: `e${seq}`, kind: "system_event", text: "这次收尾没有完成：还有分身在工作，等它们结束后再收尾" };
+  if (NOT_CARRIED_OUT.test(text)) {
+    const why = text.includes(MESSAGE_ARRIVED) ? "有新消息先到了，处理完再收尾" : "还有分身在工作，等它们结束后再收尾";
+    return { seq, at, id: `e${seq}`, kind: "system_event", text: `这次收尾没有完成：${why}` };
   }
   // Step-limit notes are told by the run's end; other notes are bookkeeping.
   return null;
 }
 
-function boundaryItem(seq: number, at: number, r: Extract<StepOrExternalEvidence, { kind: "run_boundary" }>): TimelineItemDTO | null {
+/** "OK", "好的", "收到" and the like, alone: a turn's closing token, not something said to anybody. */
+const BARE_ACK = /^[\s"“”'`*_]*(ok(ay)?|好的?|收到|明白|done|understood|noted)[\s"“”'`*_.。!！]*$/i;
+
+function boundaryItem(seq: number, at: number, r: Extract<StepOrExternalEvidence, { kind: "run_boundary" }>, newCard = true): TimelineItemDTO | null {
   if (r.phase !== "end") return null;
   const e = `e${seq}`;
   switch (r.outcome) {
     case "deferred_for_approval":
-      return { seq, at, id: e, kind: "milestone", text: "提交了一张卡等你确认", tone: "info" };
+      return { seq, at, id: e, kind: "milestone", text: newCard ? "提交了一张卡等你确认" : "更新了等你确认的那张卡", tone: "info" };
     case "cancelled":
       return { seq, at, id: e, kind: "system_event", text: "已被打断" };
     case "step_limit":
@@ -217,6 +226,14 @@ function boundaryItem(seq: number, at: number, r: Extract<StepOrExternalEvidence
   }
 }
 
+/** A steer interrupts only a turn that is under way: the inbox marks those it drained into a running turn. */
+function interrupted(kernel: DeskKernel, cellId: string, envelopeId: string | undefined): boolean {
+  if (!envelopeId) return false;
+  const [m] = kernel.inbox.listMessagesSync({ cellId, envelopeId, limit: 1 });
+  return m?.statusReason === DRAINED_MID_RUN;
+}
+
+/** Asked of the reader, on its face: it ends with a question mark. */
 const isQuestion = (text: string) => /[?？]\s*$/.test(text.trim());
 
 function artifactRef(kernel: DeskKernel, artifactId: string, version?: number): ArtifactRefDTO | null {
@@ -237,6 +254,7 @@ function buildItems(ctx: BuildCtx, records: readonly EvidenceEntry[]): Built[] {
   const inputs = new Map<number, unknown>();
   let group: { built: Built; steps: ToolStepDTO[] } | null = null;
   let pendingArtifacts: Built[] = [];
+  let runStartedAt: number | null = null;
 
   const finishGroup = () => {
     if (group) {
@@ -265,7 +283,8 @@ function buildItems(ctx: BuildCtx, records: readonly EvidenceEntry[]): Built[] {
         break;
       }
       case "assistant_text":
-        if (r.text.trim()) push({ seq, at, id: `r${seq}`, kind: "assistant_reply", text: r.text.trim(), toOwner: false, question: isQuestion(r.text) }, seq);
+        // Shown in the chat, or handed to the owner's agent to relay, a bare "OK" reads as the answer to what they said.
+        if (r.text.trim() && !BARE_ACK.test(r.text.trim())) push({ seq, at, id: `r${seq}`, kind: "assistant_reply", text: r.text.trim(), toOwner: false, question: isQuestion(r.text) }, seq);
         break;
       case "system_note":
         push(noteItem(ctx, seq, at, r.text), seq);
@@ -274,7 +293,13 @@ function buildItems(ctx: BuildCtx, records: readonly EvidenceEntry[]): Built[] {
         push({ seq, at, id: `e${seq}`, kind: "peer_message", fromLabel: `外部资料 · ${r.title ?? r.source}`, text: clip(r.text, 4_000) }, seq);
         break;
       case "run_boundary": {
-        const item = boundaryItem(seq, at, r);
+        if (r.phase === "start") runStartedAt = at;
+        // A turn ends this way only by raising or updating a card: with none created in it, it was an update.
+        const newCard =
+          r.phase !== "end" || r.outcome !== "deferred_for_approval" || runStartedAt === null
+            ? true
+            : get<{ n: number }>(kernel.db, "SELECT 1 AS n FROM human_items WHERE cell_id = ? AND created_at >= ? AND created_at <= ? LIMIT 1", [cell.id, runStartedAt, at]) !== undefined;
+        const item = boundaryItem(seq, at, r, newCard);
         if (item) push(item, seq);
         else if (group) group.built.end = Math.max(group.built.end, seq);
         break;
@@ -407,36 +432,106 @@ export interface OpenQuestion {
   afterOwner: boolean;
 }
 
-/** The latest question the node asked that nobody has answered yet (a person's message answers it). */
-function openQuestionOf(ctx: BuildCtx): OpenQuestion | null {
-  let q: OpenQuestion | null = null;
+/** What openQuestionOf needs to know of several cells, read once for all of them. */
+interface OwnerFacts {
+  /** Cells with an item of their own on the owner's list. */
+  holdsItem: ReadonlySet<string>;
+  /** Cells waiting for the owner. */
+  waits: ReadonlySet<string>;
+}
+
+function ownerFacts(kernel: DeskKernel, cellIds: readonly string[]): OwnerFacts {
+  return {
+    holdsItem: new Set(all<{ id: string }>(kernel.db, "SELECT DISTINCT cell_id AS id FROM human_items WHERE cell_id IS NOT NULL AND status IN ('pending','snoozed')").map((r) => r.id)),
+    waits: new Set(kernel.listOpenWaits(cellIds).filter((w) => w.waitingFor === WAIT_HUMAN).map((w) => w.cellId)),
+  };
+}
+
+/**
+ * The latest question the node asked that nobody has answered yet (a person's message answers it).
+ *
+ * A cell below the desk with an item of its own on the owner's list asks through that item, however its notices end.
+ * Otherwise a reply that ends in a question mark is one; and a cell that waits for the owner asks with the last thing it
+ * said to them, however that is punctuated ("请给我仓库的绝对路径。"; audit R06). Wording beyond that is no guide. (The
+ * desk's cards are about other things than what it asks in the conversation.)
+ */
+function openQuestionOf(ctx: BuildCtx, facts: OwnerFacts): OpenQuestion | null {
+  const { cell } = ctx;
+  const root = cell.parentId === null;
+  const holdsItem = facts.holdsItem.has(cell.id);
+  if (!root && holdsItem) return null;
+  let asked: OpenQuestion | null = null;
+  let last: OpenQuestion | null = null;
   let spoken = false;
-  for (const { item } of buildItems({ ...ctx, steers: ctx.steers.map((s) => ({ ...s, used: false })) }, tailRecords(ctx.v.input.kernel, ctx.cell.id, 200))) {
-    if (item.kind === "assistant_reply" && item.question) q = { id: item.id, text: item.text, at: item.at, toOwner: item.toOwner, afterOwner: spoken };
-    else if (item.kind === "user_chat") {
-      q = null;
+  for (const { item } of buildItems({ ...ctx, steers: ctx.steers.map((s) => ({ ...s, used: false })) }, tailRecords(ctx.v.input.kernel, cell.id, 200))) {
+    if (item.kind === "assistant_reply") {
+      const said = { id: item.id, text: item.text, at: item.at, toOwner: item.toOwner, afterOwner: spoken };
+      // What reaches the owner: a message sent to them, or — for the desk and for a cell they are talking to — its words.
+      if (item.toOwner || root || spoken) last = said;
+      if (item.question) asked = said;
+    } else if (item.kind === "user_chat") {
+      asked = last = null;
       spoken = true;
     }
   }
-  return q;
+  return asked ?? (facts.waits.has(cell.id) && !holdsItem ? last : null);
 }
 
 function pendingQuestionOf(ctx: BuildCtx): CellTimelineDTO["pendingQuestion"] {
-  const q = openQuestionOf(ctx);
+  const q = openQuestionOf(ctx, ownerFacts(ctx.v.input.kernel, [ctx.cell.id]));
   return q ? { id: q.id, text: q.text } : null;
 }
 
-/** The open question of each of these cells (one view for all of them): what the overview lists for the owner. */
-export function pendingQuestions(input: ProjectionInput, cellIds: readonly string[]): Map<string, OpenQuestion> {
+/** The open question of each of these cells (one view for all of them). */
+function pendingQuestions(input: ProjectionInput, cellIds: readonly string[]): Map<string, OpenQuestion> {
   const out = new Map<string, OpenQuestion>();
   if (cellIds.length === 0) return out;
+  const facts = ownerFacts(input.kernel, cellIds);
   const v = agentsView(input, cellIds);
   for (const id of cellIds) {
     const cell = v.cells.get(id);
-    const q = cell && cell.status !== "closed" ? openQuestionOf(buildCtx(v, cell)) : null;
+    const q = cell && cell.status !== "closed" ? openQuestionOf(buildCtx(v, cell), facts) : null;
     if (q) out.set(id, q);
   }
   return out;
+}
+
+export interface OwnerQuestion {
+  cellId: string;
+  title: string | null;
+  /** The timeline item the answer refers to (replyToId). */
+  id: string;
+  text: string;
+  at: number;
+  /** The desk is answered where the owner talks to it; any other cell in its own chat. */
+  desk: boolean;
+  /** The asking cell is paused or parked: nothing happens with an answer until it is brought back. */
+  stopped: boolean;
+}
+
+/**
+ * What the background is asking the owner in words, without a card: the desk's question, a project's or hub's, a
+ * worker's the owner is talking to. One list for the external agent's overview and the web's 待我处理 and its count.
+ * Only cells that can ask the owner something are read: no scripts, sensors or checkers, and workers only when the
+ * owner has spoken to them.
+ */
+export function ownerQuestions(input: ProjectionInput): OwnerQuestion[] {
+  const { kernel } = input;
+  const candidates = kernel.listCells().filter((c) => {
+    if (c.status === "closed" || c.spec.processor.kind === "code") return false;
+    if (c.parentId === null) return true;
+    const role = typeof c.spec.meta?.["role"] === "string" ? c.spec.meta["role"] : null;
+    if (role === "sensor" || role === "checker") return false;
+    if (!isLeafCell(c)) return true;
+    return (kernel.context.readStateSync<CellDirectChatState>(c.id, CELL_DIRECT_CHAT_KEY)?.total ?? 0) > 0;
+  });
+  const asked = pendingQuestions(input, candidates.map((c) => c.id));
+  return candidates.flatMap((c) => {
+    const q = asked.get(c.id);
+    const desk = c.parentId === null;
+    if (!q || !(desk || q.toOwner || q.afterOwner)) return [];
+    return [{ cellId: c.id, title: c.title, id: q.id, text: q.text, at: q.at, desk, stopped: c.status === "paused" }];
+  });
 }
 
 /** The text of the timeline item `id` of this cell (what a reply refers to), if it can be found. */
@@ -537,14 +632,23 @@ function composerOf(v: AgentsView, c: CellRecord, node: TopologyNodeDTO): Compos
     return { ...base, syncTo: null, enabled: false, mode: "script", hint: "这是零算力确定性脚本探针，不接受自然语言对话", placeholder: "", quick };
   }
   if (c.status === "closed" && !node.canChat) {
+    // A finished project can be reopened on its record (and its dormant workers with it): say so and offer it, next to
+    // starting something new — "去总助理另起新事项" alone contradicted the refusal's own hint to reopen.
+    const pid = projectIdOf(v, c);
+    const project = pid ? v.cells.get(pid) : undefined;
+    const reopen = project?.status === "closed" ? [button({ id: "reopen_project", label: pid === c.id ? "重新打开这个项目" : "重新打开所属项目", primary: true, endpoint: post(`/api/projects/${enc(pid!)}/reopen`) })] : [];
     return {
       ...base,
       syncTo: null,
       enabled: false,
       mode: "archived",
-      hint: "它已随所属项目归档，不能再发消息；有新的需要，去总助理另起新事项",
+      hint: pid === c.id
+        ? "这个项目已结束，不能再发消息；要接着做，重新打开它（原来的记录和分身都会回来），全新的事去总助理另起"
+        : reopen.length
+          ? "它已随所属项目归档，不能再发消息；要接着用它，先重新打开所属项目，全新的事去总助理另起"
+          : "它已归档，不能再发消息；有新的需要，去总助理另起新事项",
       placeholder: "",
-      quick: [button({ id: "open_desk", label: "去总助理另起新事项", primary: true, href: "#/agents/desk" })],
+      quick: [...reopen, button({ id: "open_desk", label: "去总助理另起新事项", primary: reopen.length === 0, href: "#/agents/desk" })],
     };
   }
   const running = node.state === "running";

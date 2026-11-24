@@ -188,7 +188,8 @@ export function createStallMonitor(core: KernelCore): StallMonitor {
         });
       });
       if (!remaining.length) continue;
-      const covered = new Set(core.readModel.groundedWaits(remaining, new Set()));
+      // This is the desk's own turn ending: that it is busy again already is no answer to these waiters.
+      const covered = new Set(core.readModel.groundedWaits(remaining, new Set(), { afterTurn: true }));
       const uncovered = remaining.filter(w => !covered.has(w));
       if (!uncovered.length) continue;
       const affected = [...new Set(uncovered.flatMap(w => [cells.require(w.cellId), ...cells.ancestors(w.cellId)].filter(c => isProjectRoot(core.registry, c)).map(c => c.id)))];

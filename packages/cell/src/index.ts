@@ -14,6 +14,7 @@ export type {
   Kernel,
   KernelOptions,
   KernelStats,
+  CellActivity,
   RootCellOptions,
   RosterEntry,
   RunInfo,
@@ -25,6 +26,8 @@ export {
   KERNEL_ESCALATION,
   KERNEL_ESCALATION_PRINCIPAL,
   RESURFACE_MARKER,
+  MESSAGE_ARRIVED,
+  NOT_CARRIED_OUT,
 } from "./constants";
 export { WAIT_EXTERNAL, WAIT_HUMAN, type WaitRecord } from "./waits";
 export { CELL_PAUSE_KEY, type CellPauseState } from "./pauses";

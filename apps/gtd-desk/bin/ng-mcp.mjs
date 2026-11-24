@@ -91,7 +91,8 @@ async function handle(msg) {
       else {
         try {
           const c = await loadCatalog();
-          instructions = c.instructions;
+          // The address this session reaches the workbench at: what any link to it that the owner is given starts with.
+          instructions = `${c.instructions}\nThe workbench is at ${base} (links for the owner start with this address).`;
           name = c.server || name;
         } catch (err) {
           // Still answer: the client must be able to list tools later, and the agent should learn why nothing works.

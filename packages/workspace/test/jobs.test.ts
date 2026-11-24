@@ -3,7 +3,7 @@ import { once } from "node:events";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { groupAlive, isNgError, run, validatePayload, type JobResultPayload } from "@ng/protocol";
+import { groupAlive, isNgError, run, validatePayload, type JobRecord, type JobResultPayload } from "@ng/protocol";
 import { JOB_MARKER } from "../src";
 import { markedAlive, processHasMarker, processInspection, psEnvironment } from "../src/util";
 import { AwakeClock } from "../src/jobs";
@@ -615,6 +615,144 @@ describe("job runtime timeout protection (BUG-027)", () => {
     expect(job).toMatchObject({ state: "failed", exitCode: 124 });
     expect(job.error).toMatch(/timed out/);
     expect(() => process.kill(-pid, 0)).toThrow();
+  });
+});
+
+// Audit 2026-11-23 rerun M02: a 6-minute soak test, frozen with the whole host for 92 s, was killed "after 6 minutes" at
+// the thaw. A job's time limit is run time: when the timer fires, the time this process stood still since the timer was
+// armed is given back. The standstill is simulated where the manager learns of it — its AwakeClock (whose own detection
+// is pinned by the E32 test below) — and quiet warnings are off, so the clock's readers are the time-limit timer and, last, the job's result.
+describe("a job's time limit does not count time the process stood still (M02)", () => {
+  const T = 300;
+  const X = 500;
+  /** Firings of `setTimeout` may be a few ms early against Date.now (libuv's cached loop time). */
+  const SLACK = 50;
+  type Row = Pick<JobRecord, "state" | "cancelRequestedAt"> | undefined;
+  interface Fire { from: number; to: number; stoodStill: number; after: Promise<Row> }
+
+  /**
+   * Watches the manager's AwakeClock: each time-limit firing with the standstill it was told (scripted, or the real
+   * clock's answer when `standstills` is null) and the job's row right after the manager acted on it — it decides
+   * synchronously (re-arm, or record the kill request), so the next macrotask sees the decision.
+   */
+  function watchFirings(row: () => Row, standstills: number[] | null) {
+    const fires: Fire[] = [];
+    const real = AwakeClock.prototype.asleepBetween;
+    const spy = vi.spyOn(AwakeClock.prototype, "asleepBetween").mockImplementation(function (this: AwakeClock, from: number, to: number) {
+      const stoodStill = standstills ? (standstills.shift() ?? 0) : real.call(this, from, to);
+      const after = new Promise<Row>((resolve) => setImmediate(() => {
+        const r = row();
+        resolve(r && { state: r.state, cancelRequestedAt: r.cancelRequestedAt });
+      }));
+      fires.push({ from, to, stoodStill, after });
+      return stoodStill;
+    });
+    return { fires, spy };
+  }
+
+  const limits = { jobTimeoutMs: T, maxJobTimeoutMs: 5_000, killGraceMs: 200, jobQuietWarningMs: 0 };
+
+  it("a timer that fires after a standstill does not kill the job: it gets that time again, then times out", async () => {
+    const h = harness({ limits });
+    const port = await h.mgr.acquire("w1");
+    let jobId = "";
+    const { fires, spy } = watchFirings(() => h.mgr.getJobSync(jobId), [X, 0, X]);
+    try {
+      const startedAt = Date.now();
+      ({ jobId } = await port.startJob({ command: "echo started; sleep 30" }));
+      const pid = h.mgr.getJobSync(jobId)!.pid!;
+      const job = await finished(h, jobId);
+      expect(job).toMatchObject({ state: "failed", exitCode: 124 });
+      // The limit it reports is the job's own, not the extended span.
+      expect(job.error).toMatch(new RegExp(`timed out after ${T}ms`));
+      expect(fires).toHaveLength(3); // two firings, then the result
+      const [first, second] = fires as [Fire, Fire, Fire];
+      // First firing: T after the job was armed, X of it standing still — the job is left running, no kill requested.
+      expect(first.from).toBeGreaterThanOrEqual(startedAt);
+      expect(first.to - first.from).toBeGreaterThanOrEqual(T - SLACK);
+      expect(first.stoodStill).toBe(X);
+      expect(await first.after).toEqual({ state: "running", cancelRequestedAt: null });
+      // Re-armed at that firing for X: the second firing comes X later, finds no standstill and kills it.
+      expect(second.from).toBeGreaterThanOrEqual(first.to);
+      expect(second.to - second.from).toBeGreaterThanOrEqual(X - SLACK);
+      expect(second.stoodStill).toBe(0);
+      expect((await second.after)?.cancelRequestedAt).not.toBeNull();
+      await waitFor(() => pidGone(pid));
+      const results = h.inbox.list("w1").filter((e) => e.type === "job.result");
+      expect(results).toHaveLength(1);
+      expect(results[0]!.payload).toMatchObject({ jobId, state: "failed", exitCode: 124 });
+      // Live rerun round 2 (uc27): the result gave wall time only, and a job that ran 344 s of wall time under a
+      // 300 s limit was reported to the owner as "the time limit did not take effect". The result says how much of
+      // its duration was standstill.
+      const payload = results[0]!.payload as { durationMs: number; standstillMs?: number; note?: string };
+      expect(payload.standstillMs).toBe(X);
+      expect(payload.note).toContain("Only the time the job ran counts against its limit");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  // Live rerun round 4 (uc47): a soak frozen for 91 s ended inside its 360 s limit and reported 333 s of wall time
+  // with no word about the standstill — only a job whose limit timer had fired said so.
+  it("a job that ends inside its limit still says how much of its duration the machine stood still", async () => {
+    const h = harness({ limits });
+    const port = await h.mgr.acquire("w1");
+    const spy = vi.spyOn(AwakeClock.prototype, "asleepBetween").mockReturnValue(700);
+    try {
+      const { jobId } = await port.startJob({ command: "echo done" });
+      expect(await finished(h, jobId)).toMatchObject({ state: "succeeded", exitCode: 0 });
+      const [result] = h.inbox.list("w1").filter((e) => e.type === "job.result");
+      const payload = result!.payload as { standstillMs?: number; note?: string };
+      expect(payload.standstillMs).toBe(700);
+      expect(payload.note).toContain("The machine stood still");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("without a standstill the job is killed when its limit first fires", async () => {
+    const h = harness({ limits });
+    const port = await h.mgr.acquire("w1");
+    let jobId = "";
+    const { fires, spy } = watchFirings(() => h.mgr.getJobSync(jobId), null); // the manager's real clock
+    try {
+      ({ jobId } = await port.startJob({ command: "echo started; sleep 30" }));
+      const job = await finished(h, jobId);
+      expect(job).toMatchObject({ state: "failed", exitCode: 124 });
+      expect(job.error).toMatch(new RegExp(`timed out after ${T}ms`));
+      expect(fires).toHaveLength(2); // one firing, then the result
+      expect(fires[0]!.to - fires[0]!.from).toBeGreaterThanOrEqual(T - SLACK);
+      expect(fires[0]!.stoodStill).toBe(0);
+      expect((await fires[0]!.after)?.cancelRequestedAt).not.toBeNull();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("a job re-attached after a restart gets a standstill back the same way", async () => {
+    const h = harness({ limits });
+    const port = await h.mgr.acquire("w1");
+    const { jobId } = await port.startJob({ command: "echo started; sleep 30", timeoutMs: 400 });
+    const pid = h.mgr.getJobSync(jobId)!.pid!;
+    h.mgr.close(); // its timer goes with it: every firing below is the new manager's
+    const next = h.restart();
+    const { fires, spy } = watchFirings(() => next.getJobSync(jobId), [X, 0, X]);
+    try {
+      await next.recover();
+      expect(next.getJobSync(jobId)!.state).toBe("running");
+      const job = await finished({ mgr: next }, jobId);
+      expect(job).toMatchObject({ state: "failed", exitCode: 124 });
+      expect(job.error).toMatch(/timed out after 400ms/);
+      expect(fires).toHaveLength(3); // two firings, then the result
+      const [first, second] = fires as [Fire, Fire, Fire];
+      expect(first.stoodStill).toBe(X);
+      expect(await first.after).toEqual({ state: "running", cancelRequestedAt: null });
+      expect(second.to - second.from).toBeGreaterThanOrEqual(X - SLACK);
+      expect((await second.after)?.cancelRequestedAt).not.toBeNull();
+      await waitFor(() => pidGone(pid));
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
 

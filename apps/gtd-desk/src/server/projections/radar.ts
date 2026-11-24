@@ -12,7 +12,7 @@ import {
   type WaitingDTO,
 } from "../../shared/api";
 import { projectOfAction, readActions, readProjects, type DeskKernel, type Located, type ProjectionInput } from "./common";
-import { button, enc, ownerLabel, post, progressDTO, waitingDeadline, waitingDTO } from "./format";
+import { button, enc, ownerLabel, pauseInfoOf, post, progressDTO, waitingDeadline, waitingDTO } from "./format";
 import { projectReview } from "./review";
 import { weekStart, whenText } from "./time";
 
@@ -242,7 +242,8 @@ export function radarProjects(input: ProjectionInput): Omit<RadarDTO, "review"> 
         actionId: a.record.id,
         title: a.record.title,
         owner: a.record.owner,
-        ownerLabel: ownerLabel(a.record.owner),
+        // Nothing of a parked project is being handled: its agents' steps wait with it.
+        ownerLabel: parked && a.record.owner === "agent" ? "已停靠，没有在处理" : ownerLabel(a.record.owner),
         text: t.text,
         progress: t.progress,
         waiting: t.waiting,
@@ -255,7 +256,13 @@ export function radarProjects(input: ProjectionInput): Omit<RadarDTO, "review"> 
     // A decision about an action supplies its own link.
     const top = topBallOwner(open.map((a) => a.record));
     const first = (owner: BallOwner) => openActions.find((a) => a.owner === owner);
-    if (top === "human") {
+    // Parked: nothing is in play — its open items wait with it (the row says who parked it and that a restart goes on).
+    // Paused: nobody is working, whatever the books say is the agents' next step.
+    if (parked) {
+      ball = null;
+    } else if (paused && top !== "human" && !card) {
+      ball = null;
+    } else if (top === "human") {
       const a = first("human")!;
       ball = { owner: "human", label: BALL_LABEL.human, text: a.text, cardId: a.actionId };
     } else if (card) {
@@ -278,6 +285,7 @@ export function radarProjects(input: ProjectionInput): Omit<RadarDTO, "review"> 
       cwd: cell?.spec.cwd ?? null,
       lifecycle: parked ? "someday" : r.lifecycle,
       paused,
+      pausedText: pauseInfoOf(kernel, p.cellId, input.settings.timeZone)?.text ?? null,
       ball,
       progress: sumProgress(openActions.filter((a) => a.owner === "agent" && a.progress).map((a) => a.progress!)),
       waiting: mergeWaiting(openActions.filter((a) => a.waiting).map((a) => a.waiting!)),

@@ -118,12 +118,13 @@ export async function recordCheck(ports: RunPorts, now: number, result: { hit: S
   const hit = result.hit;
   if (hit && !result.error) {
     const digest = hitDigest(hit);
-    if (src.lastHitDigest === digest) {
+    if (src.lastHitDigest === digest && !src.lastHitUnreported) {
       repeated = true;
       next.lastHitRepeats = (src.lastHitRepeats ?? 0) + 1;
     } else {
       next.lastHitDigest = digest;
       delete next.lastHitRepeats;
+      delete next.lastHitUnreported;
       next.hitCount = src.hitCount + 1;
       next.lastHitAt = now;
       const origin = originOf(ports, src, hit);
@@ -136,7 +137,8 @@ export async function recordCheck(ports: RunPorts, now: number, result: { hit: S
         const payload: SourceHitPayload = {
           sourceCellId: ports.self.cellId,
           title: hit.title ?? src.title,
-          summary: `${hit.summary}${originLine(origin)}`,
+          // A hit right after a reported one is what the check sees now, whole: without saying so, the reader adds the two up.
+          summary: `${hit.summary}${originLine(origin)}${src.lastHitDigest !== undefined && !src.lastHitUnreported ? "\n（这是这次检查的完整结果，取代这个信源上一次报的内容。）" : ""}`,
           ...(hit.rawInput !== undefined ? { rawInput: hit.rawInput } : {}),
           ...(uri !== undefined ? { uri } : {}),
           data: { ...data, origin },
@@ -148,6 +150,7 @@ export async function recordCheck(ports: RunPorts, now: number, result: { hit: S
     // Nothing found: the condition is gone, so its next occurrence is news again.
     delete next.lastHitDigest;
     delete next.lastHitRepeats;
+    delete next.lastHitUnreported;
   }
   await ports.context.commit(ports.self.cellId, { statePatches: { [gtdKeys.source]: next }, appendReference });
   return { source: next, repeated };

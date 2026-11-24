@@ -64,6 +64,7 @@ function card(id: string, title: string, draft: ArtifactDTO | null = null): Huma
     category: "decision",
     status: "pending",
     cellId: "desk",
+    createdAt: 1,
     epoch: 0,
     relatedProjectIds: [],
     itemRevision: 1,
@@ -91,7 +92,7 @@ async function mount(
     const method = init.method ?? "GET";
     const body = init.body ? JSON.parse(String(init.body)) : {};
     requests.push({ path, method, body });
-    if (path === "/api/human-items" && method === "GET") return Response.json({ items: readItems(), openArtifactIds: openIds() });
+    if (path === "/api/human-items" && method === "GET") return Response.json({ items: readItems(), openArtifactIds: openIds(), questions: [] });
     if (path === "/api/models" && method === "GET") {
       return Response.json({
         available: false,

@@ -16,6 +16,8 @@ const CONVERSATION_ID = /^[\w.:#@-]{1,120}$/;
 export interface AgentCallContext {
   /** The conversation the caller's session is (the MCP server's own id), when it said so. */
   conversationId?: string;
+  /** The address the caller reached this workbench at (scheme, host, port): what a link for the owner starts with. */
+  baseUrl?: string;
 }
 
 export interface AgentToolResult {
@@ -48,7 +50,13 @@ export function mountAgentApi(app: Hono, plane: AgentControlPlane): void {
       }
     }
     const conversationId = c.req.header(CONVERSATION_HEADER)?.trim();
-    const result = await plane.call(c.req.param("name"), args, AGENT_PRINCIPAL, conversationId && CONVERSATION_ID.test(conversationId) ? { conversationId } : {});
+    let baseUrl: string | undefined;
+    try {
+      baseUrl = new URL(c.req.url).origin;
+    } catch {
+      baseUrl = undefined;
+    }
+    const result = await plane.call(c.req.param("name"), args, AGENT_PRINCIPAL, { ...(conversationId && CONVERSATION_ID.test(conversationId) ? { conversationId } : {}), ...(baseUrl ? { baseUrl } : {}) });
     return c.json(result, 200);
   });
 }

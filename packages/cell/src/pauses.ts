@@ -1,4 +1,4 @@
-import { all, cellPrincipal, parsePrincipal, PAYLOAD, withTx, type ControlResult, type Envelope } from "@ng/protocol";
+import { all, cellPrincipal, get, parsePrincipal, PAYLOAD, withTx, type ControlResult, type Envelope } from "@ng/protocol";
 import type { KernelCore } from "./core";
 
 /**
@@ -19,6 +19,8 @@ export interface CellPauseState {
   note?: string;
   resumedAt?: number;
   resumedBy?: string;
+  /** The words that came with the resume (only on the root's record). */
+  resumeNote?: string;
 }
 
 type PauseCore = Pick<KernelCore, "db" | "inbox" | "context" | "clock" | "cells" | "ownerPrincipal" | "dispatcher">;
@@ -29,7 +31,9 @@ export function principalLabel(core: Pick<KernelCore, "ownerPrincipal">, princip
   if (self !== undefined && principalId === cellPrincipal(self)) return "this cell itself";
   const p = parsePrincipal(principalId, core.ownerPrincipal);
   if (p.kind === "owner") return "the owner";
-  if (p.kind === "agent") return "the owner (through their coding agent)";
+  // The act is the agent's; what the owner said is whatever is quoted with it. "The owner resumed it" for a resume
+  // the owner never asked for made a project write "主人重新启动项目" into its notes (audit R01).
+  if (p.kind === "agent") return "the owner's coding agent";
   return principalId.startsWith("cell:") ? `cell ${principalId.slice("cell:".length)}` : principalId;
 }
 
@@ -74,7 +78,8 @@ export function recordResumed(core: PauseCore, cellId: string, how: { by: string
   for (const c of [cells.require(cellId), ...cells.descendants(cellId, { status: ["active"] })]) {
     const prev = context.readStateSync<CellPauseState>(c.id, CELL_PAUSE_KEY);
     if (!prev || prev.resumedAt !== undefined || c.status !== "active") continue;
-    context.commitSync(c.id, { statePatches: { [CELL_PAUSE_KEY]: { ...prev, resumedAt: now, resumedBy: how.by } satisfies CellPauseState } });
+    const words = c.id === cellId && how.note?.trim() ? { resumeNote: how.note.trim() } : {};
+    context.commitSync(c.id, { statePatches: { [CELL_PAUSE_KEY]: { ...prev, resumedAt: now, resumedBy: how.by, ...words } satisfies CellPauseState } });
     if (c.id !== cellId) woken.push(c.id);
   }
   context.appendEvidenceSync(cellId, {
@@ -108,6 +113,35 @@ export function controlWithRecord(
   });
 }
 
+/** When the last Run of `cellId` other than `exceptRunId` started (0 when there was none). */
+export function lastRunStart(core: Pick<KernelCore, "db">, cellId: string, exceptRunId = ""): number {
+  return get<{ at: number }>(
+    core.db,
+    `SELECT at FROM evidence WHERE cell_id=? AND kind='run_boundary' AND json_extract(content,'$.phase')='start'
+       AND coalesce(json_extract(content,'$.runId'),'')<>? ORDER BY seq DESC LIMIT 1`,
+    [cellId, exceptRunId],
+  )?.at ?? 0;
+}
+
+const resumedByOwner = (core: Pick<KernelCore, "ownerPrincipal">, by: string | undefined) =>
+  by !== undefined && parsePrincipal(by, core.ownerPrincipal).kind === "owner";
+
+/**
+ * A note for the first Run of a cell after the pause that named it was lifted: who paused it, when and in what words,
+ * and who resumed it with what. On a resumed CLI session the pause record is otherwise only a line among "earlier
+ * events already handled". It states the facts; what a role makes of them is in its prompt.
+ * `runId`: the Run that reads the note — its own start is already on record.
+ */
+export function resumeNote(core: Pick<KernelCore, "ownerPrincipal" | "context" | "db">, cellId: string, runId?: string): string | null {
+  const p = core.context.readStateSync<CellPauseState>(cellId, CELL_PAUSE_KEY);
+  if (!p || p.resumedAt === undefined || p.root !== cellId || lastRunStart(core, cellId, runId) >= p.resumedAt) return null;
+  const what = p.reason === "parked" ? "parked this cell for later" : "paused this cell";
+  const words = (note: string | undefined) => (note?.trim() ? `with the words "${note.trim().replace(/\s+/g, " ").slice(0, 600)}"` : "without a word");
+  const start = (label: string) => `${label[0]!.toUpperCase()}${label.slice(1)}`;
+  const by = principalLabel(core, p.resumedBy ?? "someone", cellId);
+  return `[back from a pause — ${principalLabel(core, p.by, cellId)} ${what} at ${iso(p.pausedAt)}, ${words(p.note)}. ${start(by)} resumed it at ${iso(p.resumedAt)}, ${words(p.resumeNote)}.]`;
+}
+
 const INSTRUCTIONS: ReadonlySet<string> = new Set([PAYLOAD.cellTask, PAYLOAD.cellMessage, PAYLOAD.userMessage, PAYLOAD.controlSteer]);
 
 /**
@@ -119,12 +153,20 @@ export function prePauseNote(core: Pick<KernelCore, "ownerPrincipal" | "context"
   if (!p || p.resumedAt === undefined) return null;
   const old = incoming.filter((e) => INSTRUCTIONS.has(e.type) && e.createdAt < p.pausedAt);
   if (old.length === 0) return null;
-  const rootNote = p.root === cellId ? p.note : core.context.readStateSync<CellPauseState>(p.root, CELL_PAUSE_KEY)?.note;
+  const root = p.root === cellId ? p : core.context.readStateSync<CellPauseState>(p.root, CELL_PAUSE_KEY);
+  const rootNote = root?.note;
   const whom = p.root === cellId ? "this cell" : `${p.root} (above you, and you with it)`;
   const what = p.reason === "parked" ? "parked" : "paused";
+  // Who brought it back decides what the old instructions are worth: the owner resuming it themselves is their go-ahead
+  // for the work that was under way; anybody else resuming it is not.
+  const resumedBy = root?.resumedBy ?? p.resumedBy;
+  const who = resumedBy ? `${principalLabel(core, resumedBy, cellId)} resumed it` : "resumed";
+  const stands = resumedByOwner(core, resumedBy)
+    ? "The owner resumed it themselves, so what was under way goes on: a newer message wins; with none, these stand."
+    : "They are shown again as they were: before acting on one, check what has been said since — a newer message wins, and if nothing confirms it still stands, ask whoever sent it.";
   return (
-    `[from before a pause — ${principalLabel(core, p.by, cellId)} ${what} ${whom} at ${iso(p.pausedAt)}${quoted(rootNote)}; resumed at ${iso(p.resumedAt)}. ` +
-    `These message(s) below are older than that pause and were not finished when it came. They are shown again as they were: before acting on one, check what has been said since — a newer message wins, and if nothing confirms it still stands, ask whoever sent it.]\n` +
+    `[from before a pause — ${principalLabel(core, p.by, cellId)} ${what} ${whom} at ${iso(p.pausedAt)}${quoted(rootNote)}; ${who} at ${iso(p.resumedAt)}. ` +
+    `These message(s) below are older than that pause and were not finished when it came. ${stands}]\n` +
     old.map((e) => `- ${e.id} (${e.type}, sent ${iso(e.createdAt)})`).join("\n")
   );
 }

@@ -1,4 +1,4 @@
-import type { CellSpecInput, Kernel } from "@ng/cell";
+import type { CellActivity, CellSpecInput, Kernel } from "@ng/cell";
 
 import { OBSERVATION_NOTE, type ProjectInit, type ProjectMode } from "@ng/presets";
 import type { ProjectRecord } from "@ng/presets/records";
@@ -45,7 +45,7 @@ import type { Delivery, PersonMessage } from "../server/agents";
 import { DeskError, type Desk, type DeskActor, type ProjectOp } from "../server/desk";
 import { isLeafCell, notesOf, unpulledOf } from "../server/projections/agents";
 import { projectOfAction, readActions, readProjects, SKILL_SUGGESTION_PREFIX, type Located, type SkillSuggestion } from "../server/projections/common";
-import { parseDecisions } from "../server/projections/format";
+import { parseDecisions, planDecisions } from "../server/projections/format";
 import { AGENT_TOOLS, type AgentToolDoc } from "./guide";
 import type { AgentCallContext, AgentControlPlane, AgentToolResult } from "./routes";
 
@@ -66,6 +66,9 @@ type Handler = (args: Args, principalId: Principal, call: AgentCallContext) => P
 
 /** chat_with_desk waits at most this long for the desk's answer (audit E08): a bounded look, never a poll. */
 const MAX_WAIT_SECONDS = 30;
+
+/** A notice to the owner is quoted whole up to here: what it ends on (who merges, what is left) matters as much as how it starts. */
+const NOTICE_CHARS = 1_500;
 
 /** Who has the ball, as the agent reads it. */
 const OWNER_TEXT: Readonly<Record<BallOwner, string>> = { human: "主人", agent: "agent", waiting: "等待外部" };
@@ -266,8 +269,11 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
 
   function cardLine(item: ReturnType<typeof desk.listHumanItems>[number]) {
     const parts = [`rev=${item.itemRevision}`, item.artifactVersion !== null && `草稿 v${item.artifactVersion}`,
-      item.project?.title].filter(Boolean);
-    return `- ${item.id}「${item.title}」 ${parts.join(" · ")}`;
+      item.project && `${item.project.title}${item.project.parked ? "（项目已停靠在以后再说，这一项暂时不用办）" : item.project.paused ? "（项目已暂停）" : ""}`].filter(Boolean);
+    // What it asks of the owner: a title alone ("确认范围") does not say what to answer.
+    const ask = item.description && item.description.trim() !== item.title.trim() ? `\n  ↳ ${oneLine(item.description, 240)}` : "";
+    const choices = item.category === "decision" && item.options.length ? `\n  ↳ 选项：${item.options.map((o) => o.label).join(" / ")}` : "";
+    return `- ${item.id}「${item.title}」 ${parts.join(" · ")}${ask}${choices}`;
   }
 
   function projectLine(p: ProjectRowDTO): string {
@@ -278,7 +284,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
     if (p.cwd) parts.push(`目录 ${p.cwd}`);
     if (p.workers.length) parts.push(`${p.workers.length} 个后台分身（${p.workers.filter((w) => w.state === "running").length} 个在跑）`);
     if (p.pendingCardId) parts.push(`有一项 ${p.pendingCardId} 等你决定`);
-    if (p.paused && p.lifecycle === "active") parts.push("已暂停");
+    if (p.paused && p.lifecycle === "active") parts.push(`已暂停${desk.pauseInfo(p.id) ? `（${desk.pauseInfo(p.id)!.text}）` : ""}`);
     if (p.stalled) parts.push(`⚠ 停滞（自 ${isoMin(p.stalledSince)}，没有任何推进锚点）`);
     return `- ${p.id}「${p.title}」— ${parts.join("；")}`;
   }
@@ -306,7 +312,11 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
 
   /** Who is active in which work tree right now — a fact, not a lock: nobody is queued. */
   function workspaceLines(): { lines: string[]; data: unknown[] } {
-    const occ = kernel.activeWorkspaces();
+    // A coordinator whose own turn is under way is not at work in the tree: it reads and dispatches (audit L04).
+    const occ = kernel
+      .activeWorkspaces()
+      .map((o) => ({ ...o, active: o.active.filter((u) => u.state === "job" || isLeafCell(kernel.getCell(u.cellId)!)) }))
+      .filter((o) => o.active.length > 0);
     const lines = occ.map((o) => {
       const who = o.active.map(
         (u) =>
@@ -317,6 +327,25 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
     return { lines, data: occ };
   }
 
+  /** Whom a wait is on, for a person. */
+  function waitPartyText(waitingFor: string): string {
+    if (waitingFor === "human") return "主人";
+    if (waitingFor === "external") return "外部事件";
+    if (waitingFor === `inbox:${deskId}`) return "主台答复";
+    if (waitingFor.startsWith("inbox:")) {
+      const c = kernel.getCell(waitingFor.slice("inbox:".length));
+      return c?.title ? `「${c.title}」答复` : `${waitingFor.slice("inbox:".length)} 答复`;
+    }
+    return waitingFor;
+  }
+  /** What a waiting cell waits on, as the owner reads it. */
+  const WAIT_CAUSE: Partial<Record<NonNullable<CellActivity["cause"]>, string>> = {
+    card: "有一项在等主人决定",
+    watch: "在等它订阅的新消息",
+    timer: "定了时，到点再看",
+    wait: "在等答复",
+    child: "它派出的分身还在做",
+  };
 
   /** A cell's state in a few words for a person (and for the agent relaying it). */
   function cellStateText(c: CellRecord): string {
@@ -328,8 +357,8 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       case "paused":
         return "已暂停";
       case "waiting": {
-        const w = kernel.listWaits([c.id])[0];
-        return w ? `等待中（waiting for ${w.waitingFor}：${oneLine(w.reason, 60)}）` : `等待中（${a.why}）`;
+        const w = kernel.listOpenWaits([c.id])[0];
+        return w ? `等待中（在等${waitPartyText(w.waitingFor)}：${oneLine(w.reason, 60)}）` : `等待中（${(a.cause && WAIT_CAUSE[a.cause]) ?? a.why}）`;
       }
       case "dormant":
         return "待命可唤醒";
@@ -409,30 +438,16 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
    * only for the desk or after the owner spoke to it; a message sent to the owner always does.
    */
   function openQuestions(): { lines: string[]; data: Array<{ cellId: string; title: string | null; id: string; text: string; answerWith: string }> } {
-    const candidates = kernel.listCells().filter((c) => {
-      if (c.status === "closed" || c.spec.processor.kind === "code") return false;
-      if (c.id === deskId) return true;
-      const role = roleOf(c);
-      if (role === "sensor" || role === "checker") return false;
-      if (!isLeafCell(c)) return true;
-      return (context.readStateSync<CellDirectChatState>(c.id, CELL_DIRECT_CHAT_KEY)?.total ?? 0) > 0;
-    });
-    const asked = desk.questions(candidates.map((c) => c.id));
-    const data = candidates.flatMap((c) => {
-      const q = asked.get(c.id);
-      if (!q || !(c.id === deskId || q.toOwner || q.afterOwner)) return [];
-      const answerWith = c.id === deskId ? "chat_with_desk" : "message_cell";
-      return [{ cellId: c.id, title: c.title, id: q.id, text: q.text, answerWith }];
-    });
+    const data = desk.questions().map((q) => ({ cellId: q.cellId, title: q.title, id: q.id, text: q.text, answerWith: q.desk ? "chat_with_desk" : "message_cell", stopped: q.stopped }));
     const lines = data.map((q) => {
       const who = q.cellId === deskId ? "主台" : `${q.cellId}${q.title ? `「${q.title}」` : ""}`;
-      return `- ${who}在问主人：${oneLine(q.text, 300)}\n  ↳ ${questionNote(q.id, q.answerWith as "chat_with_desk" | "message_cell")}`;
+      return `- ${who}在问主人${q.stopped ? "（它已停靠或暂停，这一项暂时不用答）" : ""}：${oneLine(q.text, NOTICE_CHARS)}\n  ↳ ${questionNote(q.id, q.answerWith as "chat_with_desk" | "message_cell")}`;
     });
     return { lines, data };
   }
 
-  /** The latest result a leaf handed its parent (cell.result), without the kernel's stand-ins for "it said nothing". */
-  function latestResultOf(c: CellRecord): string | null {
+  /** The gist of the latest result a leaf handed its parent (cell.result), without the kernel's stand-ins for "it said nothing". */
+  function latestResultOf(c: CellRecord, max: number): string | null {
     if (!c.parentId) return null;
     const row = get<{ envelope: string }>(
       kernel.db,
@@ -441,19 +456,72 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
     );
     if (!row) return null;
     try {
-      const summary = ((JSON.parse(row.envelope) as { payload?: Partial<CellResultPayload> }).payload?.summary ?? "").trim();
-      return !summary || /^(Finished without a report\.|Its turn ended without a word|Closed \((completed|cancelled)\) by )/.test(summary) ? null : summary;
+      const p = (JSON.parse(row.envelope) as { payload?: Partial<CellResultPayload> }).payload;
+      const summary = (p?.summary ?? "").trim();
+      if (!summary || /^(Finished without a report\.|Its turn ended without a word|Closed \((completed|cancelled)\) by )/.test(summary)) return null;
+      // Spoken to after it had reported, its last words may answer only that: the report comes first.
+      return p?.saidBefore ? `${firstLine(p.saidBefore, max)}；之后又说：${firstLine(summary, max)}` : firstLine(summary, max);
     } catch {
       return null;
     }
   }
 
-  /** Audit E27: live hubs, with their state and status line (a review with a blocking conclusion shows here). */
+  /** What the desk told the owner unprompted in the past day, the latest few (projections/desk-words.ts). */
+  function deskLastSaid(listed: ReadonlySet<string>): string[] {
+    return desk.unpromptedWords(now() - 24 * 3_600_000)
+      .filter((w) => !listed.has(w.id))
+      .slice(-3)
+      .map((w) => `- ${desk.localTime(w.at)} [${w.id}] ${oneLine(w.text, NOTICE_CHARS)}`);
+  }
+
+  /** The last thing a cell sent to the owner (send_message to their workbench address), from its recent record. */
+  function lastToOwner(cellId: string): { id: string; text: string; at: number } | null {
+    const t = desk.timeline(cellId, { limit: 30 });
+    for (let i = t.items.length - 1; i >= 0; i--) {
+      const it = t.items[i]!;
+      if (it.kind === "assistant_reply" && it.toOwner) return { id: it.id, text: it.text, at: it.at };
+    }
+    return null;
+  }
+
+  /** Audit E27/R06: live hubs with their last message to the owner and their workers' latest results: a hub keeps no status line. */
   function hubLines(): { lines: string[]; data: unknown[] } {
     const hubs = kernel.listCells().filter((c) => c.status !== "closed" && roleOf(c) === "hub");
-    const data = hubs.map((c) => ({ cellId: c.id, title: c.title, state: cellStateText(c), statusLine: statusLineOf(c.id) }));
-    const lines = data.map((h) => `- ${h.cellId}${h.title ? `「${h.title}」` : ""}（${h.state}）${h.statusLine ? ` — ${oneLine(h.statusLine, 160)}` : ""}`);
+    const data = hubs.map((c) => {
+      const workers = kernel.listCells({ parentId: c.id }).filter((w) => w.status !== "closed" && isLeafCell(w)).map((w) => {
+        return { cellId: w.id, title: w.title, state: cellStateText(w), latestResult: latestResultOf(w, 220), statusLine: statusLineOf(w.id) };
+      });
+      const topics = [...new Set((c.spec.watches ?? []).flatMap((w) => (typeof w.threadOrFilter["thread"] === "string" ? [w.threadOrFilter["thread"] as string] : [])))];
+      return { cellId: c.id, title: c.title, state: cellStateText(c), statusLine: statusLineOf(c.id), topics, lastToOwner: lastToOwner(c.id), workers };
+    });
+    const lines = data.map((h) => {
+      const own = `- ${h.cellId}${h.title ? `「${h.title}」` : ""}（${h.state}${h.topics.length ? `；收 ${h.topics.join("、")}` : ""}）${h.statusLine ? ` — ${oneLine(h.statusLine, 160)}` : ""}`;
+      const said = h.lastToOwner ? `\n  ↳ 最近对主人说（${isoMin(h.lastToOwner.at)}，${h.lastToOwner.id}）：${oneLine(h.lastToOwner.text, NOTICE_CHARS)}` : "";
+      const below = h.workers.map((w) => {
+        const gist = w.latestResult ? `最近结果：${w.latestResult}` : w.statusLine ? `状态：${oneLine(w.statusLine, 160)}` : "还没有结果";
+        return `\n  - ${w.cellId}${w.title ? `「${w.title}」` : ""}（${w.state}）— ${gist}`;
+      });
+      return `${own}${said}${below.join("")}`;
+    });
     return { lines, data };
+  }
+
+  /** What these cells told the owner lately (their workbench notices), oldest first. */
+  function noticesOf(cellIds: readonly string[], limit: number, since = 0): Array<{ cellId: string; at: number; text: string }> {
+    return kernel.hub.listNotificationsSync(limit, { cellIds, since }).reverse().map((n) => ({ cellId: n.cellId, at: n.createdAt, text: n.content.body }));
+  }
+
+  /** Reminders set for the owner that have not come due yet (they become items in 待我处理 when they fire). */
+  function upcomingReminders(): { lines: string[]; data: Array<{ id: string; text: string; remindAt: number }> } {
+    const data = kernel.inbox
+      .listMessagesSync({ cellId: deskId, type: PAYLOAD.timerFired, status: ["pending"] })
+      .filter((m) => m.deliverAt > now())
+      .flatMap((m) => {
+        const g = ((m.envelope.payload as { data?: { gtd?: { kind?: string; id?: string; text?: string } } } | null)?.data ?? {}).gtd;
+        return g?.kind === "reminder" && g.id && g.text ? [{ id: g.id, text: g.text, remindAt: m.deliverAt }] : [];
+      })
+      .sort((a, b) => a.remindAt - b.remindAt);
+    return { lines: data.map((r) => `- ${isoMin(r.remindAt)} ${r.text}`), data };
   }
 
   /**
@@ -463,8 +531,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
   function deskLeafLines(): { lines: string[]; data: unknown[] } {
     const leaves = kernel.listCells({ parentId: deskId }).filter((c) => c.status !== "closed" && isLeafCell(c) && roleOf(c) !== "sensor");
     const data = leaves.map((c) => {
-      const result = latestResultOf(c);
-      return { cellId: c.id, title: c.title, preset: c.preset, state: cellStateText(c), latestResult: result ? firstLine(result, 200) : null, statusLine: statusLineOf(c.id), unpulled: unpulledOf(kernel, c).count };
+      return { cellId: c.id, title: c.title, preset: c.preset, state: cellStateText(c), latestResult: latestResultOf(c, 200), statusLine: statusLineOf(c.id), unpulled: unpulledOf(kernel, c).count };
     });
     const lines = data.map((w) => {
       const gist = w.latestResult ? `最近结果：${w.latestResult}` : w.statusLine ? `状态：${oneLine(w.statusLine, 160)}` : "";
@@ -634,10 +701,45 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
     const what = withNote ? "the owner's words, with your note marked as yours" : "the owner's words";
     if (r.targetStatus === "paused") {
       return isProject && kernel.getCell(id)?.pauseReason === "parked"
-        ? `Delivered ${what} to ${id}, but it is parked ("someday"): it reads them when it is activated. To have it act now, set_project_state ${id} activate (with the owner's words as note).`
+        ? `Delivered ${what} to ${id}, which is parked ("someday"): it reads them when it is activated. Activating it is the owner's call.`
         : `Delivered ${what} to ${id}, but it is paused: it reads them when it is resumed (set_project_state / control_cell resume).`;
     }
-    return `Delivered ${what} to ${id} (message ${r.envelopeId}); it reads them at its next turn${isProject ? " and acts on them with a new worker if needed" : ""}. Results arrive asynchronously — check later with ${isProject ? "get_project" : "get_cell"}.`;
+    return `Delivered ${what} to ${id} (message ${r.envelopeId}): so far only passed on; it reads them at its next turn. Results arrive asynchronously — ${isProject ? "get_project" : "get_cell"}.${isProject ? lastNoticeLine(id) : ""}`;
+  }
+
+  /**
+   * What a cell said in the turn that took a person's words (`messageId`, or their latest): its last words there, and
+   * the notices it sent the owner in that turn — a notice, when there is one, is the answer.
+   */
+  function answerOf(cellId: string, messageId?: string): { said: { at: number; text: string } | null; notices: string[]; did: string[] } {
+    const items = desk.timeline(cellId, { limit: 60 }).items;
+    let from = -1;
+    for (let i = items.length - 1; i >= 0; i--) {
+      const it = items[i]!;
+      if (it.kind === "user_chat" && (!messageId || it.id === messageId)) {
+        from = i;
+        break;
+      }
+    }
+    let said: { at: number; text: string } | null = null;
+    const notices: string[] = [];
+    const did: string[] = [];
+    if (from < 0) return { said, notices, did };
+    for (const it of items.slice(from + 1)) {
+      if (it.kind === "assistant_reply") {
+        if (it.toOwner) notices.push(it.text);
+        else said = { at: it.at, text: it.text };
+      } else if (it.kind === "tool_group") {
+        if (it.summary.trim()) did.push(oneLine(it.summary, 200));
+      } else if (it.kind !== "artifact_event") break;
+    }
+    return { said, notices, did };
+  }
+
+  /** Where a project stood when it last told the owner. */
+  function lastNoticeLine(projectId: string): string {
+    const [last] = noticesOf(subtreeIds(projectId), 1);
+    return last ? `\n它上一次发给主人的通知（${desk.localTime(last.at)}，在这之前）：${oneLine(last.text, NOTICE_CHARS)}` : "";
   }
 
   /** How a question from the workbench is put to the agent: it is the owner's to answer (audit E02). */
@@ -649,10 +751,13 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
    * chat_with_desk's waitSeconds: resolves once the desk has taken the message in and its turn is over (so the answer
    * is its whole reply, not a "let me look" on the way), or when the time is up. Event-driven on the kernel's bus.
    */
-  function deskSettles(messageId: string, ms: number): Promise<"settled" | "timeout"> {
+  const deskSettles = (messageId: string, ms: number) => cellSettles(deskId, messageId, ms);
+
+  /** Resolves when `cellId` has dealt with message `messageId` and has no turn in flight, or after `ms`. */
+  function cellSettles(cellId: string, messageId: string, ms: number): Promise<"settled" | "timeout"> {
     const settled = () => {
-      if (kernel.activeRuns().some((r) => r.cellId === deskId)) return false;
-      const [m] = kernel.inbox.listMessagesSync({ cellId: deskId, envelopeId: messageId, limit: 1 });
+      if (kernel.activeRuns().some((r) => r.cellId === cellId)) return false;
+      const [m] = kernel.inbox.listMessagesSync({ cellId, envelopeId: messageId, limit: 1 });
       return !m || (m.status !== "pending" && m.status !== "claimed");
     };
     return new Promise((resolve) => {
@@ -666,7 +771,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       };
       // After the run's own bookkeeping (the claim is settled in the same tick that announces the end).
       const off = kernel.bus.on("run.finished", (e) => {
-        if (e.cellId === deskId) setTimeout(() => settled() && finish("settled"), 0);
+        if (e.cellId === cellId) setTimeout(() => settled() && finish("settled"), 0);
       });
       const timer = setTimeout(() => finish("timeout"), ms);
       if (settled()) finish("settled");
@@ -676,7 +781,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
   // ==================== tools ====================
 
   const handlers: Record<string, Handler> = {
-    workbench_overview(args) {
+    workbench_overview(args, _principalId, call) {
       const all = desk.listHumanItems(true);
       const items = all.filter((item) => item.snoozedUntil == null || item.snoozedUntil <= now());
       const actions = items.filter((item) => item.category === "action");
@@ -685,13 +790,23 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const running = runningLines();
       const ws = workspaceLines();
       const questions = openQuestions();
+      const deskSaid = deskLastSaid(new Set(questions.data.map((q) => q.id)));
       const hubs = hubLines();
       const leaves = deskLeafLines();
+      const reminders = upcomingReminders();
       const { today, backend, model } = desk.status();
+      // Who parked it, when and in what words: whoever is about to bring a parked project back reads this first.
+      const parkedLine = (p: ProjectRowDTO) => {
+        const info = desk.pauseInfo(p.id);
+        return `- ${p.id}「${p.title}」— 以后再说${info ? `（${info.text}）` : ""}${p.summary ? `；摘要：${oneLine(p.summary, 120)}` : ""}${p.cwd ? `；目录 ${p.cwd}` : ""}`;
+      };
       const parts = [
+        ...(call.baseUrl ? [`工作台地址：${call.baseUrl}`] : []),
         section("待我处理", [...items.map(cardLine), ...questions.lines]),
+        ...(deskSaid.length ? [section("主台最近对主人说的", deskSaid)] : []),
+        ...(reminders.lines.length ? [section("已设好、还没到点的提醒", reminders.lines)] : []),
         section("进行中的项目", radar.projects.map(projectLine)),
-        section("已停靠", radar.someday.map((p) => `- ${p.id}「${p.title}」— 以后再说${p.summary ? `；摘要：${oneLine(p.summary, 120)}` : ""}${p.cwd ? `；目录 ${p.cwd}` : ""}`)),
+        section("已停靠（重新启动前先问主人，除非主人此后明确说了现在开始）", radar.someday.map(parkedLine)),
         ...(hubs.lines.length ? [section("领域中枢", hubs.lines)] : []),
         ...(leaves.lines.length ? [section("主台直接派出的分身", leaves.lines)] : []),
         section("正在运行", running.lines),
@@ -699,10 +814,29 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         `今日（自 ${isoMin(today.since)}）：静默归档通知 ${today.archivedNotifications}，存笔记 ${today.notesSaved}，设提醒 ${today.remindersSet}，撤卡 ${today.cardsWithdrawn}（list_activity 看明细）`,
         `执行后端：${backend}${model ? ` · ${model}` : ""}`,
       ];
+      // What closed in the past day, with its closing notice: "is anything left for me?" is asked right after an
+      // acceptance, when the project is gone from the lists above — and where its work landed is in that notice.
+      const justClosed = readProjects(kernel)
+        .filter((p) => (p.record.lifecycle === "completed" || p.record.lifecycle === "cancelled") && (p.record.completedAt ?? p.record.updatedAt) >= now() - 24 * 3_600_000)
+        .sort((a, b) => (b.record.completedAt ?? b.record.updatedAt) - (a.record.completedAt ?? a.record.updatedAt))
+        .slice(0, 6);
+      if (justClosed.length) {
+        parts.push(
+          section(
+            "24 小时内结束的项目（附它发过的最后一条通知；主人自己结束的项目，那条可能早于结束，里面的请求未必还成立）",
+            justClosed.map((p) => {
+              const [last] = noticesOf(subtreeIds(p.cellId), 1);
+              return `- ${p.cellId}「${p.record.title}」— ${p.record.lifecycle === "completed" ? "已完成" : "已取消"} ${desk.localTime(p.record.completedAt ?? p.record.updatedAt)}${last ? `\n  ↳ 最后一条通知（${desk.localTime(last.at)}）：${oneLine(last.text, NOTICE_CHARS)}` : p.record.summary ? `\n  ↳ ${oneLine(p.record.summary, 300)}` : ""}`;
+            }),
+          ),
+        );
+      }
       let finished: unknown[] | undefined;
       if (args["includeFinished"] === true) {
+        // (Those closed in the past day are in the section above, with their closing notices: not listed twice.)
+        const shown = new Set(justClosed.map((p) => p.cellId));
         const recent = readProjects(kernel)
-          .filter((p) => p.record.lifecycle === "completed" || p.record.lifecycle === "cancelled")
+          .filter((p) => (p.record.lifecycle === "completed" || p.record.lifecycle === "cancelled") && !shown.has(p.cellId))
           .sort((a, b) => (b.record.completedAt ?? b.record.updatedAt) - (a.record.completedAt ?? a.record.updatedAt))
           .slice(0, 30);
         parts.push(
@@ -715,13 +849,15 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       }
       const snoozed = all.length - items.length;
       if (snoozed > 0) parts.push(`另有 ${snoozed} 项已推迟，到点会回到「待我处理」。`);
-      return ok(`工作台概览（${isoMin(now())}）\n\n${parts.join("\n\n")}`, {
+      return ok(`工作台概览（主人的本地时间 ${desk.localTime(now())}，即 ${isoMin(now())}）\n\n${parts.join("\n\n")}`, {
         generatedAt: now(),
         humanActions: actions.map((item) => ({ ...item, nextStep: item.description, projectId: item.project?.id ?? null, overdue: item.dueAt != null && item.dueAt < now() })),
         cards,
         questions: questions.data,
         projects: radar.projects.map(projectData),
-        parked: radar.someday.map(projectData),
+        parked: radar.someday.map((p) => ({ ...projectData(p), parkedBy: desk.pauseInfo(p.id) })),
+        upcomingReminders: reminders.data,
+        ...(call.baseUrl ? { baseUrl: call.baseUrl } : {}),
         hubs: hubs.data,
         deskWorkers: leaves.data,
         running: running.data,
@@ -757,6 +893,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const waitSeconds = text && typeof args["waitSeconds"] === "number" ? Math.max(0, Math.min(MAX_WAIT_SECONDS, args["waitSeconds"])) : 0;
       const from = since ?? context.lastEvidenceSeqSync(deskId);
       let sent: Delivery | null = null;
+      const sentAt = now();
       if (text) {
         sent = desk.directMessage(
           deskId,
@@ -769,23 +906,40 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const t = desk.timeline(deskId, { afterSeq: from, limit: 50 });
       const replies = t.items.filter((i): i is Extract<TimelineItemDTO, { kind: "assistant_reply" }> => i.kind === "assistant_reply");
       const cursor = Math.max(from, t.lastSeq);
-      const lines = replies.map((r) => `- [${r.id}] ${r.text}${r.question ? `\n  ↳ ${questionNote(r.id, "chat_with_desk")}` : ""}`);
+      // A reply is a question by its wording, or because it is what the desk now waits for the owner on (R06).
+      const waitingOn = desk.questions().find((q) => q.cellId === deskId)?.id;
+      const asks = (r: (typeof replies)[number]) => r.question || r.id === waitingOn;
+      const stillWorking = waited === "timeout" || (waited === null && kernel.activeRuns().some((r) => r.cellId === deskId));
+      const lines = replies.map((r) => `- [${r.id}] ${r.text}${asks(r) ? `\n  ↳ ${questionNote(r.id, "chat_with_desk")}` : ""}`);
+      // What the desk did in words elsewhere: notices its tools sent the owner, and cards it put before them (raising one
+      // ends its turn without a word). Without them "no written reply" reads as if nothing had come back.
+      const notices = sent ? noticesOf([deskId], 5, sentAt) : [];
+      const cards = desk.listHumanItems(sent !== null).filter((i) => i.cellId === deskId && (sent ? i.createdAt >= sentAt : i.category === "decision" && !stillWorking));
+      const later = `chat_with_desk { since: ${cursor} }`;
+      const state = stillWorking
+        ? `The desk is still working on it${waited === "timeout" ? ` (no final answer within ${waitSeconds} s)` : ""}. Its answer may hold a question or a card: read it (${later}) before you decide or pass on anything about this request.`
+        : !sent && !replies.length
+          ? `Nothing new from the desk after #${from}${waitingOn ? `: it is waiting for the owner's answer to its question ${waitingOn}` : ""}.`
+          : sent && waited === null && !replies.length
+            ? `It answers in the background: ${later}, or pass waitSeconds next time.`
+            : sent && !replies.length
+              ? `The desk has taken it in${notices.length || cards.length ? "" : " without a written reply"}.`
+              : `Later replies: ${later}.`;
+      const parts = [
+        replies.length ? `${stillWorking ? `What the desk has said on the way after #${from} (not its answer)` : `The desk's replies after #${from}`}:\n${lines.join("\n")}` : "",
+        notices.length ? `Notices the desk sent the owner since${replies.length ? ` (a reply above, such as "我会安排…", may be older than these)` : ""}:\n${notices.map((n) => `- ${oneLine(n.text, NOTICE_CHARS)}`).join("\n")}` : "",
+        cards.length ? `Cards of the desk waiting for the owner${sent ? ", raised since" : ""} (list_human_items has the options):\n${cards.map((i) => `- ${i.id}「${oneLine(i.title, 80)}」${i.proposal ? "（立项方案）" : ""}`).join("\n")}` : "",
+      ].filter(Boolean);
       const head = sent
         ? `Passed to the desk (message ${sent.id}, conversation ${conversationId}${replyToId ? `, answering ${replyToId}` : ""}) ${note ? "as the owner's words, with your note marked as yours" : "as the owner's words"}. `
         : "";
-      const body = replies.length
-        ? `The desk's replies after #${from}:\n${lines.join("\n")}\nRelay them to the owner. Later replies: chat_with_desk { since: ${cursor} }.`
-        : waited === "timeout"
-          ? `No reply from the desk within ${waitSeconds} s — it is still on it. Tell the owner it is under way; read its answer later with chat_with_desk { since: ${cursor} } (when the owner asks, never in a loop).`
-          : waited === "settled"
-            ? `The desk has taken it in without a written reply (get_cell desk shows what it did).`
-            : `No reply from the desk yet — it answers in the background. When the owner asks (never in a loop), read its answer with chat_with_desk { since: ${cursor} }, or pass waitSeconds next time.`;
-      return ok(`${head}${body}`, {
+      return ok([`${head}${state}`, ...parts].join("\n"), {
         ...(sent ? { messageId: sent.id } : {}),
         conversationId,
         cursor,
         ...(waited ? { waited } : {}),
-        replies: replies.map((r) => ({ id: r.id, text: r.text, question: r.question, forOwner: r.question, toOwner: r.toOwner, at: r.at })),
+        stillWorking,
+        replies: replies.map((r) => ({ id: r.id, text: r.text, question: asks(r), forOwner: asks(r), toOwner: r.toOwner, at: r.at })),
       });
     },
 
@@ -845,8 +999,10 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         title: str(args["title"])!,
         outcome: str(args["outcome"])!,
         brief: str(args["brief"])!,
+        briefBy: "agent",
+        ...(str(args["context"]) ? { agentContext: str(args["context"])! } : {}),
         mode,
-        source: { label: "主 Agent", principalId, at: now() },
+        source: { label: "编码助手", principalId, at: now() },
         ...(cwd ? { cwd } : {}),
         ...(phases.length ? { phases } : {}),
         runnerOverride: await childRunnerOverride(kernel, runnerSelection(args), { role: "project", tier: "strong" }),
@@ -857,7 +1013,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       } catch (err) {
         if (isNgError(err, "invalid_argument") && /\bcwd\b|directory|path/i.test(err.message)) {
           return fail(
-            `Not started: ${err.message}. Ask the owner for the correct absolute path of the directory or repository on this machine, then call create_project again with it. Never guess or invent a path.`,
+            `Not started: ${err.message} Then call create_project again with the absolute path of the directory or repository on this machine.`,
           );
         }
         throw err;
@@ -885,7 +1041,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const ids = subtreeIds(id);
       // Every cell below it, the archived ones included: what ran for it, what rests and can be woken, what is history.
       const below = ids.filter((cid) => cid !== id).map((cid) => kernel.getCell(cid)!);
-      const waits = kernel.listWaits(ids.filter((cid) => kernel.getCell(cid)?.status !== "closed"));
+      const waits = kernel.listOpenWaits(ids.filter((cid) => kernel.getCell(cid)?.status !== "closed"));
       const running = new Set(kernel.activeRuns().map((r) => r.cellId));
       const artifacts = ids.flatMap((cid) => context.listArtifactsSync(cid)).sort((a, b) => b.updatedAt - a.updatedAt);
       const notes = notesOf(kernel, id);
@@ -893,19 +1049,21 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const cards = desk.listHumanItems(true).filter(r => r.category === "decision" &&
         ((r.cellId && ids.includes(r.cellId)) || r.relatedProjectIds.includes(id) || r.subjectKey === `project:${id}`));
       const anchors = cell && cell.status !== "closed" ? kernel.anchorsOf(id) : null;
+      const notices = noticesOf(ids, 6);
       // BUG-011.3: a parked project is paused underneath, but it is brought back with activate — never resume.
+      const pausedBy = desk.pauseInfo(id);
       const state =
         cell?.pauseReason === "parked"
-          ? "以后再说（停靠中，什么都不运行；要它继续：set_project_state activate，不是 resume）"
+          ? `以后再说（停靠中，什么都不运行${pausedBy ? `；${pausedBy.text}` : ""}。重新启动前先问主人；启动用 set_project_state activate，不是 resume）`
           : cell?.status === "closed"
             ? `${record.lifecycle}（cell closed: ${cell.closeReason ?? "?"}）`
             : cell?.status === "paused"
-              ? `${record.lifecycle}；已暂停（set_project_state resume 继续）`
+              ? `${record.lifecycle}；已暂停（${pausedBy ? `${pausedBy.text}；` : ""}主人说继续时 set_project_state resume）`
               : record.lifecycle;
       const actionLine = (a: Located<ActionRecord>) => {
         const r = a.record;
         const carrier = r.cellId ? `，由 ${r.cellId} 承担` : "";
-        return `- ${r.id}「${r.title}」${OWNER_TEXT[r.owner]}，${r.status}${carrier}${r.nextStep && r.nextStep !== r.title ? ` — 下一步：${oneLine(r.nextStep, 120)}` : ""}${r.dueAt ? `，到期 ${isoMin(r.dueAt)}` : ""}`;
+        return `- ${r.id}「${r.title}」${OWNER_TEXT[r.owner]}，${r.status}${carrier}${r.status === "open" && r.nextStep && r.nextStep !== r.title ? ` — 下一步：${oneLine(r.nextStep, 120)}` : ""}${r.status === "open" && r.dueAt ? `，到期 ${isoMin(r.dueAt)}` : ""}`;
       };
       const runnerInfo = (cell: CellRecord) => {
         if (cell.spec.processor.kind !== "llm") return null;
@@ -921,12 +1079,18 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       });
       // Proposal 02 §四.2: what its workers did or were told past the project's own cursor, read live — the project
       // may not have woken since, but whoever asks sees it now (the owner's direct words included).
-      const unpulled = below
+      // What the project said in answer to the owner's latest words without sending it as a notice: an owner who talks
+      // through their agent never opens its record. Only while it is the project's latest word, and it is at rest.
+      const back = answerOf(id);
+      const laterNotice = back.said !== null && notices.some((n) => n.at >= back.said!.at);
+      const busyNow = ids.some((cid) => running.has(cid));
+      const saidBack = back.said && !back.notices.length && !laterNotice && !busyNow && cell?.status !== "closed" ? [`- ${desk.localTime(back.said.at)} ${oneLine(back.said.text, 500)}`] : [];
+      const unpulled = (cell?.status === "closed" ? [] : below)
         .filter((c) => isLeafCell(c) && c.parentId !== null)
         .map((c) => ({ c, ...unpulledOf(kernel, c) }))
         .filter((u) => u.count > 0)
         .map((u) => ({ cellId: u.c.id, count: u.count, text: kernel.inspectCell(u.c.id, { afterSeq: u.cursor, maxChars: 3_000 }).text }));
-      const ownWaits = waits.filter((w) => w.cellId === id).map((w) => `${w.waitingFor}（${oneLine(w.reason, 80)}）`);
+      const ownWaits = waits.filter((w) => w.cellId === id).map((w) => `${waitPartyText(w.waitingFor)}（${oneLine(w.reason, 80)}）`);
       const head = [
         `项目 ${id}「${record.title}」`,
         `状态：${state}${row?.stalled ? `；⚠ 停滞（自 ${isoMin(row.stalledSince)}）` : ""}`,
@@ -938,6 +1102,8 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         ...(ownWaits.length ? [`项目本身在等：${ownWaits.join("；")}`] : []),
         ...(anchors?.stalled ? [`为什么停滞：${anchors.detail}`] : []),
       ];
+      // Right under the state line, ahead of the summary and the ball it qualifies.
+      if (cell?.status === "paused") head.splice(2, 0, "（以下是停下那一刻的情况。）");
       const text = [
         head.join("\n"),
         section("未完成的动作", open.map(actionLine)),
@@ -946,14 +1112,17 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         ...(jobs.length ? [section("在途后台命令", jobs.map((j) => jobLine(j, true)))] : []),
         ...(notes ? [`项目白板\n${notes}`] : []),
         ...(unpulled.length ? [section("尚未汇总至项目的 Worker 最新动态", unpulled.map((u) => `- ${u.cellId}：${u.count} 条新记录\n${u.text.split("\n").map((l) => `  ${l}`).join("\n")}`))] : []),
+        ...(saidBack.length ? [section("它对主人上一句话的答复（没有发通知，主人没看到）", saidBack)] : []),
+        ...(notices.length ? [section("它最近发给主人的通知", notices.map((n) => `- ${desk.localTime(n.at)} ${n.text.replace(/\n+/g, "\n  ")}`))] : []),
         section("报告与草稿", artifacts.map((a) => `- ${a.artifactId} v${a.version}${a.content.title ? `「${a.content.title}」` : ""}（${a.content.format}，${a.updatedBy} 更新于 ${isoMin(a.updatedAt)}）`)),
         section("等你决定", cards.map(cardLine)),
       ].join("\n\n");
       return ok(text, {
         id,
         title: record.title,
-        lifecycle: record.lifecycle,
+        lifecycle: cell?.pauseReason === "parked" ? "someday" : record.lifecycle,
         cellStatus: cell?.status ?? null,
+        pausedBy,
         outcome: record.outcome ?? null,
         summary: record.summary ?? null,
         cwd: cell?.spec.cwd ?? null,
@@ -968,6 +1137,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         cells: below.map((c) => ({ id: c.id, title: c.title, preset: c.preset, status: c.status, state: cellStateText(c), running: running.has(c.id), waitingFor: waits.filter((w) => w.cellId === c.id).map((w) => w.waitingFor), statusLine: statusLineOf(c.id) })),
         notes,
         jobs,
+        notices,
         unpulled: unpulled.map((u) => ({ cellId: u.cellId, count: u.count })),
         waits: waits.map((w) => ({ cellId: w.cellId, waitingFor: w.waitingFor, reason: w.reason })),
         artifacts: artifacts.map((a) => ({ id: a.artifactId, title: a.content.title ?? null, version: a.version, cellId: a.cellId, updatedAt: a.updatedAt })),
@@ -975,7 +1145,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       });
     },
 
-    message_project(args, principalId, call) {
+    async message_project(args, principalId, call) {
       const id = str(args["id"])!;
       const text = str(args["text"])!;
       const note = str(args["context"]);
@@ -986,9 +1156,24 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const cell=kernel.getCell(id);
       if (cell?.status==="closed") return sendFailure(id,{status:"closed",closeReason:cell.closeReason},true);
       const r=desk.directMessage(id,{text,mode,clientId:newId("agmsg",clock),conversationId,...(note ? {agentContext:note} : {})},{principalId});
-      if (mode==="enqueue" && r.ok && r.id) {
+      const waitSeconds = typeof args["waitSeconds"] === "number" ? Math.max(0, Math.min(MAX_WAIT_SECONDS, args["waitSeconds"])) : 0;
+      if (r.ok && r.id && (mode==="enqueue" || waitSeconds > 0)) {
         const delivered={status:"delivered" as const,envelopeId:r.id,targetStatus:cell?.status==="paused" ? "paused" as const : "active" as const};
-        return ok(deliveredText(id,delivered,true,Boolean(note)),{...delivered,conversationId});
+        if (waitSeconds === 0 || delivered.targetStatus === "paused") return ok(deliveredText(id,delivered,true,Boolean(note)),{...delivered,conversationId});
+        const waited = await cellSettles(id, r.id, waitSeconds * 1_000);
+        const head = `Delivered ${note ? "the owner's words, with your note marked as yours" : "the owner's words"} to ${id} (message ${r.id}).`;
+        if (waited === "timeout") return ok(`${head} It is still working on them (no answer within ${waitSeconds} s); get_project has its answer later.${lastNoticeLine(id)}`, { ...delivered, conversationId, stillWorking: true });
+        // What it answered in the turn that took the words — said in the turn, or sent as a notice — and what it did: a
+        // request it withdrew no longer stands, whatever an earlier notice says.
+        const back = answerOf(id, r.id);
+        const open = desk.listHumanItems(false).filter((i) => i.project?.id === id);
+        const lines = [
+          ...back.notices.map((n) => `它这一回合发给主人的通知：${oneLine(n, NOTICE_CHARS)}`),
+          ...(back.said && !back.notices.length ? [`它这一回合的答复（没有发通知，主人没看到）：${oneLine(back.said.text, 500)}`] : []),
+          ...(back.did.length ? [`它这一回合做了：${back.did.join("；")}`] : []),
+          `它现在等主人的事项：${open.length ? open.map((i) => `「${oneLine(i.title, 60)}」`).join("、") : "没有"}`,
+        ];
+        return ok(`${head} It has taken them in${back.said || back.notices.length ? "" : " without a word for the owner"}.\n${lines.join("\n")}`, { ...delivered, conversationId, stillWorking: false, reply: back.said?.text ?? null });
       }
       return deliveredToCell(id,r,mode,undefined,Boolean(note));
     },
@@ -996,8 +1181,18 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
     async set_project_state(args, principalId) {
       const id = str(args["id"])!;
       if (!projectRecordOf(id)) return noProject(id);
-      const r = await desk.projectOp(id, args["state"] as ProjectOp, as(principalId, str(args["note"])));
-      return r.ok ? ok(r.message, { outcome: r.outcome }) : fail(`Not applied: ${r.message}`, { outcome: r.outcome });
+      const state = args["state"] as ProjectOp;
+      const r = await desk.projectOp(id, state, as(principalId, str(args["note"])));
+      if (!r.ok) return fail(`Not applied: ${r.message}`, { outcome: r.outcome });
+      if (state !== "pause" && state !== "someday") return ok(r.message, { outcome: r.outcome });
+      // Stopping a project does not make what it has put before the owner go away.
+      const ids = subtreeIds(id);
+      const open = desk.listHumanItems(true).filter((i) => (i.cellId && ids.includes(i.cellId)) || i.relatedProjectIds.includes(id));
+      const lines = [
+        r.message,
+        ...(open.length ? [`它还有 ${open.length} 项在等主人：${open.map((i) => `「${oneLine(i.title, 60)}」`).join("、")}（停着的时候不用办）`] : []),
+      ];
+      return ok(`${lines.join("\n")}${lastNoticeLine(id)}`, { outcome: r.outcome, workTrees: r.workTrees ?? [], openItems: open.map((i) => i.id) });
     },
 
     async add_action(args, principalId) {
@@ -1016,10 +1211,18 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
     list_human_items(args) {
       const items = desk.listHumanItems(args["includeSnoozed"] === true);
       // A project confirmation card's plan in one line each (stages included), ahead of the full JSON (audit E17).
-      const plans = items.flatMap((i) => (i.proposal ? [`- ${i.id} 立项方案 v${i.artifactVersion ?? "—"}：${planFacts(i.proposal)}`] : []));
+      const plans = items.flatMap((i) => {
+        if (!i.proposal) return [];
+        const marked = planDecisions(i.proposal);
+        return [`- ${i.id} 立项方案 v${i.artifactVersion ?? "—"}：${planFacts(i.proposal)}${marked.length ? `；需要主人拍板的段落 ${marked.length} 处：${marked.map((d) => `「${oneLine(d.label, 80)}」`).join("、")}（逐条问过主人再批准；没答的在改方案时留着）` : ""}`];
+      });
       return ok(`待处理 ${items.length} 项\n${plans.length ? `${plans.join("\n")}\n` : ""}${JSON.stringify(items, null, 2)}`, {items});
     },
     async decide_human_item(args,principalId) {
+      // Whose item it is, read before the decision closes it.
+      const decided = desk.listHumanItems(true).find((i) => i.id === str(args.id));
+      // (An acceptance or another to-do of the owner's — a decision card says itself what it is about.)
+      const ofProject = decided?.category === "action" ? (decided.project?.id ?? null) : null;
       const result = await desk.decideHumanItem(str(args.id)!,{
         optionId:str(args.optionId)!, seenItemRevision:args.seenItemRevision as number,
         ...(typeof args.seenArtifactVersion==="number" ? {seenArtifactVersion:args.seenArtifactVersion} : {}),
@@ -1028,11 +1231,24 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         ...(Array.isArray(args.confirmedClosure) ? {confirmedClosure:args.confirmedClosure as string[]} : {}),
         ...(Array.isArray(args.confirmedTargets) ? {confirmedTargets:args.confirmedTargets as string[]} : {}),
       },as(principalId));
-      return ok(JSON.stringify(result),result);
+      // Recording an acceptance does not land the work: where the delivery sits is in what the project last told the
+      // owner, and "还要我做什么吗" is often asked in the same breath.
+      const recent = ofProject ? noticesOf(subtreeIds(ofProject), 3) : [];
+      const where = recent.length ? `\n这个项目最近发给主人的通知（在这个决定之前；交付落在哪个分支、由谁合并见其中）：\n${recent.map((n) => `- ${desk.localTime(n.at)} ${oneLine(n.text, NOTICE_CHARS)}`).join("\n")}` : "";
+      return ok(`${JSON.stringify(result)}${where}`,result);
     },
     async reopen_project(args,principalId) {
-      const result = await desk.reopenProject(str(args.projectId)!,as(principalId));
-      return ok("项目已重新打开",result);
+      const text = str(args["text"]);
+      const note = str(args["context"]);
+      if (note && !text) return fail("context goes with text: it is your note on the owner's words, sent together with them.");
+      const id = str(args.projectId)!;
+      const result = await desk.reopenProject(id,as(principalId),{ ...(text ? { text } : {}), ...(note ? { agentContext: note } : {}) });
+      return ok(
+        text
+          ? `Reopened ${id}: it wakes with the owner's words${note ? " (your note marked as yours)" : ""} and continues on its previous record; its dormant workers are back too.`
+          : `Reopened ${id} without any words from the owner; it is told so. Words for it or for one of its workers go with message_project / message_cell.`,
+        result,
+      );
     },
     async undo_human_decision(args,principalId) {
       const result = await desk.undoHumanDecision(str(args.activityId)!,as(principalId));
@@ -1053,7 +1269,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const content = ver?.content ?? a.content;
       const version = ver?.version ?? a.version;
       const body = aside?.body ?? content.body;
-      const decisions = !ver && (content.format === "markdown" || content.format === "text") ? parseDecisions(content.body) : [];
+      const decisions = ver ? [] : content.format === "markdown" || content.format === "text" ? parseDecisions(content.body) : content.format === "json" ? planDecisions(content.data) : [];
       const offset = typeof args["offset"] === "number" ? Math.max(0, Math.floor(args["offset"])) : 0;
       const limit = typeof args["limit"] === "number" ? Math.max(1, Math.min(MAX_RESOURCE_PAGE_CHARS, Math.floor(args["limit"]))) : 16_000;
       const page = body.slice(offset, offset + limit);
@@ -1069,7 +1285,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       // What goes with the text is said once, on its first page.
       const extras = offset > 0 ? [] : [
         ...(versions.length > 1 ? [`版本：${versions.slice(-20).map((v) => `v${v.version} ${v.updatedBy} ${isoMin(v.createdAt)}`).join("；")}`] : []),
-        ...(decisions.length ? [section("需要主人拍板的段落", decisions.map((x) => `- 第 ${x.startLine + 1}–${x.endLine + 1} 行「${x.label}」：${oneLine(x.text, 200)}`))] : []),
+        ...(decisions.length ? [section("需要主人拍板的段落", decisions.map((x) => `- ${content.format === "json" ? "" : `第 ${x.startLine + 1}–${x.endLine + 1} 行`}「${x.label}」：${oneLine(x.text, 200)}`))] : []),
         ...parkedSection(id, parked),
       ];
       return ok(`${head}${paging}${extras.map((e) => `\n${e}`).join("")}\n---\n${page}`, {
@@ -1167,7 +1383,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const n = typeof args["tail"] === "number" ? Math.max(0, Math.min(100, Math.floor(args["tail"]))) : 12;
       const activity = c.status === "closed" ? null : (kernel.activityOf([id]).get(id) ?? null);
       const chats = context.readStateSync<CellDirectChatState>(id, CELL_DIRECT_CHAT_KEY)?.total ?? 0;
-      const waits = kernel.listWaits([id]);
+      const waits = kernel.listOpenWaits([id]);
       const running = kernel.activeRuns().some((r) => r.cellId === id);
       const children = kernel.listCells({ parentId: id });
       const cards = desk.listHumanItems(true).filter(r => r.category === "decision" && r.cellId === id);
@@ -1237,7 +1453,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       let cellId: string;
       try {
         if (preset === "project") {
-          cellId = desk.createProject({ title, outcome: title, brief: instruction, source: { label: "主 Agent", principalId, at: now() }, ...(cwd ? { cwd } : {}), runnerOverride }, { principalId },parentId).projectId;
+          cellId = desk.createProject({ title, outcome: title, brief: instruction, briefBy: "agent", source: { label: "编码助手", principalId, at: now() }, ...(cwd ? { cwd } : {}), runnerOverride }, { principalId },parentId).projectId;
         } else {
           const spec: CellSpecInput = { preset: preset as NonNullable<CellSpecInput["preset"]>, title };
           if (cwd) spec.cwd = cwd;
@@ -1247,7 +1463,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         }
       } catch (err) {
         if (isNgError(err, "invalid_argument") && /\bcwd\b|directory|path/i.test(err.message)) {
-          return fail(`Not started: ${err.message}. Ask the owner for the correct absolute path; never guess one.`);
+          return fail(`Not started: ${err.message}`);
         }
         throw err;
       }
@@ -1326,6 +1542,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
           ...(title ? { title } : {}),
           outcome: str(args["outcome"])!,
           ...(args["background"] !== undefined ? { background: args["background"] as string } : {}),
+          ...(args["context"] !== undefined ? { agentContext: args["context"] as string } : {}),
           ...(args["runnerOverride"] !== undefined ? { runnerOverride: args["runnerOverride"] as NonNullable<PlanSaveRequest["proposal"]["runnerOverride"]> | null } : {}),
           ...(args["phases"] !== undefined ? { phases: args["phases"] as string[] } : {}),
           ...(args["cwd"] !== undefined ? { cwd: args["cwd"] as string | null } : {}),
@@ -1333,13 +1550,29 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
           actions: args["actions"] as PlanSaveRequest["proposal"]["actions"],
         },
       };
+      const previous = desk.listHumanItems(true).find((i) => i.id === id)?.proposal;
+      const before = planDecisions(previous);
       const r = await desk.savePlan(id, req, as(principalId));
       if (!r.ok) return conflictOf(`Not saved: the plan of ${id} has moved on since v${req.expectedVersion}`, r.current, r.outcome);
       const item = desk.listHumanItems(true).find((i) => i.id === id);
       const saved = r.artifact.data as ProjectProposal | undefined;
+      // What the new version no longer has is easily overwritten without anybody noticing, and the project reads only
+      // the new text: marked passages, steps, and a background that was replaced.
+      const named = (titles: readonly string[]) => titles.map((t) => `「${oneLine(t, 80)}」`).join("、");
+      const left = planDecisions(saved).map((x) => x.label);
+      const dropped = before.map((x) => x.label).filter((label) => !left.includes(label));
+      const stepsNow = new Set((saved?.actions ?? []).map((a) => a.title.trim()));
+      const goneSteps = (previous?.actions ?? []).map((a) => a.title.trim()).filter((t) => !stepsNow.has(t));
+      const [bgBefore, bgNow] = [previous?.background?.trim() ?? "", saved?.background?.trim() ?? ""];
+      const changes = [
+        dropped.length ? ` No longer in it: ${dropped.length} passage(s) marked for the owner to decide: ${named(dropped)}.` : "",
+        left.length ? ` Still marked for the owner to decide (${left.length}): ${named(left)} — each needs their answer before approving.` : "",
+        goneSteps.length ? ` Steps of v${req.expectedVersion} that are gone or reworded: ${named(goneSteps)}.` : "",
+        bgBefore && bgBefore !== bgNow ? ` Its background was replaced (${bgBefore.length} → ${bgNow.length} characters; the earlier one: read_artifact version ${req.expectedVersion}).` : "",
+      ].join("");
       return ok(
-        `Saved the plan of ${id} as v${r.artifact.version}. ${saved ? `Now: ${planFacts(saved)}. ` : ""}Show the owner what changed; to approve it on their word: decide_human_item with seenArtifactVersion ${r.artifact.version}${item ? ` and seenItemRevision ${item.itemRevision}` : ""}.`,
-        { outcome: r.outcome, itemRevision: item?.itemRevision ?? null, ...artifactData(r.artifact), proposal: saved ?? null },
+        `Saved the plan of ${id} as v${r.artifact.version}. ${saved ? `Now: ${planFacts(saved)}. ` : ""}Show the owner what changed; to approve it on their word: decide_human_item with seenArtifactVersion ${r.artifact.version}${item ? ` and seenItemRevision ${item.itemRevision}` : ""}.${changes}`,
+        { outcome: r.outcome, itemRevision: item?.itemRevision ?? null, ...artifactData(r.artifact), proposal: saved ?? null, droppedDecisions: dropped },
       );
     },
 
@@ -1352,7 +1585,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         const h = hits.get(s.id)!;
         return [
           `- ${s.id}「${s.title}」`,
-          ` ${s.scheduleText}；${s.processorLabel}；${s.modeLabel}；${s.statusLabel}；跑了 ${s.runCount} 次，命中 ${s.hitCount} 次；上次运行 ${isoMin(s.lastRunAt)}，上次命中 ${isoMin(s.lastHitAt)}`,
+          ` ${s.scheduleText}；${s.processorLabel}；${s.modeLabel}；${s.statusLabel}；跑了 ${s.runCount} 次，${s.mode === "observe" ? "记进观察笔记" : "记下或报出"} ${s.hitCount} 次（结果不变时不重复）；上次运行 ${isoMin(s.lastRunAt)}，上次${s.mode === "observe" ? "记下" : "记下或报出"} ${isoMin(s.lastHitAt)}${s.lastCheckText ? `；${s.lastCheckText}` : ""}`,
           s.description ? `；${oneLine(s.description, 200)}` : "",
           s.lastError ? `；⚠ 最近错误：${oneLine(s.lastError, 300)}` : "",
           h.text ? `\n  ${h.label}：\n${h.text.split("\n").map((l) => `    ${l}`).join("\n")}${h.more ? `\n  ${h.more}` : ""}` : "",
@@ -1525,7 +1758,9 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         const before = d.before;
         let what: string;
         if (d.outcome === "reopened") what = `${id} had been closed and was brought back for this: it continues on its previous record (no new cell).`;
-        else if (mode === "steer") what = `${id} was interrupted with it: it sees it now, between its steps.`;
+        else if (mode === "steer" && before?.state === "running") what = `${id} was interrupted with it: it sees it now, between its steps.`;
+        else if (mode === "steer" && before?.state === "paused") what = `${id} is paused: nothing was interrupted; it reads it when it is resumed.`;
+        else if (mode === "steer") what = `${id} was not running (its turn had already ended), so nothing was interrupted: the message is delivered and it ${before?.state === "dormant" ? "is woken by it, on its previous record" : "reads it at its next turn"}. Do not tell the owner it was interrupted.`;
         else if (before?.state === "paused") what = `${id} is paused: it reads it when it is resumed.`;
         else if (before?.state === "running") what = `${id} is at work: it takes the message when its current step ends.`;
         else if (before?.state === "dormant") what = `${id} was dormant and is woken by it, on its previous record (no new cell).`;

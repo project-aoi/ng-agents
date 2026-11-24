@@ -32,7 +32,7 @@ import type { ManagedWorkspacePort } from "@ng/workspace";
 import { isProjectRoot, type KernelCore } from "./core";
 import type { RunHandle } from "./dispatcher";
 import { inspectCell } from "./inspect";
-import { sendCellMessage } from "./messages";
+import { ownerMessageIn, sendCellMessage, spokenBy } from "./messages";
 import { controlWithRecord } from "./pauses";
 import { ensureCwd } from "./workdir";
 
@@ -202,7 +202,7 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
             const lineage = isDescendant(current.cellId) || cells.ancestors(cellId).some(a => a.id === current.cellId);
             const projectOf = (id: string) => [cells.require(id), ...cells.ancestors(id)].find(c => isProjectRoot(core.registry, c))?.id;
             const project = projectOf(cellId);
-            if (!lineage && (!project || projectOf(current.cellId) !== project)) throw new NgError("bounds_violation", "文稿属于无关任务");
+            if (!lineage && (!project || projectOf(current.cellId) !== project)) throw new NgError("bounds_violation", "这份文稿是另一个节点写的，你不能改：它不是你上级或下级的文稿，也不在你所在的项目里（同一个上级下的另一个分身的报告也算）。要改它，交给写它的节点，或你们共同的上级；你自己的结论写在你自己的文稿里");
           }
           const bindings = all<{ action: string; cell_id: string }>(core.db,
             "SELECT action, cell_id FROM human_items WHERE artifact_id=? AND disposition='pending'", [artifactId]);
@@ -327,6 +327,12 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
       assertLive("withdrawHumanItem");
       return core.humanItems.withdrawOwn(id, cellId, reason);
     },
+    settleHumanItem(id, request) {
+      assertLive("settleHumanItem");
+      // Whose word it is: the person whose message this Run is answering — written to this cell, or passed on to it.
+      const spoke = [...batch.envelopes].reverse().map((e) => spokenBy(core, e)).find((p) => p !== null);
+      return core.humanItems.settleOwn(id, cellId, { ...request, ...(spoke ? { approverId: spoke } : {}) });
+    },
 
     confirmCliInput(sessionId, throughSeq) {
       assertLive("confirm CLI input");
@@ -422,7 +428,7 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
     async controlCell(targetId, cmd) {
       assertLive("controlCell");
       requireDescendant(targetId, "controlCell");
-      if (cmd.action === "pause" || cmd.action === "resume") return controlWithRecord(core, targetId, { action: cmd.action, principalId });
+      if (cmd.action === "pause" || cmd.action === "resume") return controlWithRecord(core, targetId, { action: cmd.action, principalId }, cmd.note?.trim() || undefined);
       return inbox.controlSync(targetId, {
         action: cmd.action,
         principalId,
@@ -452,6 +458,9 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
       if (parsed.cellId === cellId) return { status: "refused", reason: "that is this cell's own inbox; use a reminder to wake yourself" };
       if (!deliveryAllowed(liveBounds(), cell.parentId, parsed.addr)) {
         return { status: "refused", reason: `${to} is outside this cell's send permissions` };
+      }
+      if (message.ownerMessageId !== undefined && !ownerMessageIn(core, cellId, message.ownerMessageId)) {
+        return { status: "refused", reason: `"${message.ownerMessageId}" is not a message from the owner that this cell received` };
       }
       return sendCellMessage(core, {
         from: inboxAddr(cellId),
@@ -522,7 +531,8 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
       }
       const pending = request.action === "complete" ? core.readModel.pendingSettlement(cellId, request.force) : [];
       if (pending.length) throw new NgError("conflict", `请先处理项目尚未结束的工作：${pending.join("、")}`);
-      handle.selfSettle = { ...request };
+      const { ownerNotice, ...rest } = request;
+      handle.selfSettle = ownerNotice && deliveryAllowed(liveBounds(), cell.parentId, "channel:ui:owner") ? request : rest;
     },
 
     activeWorkspaces() {

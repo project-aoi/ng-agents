@@ -5,8 +5,10 @@ import type { ActivityRecord, ProjectRecord } from "../shared/product-records";
 import {
   childRunnerOverride,
   defineTool,
+  isEnvelopeOfType,
   isNgError,
   newId,
+  parsePrincipal,
   runnerSelectionInput,
   subjectKeys,
   type CellSpec,
@@ -18,6 +20,7 @@ import {
   type ToolDef,
   type ToolResult,
   type Toolset,
+  speaks,
 } from "@ng/protocol";
 import type { ProjectInit } from "../project/launch";
 import { cardDeliverable, prep as cardPrep, proposalCard } from "../shared/cards";
@@ -40,6 +43,9 @@ import {
 
 
 const effort = z.enum(["15m", "45m", "low_energy"]);
+const stepOwner = z
+  .enum(["agent", "human", "waiting"])
+  .describe('who moves it: "agent" — the background (also a step the owner gives to a worker); "human" — the owner themselves; "waiting" — nobody here: an outside party or event');
 const prepInput = z
   .object({
     summary: z.string().min(1).describe("what you checked before asking, one or two sentences"),
@@ -63,6 +69,16 @@ function prepOf(p: z.infer<typeof prepInput> | undefined, fallback: string) {
 
 const PHASES_TEXT =
   "staged work, only when the owner wants to look at each stage before the next starts (a small change is not staged): the phases in order; the project runs one at a time, each after the owner's go-ahead — a phase that is the owner's own to do needs none, their ticking it off is the go-ahead";
+
+/**
+ * The owner's message this Run is answering (written in the workbench, or passed on by their coding agent), if the
+ * batch holds one: what the desk passes on to a project with steer_item is then the owner's word, and a project that
+ * was waiting for the owner has its answer.
+ */
+function ownerMessageId(ctx: ToolContext): string | undefined {
+  const person = (id: string) => ["owner", "agent"].includes(parsePrincipal(id).kind);
+  return [...ctx.snapshot.batch.envelopes].reverse().find((e) => (e.type === "user.message" || e.type === "cell.message") && person(e.principalId) && speaks(e))?.id;
+}
 
 /** Take back a card a project now carries; says what happened. */
 function withdrawn(ctx: ToolContext, id: string, reason: string): string {
@@ -201,19 +217,21 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
   const presentToOwner = tool({
     name: "present_to_owner",
     description:
-      "Put an item in front of the owner on a card when they should see or acknowledge it but nothing goes out (e.g. something they moved back from the archive, a finding they must know about, a draft they want to edit before it is final). One card per item; confirming just files it as seen. It ends your run: write any chat reply first.",
+      "Put an item in front of the owner on a card when they should see or acknowledge it but nothing goes out (e.g. something they moved back from the archive, a source's hit, a draft they want to edit before it is final). One card per item; \"知道了\" files it as seen, \"回一句\" brings their words back to you. It ends your run: write any chat reply first.",
     input: z.object({
       title: z.string().min(1).describe("card title in Chinese"),
       summary: z.string().min(1).describe("what it is and what (if anything) the owner might do, in Chinese"),
       prep: prepInput.optional(),
       artifactId: z.string().min(1).optional().describe("a draft saved with save_artifact that the card is about: the card is bound to its current version, the owner can edit it there, and their decision names the version they saw"),
-      subjectKey: z.string().min(1).optional().describe("when redrafting a pending card after approval.revise, its subjectKey: that card is updated instead of a second one raised"),
+      subjectKey: z.string().min(1).optional().describe("when redrafting a pending card after approval.revise, its subjectKey: that card is updated instead of a second one raised. Leave it out for a source hit: a source has one open card, which its next hit updates"),
     }),
     async run(args, ctx) {
       const { ports } = ctx;
       const t = now(ctx);
       const env = currentItem(ctx);
-      const subjectKey = args.subjectKey?.trim() || (env ? subjectKeys.inbound(env.id) : subjectKeys.cell(self(ctx)));
+      // One source, one open card: a further hit of the same source updates the card that is already there.
+      const source = env && isEnvelopeOfType(env, "source.hit") ? `source:${env.payload.sourceCellId}` : null;
+      const subjectKey = args.subjectKey?.trim() || source || (env ? subjectKeys.inbound(env.id) : subjectKeys.cell(self(ctx)));
       if (!ports.createHumanItem) throw new Error("Human inbox is unavailable");
       const draft = args.artifactId ? await ports.context.getArtifact(args.artifactId) : null;
       if (args.artifactId && !draft) return { output: `There is no artifact ${args.artifactId}: save the draft first (save_artifact), then put its id on the card.`, isError: true };
@@ -222,13 +240,14 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
         source: itemSource(env, t), rawInput: itemRawInput(env), prep: prepOf(args.prep, ""),
         options: draft
           ? [{ id: "final", label: "定稿", effect: "reply" }, { id: "revise", label: "请修改", effect: "revise", input: { mode: "required" } }]
-          : [{ id: "acknowledge", label: "知道了", effect: "reply" }],
+          : [{ id: "acknowledge", label: "知道了", effect: "reply" }, { id: "reply", label: "回一句", effect: "reply", input: { mode: "required", placeholder: "要怎么处理，直接写在这里" } }],
         ...(draft ? { artifactId: draft.artifactId } : {}),
       });
       const bound = draft
         ? ` It is bound to ${draft.artifactId} v${draft.version}; the owner may edit the draft before deciding — when the decision says humanEdited or a newer artifactVersion, read_artifact before you act on it.`
         : "";
-      return { output: `The card is waiting for the owner.${bound}`, endRun: "deferred_for_approval", data: { ...item, ...(draft ? { artifactId: draft.artifactId, artifactVersion: draft.version } : {}) } };
+      const again = item.itemRevision > 1 ? "The card the owner already has on this was updated (the same card, not a second one)." : "The card is waiting for the owner.";
+      return { output: `${again}${bound}`, endRun: "deferred_for_approval", data: { ...item, ...(draft ? { artifactId: draft.artifactId, artifactVersion: draft.version } : {}) } };
     },
   });
 
@@ -300,7 +319,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
     .array(
       z.object({
         title: z.string().min(1),
-        owner: z.enum(["agent", "human", "waiting"]),
+        owner: stepOwner,
         nextStep: z.string().optional(),
         phase: z.number().int().min(1).optional(),
       }),
@@ -317,14 +336,14 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
     runnerOptions: true,
     description: [
       "Start a project for anything that takes more than a quick lookup (a task, a todo, a code change, research, an idea). A persistent project cell plans it, keeps its records and its report, and hands every piece of heavy work to workers; it starts at once and the owner gets a short notice.",
-      "Put everything it needs into brief: the owner's exact words, constraints, links, what to deliver. cwd is the absolute path of the repository on this machine — ask the owner when you do not know it.",
+      "Put everything it needs into brief: the owner's exact words (「…」), links, what to deliver; what you add is marked as yours. cwd is the absolute path of the repository on this machine — ask the owner when you do not know it.",
       'mode "research_then_park" for an idea the owner only wants to keep for later: the project researches what it should be, saves a report and parks itself as someday.',
       "itemId: a card of yours this project takes over (e.g. the one raised for a source hit) — it is withdrawn once the project has started.",
     ].join(" "),
     input: z.object({
       title: z.string().min(1).describe("short Chinese title shown in the owner's project list"),
       outcome: z.string().min(1).describe("what done looks like"),
-      brief: z.string().min(1).describe("the request in full: the owner's words, constraints, links, what to deliver"),
+      brief: z.string().min(1).describe("the request in full: the owner's words (「…」), links, what to deliver"),
       cwd: z.string().optional().describe("absolute path of the directory the work happens in"),
       repos: z.array(repoInput).optional().describe("the repositories involved, when there are several"),
       mode: z.enum(["now", "research_then_park"]).optional(),
@@ -361,7 +380,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
       const park = args.mode === "research_then_park";
       await notifyOwner(ctx.ports, park ? `已记下：${args.title}，先做个调研，完成后放进以后再说` : `已立项：${args.title}，后台开始推进`, `start:${r.projectId}`);
       const card = args.itemId ? ` ${withdrawn(ctx, args.itemId, `已由项目「${args.title}」接手`)}` : "";
-      return `Started project ${r.projectId}「${args.title}」 and told the owner. Pass later changes to it with steer_item; stop it with stop_item.${card}`;
+      return `Started project ${r.projectId}「${args.title}」 and told the owner (they have that notice: do not repeat it). Pass later changes to it with steer_item; stop it with stop_item.${card}`;
     },
   });
 
@@ -369,15 +388,18 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
     name: "propose_project",
     runnerOptions: true,
     description: [
-      "Propose a project whose plan needs the owner's sign-off first (large, costly, or built on assumptions): one proposal card where the owner can edit the plan, approve it, or park it for later.",
+      "Propose a project whose plan needs the owner's sign-off first (they asked to see it, or it is large, costly, or built on assumptions): one proposal card where the owner can edit the plan, approve it, or park it for later.",
       "On approval the project starts with the plan they approved automatically (apply_updates shows it). When revising an existing proposal after approval.revise, pass its original subjectKey so this updates the existing card instead of creating a duplicate.",
       "It ends your run: write any chat reply first.",
     ].join(" "),
     input: z.object({
       title: z.string().min(1),
       outcome: z.string().min(1).describe("what done looks like"),
-      background: z.string().optional(),
-      actions: z.array(z.object({ title: z.string().min(1), owner: z.enum(["agent", "human", "waiting"]), effort: effort.optional(), nextStep: z.string().optional() })).min(1),
+      background: z
+        .string()
+        .optional()
+        .describe("the owner's request in their words (「…」) and the facts of the work: on approval it is the brief. What the owner said to you about how to proceed does not belong in it"),
+      actions: z.array(z.object({ title: z.string().min(1), owner: stepOwner, effort: effort.optional(), nextStep: z.string().optional() })).min(1),
       prep: prepInput.optional(),
       cwd: z.string().optional().describe("absolute path of the directory the work happens in"),
       repos: z.array(repoInput).optional(),
@@ -449,10 +471,14 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
   const steerItem = tool({
     name: "steer_item",
     description:
-      "Pass the owner's new instruction or extra requirement to a project (or hub) in flight; it carries it out at its next turn, with the worker that already knows the work or a new one. urgent: it interrupts what the item is doing right now.",
+      "Pass the owner's new instruction or extra requirement to a project (or hub) in flight — or something else that belongs to it, such as a further hit of the source it investigates. It takes it at its next turn, with the worker that already knows the work or a new one. Say in the message whose words they are. urgent: it interrupts what the item is doing right now.",
     input: z.object({
       itemId: z.string().min(1),
-      message: z.string().min(1).describe("the owner's words and anything the project needs with them"),
+      message: z.string().min(1).describe("the owner's words (quoted as theirs) and anything the project needs with them; or what it is and where it comes from"),
+      fromOwner: z
+        .boolean()
+        .optional()
+        .describe("true when it passes on what the owner said in this wake-up: it then reaches the project as their word and answers its wait for them. Leave it out for a note of your own"),
       urgent: z.boolean().optional(),
     }),
     async run(args, ctx) {
@@ -469,7 +495,8 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
         return { output: `Not passed on: ${r.reason ?? "refused"}.`, isError: true };
       }
       if (!ports.sendToCell) return { output: "Messages to items are not available in this environment.", isError: true };
-      const r = await ports.sendToCell(`inbox:${args.itemId}`, { text: args.message, summary: "主人的新要求", id: `${ctx.snapshot.runId}:${ctx.toolUseId}:steer` });
+      const said = args.fromOwner ? ownerMessageId(ctx) : undefined;
+      const r = await ports.sendToCell(`inbox:${args.itemId}`, { text: args.message, summary: said ? "主人的新要求" : "主台转来的补充（不是主人说的）", id: `${ctx.snapshot.runId}:${ctx.toolUseId}:steer`, ...(said ? { ownerMessageId: said } : {}) });
       return sendResult(args.itemId, r, `Passed on to ${args.itemId}; it takes it at its next turn.`);
     },
   });
@@ -505,14 +532,16 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
       let queued = false;
       if (args.message) {
         if (!ports.sendToCell) return { output: "Messages to items are not available in this environment.", isError: true };
-        const s = await ports.sendToCell(`inbox:${args.itemId}`, { text: args.message, summary: "主人要继续推进", id: `${ctx.snapshot.runId}:${ctx.toolUseId}:resume` });
+        const said = ownerMessageId(ctx);
+        const s = await ports.sendToCell(`inbox:${args.itemId}`, { text: args.message, summary: "主人要继续推进", id: `${ctx.snapshot.runId}:${ctx.toolUseId}:resume`, ...(said ? { ownerMessageId: said } : {}) });
         if (s.status !== "delivered") return sendResult(args.itemId, s, "");
         queued = true;
       }
       const words = queued ? " The owner's words are queued for it and are read when it is resumed." : "";
       let r;
       try {
-        r = await ports.controlCell(args.itemId, { action: "resume" });
+        // The words go on the resume's record too: the project's note about being resumed quotes them.
+        r = await ports.controlCell(args.itemId, { action: "resume", ...(args.message ? { note: args.message } : {}) });
       } catch (err) {
         return { output: queued ? `${args.itemId} was not resumed (${errorText(err)}).${words}` : `There is no item ${args.itemId} under the desk (${errorText(err)}).`, isError: true };
       }
@@ -567,7 +596,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
         return { output: `Not added: ${errorText(err)}`, isError: true };
       }
       await notifyOwner(ctx.ports, `已添加直通入口：${args.title}`, `hub:${id}`);
-      return `Hub ${id} added and the owner was told: matching messages now go straight to it${coalesceMs > 0 ? `, batched over ${args.coalesceMinutes ?? 2} minute(s)` : ""}.`;
+      return `Hub ${id} added. The owner's notice has only its title: say what it takes in and where its answers go. Matching messages now go straight to it${coalesceMs > 0 ? `, batched over ${args.coalesceMinutes ?? 2} minute(s)` : ""}.`;
     },
   });
 

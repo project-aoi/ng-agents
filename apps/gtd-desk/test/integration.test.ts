@@ -142,7 +142,9 @@ describe("app × real presets", () => {
     expect(d.kernel.getCell(projectId)!.status).toBe("active");
     expect(d.kernel.context.readStateSync<ProjectRecord>(projectId, gtdKeys.project)!.lifecycle).toBe("active");
     expect((await itemsOf(d)).map((i) => i.title)).toEqual(["和市场部对齐风格"]);
-    expect(texts(d, projectId)).toEqual([expect.stringContaining("主人点了启动")]);
+    // Audit 2026-11-23 rerun R01: who brought it back (the owner, in the workbench) and that no words of theirs came with it.
+    expect(texts(d, projectId)).toEqual([expect.stringContaining("主人在工作台里把「官网改版」从以后再说里拿了出来")]);
+    expect(texts(d, projectId)[0]).toContain("这次没有带来主人的话");
   });
 
 });

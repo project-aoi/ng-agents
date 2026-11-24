@@ -169,9 +169,10 @@ describe("searchHistory scopes", () => {
     const [res] = sub("zq_middle_token");
     expect(sub("zq_middle_token")).toHaveLength(1);
     expect(res).toMatchObject({ source: "resource", kind: "resource", cellId: "w1", seq: 0, uri: spillUri, runId: "r1", title: "tool:bash" });
-    expect(res!.text).toMatch(/^…x+ zq_middle_token y+…$/);
-    const offset = h.store.readResourceSync("proj", spillUri, { offset: 0, limit: 5000 }).indexOf("zq_middle_token");
-    expect(h.store.readResourceSync("proj", spillUri, { offset, limit: 15 })).toBe("zq_middle_token");
+    // M07: the excerpt says where it starts, as a read_resource offset.
+    expect(res!.text).toMatch(/^@\d+ …x+ zq_middle_token y+…$/);
+    const offset = Number(/^@(\d+) /.exec(res!.text)![1]);
+    expect(h.store.readResourceSync("proj", spillUri, { offset, limit: 200 })).toMatch(/^x+ zq_middle_token y+$/);
 
     // A match the evidence already shows (spill head) is reported once, as evidence pointing at the resource.
     expect(sub("HEADMARK")).toEqual([expect.objectContaining({ source: "evidence", kind: "tool_result", uri: spillUri, spillUri })]);
@@ -248,5 +249,68 @@ describe("searchHistory scopes", () => {
       caught = e;
     }
     expect(isNgError(caught, "invalid_argument")).toBe(true);
+  });
+});
+
+/** `@<offset> ` of an excerpt; 0 without one. */
+const offsetOf = (text: string) => Number(/^@(\d+) /.exec(text)?.[1] ?? 0);
+
+/** 10 000 log lines, "step 0 ok" … "step 9999 ok", with line 5998 failing; "alpha omega" only in the middle. */
+function stepLog(): string {
+  const lines: string[] = [];
+  for (let i = 0; i < 10_000; i++) lines.push(i === 5998 ? "step 5998 failed: alpha omega" : `step ${i} ok`);
+  return `alpha begins\n${lines.join("\n")}\nomega ends`;
+}
+
+describe("M07: search hits are excerpted where the query is, and say where that is", () => {
+  it("a long resource: the excerpt is the line with the whole phrase, at an offset read_resource understands", () => {
+    const { h } = tree();
+    const log = stepLog();
+    const uri = h.store.writeResourceSync("w2", log);
+    const [hit] = h.store.searchHistorySync("proj", "step 5998", { scope: "subtree" });
+    expect(hit).toMatchObject({ source: "resource", uri });
+    expect(hit!.text).toMatch(/^@\d+ …/);
+    expect(hit!.text).toContain("step 5998 failed");
+    expect(hit!.text).not.toContain("step 1 ok");
+    const offset = offsetOf(hit!.text);
+    expect(offset).toBeGreaterThan(50_000);
+    expect(h.store.readResourceSync("proj", uri, { offset, limit: 200 })).toContain("step 5998 failed");
+  });
+
+  it("a spilled tool output is excerpted from its full text, with the offset in the spilled resource", () => {
+    const { h } = tree();
+    const log = stepLog();
+    const { spill } = h.store.appendEvidenceSync("w1", { kind: "tool_result", toolUseId: "t9", name: "bash", output: log, runId: "r1", at: h.clock.advance(1000) });
+    // The record keeps "alpha" (head) and "omega" (tail); the whole phrase is only in the middle of the full output.
+    const [hit] = h.store.searchHistorySync("w1", "alpha omega");
+    expect(hit).toMatchObject({ source: "evidence", kind: "tool_result", spillUri: spill!.uri });
+    expect(hit!.text).toContain("step 5998 failed: alpha omega");
+    const offset = offsetOf(hit!.text);
+    expect(h.store.readResourceSync("w1", spill!.uri, { offset, limit: 200 })).toContain("alpha omega");
+
+    // A match in the kept tail: the offset still counts in the full output, not in the record's head and tail.
+    const [tail] = h.store.searchHistorySync("w1", "omega ends");
+    expect(tail!.text).toMatch(/^@\d+ …/);
+    expect(offsetOf(tail!.text)).toBeGreaterThan(log.length - 200);
+    expect(h.store.readResourceSync("w1", spill!.uri, { offset: offsetOf(tail!.text), limit: 400 })).toContain("omega ends");
+
+    // Words only in the record's own text (the tool's name): its excerpt, and no offset into the resource.
+    const [byName] = h.store.searchHistorySync("w1", "bash");
+    expect(byName).toMatchObject({ kind: "tool_result", spillUri: spill!.uri });
+    expect(byName!.text).not.toMatch(/^@/);
+  });
+
+  it("a knowledge hit's offset counts in the body its URI reads, not in description + body", () => {
+    const { h } = tree();
+    const body = `${"背景说明。".repeat(200)}结论：报价单必须含税。${"附录。".repeat(100)}`;
+    h.store.upsertSkillOrNoteSync("proj", { kind: "working_note", scope: "cell", name: "报价规则", description: "项目报价约定的长说明", body, mode: "upsert" });
+    const [hit] = h.store.searchHistorySync("proj", "报价单 含税").filter((x) => x.source === "knowledge");
+    expect(hit!.text).toContain("报价单必须含税");
+    const offset = offsetOf(hit!.text);
+    expect(offset).toBeGreaterThan(0);
+    expect(body.slice(offset, offset + 200)).toContain("报价单必须含税");
+    expect(h.store.readResourceSync("proj", hit!.uri!, { offset, limit: 200 })).toContain("报价单必须含税");
+    // Short texts are shown whole: no offset.
+    expect(h.store.searchHistorySync("proj", "kafka-topic-clicks", { scope: "subtree" })[0]!.text).toBe("埋点数据源 kafka-topic-clicks");
   });
 });

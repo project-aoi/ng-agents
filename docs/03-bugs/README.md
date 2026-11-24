@@ -26,6 +26,8 @@
 
 [2026-11-23 八组工作流实机核对](audits/2026-11-23-codex-e2e-workflows.md)：列出 E01–E40，其中 13 项高优先级。同日全部修复，逐项的改动和回归入口见报告末尾的“修复记录”。自动回归通过；提示词和工具文字的改动尚未用真实命令行复跑八组工作流。
 
+[2026-11-23 八组工作流复跑](audits/2026-11-23-codex-e2e-rerun.md)：在修复后的 `1a2aea9` 上用 Codex 重跑八组，逐个读会话轨迹，列出 R01–R11、M01–M21、L01–L07。11 月 24 日全部修复，并用真实命令行又跑了十轮八组，直到第十轮八组都没有再发现产品缺陷；复跑中新发现的问题一并修复，遗留的模型失误和没有走到的路径列在报告的“遗留”一节。逐项改动、回归入口和实机结论见报告末尾的“修复记录”。
+
 | 编号 | 范围 | 已验证行为 | 回归入口 |
 | --- | --- | --- | --- |
 | E01 | 后台与主人控制面 | 后台命令行进程带节点标记，接入套件在其中只给一个说明用的占位工具；Codex 后台进程关闭 `ng-desk` 插件。 | [adapters.test.ts](../../packages/loop/test/adapters.test.ts)、[cli.test.ts](../../packages/loop/test/cli.test.ts)、[agent-relay.test.ts](../../apps/gtd-desk/test/agent-relay.test.ts) |
@@ -40,6 +42,23 @@
 | E18、E28、E29、E31、E34 | 预设工具 | 立项简报不重复附原话；审批选项去掉必然报错的 `complete`；完成通知按边界截断，正常结项不再空唤醒主台；对停靠项目说话只送达一次；停靠说明与实际一致。 | [tools.test.ts](../../presets/test/tools.test.ts)、[tools.test.ts](../../packages/loop/test/tools.test.ts) |
 | E32 | 后台任务 | 静默告警不计宿主冻结的时段。 | [jobs.test.ts](../../packages/workspace/test/jobs.test.ts) |
 | E12、E16、E20、E21、E25、E37–E39 | 提示词与技能 | 仲裁收尾、验收事项、查阅范围、任务大小、技能触发、面向主人的措辞。内置技能未被主人改过时随版本更新。 | [conventions.test.ts](../../presets/test/conventions.test.ts)、[tools.test.ts](../../presets/test/tools.test.ts) |
+
+| 编号 | 范围 | 已验证行为 | 回归入口 |
+| --- | --- | --- | --- |
+| R01、R03 | 停靠、恢复与重开 | 停靠记录对外部助手可见；恢复写实际操作者，主人的话单独引用；恢复后的第一个回合有实时附注，主人本人恢复才算继续指令；重开带主人的话。 | [audit-rerun.test.ts](../../packages/cell/test/audit-rerun.test.ts)、[agent-relay.test.ts](../../apps/gtd-desk/test/agent-relay.test.ts)、[projects.test.ts](../../apps/gtd-desk/test/projects.test.ts) |
+| R02、M17 | 停滞与花名册 | 等待的协调器有回合在途或有未读消息时不判停滞；答复已在收件箱里的等待不显示为还在等。 | [audit-rerun.test.ts](../../packages/cell/test/audit-rerun.test.ts)、[docs05-anchors.test.ts](../../packages/cell/test/docs05-anchors.test.ts) |
+| R04 | 信源 | 观察转正式不吞掉仍在的故障；命中先出一张卡，同一信源一张开放卡；命中不标成主人的话。 | [agent-relay.test.ts](../../apps/gtd-desk/test/agent-relay.test.ts)、[tools.test.ts](../../presets/test/tools.test.ts)、[conventions.test.ts](../../presets/test/conventions.test.ts) |
+| R05、M01、L04、L06 | 回合附注 | 主人改文稿的提示到达项目和主台；首回合不重复任务；同目录占用不列协调器；重投的消息有标注。 | [audit-rerun.test.ts](../../packages/cell/test/audit-rerun.test.ts)、[hydrate.test.ts](../../packages/context/test/hydrate.test.ts)、[render.test.ts](../../packages/context/test/render.test.ts) |
+| R06、R10、L01、L03、L05 | 外部助手读到的内容 | 等主人的最后一句算提问；hub 下列出分身结论和专题；项目发给主人的通知、停靠记录、工作台地址可见；状态文字为中文。 | [agent-relay.test.ts](../../apps/gtd-desk/test/agent-relay.test.ts)、[agent.test.ts](../../apps/gtd-desk/test/agent.test.ts) |
+| R07、R08、M18 | 简报与方案 | 助手补充单列；简报标明转述人；方案卡显示当前方案并列出待拍板段落，`save_plan` 报告去掉的段落；`update_project` 可改方案。 | [tools.test.ts](../../presets/test/tools.test.ts)、[agent-relay.test.ts](../../apps/gtd-desk/test/agent-relay.test.ts) |
+| R09、M13、M16 | 主人的决定落在事项上 | `settle_item` 按主人的话结清；冲突写出当前版本；主台转达主人的话可结清等待；分身途中提过问时不代关动作；主台自行撤回的卡进活动记录。 | [audit-rerun.test.ts](../../packages/cell/test/audit-rerun.test.ts)、[tools.test.ts](../../packages/loop/test/tools.test.ts)、[tools.test.ts](../../presets/test/tools.test.ts)、[agent-relay.test.ts](../../apps/gtd-desk/test/agent-relay.test.ts) |
+| M02 | 后台任务 | 时限只计运行时间，结果写明停转时长。 | [jobs.test.ts](../../packages/workspace/test/jobs.test.ts) |
+| M07 | 检索 | 摘录落在命中处并带偏移。 | [text.test.ts](../../packages/context/test/text.test.ts)、[search.test.ts](../../packages/context/test/search.test.ts) |
+| M09、M10 | 插话与等待答复 | 没有打断时如实说明；主台仍在处理时不把途中话当答复。 | [agent-relay.test.ts](../../apps/gtd-desk/test/agent-relay.test.ts)、[agents.test.ts](../../apps/gtd-desk/test/agents.test.ts) |
+| M14、M15 | 通知与结束回合 | 完成通知一份，在真正结清时发出；没人对话的回合里结束工具之后的复述不记录。 | [tools.test.ts](../../presets/test/tools.test.ts)、[cli.test.ts](../../packages/loop/test/cli.test.ts)、[audit-rerun.test.ts](../../packages/cell/test/audit-rerun.test.ts) |
+| R11、M03–M06、M08、M11、M12、M19–M21、L02、L07 | 提示词与技能 | 交付清单、带选项的卡、检查脚本、默认提醒时间、定稿、修复位置、对外动作确认、不自行加规矩、先报告做不了的事、先找查平台的命令、专题走 capture。 | [conventions.test.ts](../../presets/test/conventions.test.ts)、[agent-relay.test.ts](../../apps/gtd-desk/test/agent-relay.test.ts) |
+| 复跑中新发现 | 对外显示与转达 | 网页待我处理列出并计入节点用话提的问题；对外只显示还没答复的等待；卡片来源只引用人说的话；停靠回执列出还在等主人的事项；项目全局显示停靠记录；插话行写明来自谁；直连消息默认不唤醒项目；周回顾统计主人改过的草稿；时间线区分新卡与更新。 | [agent-relay.test.ts](../../apps/gtd-desk/test/agent-relay.test.ts)（“live rerun round 3”）、[audit-rerun.test.ts](../../packages/cell/test/audit-rerun.test.ts)（“rerun round 3”）、[tools.test.ts](../../presets/test/tools.test.ts)、[tools.test.ts](../../packages/loop/test/tools.test.ts)、[contract-helpers.test.ts](../../packages/protocol/test/contract-helpers.test.ts)、[dispatch.test.ts](../../packages/cell/test/dispatch.test.ts) |
+| 清理 | 结清、转达与计数 | `settle_item` 与卡片决定同一路径（版本核对、留言、撤销）；转达主人的话核对来源；总览不写状态，按每轮实际收到的消息判断主台的话是否由人引出；撤销的更正不算主人说话；已停靠节点的提问不计数；时间线写对没有收尾的原因。 | [audit-rerun.test.ts](../../packages/cell/test/audit-rerun.test.ts)、[agent-relay.test.ts](../../apps/gtd-desk/test/agent-relay.test.ts)、[projects.test.ts](../../apps/gtd-desk/test/projects.test.ts) |
 
 ## 专项记录
 

@@ -4,6 +4,7 @@ import {
   PAYLOAD,
   parsePrincipal,
   pullCursorKey,
+  STEER_NOTE_HEAD,
   type ApprovalResolvedPayload,
   type CellDirectChatState,
   type CellInspection,
@@ -11,6 +12,7 @@ import {
   type EvidenceEntry,
   type InspectCellOptions,
   type JobResultPayload,
+  speaks,
 } from "@ng/protocol";
 import type { KernelCore } from "./core";
 import { pauseLine } from "./pauses";
@@ -86,7 +88,7 @@ function callBrief(input: unknown): string {
 }
 
 export function inspectCell(
-  core: Pick<KernelCore, "cells" | "context" | "readModel" | "ownerPrincipal">,
+  core: Pick<KernelCore, "cells" | "context" | "readModel" | "ownerPrincipal" | "inbox">,
   targetId: string,
   opts: InspectCellOptions = {},
   who: { inspectorId?: string } = {},
@@ -120,7 +122,7 @@ export function inspectCell(
         const env = r.envelope;
         // Kernel bookkeeping that woke it says nothing about the work.
         if (env.type === PAYLOAD.stalledCheck || env.type === PAYLOAD.runContinue) break;
-        const person = isPerson(env.principalId) && (env.type === PAYLOAD.cellMessage || env.type === PAYLOAD.userMessage || env.type === PAYLOAD.controlSteer);
+        const person = isPerson(env.principalId) && speaks(env) && (env.type === PAYLOAD.cellMessage || env.type === PAYLOAD.userMessage || env.type === PAYLOAD.controlSteer);
         if (person) directChats++;
         const from = person ? `the owner, directly (${env.principalId})` : env.type === PAYLOAD.cellTask ? "its task" : `${env.type} from ${env.from}`;
         const body = payloadText(env);
@@ -130,10 +132,20 @@ export function inspectCell(
         line = `#${seq} ← ${from}: ${detail === "full" ? body : one(body, 600)}${note}`;
         break;
       }
-      case "system_note":
-        // Steers are recorded as notes by the loops; the owner's are the ones worth a parent's attention.
+      case "system_note": {
+        // A steer is recorded as a note that names its envelope; the owner's is them speaking to it directly, like any
+        // other message of theirs.
+        const steer = r.envelopeId ? core.inbox.listMessagesSync({ cellId: targetId, envelopeId: r.envelopeId, limit: 1 })[0]?.envelope : undefined;
+        if (steer?.type === PAYLOAD.controlSteer) {
+          const words = r.text.replace(STEER_NOTE_HEAD, "");
+          const byPerson = isPerson(steer.principalId);
+          if (byPerson) directChats++;
+          line = `#${seq} ← ${byPerson ? `the owner, directly, interrupting its work (${steer.principalId})` : `interruption from ${steer.from} (${steer.principalId})`}: ${detail === "full" ? words : one(words, 600)}`;
+          break;
+        }
         line = `#${seq} ← note: ${detail === "full" ? r.text : one(r.text, 400)}`;
         break;
+      }
       case "assistant_text":
         if (r.text.trim()) line = `#${seq} → said: ${detail === "full" ? r.text.trim() : one(r.text, 800)}`;
         break;
@@ -178,6 +190,7 @@ export function inspectCell(
   let lines: string[];
   let more = false;
   const toSeq = records.length > 0 ? records[records.length - 1]!.seq : afterSeq;
+  const firstSeq = records[0]?.seq;
   let resumeAfterSeq = toSeq;
 
   if (totalChars <= maxChars) {
@@ -230,7 +243,8 @@ export function inspectCell(
     `${targetId}${target.title ? ` "${target.title}"` : ""} — ${activity?.why ?? target.status}`,
     target.status === "paused" ? pauseLine(core, targetId) : null,
     target.spec.cwd ? `directory ${target.spec.cwd}` : null,
-    lines.length > 0 ? `records #${afterSeq + 1}–#${toSeq}` : `nothing new after #${afterSeq}`,
+    // Record numbers run across the whole workbench, not per cell: name the first one this cell actually has.
+    lines.length > 0 ? `records #${afterSeq === 0 ? (firstSeq ?? 1) : afterSeq + 1}–#${toSeq}` : `nothing new after #${afterSeq}`,
     directChats > 0 ? `the owner spoke to it directly ${directChats} time(s) in this stretch` : chat?.total ? "the owner has spoken to it directly before this stretch" : null,
     artifactIds.size > 0 ? `artifacts: ${[...artifactIds].join(", ")}` : null,
   ].filter(Boolean);

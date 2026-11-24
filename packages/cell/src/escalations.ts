@@ -57,7 +57,7 @@ function sourceOf(env: Envelope | undefined, at: number): ItemSource {
   if (from?.kind === "channel") return { ...base, label: from.channelId === "ui" ? "随手记" : from.channelId, channelId: from.channelId };
   if (from?.kind === "inbox") return { ...base, label: "后台任务" };
   if (item.from.startsWith("timer:")) return { ...base, label: "定时提醒" };
-  if (item.from === "kernel:control" && isEnvelopeOfType(item, "user.message")) return { ...base, label: item.principalId.startsWith("agent:") ? "外部助手" : "对话" };
+  if (item.from === "kernel:control" && isEnvelopeOfType(item, "user.message")) return { ...base, label: item.principalId.startsWith("agent:") ? "编码助手" : "对话" };
   return { ...base, label: "系统" };
 }
 

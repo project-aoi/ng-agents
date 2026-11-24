@@ -51,6 +51,8 @@ export interface SourceState {
   lastHitDigest?: string;
   /** How many later checks found that same hit again. */
   lastHitRepeats?: number;
+  /** The last hit was only noted (observe mode) and the source has since been made active: the next check reports it even when it is unchanged. */
+  lastHitUnreported?: boolean;
   lastError?: string;
   runCount: number;
   hitCount: number;

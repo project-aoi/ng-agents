@@ -2,8 +2,10 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  isChannelAddr,
   NgError,
   normalizeToolResult,
+  parsePrincipal,
   RUN_END_PRECEDENCE,
   selectRunTools,
   steerNoteText,
@@ -22,6 +24,7 @@ import {
   type ToolKind,
   type ToolResult,
   type WorkspaceAccess,
+  speaks,
 } from "@ng/protocol";
 import { raceAbort } from "../loop";
 import { agyAdapter } from "./adapters/agy";
@@ -45,7 +48,9 @@ export const CLI_FORK_SESSION_KEY = "cli:session:fork";
 export { CLI_MCP_SERVER } from "./instructions";
 
 export const RUN_ENDED_NOTICE =
-  "[The kernel ended this run with that result. Stop now: make no further tool calls and do no further work. If something is still unsaid to whoever reads you, say it in one short sentence — it is kept on your record. You will be woken with the next message.]";
+  "[The kernel ended this run with that result. Stop now: make no further tool calls and do no further work. What you have said or sent in this turn has been delivered: do not repeat or summarise it. If something is still unsaid to whoever reads you, say it in one short sentence; otherwise answer with nothing but \"OK\". You will be woken with the next message.]";
+/** Letters and digits only: how a text is compared with one that was already said, whatever its punctuation. */
+const bare = (text: string) => text.replace(/[\s\p{P}\p{S}]+/gu, "").toLowerCase();
 export const RUN_ALREADY_ENDED = "Not executed: this run has already ended. Stop now; you will be woken with the next message.";
 
 export function cliAdapterFor(engine: CliEngine): CliAdapter {
@@ -106,7 +111,8 @@ export interface CliAgentLoopOptions {
 export type CliDebugEvent =
   | { type: "launch"; engine: CliEngine; cellId: string; runId: string; argv: readonly string[]; cwd: string; session?: LaunchRequest["session"]; caps: CliCapabilities; permissions: string }
   | { type: "notice"; cellId: string; text: string }
-  | { type: "exit"; cellId: string; code: number | null; signal: string | null; stderr: string };
+  /** `stopped`: the loop itself ended the process (the turn's run-ending tool was called, or the Run was stopped) — not a failure. */
+  | { type: "exit"; cellId: string; code: number | null; signal: string | null; stderr: string; stopped?: boolean };
 
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
 type EvidenceInput = DistributiveOmit<StepOrExternalEvidence, "runId" | "at">;
@@ -210,13 +216,24 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
 
     // ---------- input ----------
     const initialBatchIds = new Set(snapshot.batch.envelopes.map((e) => e.id));
+    // Words after the tool that ended the Run answer a person who spoke in it and has not been sent a message since, or
+    // are the only words of the Run (said or sent); otherwise they recap it. "OK" is what RUN_ENDED_NOTICE asks for.
+    const said = new Set<string>();
+    const isPerson = (principalId: string) => ["owner", "agent"].includes(parsePrincipal(principalId).kind);
+    let personWaits = snapshot.batch.envelopes.some((e) => e.delivery !== "silent_inject" && isPerson(e.principalId) && speaks(e));
+    const worthKeeping = (closing: string) => (personWaits || said.size === 0) && bare(closing) !== "ok" && !said.has(bare(closing));
+    const speak = async (text: string) => {
+      if (text.trim()) said.add(bare(text));
+      await append({ kind: "assistant_text", text, model: sessionModel ?? model ?? engine });
+    };
     const tracked = new Map<string, AppendedInput>();
     const initialSteerItems: AppendedInput[] = [];
     for (const m of ports.drainSteer()) {
-      const text = steerNoteText(m.message);
+      const text = steerNoteText(m.message, m.envelope?.principalId);
       const item: AppendedInput = { envelopeId: m.envelopeId, kind: "steer", text, status: "queued" };
       tracked.set(item.envelopeId, item);
       initialSteerItems.push(item);
+      if (m.envelope && isPerson(m.envelope.principalId)) personWaits = true;
     }
     const inputOf = (tail: string) => [tail, ...initialSteerItems.map((i) => i.text)].filter((t) => t.trim()).join("\n\n");
     // What a session of this cell's own starts from (also the fallback when a resume or a fork fails).
@@ -394,6 +411,10 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
       let text = ev.modelText ?? result.output;
       if (stale()) return {text: RUN_ALREADY_ENDED, isError: true};
       if (result.awaitsWakeup) awaitsWakeup = true;
+      if (result.sent && !result.isError) {
+        said.add(bare(result.sent.text));
+        if (isChannelAddr(result.sent.to)) personWaits = false;
+      }
       if (result.endRun) {
         // The CLI demonstrably processed the active turn of this leg to invoke this tool: confirm items belonging to
         // this active turn (including turn_end follow-ups), while leaving any mid-turn queued steers unconfirmed.
@@ -696,6 +717,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
             const item: AppendedInput = { envelopeId: a.envelope.id, kind: "inbound", text: a.text, status: "queued" };
             tracked.set(item.envelopeId, item);
             items.push(item);
+            if (a.envelope.delivery !== "silent_inject" && isPerson(a.envelope.principalId) && speaks(a.envelope)) personWaits = true;
           }
           return items;
         } catch (err) {
@@ -709,7 +731,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
           // The closing words after the tool that ended the Run (the kernel asked for them: RUN_ENDED_NOTICE) are
           // what the owner reads as the answer — "方案已提交，等你确认后开始" — so they go on the record.
           // Only up to the end of that turn: text after it answers input the kernel has put back in the queue.
-          if (e.type === "text" && endOutcome && !refused && !closingDone && e.text.trim()) await append({ kind: "assistant_text", text: e.text, model: sessionModel ?? model ?? engine });
+          if (e.type === "text" && endOutcome && !refused && !closingDone && e.text.trim() && worthKeeping(e.text)) await speak(e.text);
           if (e.type === "tool_start") interruptAndKill();
           if (e.type === "turn_end") {
             closingDone = true;
@@ -739,7 +761,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
             break;
           case "text":
             progressed();
-            await append({ kind: "assistant_text", text: e.text, model: sessionModel ?? model ?? engine });
+            await speak(e.text);
             break;
           case "tool_start": {
             if (endOutcome || stopReason) {
@@ -854,10 +876,11 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
               if (existing.status !== "confirmed") items.push(existing);
               continue;
             }
-            const text = steerNoteText(m.message);
+            const text = steerNoteText(m.message, m.envelope?.principalId);
             const item: AppendedInput = { envelopeId: m.envelopeId, kind: "steer", text, status: "queued" };
             tracked.set(item.envelopeId, item);
             items.push(item);
+            if (m.envelope && isPerson(m.envelope.principalId)) personWaits = true;
           }
           if (!ended) await deliver(items, "interrupt");
         });
@@ -886,7 +909,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
       if (!endOutcome && !stopReason && !refused) {
         state.relaunchItems = unconfirmed;
       }
-      debug({ type: "exit", cellId, code: exit.code, signal: exit.signal, stderr: state.stderr });
+      debug({ type: "exit", cellId, code: exit.code, signal: exit.signal, stderr: state.stderr, ...(endOutcome || stopReason ? { stopped: true } : {}) });
       return state;
     }
   }

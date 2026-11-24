@@ -1,3 +1,4 @@
+import { parsePrincipal } from "../address";
 import type { CellSpec, CellStatus, PresetName } from "./cell";
 import type { Deliverable } from "./deliverable";
 import type { Envelope, InboxAddr, PolicyBounds } from "./envelope";
@@ -300,9 +301,22 @@ export function spillNotice(uri: string, totalChars: number, headChars: number, 
  * Steer messages drained mid-Run: the Loop appends a `system_note` whose text is `steerNoteText(msg)` and feeds the
  * model the same text as a user text block; Context renders system_note text verbatim, so both match.
  */
-export function steerNoteText(message: string): string {
-  return `[steer from the user while you were working] ${message}`;
+export function steerNoteText(message: string, principalId?: string): string {
+  return `[steer from ${steerSender(principalId)} while you were working] ${message}`;
 }
+
+/** Who interrupts, as the interrupted cell reads it: the owner, the owner through their agent, or the cell above. */
+function steerSender(principalId: string | undefined): string {
+  if (!principalId) return "the user";
+  const who = parsePrincipal(principalId);
+  if (who.kind === "owner") return "the owner";
+  if (who.kind === "agent") return "the owner, through their coding agent,";
+  if (who.kind === "cell") return `cell ${who.cellId}`;
+  return "the user";
+}
+
+/** Matches the head of a steer note, whoever sent it. */
+export const STEER_NOTE_HEAD = /^\[steer from [^\]]*? while you were working\]\s*/;
 
 /** A stored evidence record as read back (large text already cut to its inline form, `spillUri` set if spilled). */
 export interface EvidenceEntry {
@@ -434,11 +448,12 @@ export interface ChildSummary {
   parentId?: string | null;
   cwd?: string;
   /**
-   * What the cell is doing right now: `working` (a Run or Job in flight, or a message waiting to start it), `waiting`
+   * What the cell is doing right now: `working` (a Run or Job in flight), `queued` (a message is waiting to start its
+   * next Run — nothing has started yet), `waiting`
    * (a watch, a timer, an open wait or a card), `dormant` (a wakeable worker with nothing in flight and nothing that
    * would wake it — a message does), `paused`.
    */
-  activity?: "working" | "waiting" | "dormant" | "paused";
+  activity?: "working" | "queued" | "waiting" | "dormant" | "paused";
   /** Direct leaf children only: evidence the viewing cell has not looked at with inspect_cell yet (`from`..`to`). */
   unread?: { from: number; to: number };
 }

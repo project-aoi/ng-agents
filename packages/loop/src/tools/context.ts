@@ -99,7 +99,7 @@ const saveArtifact = defineTool({
   kind: "kernel",
   description: [
     "Create or revise a human-visible draft (reply, proposal, report). Omit artifactId to create one; to change part of an existing artifact use patch_artifact.",
-    "To revise an existing one — yours or one another cell created, such as a project's shared report — read it first and pass the expectedVersion you read (required): if someone saved a newer version in between, nothing is overwritten — you get the current version back to rework (and when that newer version is the human's, your text is kept beside it as a suggestion).",
+    "To revise an existing one — yours, your parent's or your worker's, or one that belongs to the project you work in (a project's shared report); another worker's report under a hub is not yours to change: write your own and say which one it replaces — read it first and pass the expectedVersion you read (required): if someone saved a newer version in between, nothing is overwritten — you get the current version back to rework (and when that newer version is the human's, your text is kept beside it as a suggestion).",
     "Without title, a revision keeps the current title.",
   ].join(" "),
   input: z.object({
@@ -310,8 +310,9 @@ const patchArtifact = defineTool({
           text: z.string().optional().describe("append / prepend: the text to add; replace_section: the section's new content"),
         }),
       )
-      .min(1),
-    title: z.string().optional().describe("a new title; omit to keep the current one"),
+      .default([])
+      .describe("the edits, applied in order; may be empty when only the title changes"),
+    title: z.string().optional().describe("a new title; omit to keep the current one. To rename only, pass title with no edits"),
   }),
   async handler(args, ctx) {
     const { artifactId, expectedVersion } = args;
@@ -332,6 +333,7 @@ const patchArtifact = defineTool({
         return artifactConflict(cur, PATCH_AGAIN, false);
       }
     }
+    if (args.edits.length === 0 && !args.title?.trim()) return { output: `Nothing to do: pass at least one edit, or a new title. ${artifactId} stays at v${cur.version}.`, isError: true, data: { artifactId, version: cur.version } };
     const patched = applyEdits(base, args.edits);
     if (!patched.ok) {
       if (stale) return artifactConflict(cur, PATCH_AGAIN, false);
@@ -406,6 +408,7 @@ const searchHistory = defineTool({
   description: [
     "Full-text search (Chinese and English) over what was said, done and saved — earlier searches and this wake-up's own records are left out.",
     "scope lineage (default): this cell's own messages, tool output and notes, plus shared notes. scope subtree: also everything below you — closed workers included — with their artifacts, state and the full text of long tool outputs. scope global: every cell on the workbench — use it before starting something new (is there already a project, a report or a preference about this?) and to find how something was done before.",
+    "An excerpt that starts with @N begins at character N of the hit's full text: read on from there (read_resource or read_artifact with offset N).",
   ].join(" "),
   input: z.object({ query: z.string().min(1), scope: z.enum(["lineage", "subtree", "global"]).optional() }),
   async handler(args, ctx) {
@@ -423,8 +426,11 @@ const searchHistory = defineTool({
             : h.source === "evidence"
               ? `#${h.seq} ${h.kind} ${new Date(h.at).toISOString()}${cell}`
               : `${h.source}${h.title ? ` ${h.title}` : ""}${cell}`;
-        const full = h.spillUri ?? h.uri;
-        return `- [${where}] ${clip(h.text.replace(/\s+/g, " "), 300)}${full ? ` (full: ${full})` : ""}`;
+        // Another cell's note (a source's observation notes, …) is found by a global search but cannot be opened from
+        // here: say whose it is instead of handing out an address that answers "not found".
+        const foreignNote = h.source === "knowledge" && h.cellId !== undefined && h.cellId !== null && h.cellId !== selfId(ctx);
+        const full = foreignNote ? undefined : (h.spillUri ?? h.uri);
+        return `- [${where}] ${clip(h.text.replace(/\s+/g, " "), 300)}${full ? ` (full: ${full})` : foreignNote ? ` (a note kept by cell ${h.cellId}; this excerpt is what you can read of it)` : ""}`;
       })
       .join("\n");
   },

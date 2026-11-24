@@ -73,6 +73,8 @@ interface LiveJob {
   pendingOutcome: Outcome | null;       // completion transaction failed; being retried
   retry: NodeJS.Timeout | null;
   attempts: number;
+  /** Wall time since which this process has watched the job: the standstills it can know of start here. */
+  watchedFrom: number;
 }
 
 export interface JobDeps {
@@ -293,6 +295,7 @@ export class JobManager {
       pendingOutcome: null,
       retry: null,
       attempts: 0,
+      watchedFrom: Date.now(),
     };
     this.#live.set(jobId, live);
     this.#watchOutput(live);
@@ -319,8 +322,7 @@ export class JobManager {
   #watchOutput(live: LiveJob): void {
     const threshold = this.d.limits.jobQuietWarningMs;
     if (!live.logPath || threshold <= 0) return;
-    const awake = (this.#awake ??= new AwakeClock(Math.min(5_000, Math.max(50, Math.floor(threshold / 4)))));
-    awake.start();
+    const awake = this.#awakeClock();
     const check = () => {
       const job = this.d.store.getJob(live.jobId);
       if (!job || job.state !== "running" || live.cancelReason !== null) return;
@@ -342,11 +344,28 @@ export class JobManager {
     arm(Math.min(threshold, this.d.limits.jobPollMs));
   }
 
+  /** One heartbeat for every job of this manager: it knows the spans in which this process (and its jobs) stood still. */
+  #awakeClock(): AwakeClock {
+    const threshold = this.d.limits.jobQuietWarningMs;
+    const awake = (this.#awake ??= new AwakeClock(threshold > 0 ? Math.min(5_000, Math.max(50, Math.floor(threshold / 4))) : 5_000));
+    awake.start();
+    return awake;
+  }
+
+  /**
+   * A job's time limit is run time, not wall time (audit M02): while the host slept or the whole process group was
+   * stopped the job did not run either, so when the timer fires the standstill it spanned is given back. A job
+   * re-adopted after a kernel restart only gets back the standstills this process itself saw.
+   */
   #armTimeout(live: LiveJob, remainingMs: number, totalTimeoutMs: number): void {
     if (live.timeoutTimer) clearTimeout(live.timeoutTimer);
+    const awake = this.#awakeClock();
+    const armedAt = Date.now();
     live.timeoutTimer = setTimeout(() => {
       live.timeoutTimer = null;
-      void this.#onTimeout(live, totalTimeoutMs);
+      const stoodStill = Math.floor(awake.asleepBetween(armedAt, Date.now()));
+      if (stoodStill > 0 && !this.#closed && !live.isDone && live.cancelReason === null) this.#armTimeout(live, stoodStill, totalTimeoutMs);
+      else void this.#onTimeout(live, totalTimeoutMs);
     }, Math.max(0, remainingMs));
     live.timeoutTimer.unref();
   }
@@ -379,13 +398,24 @@ export class JobManager {
       const envelopeId = `${jobId}:result`;
       if (!store.finishJob(jobId, { state: outcome.state, exitCode: outcome.exitCode, error: outcome.error, resultEnvelopeId: envelopeId })) return false;
       const now = clock.now();
+      const durationMs = Math.max(0, now - job.startedAt);
+      // Wall time that was not run time, also for a job that ended inside its limit.
+      const live = this.#live.get(jobId);
+      const standstillMs = live && this.#awake ? Math.floor(this.#awake.asleepBetween(live.watchedFrom, Date.now())) : 0;
+      const limit = job.timeoutMs ?? limits.jobTimeoutMs;
       const payload: JobResultPayload = {
         jobId,
         command: job.command,
         state: outcome.state,
         exitCode: outcome.exitCode,
         tail: readTail(job.logPath, limits.jobResultTailChars),
-        durationMs: Math.max(0, now - job.startedAt),
+        durationMs,
+        ...(standstillMs > 0
+          ? {
+              standstillMs,
+              note: `The machine stood still for about ${Math.round(standstillMs / 1000)} s of this (asleep or suspended). Only the time the job ran counts against its limit of ${Math.round(limit / 1000)} s: about ${Math.round(Math.max(0, durationMs - standstillMs) / 1000)} s.`,
+            }
+          : {}),
         ...(outcome.error ? { error: outcome.error } : {}),
       };
       if (this.d.resources && job.logPath && existsSync(job.logPath)) {

@@ -29,12 +29,15 @@ export type DeskKernel = Pick<
   | "activityOf"
   | "activeWorkspaces"
   | "listWaits"
+  | "listOpenWaits"
 >;
 
 export interface DeskSettings {
   backend: string;
   /** Weekly review slot in local time: weekday 0 = Sunday … 5 = Friday. */
   weeklyReview: { weekday: number; hour: number };
+  /** The owner's time zone (times shown to them are local there). Default: the host's. */
+  timeZone?: string;
 }
 
 export const DEFAULT_SETTINGS: DeskSettings = {

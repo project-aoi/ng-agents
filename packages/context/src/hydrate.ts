@@ -79,8 +79,11 @@ export interface HydrateDeps extends Deps {
   toolContract(cell: CellRecord): unknown;
   resolvePrompt(cell: CellRecord): string;
   roster(cellId: string): ChildSummary[];
-  /** `incoming`: the batch the Run is about to see (a wait it answers is no longer shown as open). */
-  tailNotes(cellId: string, incoming?: readonly Envelope[]): string[];
+  /**
+   * `incoming`: the batch the Run is about to see (a wait it answers is no longer shown as open). `runId`: that Run —
+   * the notes are read again after its start is on record, and "since your last turn" must not mean this one.
+   */
+  tailNotes(cellId: string, incoming?: readonly Envelope[], runId?: string): string[];
 }
 
 export function createHydrate(deps: HydrateDeps): HydrateModule {
@@ -441,8 +444,11 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
   /** The volatile tail: roster, the first task, the kernel's notes, then the batch. Read from the records as they are now. */
   function tailOf(cell: CellRecord, batch: ClaimedBatch, extraNotes: readonly string[]): PromptSnapshot["tail"] {
     const roster = deps.roster(cell.id);
-    const notes = [...extraNotes, ...(deps.tailNotes(cell.id, batch.envelopes) ?? [])].filter((n) => typeof n === "string" && n.trim() !== "");
-    const task = cell.spec.processor.kind === "llm" ? originalTask(cell.id) : null;
+    const notes = [...extraNotes, ...(deps.tailNotes(cell.id, batch.envelopes, batch.claimId) ?? [])].filter((n) => typeof n === "string" && n.trim() !== "");
+    // The reminder of the first task is for later turns. The Run that receives the task itself has it in full right
+    // below (and, once its batch is on record, the reminder would be that same text again, marked as possibly stale).
+    const first = batch.envelopes.some((e) => e.type === PAYLOAD.cellTask);
+    const task = cell.spec.processor.kind === "llm" && !first ? originalTask(cell.id) : null;
     if (task) notes.unshift(task);
     const messages: ModelMessage[] = [];
     if (roster.length > 0) messages.push(rosterMessage(roster));

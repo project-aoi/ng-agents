@@ -1,4 +1,5 @@
 import type { WeeklyReviewDTO } from "../../shared/api";
+import { get } from "@ng/protocol";
 import {
   projectOfAction,
   readActions,
@@ -42,11 +43,12 @@ export function projectReview(input: ProjectionInput): WeeklyReviewDTO {
       completed.push({ kind: "project", title: p.record.title, at: p.record.completedAt ?? p.record.updatedAt, project: null });
     }
   }
-  let editedDrafts = 0;
-  for (const r of kernel.gate.listApprovalsSync({ status: ["executed", "approved"] })) {
-    if ((r.resolvedAt ?? r.updatedAt) < ws) continue;
-    if (r.humanEdited) editedDrafts++;
-  }
+  // Every decided item whose draft the owner changed — a Gate-held action or a card a cell put before them.
+  const editedDrafts = get<{ n: number }>(
+    kernel.db,
+    "SELECT count(*) AS n FROM human_items WHERE human_edited = 1 AND status IN ('executed','approved','resolved') AND COALESCE(resolved_at, updated_at) >= ?",
+    [ws],
+  )!.n;
   completed.sort((a, b) => b.at - a.at);
 
   const overdueWaits: WeeklyReviewDTO["overdueWaits"] = [];

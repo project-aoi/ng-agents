@@ -95,7 +95,10 @@ export function createWaits(core: Pick<KernelCore, "db" | "clock" | "inbox" | "b
     if (wait.waitingFor === WAIT_HUMAN) {
       // The owner spoke, decided a card, or an agent acting for them on the control plane did.
       const p = parsePrincipal(env.principalId, core.ownerPrincipal);
-      return env.type === PAYLOAD.approvalResolved ||
+      // …or a cell passed their words on (the desk relaying an answer the owner gave in conversation): the message says
+      // which message of the owner it carries.
+      const relayed = env.type === PAYLOAD.cellMessage && typeof (env.payload as { ownerMessageId?: unknown } | null)?.ownerMessageId === "string";
+      return env.type === PAYLOAD.approvalResolved || relayed ||
         ((env.type === PAYLOAD.userMessage || env.type === PAYLOAD.cellMessage) && (p.kind === "owner" || p.kind === "agent"));
     }
     if (wait.waitingFor === WAIT_EXTERNAL) {
@@ -119,12 +122,19 @@ export function createWaits(core: Pick<KernelCore, "db" | "clock" | "inbox" | "b
       const candidates = open.filter(w => !done.has(w.waitId) && w.registeredRun !== runId && answers(w, env));
       const keys = p?.actionId ? [...refs, p.actionId] : refs;
       const explicit = candidates.filter(w => keys.includes(w.waitId) || (w.refId !== null && keys.includes(w.refId)));
-      const direct = env.from === KERNEL_FROM.control && ["owner", "agent"].includes(parsePrincipal(env.principalId, core.ownerPrincipal).kind);
+      const direct = (env.from === KERNEL_FROM.control && ["owner", "agent"].includes(parsePrincipal(env.principalId, core.ownerPrincipal).kind)) ||
+        (env.type === PAYLOAD.cellMessage && typeof p?.ownerMessageId === "string");
       const unnamed = candidates.filter(w => w.refId === null && w.waitId === w.waitingFor);
       const chatReply = direct && !p?.actionId && ![p?.refId, p?.waitId, data?.refId, data?.waitId].some(Boolean);
+      // A wait on the very cell that now reports is the specific one; "external" beside it is the vague standing wait
+      // (a hub waiting for whatever comes next) and is not what this result answers. Without this, a result that could
+      // answer both closed neither, and the waits on workers piled up (live rerun, uc06).
+      const fromSender = unnamed.filter(w => w.waitingFor === env.from);
       const fallback = chatReply && !refs.length ? candidates
         : chatReply ? unnamed.filter(w => w.waitingFor === "human")
-        : !refs.length && candidates.length === 1 ? unnamed : [];
+        : refs.length ? []
+        : fromSender.length ? fromSender
+        : candidates.length === 1 ? unnamed : [];
       const matches = env.type === PAYLOAD.waitTimeout ? candidates : explicit.length ? explicit : fallback;
       for (const w of matches) done.set(w.waitId, w);
     }

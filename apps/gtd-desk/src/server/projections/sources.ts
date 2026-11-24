@@ -28,7 +28,8 @@ export function scheduleText(s: SourceRecord["schedule"]): string {
   return "收到消息时";
 }
 
-const STATUS_LABEL = { ok: "运行正常", error: "出错", paused: "已暂停" } as const;
+// The check itself, not what it found: a source that keeps finding the same failure "runs normally" too.
+const STATUS_LABEL = { ok: "检查照常运行", error: "出错", paused: "已暂停" } as const;
 const MODE_LABEL = { active: "命中时投进信箱", observe: "只记观察笔记，不弹卡" } as const;
 const PROCESSOR_LABEL = { code: "脚本检查（零 Token）", llm: "模型初筛" } as const;
 
@@ -59,6 +60,15 @@ export function projectSources(input: ProjectionInput): SourcesDTO {
       lastError: r.lastError ?? null,
       runCount: r.runCount,
       hitCount: r.hitCount,
+      stillHitting: r.lastHitDigest !== undefined,
+      repeats: r.lastHitRepeats ?? 0,
+      lastCheckText: !r.lastRunAt
+        ? null
+        : r.lastError && status === "error"
+          ? "上次检查出错"
+          : r.lastHitDigest !== undefined
+            ? `上次检查仍然命中${r.lastHitUnreported ? "（观察期间记下的，还没有报出；下次检查仍在就报）" : r.lastHitRepeats ? `（同样的结果又出现 ${r.lastHitRepeats} 次，没有重复${r.mode === "observe" ? "记录" : "上报"}）` : ""}`
+            : "上次检查没有命中",
       buttons: [
         status === "paused"
           ? button({ id: "resume", label: "▶ 恢复", primary: true, endpoint: post(`${base}/resume`) })

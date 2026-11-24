@@ -60,10 +60,11 @@ export function createChannelHub({ db, bus, clock = systemClock, ownerPrincipal 
         VALUES (?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`, [id, cellId, JSON.stringify(content), createdAt]);
       if (result.changes) afterCommit(db, () => bus.emit("owner.notified", { id, cellId, content, createdAt }));
     },
-    listNotificationsSync(limit = 50) {
+    listNotificationsSync(limit = 50, { cellIds, since = 0 } = {}) {
       return all<Omit<LocalNotification, "content"> & { content: string }>(db,
         `SELECT id, cell_id AS cellId, content, created_at AS createdAt FROM owner_notifications
-         ORDER BY created_at DESC, rowid DESC LIMIT ?`, [limit])
+         WHERE created_at >= ?${cellIds ? " AND cell_id IN (SELECT value FROM json_each(?))" : ""}
+         ORDER BY created_at DESC, rowid DESC LIMIT ?`, [since, ...(cellIds ? [JSON.stringify(cellIds)] : []), limit])
         .map(row => ({ ...row, content: JSON.parse(row.content) }));
     },
   };

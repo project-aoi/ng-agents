@@ -90,7 +90,7 @@ const isKernelNotice = (env: Envelope) => env.type.startsWith("kernel.");
  * 5. A parked or finished record whose cell was woken by something real (resumed, or a follow-up beat the close) is
  *    active again.
  */
-export async function prepareProjectRun({ snapshot, ports, clock }: PrepareRunInput): Promise<void> {
+export async function prepareProjectRun({ snapshot, ports, clock }: PrepareRunInput): Promise<void | { notes: string[] }> {
   if (ports.self.spec.meta?.["role"] !== ROLES.project) return;
   const self = ports.self.cellId;
   const now = clock.now();
@@ -120,11 +120,16 @@ export async function prepareProjectRun({ snapshot, ports, clock }: PrepareRunIn
   // Every open action the child carries: a worker that was sent a second piece of work (track_action with its cellId)
   // carries two, and its turn settles both — the kernel tells the model which ones were closed.
   const carrying = (cellId: string) => [...actions.values()].filter((a) => a.status === "open" && a.owner !== "human" && a.cellId === cellId);
+  // A worker that stopped to ask this project something may, in the turn the answer started, have done only what the
+  // answer said ("只做查阅") and not the piece it carries: its action stays open for the project to judge (audit M16).
+  const leftOpen: ActionRecord[] = [];
   for (const env of batch) {
     if (isEnvelopeOfType(env, "cell.result")) {
       const p = env.payload as CellResultPayload;
       for (const a of carrying(p.childCellId)) {
-        if (p.status === "completed") {
+        if (p.status === "completed" && p.childState === "dormant" && p.turn?.messagesToParent) {
+          leftOpen.push(a);
+        } else if (p.status === "completed") {
           set(patchAction(a, { status: "done", ...(p.artifactId ? { artifactId: p.artifactId } : {}) }, now));
         } else if (p.childState !== "dormant") {
           set(patchAction(a, { cellId: null }, now));
@@ -154,4 +159,11 @@ export async function prepareProjectRun({ snapshot, ports, clock }: PrepareRunIn
   }
 
   if (updates.size || Object.keys(patches).length) ports.actionBooks!.commit([...updates.values()], patches);
+  if (leftOpen.length) {
+    return {
+      notes: [
+        `[actions left open at this wake-up — the cell carrying each asked you something before its turn ended, so it may only have dealt with your answer. Read its report: close the action (track_action with status "done") or send that cell the next instruction]\n${leftOpen.map((a) => `- ${a.id} "${a.title}"${a.cellId ? ` (cell ${a.cellId})` : ""}`).join("\n")}`,
+      ],
+    };
+  }
 }

@@ -1,6 +1,6 @@
 FX=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$FX"/lib.sh; mkdir -p ~/dev/gateway/src ~/dev/gateway/test; cd ~/dev/gateway
-printf 'def handle(req):\n    return {"status": 200}\n' > src/server.py; printf '# gateway\nAPI gateway. `python3 -m unittest discover -s test -q`.\n' > README.md; repo gateway
+printf 'def handle(req):\n    return {"status": 200}\n' > src/server.py; printf '# gateway\nAPI gateway. `python3 -m unittest discover -s test -q`.\nMerge requests and CI live on the team forge: `forge mr list`, `forge mr view <n>`, `forge ci status <n>`.\n' > README.md; repo gateway
 git checkout -q -b feat/rate-limit; cat > src/limiter.py <<'T'
 import time
 class TokenBucket:

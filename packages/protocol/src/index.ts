@@ -32,4 +32,4 @@ export * from "./db/repos";
 export * from "./schema";
 export * from "./human-item";
 
-export {CHANNEL_LABELS,describeEnvelopeSource} from "./source";
+export {CHANNEL_LABELS,describeEnvelopeSource,speaks} from "./source";

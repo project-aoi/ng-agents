@@ -17,11 +17,12 @@ import {
   type RunPorts,
   type ToolContext,
   type VersionedArtifact,
+  sha256Hex,
 } from "@ng/protocol";
 import { projectLaunch, startProjectSync, type ProjectInit, type RepoRef } from "../project/launch";
 import { RESTORE_REASON, ROLES, type PresetsConfig } from "../shared/config";
 import { notifyOwner } from "../shared/notify";
-import { clipLine, newActivity, primaryItem, type RawInput } from "../shared/records";
+import { newActivity, primaryItem, type RawInput } from "../shared/records";
 
 /** What the desk remembers about a proposal until the owner decides (`desk:proposal:<artifactId>`). */
 export interface ProposalItem {
@@ -81,12 +82,14 @@ export function approvedProjectInit(
   const card = asDecisionCard(action.card?.data);
   const proposal = action.artifactId ? art?.content.data : action.proposal;
   if (!isProjectProposal(proposal)) throw new NgError("conflict", "立项方案的内容不完整，请修改方案后再确认");
-  const brief = ["主人在立项卡上确认了这份方案（可能亲手改过），按它开始推进。", proposal.background ?? ""].filter(Boolean).join("\n");
+  const brief = ["主人在立项卡上确认了这份方案（确认前方案可能按主人的意思改过），按它开始推进。", proposal.background ?? ""].filter(Boolean).join("\n");
   return {
     id: projectIdForApproval(approvalId),
     title: proposal.title,
     outcome: proposal.outcome,
     brief,
+    briefBy: "plan",
+    ...(proposal.agentContext?.trim() ? { agentContext: proposal.agentContext.trim() } : {}),
     proposal,
     plan: proposal.actions.map((a) => ({ title: a.title, owner: a.owner, ...(a.nextStep ? { nextStep: a.nextStep } : {}), ...(a.effort ? { effort: a.effort } : {}) })),
     source: card?.source ?? remembered?.source ?? { label: "立项", at: clock.now() },
@@ -197,13 +200,18 @@ export async function settleDeskBatch(cfg: PresetsConfig, ctx: ToolContext): Pro
    * A project of the desk finished: one line in the "后台已处理" drawer. Once per project. True when it was a project
    * that completed normally — the owner has been told and nothing else follows from it.
    */
-  async function projectFinished(p: CellResultPayload): Promise<boolean> {
+  async function projectFinished(p: CellResultPayload, resultId: string): Promise<boolean> {
     if (p.status !== "completed") return false;
     const project = await ports.context.readState<ProjectRecord>(p.childCellId, gtdKeys.project).catch(() => null);
     if (!project || project.lifecycle !== "completed") return false;
-    const id = `done-${p.childCellId}`;
+    // One record per closing: a project that was reopened and finished again is filed again, with what it delivered
+    // the second time (the first closing keeps the id it always had).
+    const first = `done-${p.childCellId}`;
+    const earlier = await ports.context.readState<ActivityRecord>(self, gtdKeys.activity(first));
+    const id = !earlier || earlier.detail === p.summary ? first : `${first}-${sha256Hex(resultId).slice(0, 10)}`;
     if (await ports.context.readState(self, gtdKeys.activity(id))) return true;
-    await notifyOwner(ports, `「${project.title}」已完成：${clipLine(p.summary.split("\n")[0]!, 120)}`, `finished:${p.childCellId}:${id}`);
+    // The owner is told once, by the project itself: finish_project sends its summary as the completion notice. A
+    // second, shortened notice from here cut the sentence before its main caveat (audit M14).
     const a: ActivityRecord = newActivity({ id, kind: "action_completed", title: `已完成：${project.title}`, detail: p.summary, ...(project.source ? { source: project.source } : {}), restorable: false }, now);
     await ports.context.commit(self, { statePatches: { [gtdKeys.activity(id)]: a } });
     out.push(`项目已完成：${project.title}`);
@@ -233,7 +241,7 @@ export async function settleDeskBatch(cfg: PresetsConfig, ctx: ToolContext): Pro
     } else if (isEnvelopeOfType(env, "cell.result")) {
       // A project that completed normally has told the owner itself; its result is bookkeeping. Every other result —
       // a fixer's, a failure, one somebody waits on — is for the model.
-      return (await projectFinished(env.payload as CellResultPayload)) && !waitedOn;
+      return (await projectFinished(env.payload as CellResultPayload, env.id)) && !waitedOn;
     } else if (isEnvelopeOfType(env, "cell.progress")) {
       return true;
     }

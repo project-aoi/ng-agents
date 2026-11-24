@@ -276,7 +276,8 @@ export interface Kernel {
   // ---------- ingress and approvals ----------
   /** The hub's ingress sink: route by watches (thread / filter), else to the desk; durably enqueued before it resolves. */
   ingest(raw: Omit<Envelope, "to">, channelId: string): Promise<IngestResult>;
-  reopenProject(cellId: string, principalId: string): Promise<string[]>;
+  /** `words`: what the owner said with it (the project wakes with them), and their coding agent's own note, if any. */
+  reopenProject(cellId: string, principalId: string, words?: { text?: string; agentContext?: string }): Promise<string[]>;
 
   // ---------- read models ----------
   getCell(cellId: string): CellRecord | undefined;
@@ -305,6 +306,8 @@ export interface Kernel {
   anchorsOf(cellId: string): AnchorReport;
   /** Open waits of these cells (all cells when omitted). */
   listWaits(cellIds?: readonly string[]): WaitRecord[];
+  /** `listWaits` without the waits whose answer is already queued for (or being handled by) the waiting cell: what an onlooker should be shown as "waiting". */
+  listOpenWaits(cellIds?: readonly string[]): WaitRecord[];
   /**
    * Cell-to-cell message as the explicit `principalId` — the control plane's twin of RunPorts.sendToCell:
    * `closed` / `not_found` are answers, not errors. From the owner or an agent to a leaf below a coordinator, the
@@ -337,6 +340,8 @@ export interface AnchorReport {
 /** What a cell is doing right now (ReadModel.activityOf). `idle` is a coordinator with nothing in flight; `dormant` a leaf. */
 export interface CellActivity {
   state: "working" | "waiting" | "dormant" | "idle" | "paused" | "closed";
+  /** What that rests on, for `working` and `waiting`. */
+  cause?: "run" | "job" | "message" | "card" | "wait" | "watch" | "timer" | "child";
   /** One plain clause saying why (for refusals and status lines). */
   why: string;
 }

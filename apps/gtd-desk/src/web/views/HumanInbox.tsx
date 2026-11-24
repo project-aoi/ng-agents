@@ -53,6 +53,7 @@ export function HumanInbox({ cardId }: { cardId?: string | undefined }) {
   });
   if (!res.data)
     return res.error ? <ErrorState title="待办未能载入" error={res.error} onRetry={res.reload} /> : <Loading label="正在载入待办" />;
+  const { questions } = res.data;
   return (
     <div className={focused ? "human-inbox editing" : "human-inbox"}>
       {!focused && (
@@ -68,6 +69,17 @@ export function HumanInbox({ cardId }: { cardId?: string | undefined }) {
               <option value="action">待我动手</option>
             </select>
           </div>
+          {filter === "all" && questions.length > 0 && (
+            <section>
+              <h3>后台在问你</h3>
+              {questions.map((q) => (
+                <button type="button" className="inbox-row" key={q.cellId} onClick={() => navigate({ view: "agents", cellId: q.cellId })}>
+                  <strong>{q.text.length > 80 ? `${q.text.slice(0, 80)}…` : q.text}</strong>
+                  <small>{q.from}{q.stopped ? " · 已停靠或暂停，暂时不用答" : " · 去对话里回答 →"}</small>
+                </button>
+              ))}
+            </section>
+          )}
           {[true, false].map((waiting) => {
             const group = items.filter((i) => (i.category === "decision") === waiting);
             return (
@@ -108,7 +120,9 @@ export function HumanInbox({ cardId }: { cardId?: string | undefined }) {
           }}
         />
       ) : (
-        <Empty title="待办已清空">有新的事项时会出现在这里。</Empty>
+        <Empty title={questions.length > 0 ? "没有待处理的卡片" : "待办已清空"}>
+          {questions.length > 0 ? "后台有问题在等你回答，见左侧。" : "有新的事项时会出现在这里。"}
+        </Empty>
       )}
     </div>
   );
@@ -247,7 +261,6 @@ function Detail({
       const text = failure.code === "bounds_violation"
         ? "没有权限执行这项操作"
         : failure.status === 404 ? "事项已移除"
-        : failure.status === 409 && failure.message === "事项已变动" ? "事项已经更新，请核对最新选项后重新提交。"
         : /[㐀-鿿]/.test(failure.message) ? failure.message
         : failure.status === 409 ? "事项内容已变动，请核对后重新提交"
         : failure.status === 400 ? "请检查填写的说明和选项" : "提交失败，请稍后重试";
@@ -320,9 +333,9 @@ function Detail({
         </p>
       )}
       {item.rawInput?.text && <blockquote>{item.rawInput.text}</blockquote>}
-      {item.prep && (
+      {item.prep && (item.prep.summary || item.prep.checked.length > 0) && (
         <>
-          <p>{item.prep.summary}</p>
+          {item.prep.summary && <p>{item.prep.summary}</p>}
           <References items={item.prep.checked} />
         </>
       )}

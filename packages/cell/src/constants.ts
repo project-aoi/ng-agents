@@ -19,6 +19,13 @@ export const KERNEL_ESCALATION_PRINCIPAL = "kernel:escalation";
 /** `timer.fired` payload.data.kernel marker of a snoozed card's resurfacing wake-up (handled by the kernel, no Run). */
 export const RESURFACE_MARKER = "approval.resurface";
 
+/** The record a cell keeps when the close or park it asked for was not carried out: what was asked, and what stood in the way. */
+export function notCarriedOut(action: "complete" | "cancel" | "pause", because: string): string {
+  return `[${action === "pause" ? "parking" : action === "cancel" ? "cancelling" : "closing"} this cell was not carried out: ${because}]`;
+}
+export const NOT_CARRIED_OUT = /^\[(?:closing|cancelling|parking) this cell was not carried out: /;
+export const MESSAGE_ARRIVED = "a message arrived before the turn settled";
+
 export const DEFAULTS = {
   ownerPrincipal: "owner",
   deskCellId: "desk",

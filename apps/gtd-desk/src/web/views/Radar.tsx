@@ -128,6 +128,7 @@ function ProjectRow({ row, now, onRun }: { row: ProjectRowDTO; now: number; onRu
         </div>
         {row.outcome && <p className="project-outcome">{row.outcome}</p>}
         {row.summary && <p className="muted small">{row.summary}</p>}
+        {row.pausedText && <p className="muted small">{row.pausedText}</p>}
         {row.cwd && <p className="muted small">{row.cwd}</p>}
       </div>
 

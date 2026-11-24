@@ -107,7 +107,7 @@ describe("tools", () => {
     expect(created.text).toContain(`Started project ${projectId}「Harness 对比」`);
     expect(d.kernel.getCell(projectId)).toMatchObject({ preset: "project", principalId: "agent:local", parentId: "desk", spec: {cwd:repo} });
     await d.kernel.idle();
-    expect(d.kernel.context.readStateSync<ProjectRecord>(projectId, gtdKeys.project)).toMatchObject({ title: "Harness 对比", source: { label: "主 Agent", principalId: "agent:local" } });
+    expect(d.kernel.context.readStateSync<ProjectRecord>(projectId, gtdKeys.project)).toMatchObject({ title: "Harness 对比", source: { label: "编码助手", principalId: "agent:local" } });
 
     const card = d.kernel.humanItems.create({title:"选择交付范围", subjectKey:"scope",
       options:[{id:"reply", label:"回复", effect:"reply"}]}, projectId);
@@ -120,7 +120,7 @@ describe("tools", () => {
     expect(got.text).toContain(`项目 ${projectId}「Harness 对比」`);
     expect(got.text).toContain(action.id);
     expect(got.text).toContain(`目录：${repo}`);
-    expect(got.text).toContain("项目本身在等：human");
+    expect(got.text).toContain("项目本身在等：主人");
 
     const msg = await ok(d, "message_project", { id: projectId, text: "做完后用 /ship-mr 提 MR" });
     expect(msg.text).toContain(`Delivered the owner's words to ${projectId}`);
@@ -151,7 +151,7 @@ describe("tools", () => {
   it("create_project with a directory that does not exist asks for the right path instead of guessing", async () => {
     const d = await bootRealDesk();
     const r = await refused(d, "create_project", { title: "改 TUI", outcome: "复制出 Markdown", brief: "改表格复制", cwd: "/definitely/not/here" });
-    expect(r.text).toContain("Ask the owner for the correct absolute path");
+    expect(r.text).toContain("Ask the owner for the right path instead of guessing");
     expect(d.kernel.listCells({ parentId: "desk" })).toEqual([]);
   });
 
@@ -170,7 +170,10 @@ describe("tools", () => {
     expect((await refused(d, "set_project_state", { id: projectId, state: "resume" })).text).toContain("以后再说");
     await ok(d, "set_project_state", { id: projectId, state: "activate", note: "先做第一阶段" });
     expect(d.kernel.getCell(projectId)!.status).toBe("active");
-    expect(texts(d, projectId).at(-1)).toMatchObject({ principalId: "agent:local", text: expect.stringContaining("主人（经主 Agent）的话：先做第一阶段") });
+    // Audit 2026-11-23 rerun R01: the project hears that the owner's coding agent brought it back, and the owner's words apart.
+    const woke = texts(d, projectId).at(-1)!;
+    expect(woke).toMatchObject({ principalId: "agent:local", text: expect.stringContaining("这次带来的主人的话：「先做第一阶段」") });
+    expect(woke.text).toContain("主人的编码助手把「极简模式」从以后再说里拿了出来");
     await d.kernel.idle();
     const last = requestsOf(d.script, projectId).at(-1)!;
     expect(last).toContain("范围缩小到第一阶段");
@@ -236,7 +239,7 @@ describe("tools", () => {
     await refused(d, "decide_human_item", { ...approve, seenArtifactVersion: undefined });
     await refused(d, "decide_human_item", { ...approve, seenArtifactVersion: 2 });
     await expect(d.kernel.humanItems.decide(proposal.id, {optionId:"system.someday",
-      seenArtifactVersion:1, seenItemRevision:proposal.itemRevision}, "owner")).rejects.toMatchObject({code:"conflict", message:"选项已变动"});
+      seenArtifactVersion:1, seenItemRevision:proposal.itemRevision}, "owner")).rejects.toMatchObject({code:"conflict", message:expect.stringMatching(/^选项已变动：现在可选 /)});
     expect(d.kernel.gate.getApprovalSync(proposal.id)!.status).toBe("pending");
     expect(d.kernel.listCells({ parentId: "desk" })).toEqual([]);
 
@@ -511,7 +514,8 @@ describe("MCP stdio server (bin/ng-mcp.mjs)", () => {
       mcp.send({ id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "test", version: "0" } } });
       const init = (await mcp.next()) as { id: number; result: { protocolVersion: string; serverInfo: { name: string }; instructions: string; capabilities: unknown } };
       expect(init).toMatchObject({ id: 1, result: { protocolVersion: "2025-06-18", serverInfo: { name: AGENT_SERVER_NAME }, capabilities: { tools: {} } } });
-      expect(init.result.instructions).toBe(AGENT_INSTRUCTIONS);
+      // Audit 2026-11-23 rerun L01: the instructions end with the address this session reaches the workbench at.
+      expect(init.result.instructions).toBe(`${AGENT_INSTRUCTIONS}\nThe workbench is at ${url.replace(/\/+$/, "")} (links for the owner start with this address).`);
       mcp.send({ method: "notifications/initialized" });
       mcp.send({ id: 2, method: "tools/list" });
       const list = (await mcp.next()) as { id: number; result: { tools: Array<{ name: string; inputSchema: unknown }> } };
@@ -531,6 +535,8 @@ describe("MCP stdio server (bin/ng-mcp.mjs)", () => {
       expect(overview.id).toBe(3);
       expect(overview.result.isError).toBeUndefined();
       expect(overview.result.content[0]!.text).toContain(item.title);
+      // L01: and the overview names the same address first.
+      expect(overview.result.content[0]!.text).toContain(`\n\n工作台地址：${url.replace(/\/+$/, "")}\n`);
       mcp.send({id:21,method:"tools/call",params:{name:"decide_human_item",arguments:{id:item.id,optionId:"research",seenItemRevision:1,note:"看第一份"}}});
       const decision=(await mcp.next()) as {result:{content:Array<{text:string}>}};
       expect(JSON.parse(decision.result.content[0]!.text)).toMatchObject({status:"resolved",activityId:expect.any(String),restorable:true});

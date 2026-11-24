@@ -1,5 +1,7 @@
 import type { NotificationDTO, StatusDTO } from "../../shared/api";
 import { get } from "@ng/protocol";
+import { withdrawnCards } from "./activity";
+import { ownerQuestions } from "./agents";
 import { readActivities, type DeskKernel, type ProjectionInput } from "./common";
 import { radarProjects } from "./radar";
 import { localMidnight, nextWeekly, whenText } from "./time";
@@ -60,6 +62,8 @@ export function projectStatus(input: ProjectionInput): StatusDTO {
     SELECT COUNT(*) FILTER (WHERE snoozed_until IS NULL OR snoozed_until <= ?) AS pending,
            COUNT(*) FILTER (WHERE snoozed_until > ?) AS snoozed
     FROM human_items WHERE status IN ('pending','snoozed') AND (cell_id IS NOT NULL OR due_at IS NULL OR due_at <= ?)`, [now, now, now])!;
+  // A paused or parked cell's question is listed too, but nobody needs to answer it now.
+  const questions = ownerQuestions(input).filter((q) => !q.stopped).length;
   const since = localMidnight(now);
   const today = { archivedNotifications: 0, notesSaved: 0, remindersSet: 0, cardsWithdrawn: 0, since };
   for (const a of readActivities(kernel)) {
@@ -71,7 +75,8 @@ export function projectStatus(input: ProjectionInput): StatusDTO {
   }
   today.cardsWithdrawn = get<{n: number}>(kernel.db, `SELECT COUNT(*) AS n FROM human_item_activity a
     WHERE a.at >= ? AND a.undone_at IS NULL
-    AND a.after_disposition IN ('denied','cancelled')`, [since])!.n;
+    AND a.after_disposition IN ('denied','cancelled')`, [since])!.n
+    + withdrawnCards(kernel, since).length;
   const radar = radarProjects(input);
   const nextReviewAt = nextWeekly(now, settings.weeklyReview.weekday, settings.weeklyReview.hour);
 
@@ -85,7 +90,8 @@ export function projectStatus(input: ProjectionInput): StatusDTO {
   radarLine.push(`下次周回顾 ${whenText(nextReviewAt, now)}`);
 
   return {
-    humanPending: counts.pending,
+    humanPending: counts.pending + questions,
+    humanQuestions: questions,
     humanSnoozed: counts.snoozed,
     generatedAt: now,
     backend: settings.backend,

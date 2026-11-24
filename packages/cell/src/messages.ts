@@ -17,6 +17,7 @@ import {
   type Envelope,
   type SendToCellResult,
   type UserMessagePayload,
+  speaks,
 } from "@ng/protocol";
 import { AGENT_NOTE_LABEL } from "@ng/context";
 import { isProjectRoot, type KernelCore } from "./core";
@@ -30,6 +31,21 @@ const clip = (text: string) => (text.length > 400 ? `${text.slice(0, 400)}…` :
 export function isPersonPrincipal(core: Pick<KernelCore, "registry" | "ownerPrincipal">, principalId: string): boolean {
   const kind = parsePrincipal(principalId, core.ownerPrincipal).kind;
   return kind === "owner" || kind === "agent";
+}
+
+/** The message `id` in this cell's inbox, when a person (the owner, their agent) sent it: what may be passed on as the owner's word. */
+export function ownerMessageIn(core: Pick<KernelCore, "registry" | "ownerPrincipal" | "inbox">, cellId: string, id: string): Envelope | null {
+  const env = core.inbox.listMessagesSync({ cellId, envelopeId: id, limit: 1 })[0]?.envelope;
+  return env && isPersonPrincipal(core, env.principalId) && speaks(env) ? env : null;
+}
+
+/** The person whose words an envelope carries: its sender, or — passed on by another cell — the sender of the message it names. */
+export function spokenBy(core: Pick<KernelCore, "registry" | "ownerPrincipal" | "inbox">, env: Envelope): string | null {
+  if (isPersonPrincipal(core, env.principalId) && speaks(env)) return env.principalId;
+  const p = env.payload as { ownerMessageId?: unknown } | null;
+  const from = parsePrincipal(env.principalId, core.ownerPrincipal);
+  if (env.type !== PAYLOAD.cellMessage || from.kind !== "cell" || typeof p?.ownerMessageId !== "string") return null;
+  return ownerMessageIn(core, from.cellId, p.ownerMessageId)?.principalId ?? null;
 }
 
 /**
@@ -116,6 +132,7 @@ export function sendCellMessage(
       ...(o.replyToText ? { replyToText: clip(o.replyToText) } : {}),
       ...(o.conversationId ? { conversationId: o.conversationId } : {}),
       ...(o.agentContext ? { agentContext: o.agentContext } : {}),
+      ...(o.message.ownerMessageId ? { ownerMessageId: o.message.ownerMessageId } : {}),
     };
     const envelope = createEnvelope<CellMessagePayload>(
       {
@@ -127,6 +144,7 @@ export function sendCellMessage(
         type: PAYLOAD.cellMessage,
         payload,
         expectedEpoch: target.epoch,
+        ...(o.message.quiet ? { delivery: "silent_inject" as const } : {}),
         ...(o.message.threads?.length ? { threads: o.message.threads } : {}),
       },
       core.clock,

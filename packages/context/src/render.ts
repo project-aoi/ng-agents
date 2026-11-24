@@ -62,10 +62,30 @@ const OMITTED_FIELDS: Readonly<Record<string, readonly string[]>> = {
 export const AGENT_NOTE_LABEL = "[note added by the owner's coding agent — not the owner's words]";
 const AGENT_NOTE_TYPES: ReadonlySet<string> = new Set(["user.message", "cell.message", "cell.direct_chat"]);
 
+/** The account a worker had ended on when somebody then spoke to it, shown under its last words (payload `saidBefore`). */
+const SAID_BEFORE_LABEL = "[what it had reported in this turn before it was spoken to again — the account of its work may be here]";
+
 function isoTime(ms: number): string {
   if (!Number.isFinite(ms)) return String(ms);
   const d = new Date(ms);
   return Number.isNaN(d.getTime()) ? String(ms) : d.toISOString();
+}
+
+/**
+ * A message another cell handed back: what was originally said comes first, in its sender's words — the reason for
+ * handing it back is a remark on it. (Shown the other way round, the owner's sentence was a field deep inside a JSON
+ * dump under the hub's reason.)
+ */
+function renderHandback(obj: Record<string, unknown>): string | null {
+  const original = obj["original"] as Partial<Envelope> | undefined;
+  if (!original || typeof original !== "object" || typeof original.id !== "string") return null;
+  const p = original.payload as Record<string, unknown> | string | null | undefined;
+  const words = typeof p === "string" ? p : p && typeof p["text"] === "string" ? (p["text"] as string) : p ? prettyJson(p) : "";
+  const head = [`original ${original.type ?? "message"}`, `from ${original.from ?? "?"}`, `principal ${original.principalId ?? "?"}`, `id ${original.id}`];
+  if (original.threads?.length) head.push(`thread ${original.threads.join(", ")}`);
+  const who = typeof obj["fromCellId"] === "string" ? obj["fromCellId"] : "a cell";
+  const reason = typeof obj["reason"] === "string" ? obj["reason"] : "";
+  return `[${head.join(" · ")}]\n${words}\n\n[handed back by ${who}${reason ? ` — its reason: ${reason}` : ""}]`;
 }
 
 function renderPayload(env: Envelope): string {
@@ -74,6 +94,8 @@ function renderPayload(env: Envelope): string {
   if (payload === null || payload === undefined) return "";
   if (typeof payload !== "object" || Array.isArray(payload)) return prettyJson(payload);
   const obj = payload as Record<string, unknown>;
+  const handed = env.type === "handback" ? renderHandback(obj) : null;
+  if (handed !== null) return handed;
   const primary = PRIMARY_FIELD[env.type];
   const omit = new Set(OMITTED_FIELDS[env.type] ?? []);
   let text = "";
@@ -85,6 +107,10 @@ function renderPayload(env: Envelope): string {
   if (AGENT_NOTE_TYPES.has(env.type) && typeof obj["agentContext"] === "string") {
     note = (obj["agentContext"] as string).trim();
     omit.add("agentContext");
+  }
+  if (env.type === "cell.result" && typeof obj["saidBefore"] === "string") {
+    text = `${text}\n\n${SAID_BEFORE_LABEL}\n${obj["saidBefore"] as string}\n`;
+    omit.add("saidBefore");
   }
   const rest: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(obj)) if (!omit.has(k) && v !== undefined) rest[k] = v;

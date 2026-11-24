@@ -104,20 +104,23 @@ const isLeaf = (spec: CellSpec | undefined) => isLeafLifetime(spec?.lifetime);
 const settlesItself = ({ spec }: { spec?: CellSpec }) => spec !== undefined && Boolean(spec.parentId) && !isLeaf(spec);
 
 /** `inbox:<cellId>` → what to tell the model about a cell-to-cell delivery (docs/05 guard 1: a closed target is said out loud). */
-async function sendToInbox(ctx: ToolContext, to: `inbox:${string}`, args: { text?: string | undefined; refId?:string | undefined; summary: string }): Promise<ToolResult> {
+async function sendToInbox(ctx: ToolContext, to: `inbox:${string}`, args: { text?: string | undefined; refId?:string | undefined; summary: string; quiet?: boolean | undefined }): Promise<ToolResult> {
   if (!args.text) return { output: "A message to another cell needs text.", isError: true };
   const send = ctx.ports.sendToCell;
   if (!send) return { output: "Cell-to-cell messages are not available in this environment.", isError: true };
   const target = to.slice("inbox:".length);
-  const r = await send.call(ctx.ports, to, { text: args.text, summary: args.summary, ...(args.refId ? {data:{refId:args.refId}} : {}), id: `${ctx.snapshot.runId}:${ctx.toolUseId}:msg` });
+  const r = await send.call(ctx.ports, to, { text: args.text, summary: args.summary, ...(args.refId ? {data:{refId:args.refId}} : {}), ...(args.quiet ? { quiet: true } : {}), id: `${ctx.snapshot.runId}:${ctx.toolUseId}:msg` });
   switch (r.status) {
     case "delivered":
       return {
         output:
-          r.targetStatus === "paused"
+          args.quiet
+            ? `Left for ${target} as background: it reads it at its next turn, is not woken for it, and no wait of its is answered by it.`
+            : r.targetStatus === "paused"
             ? `Delivered to ${target}, which is paused: it reads the message when it is resumed.`
             : `Delivered to ${target}. It handles the message in its current run, or is woken with it (a dormant worker continues with everything it knows); if you need its answer, end your turn with wait (waitingFor "${to}").`,
         data: r,
+        sent: { to, text: args.text },
       };
     case "closed":
       return {
@@ -133,7 +136,7 @@ async function sendToInbox(ctx: ToolContext, to: `inbox:${string}`, args: { text
 }
 
 /**
- * `kernel.comms`: send_message, request_approval, withdraw_card, report_to_parent, handback, wait, clear_wait, complete_self, pause_self.
+ * `kernel.comms`: send_message, request_approval, withdraw_card, settle_item, report_to_parent, handback, wait, clear_wait, complete_self, pause_self.
  */
 export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
   const deskCellId = opts.deskCellId ?? DESK_CELL_ID;
@@ -147,6 +150,10 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
       text: z.string().min(1),
       summary: z.string().min(1),
       refId: z.string().trim().min(1).optional().describe("the reference of the individual wait this answers"),
+      quiet: z
+        .boolean()
+        .optional()
+        .describe("to a cell only: a fact for its record that it need not be woken for; it reads it at its next turn. Never a question, an instruction or an answer somebody is waiting for"),
     }),
     async handler(args, ctx) {
       if (isInboxAddr(args.to)) return sendToInbox(ctx, args.to, args);
@@ -155,7 +162,7 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
       }
       if (!anyCovers(ctx.ports.self.bounds.canSendTo, args.to)) return { output: "This cell cannot notify the owner. Send to your parent or to the desk.", isError: true };
       await ctx.ports.notifyOwner({ format: "text", body: args.text }, `${ctx.snapshot.runId}:${ctx.toolUseId}`);
-      return { output: "已通知主人。" };
+      return { output: "已通知主人。", sent: { to: args.to, text: args.text } };
     },
   });
 
@@ -363,6 +370,7 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
           output: "Result recorded. Your run ends now and your parent is told. If a follow-up message reached you first, you are woken with it instead — handle it, then report the updated result.",
           endRun: "completed",
           data: { staged: true },
+          sent: { to: inboxAddr(ctx.ports.self.parentId ?? childCellId), text: args.text },
         };
       }
       const payload: CellResultPayload = {
@@ -505,6 +513,44 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
       }
     },
   });
+  const settleItem = defineTool({
+    name: "settle_item",
+    kind: "kernel",
+    description:
+      'Close an open card, human action or reminder of yours (or of a cell below you) because the owner settled it in conversation: they said it is done, accepted it, or answered what it asked. It is recorded as their decision, with their words. A card that approves an action is settled only on the card itself; an item nobody answered is withdrawn (withdraw_card).',
+    input: z.object({
+      id: z.string().trim().min(1).describe("the item's id, as your notes list it"),
+      ownerWords: z.string().trim().min(1).describe("what the owner said that settles it, verbatim"),
+      itemRevision: z.number().int().min(1).describe("the item's revision (rev N in your notes)"),
+      artifactVersion: z.number().int().min(1).optional().describe("for an item about a document: the version the owner was talking about"),
+    }),
+    async handler(args, ctx) {
+      const settle = ctx.ports.settleHumanItem;
+      if (!settle) return { output: "Items cannot be settled in this environment.", isError: true };
+      const r = settle.call(ctx.ports, args.id, {
+        ownerWords: args.ownerWords,
+        seenItemRevision: args.itemRevision,
+        ...(args.artifactVersion !== undefined ? { seenArtifactVersion: args.artifactVersion } : {}),
+      });
+      const data = { id: args.id, ...r };
+      switch (r.status) {
+        case "settled":
+          return { output: `Recorded: ${args.id} is settled on the owner's word and off their list.`, data };
+        case "stale":
+          return {
+            output: `Not settled: ${args.id} is now rev ${r.itemRevision}${r.artifactVersion !== null ? `, about v${r.artifactVersion} of its document` : ""}. Check that the owner's words hold for what it says now, then call again with those numbers${r.artifactVersion !== null ? "; if the document has changed since they spoke, ask them" : ""}.`,
+            isError: true,
+            data,
+          };
+        case "needs_owner":
+          return { output: `Not settled: ${args.id} approves an action, which the owner does on the card itself (待我处理).`, isError: true, data };
+        case "not_pending":
+          return { output: `${args.id} is no longer open (already decided, done or withdrawn); nothing changed.`, data };
+        case "not_found":
+          return { output: `There is no open item ${args.id} of yours or of a cell below you.`, isError: true, data };
+      }
+    },
+  });
   const completeSelf = defineTool({
     name: "complete_self",
     kind: "kernel",
@@ -552,6 +598,6 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
   return {
     name: COMMS_TOOLSET,
     description: "Workbench notifications and messages to other cells, approval requests and withdrawing them, reports to the parent, handback, wait, complete_self / pause_self.",
-    tools: [sendMessage, requestApproval, withdrawCard, reportToParent, handback, wait, clearWait, completeSelf, pauseSelf],
+    tools: [sendMessage, requestApproval, withdrawCard, settleItem, reportToParent, handback, wait, clearWait, completeSelf, pauseSelf],
   };
 }

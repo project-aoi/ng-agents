@@ -47,3 +47,51 @@ describe("renderEnvelope: the agent's note", () => {
     expect(other).not.toContain(AGENT_NOTE_LABEL);
   });
 });
+
+// Audit 2026-11-23 rerun L06: a handed-back message showed the hub's reason first and the owner's sentence as a field
+// deep inside a JSON dump of the original envelope.
+describe("renderEnvelope: a handed-back message", () => {
+  const original: Envelope = {
+    id: "msg_owner_7",
+    from: "channel:ui:owner",
+    principalId: "owner",
+    kind: "event",
+    type: "user.message",
+    payload: { text: "帮我订周五下午的会议室" },
+    threads: ["ui:owner"],
+    createdAt: AT - 60_000,
+  };
+
+  it("shows the original words first under a header of their own, and the reason after them", () => {
+    const env = envelope("handback", { original, fromCellId: "proj_release", reason: "订会议室不归这个项目管" });
+    const text = renderEnvelope(env);
+    expect(text.startsWith("[handback · from kernel:control · principal agent:local · at 2026-11-23T09:00:00.000Z]\n")).toBe(true);
+    const head = text.indexOf("[original user.message · from channel:ui:owner · principal owner · id msg_owner_7 · thread ui:owner]");
+    const words = text.indexOf("\n帮我订周五下午的会议室\n");
+    const reason = text.indexOf("订会议室不归这个项目管");
+    expect(head).toBeGreaterThan(0);
+    expect(words).toBeGreaterThan(head);
+    expect(reason).toBeGreaterThan(words);
+    expect(text.slice(words, reason)).toContain("handed back by proj_release");
+    // Not as a JSON dump of the envelope.
+    expect(text).not.toContain('"payload"');
+    expect(text).not.toContain('"original"');
+  });
+
+  it("is a pure function of the envelope", () => {
+    const env = envelope("handback", { original, fromCellId: "proj_release", reason: "不归我管" });
+    const before = structuredClone(env);
+    const first = renderEnvelope(env);
+    expect(renderEnvelope(env)).toBe(first);
+    expect(renderEnvelope(structuredClone(env))).toBe(first);
+    expect(env).toEqual(before);
+  });
+
+  it("shows a non-text original payload as JSON in the same place, and falls back to the plain rendering without an original", () => {
+    const jsonPayload = renderEnvelope(envelope("handback", { original: { ...original, type: "source.hit", payload: { url: "https://example.com/x" } }, fromCellId: "w1", reason: "不归我管" }));
+    expect(jsonPayload.indexOf('"url": "https://example.com/x"')).toBeGreaterThan(jsonPayload.indexOf("[original source.hit"));
+    expect(jsonPayload.indexOf('"url": "https://example.com/x"')).toBeLessThan(jsonPayload.indexOf("不归我管"));
+    const bare = renderEnvelope(envelope("handback", { fromCellId: "w1", reason: "不归我管" }));
+    expect(bare).toMatch(/\]\n不归我管\n\{\n {2}"fromCellId": "w1"\n\}$/);
+  });
+});

@@ -33,7 +33,7 @@ describe("reminders and input attribution", () => {
       { id: "s2", from: KERNEL_FROM.control, principalId: "owner", kind: "event", type: PAYLOAD.controlSteer, payload: { message: "停一下" } },
       { now: () => 200 },
     );
-    expect(itemSource(agentEnv, 100)).toMatchObject({ label: "外部助手", principalId: "agent:main", envelopeId: "s1", at: 100 });
+    expect(itemSource(agentEnv, 100)).toMatchObject({ label: "编码助手", principalId: "agent:main", envelopeId: "s1", at: 100 });
     expect(itemSource(ownerEnv, 200)).toMatchObject({ label: "对话", principalId: "owner", envelopeId: "s2", at: 200 });
   });
 });

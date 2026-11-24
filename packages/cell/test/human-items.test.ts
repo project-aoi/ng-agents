@@ -55,7 +55,7 @@ it("shares simultaneous identical decisions and rejects background and outside a
   for (const actor of ["cell:desk", "external:mail:someone"])
     await expect(kernel.humanItems.decide(item.id, choice, actor)).rejects.toMatchObject({ code: "bounds_violation" });
   kernel.context.commitSync("desk", { artifact: { artifactId: "plan", expectedVersion: 1, content: { format: "text", body: "revised" }, updatedBy: "human" } });
-  await expect(kernel.humanItems.decide(item.id, choice, "owner")).rejects.toMatchObject({ code: "conflict", message: "草稿已变动" });
+  await expect(kernel.humanItems.decide(item.id, choice, "owner")).rejects.toMatchObject({ code: "conflict", message: expect.stringMatching(/^草稿已变动：现在是 v\d+/) });
   const reviewed = { ...choice, seenArtifactVersion: 2 };
   const results = await Promise.all([
     kernel.humanItems.decide(item.id, reviewed, "owner"),

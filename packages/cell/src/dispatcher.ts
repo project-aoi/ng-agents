@@ -1,9 +1,12 @@
 import { CLI_SESSION_KEY, type CliSessionRecord, probeOrphanCliCell, reapOrphanedCliProcesses } from "@ng/loop";
 import {
+  all,
+  get,
   timerFrom,
   CELL_DIRECT_CHAT_KEY,
   CELL_RESULT_CANDIDATE_KEY,
   CELL_TURN_KEY,
+  STEER_NOTE_HEAD,
   cellPrincipal,
   createEnvelope,
   finalResultEnvelopeId,
@@ -26,7 +29,7 @@ import {
   type SettledTurn,
   type TimerFiredPayload,
 } from "@ng/protocol";
-import { RESURFACE_MARKER } from "./constants";
+import { RESURFACE_MARKER, MESSAGE_ARRIVED, notCarriedOut } from "./constants";
 import { effectiveCwd } from "./workdir";
 import type { KernelCore } from "./core";
 import { recordPaused } from "./pauses";
@@ -88,6 +91,9 @@ function isResurface(env: Envelope): boolean {
   const data = (env.payload as TimerFiredPayload | null)?.data;
   return data !== null && typeof data === "object" && (data as Record<string, unknown>)["kernel"] === RESURFACE_MARKER;
 }
+
+/** Somebody speaking to a cell, as opposed to its own machinery waking it. */
+const SPOKEN: ReadonlySet<string> = new Set([PAYLOAD.cellMessage, PAYLOAD.userMessage, PAYLOAD.controlSteer]);
 
 export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number }): Dispatcher {
   const { inbox, cells, bus, clock, context } = core;
@@ -411,19 +417,45 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
     const records = context.listEvidenceSync(cellId, { afterSeq: fromSeq - 1 });
     const toSeq = records.length ? records[records.length - 1]!.seq : fromSeq - 1;
     let steps = 0;
+    // Its last words, and the accounts it had ended on when somebody then spoke to it: what it says after that answers
+    // the newcomer. An account is text it stopped at (no tool call since) — words on the way to its next step are not,
+    // and neither is what it says before its own machinery (a job's result, a timer) wakes it again. The range can span
+    // more than one Run (one that ended in a wait settles nothing); only the last Run's words count.
     let said: string | null = null;
+    let account: string | null = null;
+    let before: string[] = [];
     const artifactIds = new Set<string>();
     for (const { record: r } of records) {
-      if (r.kind === "assistant_text" && r.text.trim()) said = r.text.trim();
+      if (r.kind === "run_boundary" && r.phase === "start") {
+        said = account = null;
+        before = [];
+      }
+      if (r.kind === "assistant_text" && r.text.trim()) said = account = r.text.trim();
+      const spokenTo = r.kind === "inbound" ? SPOKEN.has(r.envelope.type) : r.kind === "system_note" && STEER_NOTE_HEAD.test(r.text);
+      if (spokenTo && account) {
+        before.push(account);
+        said = account = null;
+      }
       if (r.kind !== "tool_call") continue;
+      account = null;
       steps++;
       // Artifacts it wrote through the kernel tools, whoever created them first.
       const id = (r.input as { artifactId?: unknown } | null)?.artifactId;
       if ((r.name === "save_artifact" || r.name === "patch_artifact") && typeof id === "string") artifactIds.add(id);
     }
-    for (const a of context.listArtifactsSync(cellId)) if (a.updatedAt >= (prev?.settledAt ?? 0)) artifactIds.add(a.artifactId);
+    said ??= before.pop() ?? null;
+    const saidBefore = before.join("\n\n");
+    // Its own artifacts that it wrote a version of since its last settled turn — not ones somebody else changed
+    // meanwhile (a hub marking the worker's old report as superseded while the worker was closed).
+    for (const a of all<{ artifact_id: string }>(core.db, "SELECT DISTINCT artifact_id FROM artifact_versions WHERE cell_id = ? AND created_at >= ?", [cellId, prev?.settledAt ?? 0])) artifactIds.add(a.artifact_id);
     if (cand?.artifactId) artifactIds.add(cand.artifactId);
     const directChats = chat?.unsettled ?? 0;
+    const parent = cell.parentId ? cells.get(cell.parentId) : undefined;
+    const messagesToParent = !parent ? 0 : get<{ n: number }>(
+      core.db,
+      "SELECT count(*) AS n FROM inbox_messages WHERE cell_id = ? AND seq > ? AND type = ? AND json_extract(envelope, '$.from') = ?",
+      [parent.id, prev?.inboxSeq ?? 0, PAYLOAD.cellMessage, inboxAddr(cellId)],
+    )!.n;
     const turn: SettledTurn = {
       runId: handle.claimId,
       fromSeq,
@@ -436,8 +468,8 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
       // The summary below is the worker's last words unless it reported a structured result: only then is there
       // something more to preview.
       preview: said && cand?.summary && said !== cand.summary ? (said.length > 600 ? `${said.slice(0, 600)}…` : said) : null,
+      ...(messagesToParent ? { messagesToParent } : {}),
     };
-    const parent = cell.parentId ? cells.get(cell.parentId) : undefined;
     if (parent && parent.status !== "closed") {
       const payload: CellResultPayload = {
         childCellId: cellId,
@@ -446,6 +478,8 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
         ...(cand?.artifactId ? { artifactId: cand.artifactId } : {}),
         ...(cand?.data !== undefined ? { data: cand.data } : {}),
         childState: "dormant",
+        // (A structured report, or a failure, is the account itself.)
+        ...(saidBefore && how.failed === undefined && !cand?.summary ? { saidBefore: saidBefore.slice(0, 4_000) } : {}),
         turn,
       };
       inbox.enqueueSync(
@@ -468,7 +502,12 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
     }
     context.commitSync(cellId, {
       statePatches: {
-        [CELL_TURN_KEY]: { settledSeq: toSeq, settledAt: now, notices: (prev?.notices ?? 0) + 1 } satisfies CellTurnState,
+        [CELL_TURN_KEY]: {
+          settledSeq: toSeq,
+          settledAt: now,
+          notices: (prev?.notices ?? 0) + 1,
+          inboxSeq: get<{ n: number }>(core.db, "SELECT coalesce(max(seq), 0) AS n FROM inbox_messages")!.n,
+        } satisfies CellTurnState,
         // Delivered: the next turn reports for itself.
         [CELL_RESULT_CANDIDATE_KEY]: null,
         ...(chat ? { [CELL_DIRECT_CHAT_KEY]: { ...chat, unsettled: 0 } satisfies CellDirectChatState } : {}),
@@ -557,7 +596,18 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
         return;
       }
       // Drain first: something that would wake the cell is waiting, so it is not done.
-      if (inbox.pendingWakeupCountSync(cellId) > 0 || inbox.activeClaimCountSync(cellId, handle.claimId) > 0) return;
+      if (inbox.pendingWakeupCountSync(cellId) > 0 || inbox.activeClaimCountSync(cellId, handle.claimId) > 0) {
+        // A cell that asked to close or park must not go on believing it did (nor was the owner told that it had).
+        if (self) {
+          context.appendEvidenceSync(cellId, {
+            kind: "system_note",
+            runId: handle.claimId,
+            at: clock.now(),
+            text: notCarriedOut(self.action, `${MESSAGE_ARRIVED}, so nothing was closed and the owner was not told that it ended. Deal with what arrived first; then ask again if it is still right.`),
+          });
+        }
+        return;
+      }
       if (leaf && !oneShot && currentCandidate) {
         for (const wait of core.waits.list([cellId])) core.waits.clear(cellId, wait.waitId);
       }
@@ -588,7 +638,7 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
             kind: "system_note",
             runId: handle.claimId,
             at: clock.now(),
-            text: `[${self.action === "cancel" ? "cancelling" : "closing"} this cell was not carried out: ${open.length} child cell(s) were still at work when the run settled (${open.map((c) => c.id).join(", ")}). Call complete_self again once they are done or closed.]`,
+            text: notCarriedOut(self.action, `${open.length} child cell(s) were still at work when the run settled (${open.map((c) => c.id).join(", ")}). Call complete_self again once they are done or closed.`),
           });
         }
         return;
@@ -602,12 +652,17 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
         }
       }
       if (self?.statePatches) context.commitSync(cellId, { statePatches: self.statePatches });
+      const tellOwner = () => {
+        if (self?.ownerNotice) core.hub.notifyOwner({ cellId, content: { format: "text", body: self.ownerNotice.body }, idempotencyKey: self.ownerNotice.key });
+      };
       if (self?.action === "pause") {
         if (cur.status === "active" && pauseSelf(self.pauseReason).applied) {
           recordPaused(core, cellId, { by: cellPrincipal(cellId), ...(self.pauseReason ? { reason: self.pauseReason } : {}), ...(self.summary ? { note: self.summary } : {}) });
+          tellOwner();
         }
         return;
       }
+      tellOwner();
       closed = deliverAndClose(cur, handle, { reason: self?.action === "cancel" ? "cancelled" : "completed", ...(self?.summary ? { summary: self.summary } : {}) });
     });
     if (closed.length > 0) void core.track(core.lifecycle.cleanupClosed(closed));
@@ -660,8 +715,11 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
       if (prepare) {
         const books = preset?.actionBooks?.(core, cellId);
         const openBefore = new Set((books?.list() ?? []).filter((a) => a.status === "open").map((a) => a.id));
+        let said: string[] = [];
         try {
-          handled = (await prepare({ snapshot, ports, signal, clock })) === "handled";
+          const r = await prepare({ snapshot, ports, signal, clock });
+          handled = r === "handled";
+          if (r && typeof r === "object") said = r.notes;
         } catch (err) {
           if (signal.aborted) throw err;
           // The Loop still runs: a model that calls the preset's tools retries the same bookkeeping.
@@ -675,7 +733,7 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
           const note = closed.length
             ? `[actions closed for you at this wake-up — the turn of the cell carrying each ended as completed. If its report says the work is not actually done, reopen it: track_action with status "open"]\n${closed.map((a) => `- ${a.id} "${a.title}"${a.cellId ? ` (cell ${a.cellId})` : ""}`).join("\n")}`
             : null;
-          snapshot = context.refreshTailSync(snapshot, note ? [note] : []);
+          snapshot = context.refreshTailSync(snapshot, [...(note ? [note] : []), ...said]);
         }
       }
       result = handled ? "completed" : await core.loop.run(snapshot, ports, signal);

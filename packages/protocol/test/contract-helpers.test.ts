@@ -18,6 +18,8 @@ import {
   parsePrincipal,
   selectRunTools,
   stableStringify,
+  STEER_NOTE_HEAD,
+  steerNoteText,
   type ToolContext,
 } from "../src";
 
@@ -133,5 +135,29 @@ describe("mergeAdjacentMessages", () => {
     ]);
     expect(merged.map((m) => m.role)).toEqual(["user", "assistant", "user"]);
     expect(merged[2]!.content.map((b) => b.type)).toEqual(["tool_result", "tool_result", "text", "text"]);
+  });
+});
+
+describe("steer notes", () => {
+  // Live rerun round 3 (uc08): every steer read "[steer from the user …]", whoever interrupted — the owner, the owner
+  // through their coding agent, or the cell above.
+  it("steerNoteText names who interrupted, and STEER_NOTE_HEAD strips the head whoever it was", () => {
+    const notes = {
+      owner: steerNoteText("先别动对外 API", "owner"),
+      agent: steerNoteText("先别动对外 API", "agent:local"),
+      cell: steerNoteText("先别动对外 API", cellPrincipal("proj")),
+      none: steerNoteText("先别动对外 API"),
+    };
+    expect(notes).toEqual({
+      owner: "[steer from the owner while you were working] 先别动对外 API",
+      agent: "[steer from the owner, through their coding agent, while you were working] 先别动对外 API",
+      cell: "[steer from cell proj while you were working] 先别动对外 API",
+      none: "[steer from the user while you were working] 先别动对外 API",
+    });
+    for (const note of Object.values(notes)) {
+      expect(STEER_NOTE_HEAD.test(note)).toBe(true);
+      expect(note.replace(STEER_NOTE_HEAD, "")).toBe("先别动对外 API");
+    }
+    expect(STEER_NOTE_HEAD.test("先别动对外 API")).toBe(false);
   });
 });

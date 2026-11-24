@@ -1,11 +1,13 @@
 import {
   describeEnvelopeSource,
   isEnvelopeOfType,
+  parsePrincipal,
   projectCellIdOf,
   type Envelope,
   type ItemSource,
   type PromptSnapshot,
   type ToolContext,
+  speaks,
 } from "@ng/protocol";
 
 export function selfId(ctx: ToolContext): string {
@@ -42,7 +44,13 @@ export function itemRawInput(snapshot: PromptSnapshot): { text: string; kind: "m
   if (isEnvelopeOfType(env, "source.hit")) return { text: env.payload.rawInput ?? env.payload.summary, kind: "monitor_summary" };
   if (isEnvelopeOfType(env, "cell.result")) return { text: env.payload.summary, kind: "system" };
   if (isEnvelopeOfType(env, "timer.fired")) return { text: env.payload.label, kind: "system" };
-  return { text: clip(JSON.stringify(env.payload) ?? "", 2_000), kind: "system" };
+  // What a person wrote is quoted; machinery (a decision's receipt, a kernel notice) is not shown to the owner as if
+  // it were the message the item came from.
+  // …and a cell's task or message to this cell is workbench text, not the owner's.
+  const person = ["owner", "agent"].includes(parsePrincipal(env.principalId).kind) && speaks(env);
+  const p = env.payload as { text?: unknown; note?: unknown } | null;
+  const words = person ? [p?.text, p?.note].find((x): x is string => typeof x === "string" && x.trim().length > 0) : undefined;
+  return { text: words ? clip(words, 2_000) : "", kind: "system" };
 }
 
 export function clip(text: string, max: number): string {

@@ -23,5 +23,6 @@ export interface ChannelHub {
   list(): Channel[];
   onIngress(sink: (raw: Omit<Envelope, "to">, channelId: string) => Promise<void>): void;
   notifyOwner(input: { cellId: string; content: Deliverable; idempotencyKey: string }): void;
-  listNotificationsSync(limit?: number): LocalNotification[];
+  /** Newest first; `cellIds` / `since`: only what these cells sent, from that moment on. */
+  listNotificationsSync(limit?: number, filter?: { cellIds?: readonly string[]; since?: number }): LocalNotification[];
 }

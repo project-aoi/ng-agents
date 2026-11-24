@@ -139,6 +139,8 @@ export interface ProjectProposal {
   title: string;
   outcome: string;
   background?: string;
+  /** What the owner's coding agent noted on the plan of its own — kept apart from the background, never the owner's words. */
+  agentContext?: string;
   actions: ProposedProjectAction[];
   runnerOverride?: RunnerOverride;
   /** Optional spec for the project root cell (preset, processor, bounds request); the kernel fills the rest. */
@@ -153,7 +155,7 @@ export function isProjectProposal(value: unknown): value is ProjectProposal {
   return text(p.title) && text(p.outcome) && Array.isArray(p.actions) &&
     p.actions.every(a=>a && text(a.title) && ["human","agent","waiting"].includes(a.owner) &&
       (a.effort === undefined || ["15m", "45m", "low_energy"].includes(a.effort)) && (a.nextStep===undefined || typeof a.nextStep==="string")) &&
-    (p.cwd===undefined || text(p.cwd)) && (p.background===undefined || typeof p.background==="string") &&
+    (p.cwd===undefined || text(p.cwd)) && (p.background===undefined || typeof p.background==="string") && (p.agentContext===undefined || typeof p.agentContext==="string") &&
     (p.phases===undefined || Array.isArray(p.phases) && p.phases.every(text)) &&
     (p.runnerOverride === undefined || isRunnerOverride(p.runnerOverride)) &&
     (p.repos===undefined || Array.isArray(p.repos) && p.repos.every(r=>r && text(r.name) && text(r.cwd) && (r.defaultBranch===undefined || text(r.defaultBranch))));

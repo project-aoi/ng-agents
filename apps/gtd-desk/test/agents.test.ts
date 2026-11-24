@@ -37,7 +37,7 @@ import type { AgentToolResult } from "../src/agent/routes";
 import { createEventHub } from "../src/server/events";
 import { projectReview } from "../src/server/projections/review";
 import { DEFAULT_SETTINGS, inputOf } from "../src/server/projections/common";
-import { bootDesk, cleanupAll, HOUR, makeReviewCard, registerTestPresets, requestText, tempDir, tool, writeAction, writeProject, type TestDesk } from "./helpers";
+import { bootDesk, bootRealDesk, cleanupAll, HOUR, makeReviewCard, registerTestPresets, requestText, tempDir, tool, writeAction, writeProject, type TestDesk } from "./helpers";
 
 afterEach(cleanupAll);
 
@@ -386,7 +386,7 @@ describe("GET /api/cells/:cellId/timeline", () => {
     expect(probe.composer).toMatchObject({ mode: "script", enabled: false, hint: "这是零算力确定性脚本探针，不接受自然语言对话" });
     expect(probe.composer.quick.map((b) => b.id)).toEqual(["trigger", "pause"]);
     const archived = await d.get<CellTimelineDTO>("/api/cells/ow/timeline");
-    expect(archived.composer).toMatchObject({ mode: "archived", enabled: false, quick: [{ id: "open_desk", href: "#/agents/desk" }] });
+    expect(archived.composer).toMatchObject({ mode: "archived", enabled: false, quick: [{ id: "reopen_project", endpoint: { method: "POST", path: "/api/projects/old/reopen" } }, { id: "open_desk", href: "#/agents/desk" }] });
     expect(archived.controls).toEqual([]);
     const paused = await d.get<CellTimelineDTO>("/api/cells/wp/timeline");
     expect(paused.composer).toMatchObject({ mode: "paused", enabled: true });
@@ -401,6 +401,26 @@ describe("GET /api/cells/:cellId/timeline", () => {
     expect(runs()).toBe(before); // a script: no model was asked
     expect(k.inbox.listMessagesSync({ cellId: "probe", type: PAYLOAD.timerFired })).toMatchObject([{ status: "done" }]);
     expect((await d.post<CellTriggerResponse>("/api/cells/proj/trigger")).outcome).toBe("not_applied");
+  });
+
+  // Rerun round 1: a finished project's composer offered only "去总助理另起新事项", contradicting the refusal's own hint
+  // to reopen it.
+  it("a closed project's own composer offers to reopen it, ahead of starting something new; the button reopens it", async () => {
+    const d = await boot();
+    const k = d.kernel;
+    project(d, "old", "旧项目");
+    await k.closeCell("old", "completed", { principalId: k.ownerPrincipal });
+    const t = await d.get<CellTimelineDTO>("/api/cells/old/timeline");
+    expect(t.composer).toMatchObject({ mode: "archived", enabled: false, hint: expect.stringContaining("这个项目已结束") });
+    expect(t.composer.hint).toContain("重新打开它");
+    expect(t.composer.quick).toMatchObject([
+      { id: "reopen_project", label: "重新打开这个项目", primary: true, endpoint: { method: "POST", path: "/api/projects/old/reopen" } },
+      { id: "open_desk", primary: false, href: "#/agents/desk" },
+    ]);
+    const reopen = t.composer.quick[0]!.endpoint!;
+    expect((await d.req(reopen.method, reopen.path)).status).toBe(200);
+    expect(k.getCell("old")!.status).toBe("active");
+    expect((await d.get<CellTimelineDTO>("/api/cells/old/timeline")).composer.mode).not.toBe("archived");
   });
 });
 
@@ -477,6 +497,29 @@ describe("POST /api/cells/:cellId/messages", () => {
     for (const bad of [{ text: "", clientId: "x" }, { text: "x" }, { text: "x", clientId: "has space" }, { text: "x", clientId: "x", mode: "shout" }, { text: "x", clientId: "x", notifyParent: "loud" }]) {
       expect((await d.req("POST", "/api/cells/desk/messages", bad)).status, JSON.stringify(bad)).toBe(400);
     }
+  });
+
+  // Rerun round 1, uc06: the owner's message to a review hub's worker was receipted "已同步给所属项目「评审中枢」" — a hub
+  // is no project.
+  it("the receipt names a hub's worker's copy as going to its superior, a project's worker's as going to its project", async () => {
+    const d = await bootRealDesk();
+    const k = d.kernel;
+    k.spawnCell("desk", { id: "hub_review", preset: "hub", title: "评审中枢" }, undefined, { principalId: k.ownerPrincipal });
+    worker(d, "w_review", "hub_review", "评审 MR !12");
+    project(d, "proj", "支付重试改造");
+    worker(d, "w1", "proj", "核心退避编码");
+    await k.idle();
+
+    const toHubWorker = await d.post<SendCellMessageResponse>("/api/cells/w_review/messages", { text: "再看一下第 3 条", clientId: "h-1" });
+    expect(toHubWorker).toMatchObject({ ok: true, outcome: "delivered" });
+    expect(toHubWorker.message).toContain("；已同步给它的上级「评审中枢」");
+    expect(toHubWorker.message).not.toContain("所属项目");
+    const woke = await d.post<SendCellMessageResponse>("/api/cells/w_review/messages", { text: "改完叫我", clientId: "h-2", notifyParent: "wakeup" });
+    expect(woke.message).toContain("；已同步给它的上级「评审中枢」，并唤醒了上级协调");
+
+    const toProjectWorker = await d.post<SendCellMessageResponse>("/api/cells/w1/messages", { text: "最大重试改成 3", clientId: "p-1", notifyParent: "wakeup" });
+    expect(toProjectWorker.message).toContain("；已同步给所属项目「支付重试改造」，并唤醒了项目协调");
+    await k.idle();
   });
 });
 
@@ -609,7 +652,9 @@ describe("Radar: reports and the way into the Agents view (BUG-010); BUG-011", (
     expect((await d.get<StatusDTO>("/api/status")).background.paused).toBe(1);
     const got = await agentOk(d, "get_project", { id: "park" });
     expect(got.text).toContain("以后再说（停靠中");
+    // Audit 2026-11-23 rerun R01: activate (never resume), and only on the owner's later word to start.
     expect(got.text).toContain("set_project_state activate，不是 resume");
+    expect(got.text).toContain("重新启动前先问主人");
     expect(got.text).not.toMatch(/状态：someday；paused/);
   });
 });
@@ -623,7 +668,7 @@ describe("control plane: chat_with_desk, message_cell, inspect_cell, read_resour
     d.script.add("desk", tool("send_message", { to: "channel:ui:owner", text: "代码在哪个本地目录下呀？", summary: "问路径" }));
     const sent = await agentOk(d, "chat_with_desk", { text: "帮我把支付重试改成指数退避" });
     expect(sent.text).toMatch(/^Passed to the desk \(message agchat_\w+, conversation agent:local\) as the owner's words\./);
-    expect(sent.text).toContain("No reply from the desk yet");
+    expect(sent.text).toContain("It answers in the background");
     const { cursor, messageId } = sent.data as { cursor: number; messageId: string };
     expect(k.inbox.listMessagesSync({ cellId: "desk", envelopeId: messageId })[0]!.envelope).toMatchObject({
       type: PAYLOAD.userMessage,
@@ -647,7 +692,7 @@ describe("control plane: chat_with_desk, message_cell, inspect_cell, read_resour
     expect(saw).toContain("在 ~/dev/pay-core");
     expect(saw).toContain("代码在哪个本地目录下呀？");
     // The desk's own record shows who said it.
-    expect(of((await d.get<CellTimelineDTO>("/api/cells/desk/timeline")).items, "user_chat").map((c) => c.senderLabel)).toEqual(["你（经主 Agent）", "你（经主 Agent）"]);
+    expect(of((await d.get<CellTimelineDTO>("/api/cells/desk/timeline")).items, "user_chat").map((c) => c.senderLabel)).toEqual(["你（经编码助手）", "你（经编码助手）"]);
     expect((await agentRefused(d, "chat_with_desk", {})).text).toContain("Give text");
   });
 
