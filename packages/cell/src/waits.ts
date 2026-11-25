@@ -98,7 +98,7 @@ export function createWaits(core: Pick<KernelCore, "db" | "clock" | "inbox" | "b
       // …or a cell passed their words on (the desk relaying an answer the owner gave in conversation): the message says
       // which message of the owner it carries.
       const relayed = env.type === PAYLOAD.cellMessage && typeof (env.payload as { ownerMessageId?: unknown } | null)?.ownerMessageId === "string";
-      return env.type === PAYLOAD.approvalResolved || relayed ||
+      return env.type === PAYLOAD.approvalResolved || env.type === PAYLOAD.approvalRevise || relayed ||
         ((env.type === PAYLOAD.userMessage || env.type === PAYLOAD.cellMessage) && (p.kind === "owner" || p.kind === "agent"));
     }
     if (wait.waitingFor === WAIT_EXTERNAL) {

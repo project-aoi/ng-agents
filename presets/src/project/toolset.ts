@@ -231,6 +231,7 @@ export function projectToolset(): Toolset {
       };
       let action: ActionRecord;
       let onOwnersList = false;
+      let wasRevising = false;
       if (args.id === undefined) {
         if (!args.title || !args.owner) return { output: "A new action needs title and owner.", isError: true };
         action = newAction(
@@ -248,20 +249,25 @@ export function projectToolset(): Toolset {
             isError: true,
           };
         }
-        onOwnersList = cur.owner === "human" && cur.status === "open";
+        wasRevising = cur.owner === "human" && (ctx.ports.actionBooks?.isRevising?.(cur.id) ?? false);
+        onOwnersList = cur.owner === "human" && cur.status === "open" && !wasRevising;
         action = patchAction(cur, { ...fields, ...(args.status ? { status: args.status } : {}), ...(args.status === "open" ? { completedAt: null } : {}) }, now);
       }
       if (action.owner === "human") delete action.cellId;
-      ctx.ports.actionBooks!.write(action);
+      const reopenRevising = args.id === undefined || args.status === "open";
+      const stillRevising = wasRevising && action.owner === "human" && action.status === "open" && !reopenRevising;
+      ctx.ports.actionBooks!.write(action, { reopenRevising });
       const next =
         action.status !== "open"
           ? "It is closed."
-          : action.owner === "human"
-            ? `${action.nextStep ? "" : "It has no nextStep yet: the owner sees it on their list without knowing what to do — add the concrete step. "}${onOwnersList ? "The owner's list shows the change." : 'Tell the owner once (send_message), then wait with waitingFor "human"; you are woken when they tick it off or answer.'}`
-            : action.owner === "agent" && !action.cellId
-              ? "Nobody is on it yet: dispatch it with this actionId when it is time — or, when a worker that already knows the work takes it (send_message), record that worker here with cellId."
-              : "";
-      return { output: `Recorded action ${action.id}「${action.title}」: ${OWNER_LABEL[action.owner]}, ${action.status}. ${next}`.trim(), data: { id: action.id } };
+          : stillRevising
+            ? 'Still hidden from the owner while revising — pass status "open" only when the revised result is ready to review.'
+            : action.owner === "human"
+              ? `${action.nextStep ? "" : "It has no nextStep yet: the owner sees it on their list without knowing what to do — add the concrete step. "}${onOwnersList ? "The owner's list shows the change." : 'Tell the owner once (send_message), then wait with waitingFor "human"; you are woken when they tick it off or answer.'}`
+              : action.owner === "agent" && !action.cellId
+                ? "Nobody is on it yet: dispatch it with this actionId when it is time — or, when a worker that already knows the work takes it (send_message), record that worker here with cellId."
+                : "";
+      return { output: `Recorded action ${action.id}「${action.title}」: ${OWNER_LABEL[action.owner]}, ${stillRevising ? "revising" : action.status}. ${next}`.trim(), data: { id: action.id } };
     },
   });
 

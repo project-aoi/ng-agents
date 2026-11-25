@@ -50,7 +50,12 @@ export function readHumanActionRecords(db: Db, deskCellId: string, cellId?: stri
   });
 }
 
-export function writeActionRecordSync(store: ActionStore, cellId: string, record: ActionRecord): void {
+export interface WriteActionOptions {
+  /** When false, updating an action currently in `revising` keeps it hidden in `revising` until explicitly reopened. Default true. */
+  reopenRevising?: boolean;
+}
+
+export function writeActionRecordSync(store: ActionStore, cellId: string, record: ActionRecord, opts?: WriteActionOptions): void {
   const { db, bus, context, deskCellId } = store;
   const key = gtdKeys.action(record.id);
   withTx(db, () => {
@@ -85,7 +90,8 @@ export function writeActionRecordSync(store: ActionStore, cellId: string, record
       context.commitSync(cellId, { statePatches: { [key]: record } });
       return;
     }
-    const disposition = record.status === "open" ? "pending" : record.status === "done" ? "executed" : "cancelled";
+    const keepRevising = prior?.status === "revising" && record.status === "open" && opts?.reopenRevising === false;
+    const disposition = keepRevising ? "revising" : record.status === "open" ? "pending" : record.status === "done" ? "executed" : "cancelled";
     const card = {
       format: "card", title: record.title, body: record.nextStep ?? record.title,
       data: { phase: record.phase, closedEpoch: record.closedEpoch, source: record.source,
@@ -97,14 +103,16 @@ export function writeActionRecordSync(store: ActionStore, cellId: string, record
         card,options,disposition,category,related_project_ids,effort,due_at,artifact_id,created_at,updated_at,resolved_at)
       VALUES(?,?,?,?,?,'custom',?,'',?,?,?,'action',?,?,?,?,?,?,?)
       ON CONFLICT(action_id) DO UPDATE SET cell_id=excluded.cell_id,principal_id=excluded.principal_id,epoch=excluded.epoch,action=excluded.action,card=excluded.card,options=excluded.options,
-        disposition=excluded.disposition,status_reason=NULL,revise_note=NULL,related_project_ids=excluded.related_project_ids,effort=excluded.effort,
+        disposition=excluded.disposition,status_reason=NULL,
+        revise_note=CASE WHEN excluded.disposition='revising' THEN human_items.revise_note ELSE NULL END,
+        related_project_ids=excluded.related_project_ids,effort=excluded.effort,
         due_at=excluded.due_at,artifact_id=excluded.artifact_id,updated_at=excluded.updated_at,resolved_at=excluded.resolved_at,
         snoozed_until=CASE WHEN excluded.disposition='pending' AND human_items.disposition='pending' THEN human_items.snoozed_until END,
         item_revision=human_items.item_revision+1`,
       [record.id,issuer,issuer ? cell.epoch : null,issuer ? `cell:${issuer}` : store.ownerPrincipal,subject,JSON.stringify(action),
        JSON.stringify(card),JSON.stringify(options),disposition,JSON.stringify(projectId ? [projectId] : []),record.effort ?? null,
        record.dueAt ?? null, record.artifactId ?? null, record.createdAt, record.updatedAt,
-       disposition === "pending" ? null : record.completedAt ?? record.updatedAt]);
+       disposition === "pending" || disposition === "revising" ? null : record.completedAt ?? record.updatedAt]);
     if (context.readStateSync(cellId, key)) context.commitSync(cellId, { statePatches: { [key]: null } });
     changed(disposition);
   });
@@ -116,7 +124,10 @@ export function actionBooks(store: ActionStore, cellId: string): ActionBooks {
       const actions = store.context.listStateSync(cellId, gtdKeys.actionPrefix).map(entry => entry.value as ActionRecord);
       return actions.concat(readHumanActionRecords(store.db, store.deskCellId, cellId).map(entry => entry.record));
     },
-    write(record) { writeActionRecordSync(store, cellId, record); },
+    write(record, opts) { writeActionRecordSync(store, cellId, record, opts); },
+    isRevising(id) {
+      return get(store.db, "SELECT 1 FROM human_items WHERE action_id=? AND status='revising'", [id]) !== undefined;
+    },
     commit(records, statePatches) {
       withTx(store.db, () => {
         for (const record of records) writeActionRecordSync(store, cellId, record);

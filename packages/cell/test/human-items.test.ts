@@ -569,3 +569,35 @@ it("moves revised cards into dedicated revising status, hides them from list(), 
   expect(kernel.humanItems.get(card.id)?.status).toBe("cancelled");
   expect(kernel.humanItems.listRevising()).toEqual([]);
 });
+
+it("clears a cell's human wait when approval.revise arrives without dropping unrelated waits", async () => {
+  const { kernel, script } = await boot();
+  kernel.spawnCell("desk", { id: "project", preset: "project" }, undefined, { principalId: kernel.ownerPrincipal });
+  kernel.spawnCell("project", { id: "worker", preset: "worker" }, undefined, { principalId: kernel.ownerPrincipal });
+  kernel.context.commitSync("project", { artifact: { artifactId: "rep", content: { format: "markdown", body: "v1" }, updatedBy: "agent" } });
+  const card = kernel.humanItems.create(
+    { title: "验收报告", subjectKey: "rep:wait", artifactId: "rep", options: [{ id: "done", label: "通过", effect: "reply" }] },
+    "project",
+  );
+  script.add("project", {
+    toolCalls: [{ name: "wait", input: { waitingFor: "human", reason: "排查报告已交付，等待主人验收" } }],
+  });
+  kernel.sendToCell("project", { text: "等待验收" }, { principalId: "cell:desk" });
+  await kernel.idle();
+  expect(kernel.listWaits(["project"])).toMatchObject([{ waitId: "human", waitingFor: "human" }]);
+
+  // When the owner sends the card back for revision, the stale human wait is answered and cleared while the new worker wait stays.
+  script.add("project", {
+    toolCalls: [{ name: "wait", input: { waitingFor: "inbox:worker", reason: "等执行分身实现修复" } }],
+  });
+  await kernel.humanItems.decide(
+    card.id,
+    { optionId: "system.revise", seenItemRevision: card.itemRevision, seenArtifactVersion: 1, note: "评估改动范围" },
+    "owner",
+  );
+  await kernel.idle();
+  expect(kernel.listWaits(["project"])).toEqual([
+    expect.objectContaining({ waitId: "inbox:worker", waitingFor: "inbox:worker", reason: "等执行分身实现修复" }),
+  ]);
+  expect(kernel.humanItems.get(card.id)?.status).toBe("revising");
+});

@@ -316,7 +316,8 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
 
     ...(actionBooks && { actionBooks: {
       list: () => actionBooks.list(),
-      write(record) { assertLive("write action"); actionBooks.write(record); },
+      write(record, opts) { assertLive("write action"); actionBooks.write(record, opts); },
+      ...(actionBooks.isRevising ? { isRevising: (id: string) => actionBooks.isRevising!(id) } : {}),
       commit(records, patches) { assertLive("commit actions"); actionBooks.commit(records, patches); },
     } }),
     createHumanItem(draft) {

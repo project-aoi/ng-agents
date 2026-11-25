@@ -123,6 +123,11 @@ describe("review options", () => {
       owner: "agent",
       projectCellId: projectId,
     });
+    // Register a prior human wait as a real project does when handing off the initial report.
+    d.script.add("project", tool("wait", { waitingFor: "human", reason: "排查报告第1版已交付，等待主人验收" }));
+    d.kernel.sendToCell(projectId, { text: "等待验收" }, { principalId: "cell:desk" });
+    await d.kernel.idle();
+    expect((await d.get<TopologyDTO>("/api/agents/topology")).waits.filter((w) => w.fromCellId === projectId && w.targetLabel === "你")).toHaveLength(1);
 
     // When the project wakes on approval.revise, it spawns a worker whose run stays in flight while we inspect the APIs.
     let workerStarted!: () => void;
@@ -151,7 +156,8 @@ describe("review options", () => {
     // Wait a tick so the project finishes its own turn while the worker is still running.
     await new Promise((r) => setTimeout(r, 20));
 
-    // While background work is still active, the card stays in `revising` and out of pending inbox / radar human ball.
+    // While background work is still active, the card stays in `revising` and out of pending inbox / radar human ball,
+    // and the prior human wait has been cleared by approval.revise.
     const inbox = await d.get<HumanItemsResponse>("/api/human-items");
     expect(inbox.items.find(i => i.id === action.id)).toBeUndefined();
     expect(inbox.revising).toMatchObject([{ id: action.id, status: "revising", revisionNote: "补查上游 Codex 行为", options: [] }]);
@@ -165,6 +171,7 @@ describe("review options", () => {
 
     const topo = await d.get<TopologyDTO>("/api/agents/topology");
     expect(topo.nodes.find(n => n.cellId === projectId)?.state).not.toBe("blocked_human");
+    expect(topo.waits.filter((w) => w.fromCellId === projectId && w.targetLabel === "你")).toEqual([]);
 
     // Deciding while revising returns 409 conflict.
     const revItem = inbox.revising![0]!;
@@ -183,6 +190,69 @@ describe("review options", () => {
     expect(after.items).toMatchObject([{ id: action.id, title: "验收调研报告 v2", status: "pending" }]);
     expect((await d.get<StatusDTO>("/api/status"))).toMatchObject({ humanPending: 1, humanRevising: 0 });
     expect((await d.get<RadarDTO>("/api/radar")).projects.find(p => p.id === projectId)?.ball?.owner).toBe("human");
+  });
+
+  it("clears stale human wait and keeps revised acceptance action hidden when track_action updates its text without status open", async () => {
+    const d = await bootRealDesk();
+    const projectId = makeProject(d.kernel, "MCP 断线恢复排查");
+    d.kernel.context.commitSync(projectId, {
+      artifact: { artifactId: "art_mcp", content: { format: "markdown", title: "排查报告", body: "v3" }, updatedBy: "agent" },
+    });
+    const action = writeAction(d.kernel, projectId, {
+      title: "验收：MCP 断线恢复排查报告",
+      owner: "human",
+      artifactId: "art_mcp",
+      projectCellId: projectId,
+    });
+    d.script.add("project", tool("wait", { waitingFor: "human", reason: "排查报告第3版已交付，等待主人验收" }));
+    d.kernel.sendToCell(projectId, { text: "等待验收" }, { principalId: "cell:desk" });
+    await d.kernel.idle();
+
+    let workerStarted!: () => void;
+    const workerRunning = new Promise<void>((r) => { workerStarted = r; });
+    let finishWorker!: () => void;
+    const workerGate = new Promise<void>((r) => { finishWorker = r; });
+    d.script.add(
+      "project",
+      tool("track_action", { id: action.id, title: "验收：MCP 断线恢复方案与修复", nextStep: "局部修复与七项场景验证进行中" }),
+      tool("dispatch", { title: "实现局部修复", instruction: "在独立 worktree 实现修复" }),
+    );
+    d.script.add("worker", async () => {
+      workerStarted();
+      await workerGate;
+      return { text: "修复与验证完成" };
+    });
+
+    const before = (await d.get<HumanItemsResponse>("/api/human-items")).items.find((i) => i.id === action.id)!;
+    await d.post(`/api/human-items/${action.id}/decide`, {
+      optionId: "system.revise",
+      note: "如果只是小 fix 可以直接做",
+      seenItemRevision: before.itemRevision,
+      seenArtifactVersion: before.artifactVersion,
+    });
+    await workerRunning;
+    await new Promise((r) => setTimeout(r, 30));
+
+    const inbox = await d.get<HumanItemsResponse>("/api/human-items");
+    expect(inbox.items.find((i) => i.id === action.id)).toBeUndefined();
+    expect(inbox.revising).toMatchObject([{
+      id: action.id,
+      status: "revising",
+      title: "验收：MCP 断线恢复方案与修复",
+      description: "局部修复与七项场景验证进行中",
+      revisionNote: "如果只是小 fix 可以直接做",
+    }]);
+    const topo = await d.get<TopologyDTO>("/api/agents/topology");
+    expect(topo.nodes.find((n) => n.cellId === projectId)?.state).not.toBe("blocked_human");
+    expect(topo.waits.filter((w) => w.fromCellId === projectId && w.targetLabel === "你")).toEqual([]);
+    expect((await d.get<RadarDTO>("/api/radar")).projects.find((p) => p.id === projectId)?.ball?.owner).toBe("agent");
+
+    d.script.add("project", tool("track_action", { id: action.id, status: "open", nextStep: "修复与验证已就绪，请验收" }));
+    finishWorker();
+    await d.kernel.idle();
+    const after = await d.get<HumanItemsResponse>("/api/human-items");
+    expect(after.revising).toEqual([]);
+    expect(after.items).toMatchObject([{ id: action.id, status: "pending", description: "修复与验证已就绪，请验收" }]);
   });
 
   it("approves the same inbox card with the reviewed draft version", async () => {

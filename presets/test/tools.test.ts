@@ -1023,6 +1023,74 @@ describe("audit 2026-11-23 rerun: desk and project tools", () => {
     expect(changed).toContain("The owner's list shows the change.");
     expect(changed).not.toContain("Tell the owner once");
   });
+
+  it("track_action keeps a revising human action hidden until status 'open' is passed explicitly", async () => {
+    const h = await boot();
+    let actionId = "";
+    let workerId = "";
+    let updateOutput = "";
+    let reopenOutput = "";
+    h.script.add(
+      "project",
+      tool("save_artifact", { artifactId: "art_rev", title: "排查报告", body: "v1" }),
+      tool("track_action", { title: "验收：排查报告", owner: "human", artifactId: "art_rev", nextStep: "看报告 v1" }),
+      (req) => {
+        actionId = /Recorded action (\S+)「/.exec(lastToolResult(req))![1]!;
+        return tool("wait", { waitingFor: "human", reason: "等主人验收 v1" });
+      },
+    );
+    const { projectId } = startProjectSync(h.kernel, { title: "rev", outcome: "o", brief: "b" }, owner(h));
+    await h.kernel.idle();
+    expect(h.kernel.listWaits([projectId])).toMatchObject([{ waitingFor: "human" }]);
+
+    // Send back for revision: card moves to `revising`, stale human wait clears, and updating nextStep without `status: "open"` keeps it hidden.
+    let releaseWorker!: () => void;
+    const workerGate = new Promise<void>((r) => { releaseWorker = r; });
+    h.script.add("worker", async () => {
+      await workerGate;
+      return { text: "修复完成" };
+    });
+    h.script.add(
+      "project",
+      tool("dispatch", { title: "实现修复", instruction: "补修复" }),
+      (req) => {
+        workerId = /Dispatched (\S+)/.exec(lastToolResult(req))?.[1] ?? h.kernel.listCells({ parentId: projectId })[0]!.id;
+        return tool("track_action", { id: actionId, title: "验收：方案与修复", nextStep: "修复与验证进行中" });
+      },
+      (req) => {
+        updateOutput = lastToolResult(req);
+        return tool("wait", { waitingFor: `inbox:${workerId}`, reason: "等修复结果" });
+      },
+    );
+    const before = h.kernel.humanItems.get(actionId)!;
+    await h.kernel.humanItems.decide(
+      actionId,
+      { optionId: "system.revise", seenItemRevision: before.itemRevision, seenArtifactVersion: 1, note: "小 fix 直接做" },
+      "owner",
+    );
+    // Wait until the project finishes dispatching and enters wait on the worker.
+    await new Promise((r) => setTimeout(r, 40));
+    expect(updateOutput).toContain("revising");
+    expect(updateOutput).not.toContain("The owner's list shows the change.");
+    expect(h.kernel.humanItems.get(actionId)).toMatchObject({ status: "revising", title: "验收：方案与修复", revisionNote: "小 fix 直接做" });
+    expect(h.kernel.humanItems.list()).toEqual([]);
+    expect(h.kernel.listWaits([projectId]).map((w) => w.waitingFor)).toEqual([`inbox:${workerId}`]);
+
+    // Explicitly passing `status: "open"` reopens the card back to `pending` when ready.
+    h.script.add(
+      "project",
+      tool("track_action", { id: actionId, status: "open", nextStep: "修复已完成，请验收" }),
+      (req) => {
+        reopenOutput = lastToolResult(req);
+        return tool("wait", { waitingFor: "human", reason: "等主人验收修复" });
+      },
+    );
+    releaseWorker();
+    await h.kernel.idle();
+    expect(reopenOutput).toContain('Tell the owner once (send_message), then wait with waitingFor "human"');
+    expect(h.kernel.humanItems.get(actionId)).toMatchObject({ status: "pending", description: "修复已完成，请验收" });
+    expect(h.kernel.humanItems.list().map((i) => i.id)).toEqual([actionId]);
+  });
 });
 
 describe("built-in skills", () => {

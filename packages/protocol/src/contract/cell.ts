@@ -124,7 +124,8 @@ export interface ActionStore {
 
 export interface ActionBooks {
   list(): import("../gtd").ActionRecord[];
-  write(record: import("../gtd").ActionRecord): void;
+  write(record: import("../gtd").ActionRecord, opts?: { reopenRevising?: boolean }): void;
+  isRevising?(id: string): boolean;
   commit(records: import("../gtd").ActionRecord[], statePatches: Record<string, unknown>): void;
 }
 
