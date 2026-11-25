@@ -205,7 +205,7 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
             if (!lineage && (!project || projectOf(current.cellId) !== project)) throw new NgError("bounds_violation", "这份文稿是另一个节点写的，你不能改：它不是你上级或下级的文稿，也不在你所在的项目里（同一个上级下的另一个分身的报告也算）。要改它，交给写它的节点，或你们共同的上级；你自己的结论写在你自己的文稿里");
           }
           const bindings = all<{ action: string; cell_id: string }>(core.db,
-            "SELECT action, cell_id FROM human_items WHERE artifact_id=? AND disposition='pending'", [artifactId]);
+            "SELECT action, cell_id FROM human_items WHERE artifact_id=? AND disposition IN ('pending','revising')", [artifactId]);
           for (const binding of bindings) {
             const action = JSON.parse(binding.action) as ProposedAction;
             if (binding.cell_id !== cellId && action.type === "project.start")

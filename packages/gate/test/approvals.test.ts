@@ -179,23 +179,30 @@ describe("card lifecycle", () => {
     expect(f.gate.withdrawSync(d.actionId, "no", { seenItemRevision: 99 })).toBe("revision_mismatch");
     expect(f.gate.approveSync(d.actionId, "owner", undefined, { seenItemRevision: 99 })).toBe("revision_mismatch");
 
-    // Accepted revise bumps itemRevision: 1 -> 2, and old revision 1 is now stale.
-    expect(f.gate.reviseSync(d.actionId, "owner", { seenItemRevision: 1 })).toBe("revised");
-    expect(f.gate.getApprovalSync(d.actionId)!.itemRevision).toBe(2);
-    expect(f.gate.snoozeSync(d.actionId, f.clock.now() + 60_000, { seenItemRevision: 1 })).toBe("revision_mismatch");
+    // Accepted revise moves the card to `revising` (out of listPendingSync) and bumps itemRevision: 1 -> 2.
+    expect(f.gate.reviseSync(d.actionId, "owner", { seenItemRevision: 1, note: "补充细节" })).toBe("revised");
+    expect(f.gate.getApprovalSync(d.actionId)).toMatchObject({ itemRevision: 2, status: "revising" });
+    expect(f.gate.listPendingSync()).toEqual([]);
+    expect(f.gate.snoozeSync(d.actionId, f.clock.now() + 60_000, { seenItemRevision: 2 })).toBe("not_pending");
 
-    // Accepted snooze bumps itemRevision: 2 -> 3.
-    expect(f.gate.snoozeSync(d.actionId, f.clock.now() + 60_000, { seenItemRevision: 2 })).toBe("snoozed");
-    expect(f.gate.getApprovalSync(d.actionId)!.itemRevision).toBe(3);
+    // Resubmitting under the same subjectKey returns the card to `pending` and bumps itemRevision: 2 -> 3.
+    const resubmitted = expectType(f.gate.authorizeSync(proposal({ subjectKey: "rev:1" }), meta("desk")), "defer");
+    expect(resubmitted.actionId).toBe(d.actionId);
+    expect(f.gate.getApprovalSync(d.actionId)).toMatchObject({ itemRevision: 3, status: "pending" });
+    expect(f.gate.snoozeSync(d.actionId, f.clock.now() + 60_000, { seenItemRevision: 2 })).toBe("revision_mismatch");
 
-    // Accepted approve bumps itemRevision: 3 -> 4; executed outcome bumps to 5.
-    expect(f.gate.approveSync(d.actionId, "owner", undefined, { seenItemRevision: 3 })).toBe("approved");
+    // Accepted snooze bumps itemRevision: 3 -> 4.
+    expect(f.gate.snoozeSync(d.actionId, f.clock.now() + 60_000, { seenItemRevision: 3 })).toBe("snoozed");
     expect(f.gate.getApprovalSync(d.actionId)!.itemRevision).toBe(4);
+
+    // Accepted approve bumps itemRevision: 4 -> 5; executed outcome bumps to 6.
+    expect(f.gate.approveSync(d.actionId, "owner", undefined, { seenItemRevision: 4 })).toBe("approved");
+    expect(f.gate.getApprovalSync(d.actionId)!.itemRevision).toBe(5);
     f.gate.recordOutcomeSync(d.actionId, "executed", { note: "done" });
-    expect(f.gate.getApprovalSync(d.actionId)!.itemRevision).toBe(5);
-    expect(f.gate.approveSync(d.actionId, "owner", undefined, { seenItemRevision: 4 })).toBe("revision_mismatch");
-    expect(f.gate.approveSync(d.actionId, "owner", undefined, { seenItemRevision: 5 })).toBe("approved");
-    expect(f.gate.getApprovalSync(d.actionId)!.itemRevision).toBe(5);
+    expect(f.gate.getApprovalSync(d.actionId)!.itemRevision).toBe(6);
+    expect(f.gate.approveSync(d.actionId, "owner", undefined, { seenItemRevision: 5 })).toBe("revision_mismatch");
+    expect(f.gate.approveSync(d.actionId, "owner", undefined, { seenItemRevision: 6 })).toBe("approved");
+    expect(f.gate.getApprovalSync(d.actionId)!.itemRevision).toBe(6);
   });
 
 });

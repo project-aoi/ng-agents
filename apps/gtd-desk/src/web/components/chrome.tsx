@@ -122,6 +122,7 @@ function StatusPanel({ view, status }: { view: ViewKey; status: StatusDTO }) {
               后台：{bg.running} 项分身运行中 · {bg.waiting} 项{WAITING_WORDS}{bg.jobs > 0 ? ` · ${bg.jobs} 个长任务` : ""}
               {bg.paused > 0 ? ` · ${bg.paused} 项已暂停` : ""}
               {status.humanSnoozed > 0 ? ` · ${status.humanSnoozed} 张卡已推迟` : ""}
+              {(status.humanRevising ?? 0) > 0 ? ` · ${status.humanRevising} 张卡修订中` : ""}
             </p>
           </>
         )}

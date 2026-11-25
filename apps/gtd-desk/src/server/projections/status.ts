@@ -58,10 +58,11 @@ function agentsLine(kernel: DeskKernel): string {
 export function projectStatus(input: ProjectionInput): StatusDTO {
   const { kernel, now, settings } = input;
   const stats = kernel.stats();
-  const counts = get<{pending: number; snoozed: number}>(kernel.db, `
-    SELECT COUNT(*) FILTER (WHERE snoozed_until IS NULL OR snoozed_until <= ?) AS pending,
-           COUNT(*) FILTER (WHERE snoozed_until > ?) AS snoozed
-    FROM human_items WHERE status IN ('pending','snoozed') AND (cell_id IS NOT NULL OR due_at IS NULL OR due_at <= ?)`, [now, now, now])!;
+  const counts = get<{pending: number; snoozed: number; revising: number}>(kernel.db, `
+    SELECT COUNT(*) FILTER (WHERE status = 'pending' OR (status = 'snoozed' AND snoozed_until <= ?)) AS pending,
+           COUNT(*) FILTER (WHERE status = 'snoozed' AND snoozed_until > ?) AS snoozed,
+           COUNT(*) FILTER (WHERE status = 'revising') AS revising
+    FROM human_items WHERE status IN ('pending','snoozed','revising') AND (cell_id IS NOT NULL OR due_at IS NULL OR due_at <= ?)`, [now, now, now])!;
   // A paused or parked cell's question is listed too, but nobody needs to answer it now.
   const questions = ownerQuestions(input).filter((q) => !q.stopped).length;
   const since = localMidnight(now);
@@ -83,6 +84,7 @@ export function projectStatus(input: ProjectionInput): StatusDTO {
   const inboxLine: string[] = [];
   if (today.archivedNotifications > 0) inboxLine.push(`后台已静默归档 ${today.archivedNotifications} 条通知`);
   if (today.notesSaved > 0) inboxLine.push(`自动存好 ${today.notesSaved} 条随手笔记`);
+  if (counts.revising > 0) inboxLine.push(`${counts.revising} 张卡修订中`);
   const bg = stats.busyCells || stats.waitingCells ? `后台 ${stats.busyCells} 个在跑，${stats.waitingCells} 个在等` : "后台没有在途任务";
   inboxLine.push(bg);
   const radarLine = [`${radar.counts.active} 个进行中项目`];
@@ -93,6 +95,7 @@ export function projectStatus(input: ProjectionInput): StatusDTO {
     humanPending: counts.pending + questions,
     humanQuestions: questions,
     humanSnoozed: counts.snoozed,
+    humanRevising: counts.revising,
     generatedAt: now,
     backend: settings.backend,
     background: {

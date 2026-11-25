@@ -562,7 +562,7 @@ export function createDesk({ kernel, ui, assets, settings, onError = (err, where
           throw bad("JSON 草稿的内容不是合法的 JSON");
         }
       }
-      const boundPlan = get(kernel.db,"SELECT 1 FROM human_items WHERE artifact_id=? AND action_type='project.start' AND status IN ('pending','snoozed') LIMIT 1",[artifactId]);
+      const boundPlan = get(kernel.db,"SELECT 1 FROM human_items WHERE artifact_id=? AND action_type='project.start' AND status IN ('pending','snoozed','revising') LIMIT 1",[artifactId]);
       if (boundPlan && !acceptsApprovalDraft("project.start", format, data)) throw bad("立项方案需要有效的标题、目标、动作、目录和阶段");
       const title = req.title ?? art.content.title;
       const r = context.commitSync(art.cellId, {
@@ -970,6 +970,27 @@ export function createDesk({ kernel, ui, assets, settings, onError = (err, where
     return members.map(c=>({id:c.id,title:c.title?.trim() || "未命名任务"})).sort((a,b)=>a.id.localeCompare(b.id));
   }
 
+  function toHumanItemDTO(item: HumanItem) {
+    const {project, paused} = decisionCells(item.cellId);
+    const closeTargets: Record<string,ReturnType<typeof closureMembers>> = {};
+    for (const o of item.options) if (o.terminateMode==="cancel_task") closeTargets[o.id]=closureMembers(o.targetCellIds![0]!);
+    const projects=item.relatedProjectIds.map(id=>kernel.getCell(id)).filter(p=>p!==undefined)
+      .map(p=>({id:p.id,title:p.title?.trim() || "未命名项目"}));
+    const planArtifact=item.action?.type==="project.start" && item.artifactId ? context.getArtifactSync(item.artifactId) : undefined;
+    const plan=item.action?.type==="project.start" ? (item.artifactId ? planArtifact?.content.data : item.action.proposal) : undefined;
+    // The card row keeps the first draft's title, description and plan; what the owner decides on is the current
+    // version of the plan document, so that is what is shown (audit M18).
+    const stepBy = { human: "主人来做", waiting: "等外部", agent: "交给后台" };
+    const current = isProjectProposal(plan) && item.action?.type === "project.start"
+      ? { title: plan.title, description: [plan.outcome, ...plan.actions.map(a => `- [${stepBy[a.owner]}] ${a.title}`)].join("\n"), action: { ...item.action, proposal: plan },
+          // The desk's preparatory note was written for its own draft; a plan changed since may no longer fit it.
+          ...(item.prep && planArtifact?.updatedBy === "human" ? { prep: { ...item.prep, summary: "" } } : {}) }
+      : {};
+    return {...item, ...current, attachments:itemAttachments(item), options:deskOptions(item), resumeTarget:paused ? {id:paused.id, title:paused.title?.trim() || "未命名任务"} : null, proposal:isProjectProposal(plan) ? plan : null, projects, closeTargets, artifact:item.artifactId ? artifactDTO(kernel,item.artifactId,now()) : null,
+      project:project ? {id:project.id,title:project.title?.trim() || "未命名项目",paused:project.status==="paused",parked:project.pauseReason==="parked"} : null,
+    };
+  }
+
   return {
     ownerPrincipal: owner,
     models: (refresh: boolean) => models.view({ refresh }),
@@ -1003,7 +1024,7 @@ export function createDesk({ kernel, ui, assets, settings, onError = (err, where
       .slice(0,30).map(c=>({id:c.id,title:c.title?.trim() || "未命名任务",reason:c.closeReason})),
     openArtifactIds: () => all<{artifact_id: string}>(kernel.db, `
       SELECT DISTINCT artifact_id FROM human_items
-      WHERE status IN ('pending','snoozed') AND artifact_id IS NOT NULL
+      WHERE status IN ('pending','snoozed','revising') AND artifact_id IS NOT NULL
     `).map(row => row.artifact_id),
     saveCaptureImage: (value:CaptureImageUpload, check?:()=>void) => {
       if (!assets) throw missing("图片存储尚未配置");
@@ -1013,26 +1034,8 @@ export function createDesk({ kernel, ui, assets, settings, onError = (err, where
       if (!assets) throw missing("图片存储尚未配置");
       return assets.read(id);
     },
-    listHumanItems: (includeSnoozed = false) => kernel.humanItems.list(includeSnoozed).map(item => {
-      const {project, paused} = decisionCells(item.cellId);
-      const closeTargets: Record<string,ReturnType<typeof closureMembers>> = {};
-      for (const o of item.options) if (o.terminateMode==="cancel_task") closeTargets[o.id]=closureMembers(o.targetCellIds![0]!);
-      const projects=item.relatedProjectIds.map(id=>kernel.getCell(id)).filter(p=>p!==undefined)
-        .map(p=>({id:p.id,title:p.title?.trim() || "未命名项目"}));
-      const planArtifact=item.action?.type==="project.start" && item.artifactId ? context.getArtifactSync(item.artifactId) : undefined;
-      const plan=item.action?.type==="project.start" ? (item.artifactId ? planArtifact?.content.data : item.action.proposal) : undefined;
-      // The card row keeps the first draft's title, description and plan; what the owner decides on is the current
-      // version of the plan document, so that is what is shown (audit M18).
-      const stepBy = { human: "主人来做", waiting: "等外部", agent: "交给后台" };
-      const current = isProjectProposal(plan) && item.action?.type === "project.start"
-        ? { title: plan.title, description: [plan.outcome, ...plan.actions.map(a => `- [${stepBy[a.owner]}] ${a.title}`)].join("\n"), action: { ...item.action, proposal: plan },
-            // The desk's preparatory note was written for its own draft; a plan changed since may no longer fit it.
-            ...(item.prep && planArtifact?.updatedBy === "human" ? { prep: { ...item.prep, summary: "" } } : {}) }
-        : {};
-      return {...item, ...current, attachments:itemAttachments(item), options:deskOptions(item), resumeTarget:paused ? {id:paused.id, title:paused.title?.trim() || "未命名任务"} : null, proposal:isProjectProposal(plan) ? plan : null, projects, closeTargets, artifact:item.artifactId ? artifactDTO(kernel,item.artifactId,now()) : null,
-        project:project ? {id:project.id,title:project.title?.trim() || "未命名项目",paused:project.status==="paused",parked:project.pauseReason==="parked"} : null,
-      };
-    }),
+    listHumanItems: (includeSnoozed = false) => kernel.humanItems.list(includeSnoozed).map(toHumanItemDTO),
+    listRevisingHumanItems: () => kernel.humanItems.listRevising().map(toHumanItemDTO),
     async decideHumanItem(id: string, decision: HumanDecision, as: DeskActor) {
       const principal = principalOf(as);
       if (decision.optionId === "system.someday") {

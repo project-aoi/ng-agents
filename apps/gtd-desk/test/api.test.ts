@@ -10,8 +10,11 @@ import type {
   ArtifactSaveResponse,
   CaptureResponse,
   HumanItemDTO,
+  HumanItemsResponse,
   ProjectMutationResponse,
   RadarDTO,
+  StatusDTO,
+  TopologyDTO,
 } from "../src/shared/api";
 import {
   agentRedraft,
@@ -94,11 +97,92 @@ describe("review options", () => {
     const r = await d.post(`/api/human-items/${actionId}/decide`, {
       optionId: "system.revise", note: "语气再正式一点", seenItemRevision: item.itemRevision, seenArtifactVersion: item.artifactVersion,
     });
-    expect(r).toMatchObject({ status: "revising" });
-    expect(d.kernel.humanItems.get(actionId)?.itemRevision).toBe(item.itemRevision + 1);
+    expect(r).toMatchObject({ status: "revising", deskStatus: { humanPending: 0, humanRevising: 1 } });
     await d.kernel.idle();
     const text = d.script.requests.filter((x) => x.cellId === "desk").map((x) => requestText(x.req)).join("\n");
     expect(text).toContain("语气再正式一点");
+    // Safety net: if the owning cell finishes its turn idle without resubmitting, the card resurfaces as pending.
+    expect(d.kernel.humanItems.get(actionId)).toMatchObject({ status: "pending", itemRevision: item.itemRevision + 2 });
+  });
+
+  it("moves a revised project acceptance card out of pending until the project resubmits it", async () => {
+    const d = await bootDesk();
+    const projectId = makeProject(d.kernel, "核查项目");
+    d.kernel.context.commitSync(projectId, {
+      artifact: { artifactId: "art_report", content: { format: "markdown", title: "调研报告", body: "v1" }, updatedBy: "agent" },
+    });
+    const action = writeAction(d.kernel, projectId, {
+      title: "验收调研报告",
+      owner: "human",
+      artifactId: "art_report",
+      projectCellId: projectId,
+    });
+    // Also track an open background agent action on the project so Radar reflects active agent work once the human card leaves pending.
+    writeAction(d.kernel, projectId, {
+      title: "补查上游 Codex 行为",
+      owner: "agent",
+      projectCellId: projectId,
+    });
+
+    // When the project wakes on approval.revise, it spawns a worker whose run stays in flight while we inspect the APIs.
+    let workerStarted!: () => void;
+    const workerRunning = new Promise<void>((r) => { workerStarted = r; });
+    let finishWorker!: () => void;
+    const workerGate = new Promise<void>((r) => { finishWorker = r; });
+    d.script.add("project", tool("spawn_cell", { preset: "worker", title: "补查上游 Codex", instruction: "补查上游 Codex 行为" }));
+    d.script.add("worker", async () => {
+      workerStarted();
+      await workerGate;
+      return { text: "上游行为核查完毕" };
+    });
+
+    const before = (await d.get<HumanItemsResponse>("/api/human-items")).items.find(i => i.id === action.id)!;
+    expect(before.status).toBe("pending");
+    expect((await d.get<RadarDTO>("/api/radar")).projects.find(p => p.id === projectId)?.ball?.owner).toBe("human");
+
+    const revised = await d.post(`/api/human-items/${action.id}/decide`, {
+      optionId: "system.revise",
+      note: "补查上游 Codex 行为",
+      seenItemRevision: before.itemRevision,
+      seenArtifactVersion: before.artifactVersion,
+    });
+    expect(revised).toMatchObject({ status: "revising", deskStatus: { humanPending: 0, humanRevising: 1 } });
+    await workerRunning;
+    // Wait a tick so the project finishes its own turn while the worker is still running.
+    await new Promise((r) => setTimeout(r, 20));
+
+    // While background work is still active, the card stays in `revising` and out of pending inbox / radar human ball.
+    const inbox = await d.get<HumanItemsResponse>("/api/human-items");
+    expect(inbox.items.find(i => i.id === action.id)).toBeUndefined();
+    expect(inbox.revising).toMatchObject([{ id: action.id, status: "revising", revisionNote: "补查上游 Codex 行为", options: [] }]);
+
+    const status = await d.get<StatusDTO>("/api/status");
+    expect(status).toMatchObject({ humanPending: 0, humanRevising: 1 });
+    expect(status.statusLine.inbox).toContain("1 张卡修订中");
+
+    const radar = await d.get<RadarDTO>("/api/radar");
+    expect(radar.projects.find(p => p.id === projectId)?.ball?.owner).toBe("agent");
+
+    const topo = await d.get<TopologyDTO>("/api/agents/topology");
+    expect(topo.nodes.find(n => n.cellId === projectId)?.state).not.toBe("blocked_human");
+
+    // Deciding while revising returns 409 conflict.
+    const revItem = inbox.revising![0]!;
+    const blocked = await d.req("POST", `/api/human-items/${action.id}/decide`, {
+      optionId: "done",
+      seenItemRevision: revItem.itemRevision,
+    });
+    expect(blocked.status).toBe(409);
+
+    // Resubmitting the action with status "open" returns it to pending.
+    writeActionRecordSync(d.kernel, projectId, { ...action, title: "验收调研报告 v2", status: "open" });
+    finishWorker();
+    await d.kernel.idle();
+    const after = await d.get<HumanItemsResponse>("/api/human-items");
+    expect(after.revising).toEqual([]);
+    expect(after.items).toMatchObject([{ id: action.id, title: "验收调研报告 v2", status: "pending" }]);
+    expect((await d.get<StatusDTO>("/api/status"))).toMatchObject({ humanPending: 1, humanRevising: 0 });
+    expect((await d.get<RadarDTO>("/api/radar")).projects.find(p => p.id === projectId)?.ball?.owner).toBe("human");
   });
 
   it("approves the same inbox card with the reviewed draft version", async () => {

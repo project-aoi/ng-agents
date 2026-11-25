@@ -18,6 +18,8 @@ import type { HumanItem, ProjectProposal, HumanDecision } from "@ng/protocol";
 export type HumanDecisionRequest = HumanDecision;
 export interface HumanItemsResponse {
   items: HumanItemDTO[];
+  /** Cards currently being revised by the background after "请修改" (hidden from `items` until resubmitted). */
+  revising?: HumanItemDTO[];
   openArtifactIds: string[];
   /** Questions the background is asking the owner in words (no card); answered in that cell's chat. */
   questions: OwnerQuestionDTO[];
@@ -258,6 +260,8 @@ export interface StatusDTO {
   /** Of those, the questions asked in words (no card), answered in the asking cell's chat. Paused and parked cells' are not counted. */
   humanQuestions: number;
   humanSnoozed: number;
+  /** Cards currently being revised by the background after "请修改" (not counted in humanPending). */
+  humanRevising?: number;
   generatedAt: number;
   backend: string;
   /** The model the main agents run on right now, e.g. "Opus 5.5 · xhigh" (CLI backends, once the CLI has listed its models). */

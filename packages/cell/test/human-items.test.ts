@@ -523,3 +523,49 @@ it("hands the owner's note on an approved proposal to the project it starts", as
   expect(notes.map((m) => [m.envelope.principalId, (m.envelope.payload as { text: string }).text])).toEqual([["owner", "无效行沿用 parse 的行为"]]);
   expect(kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.approvalResolved }).at(-1)!.envelope.payload).toMatchObject({ status: "approved", note: "无效行沿用 parse 的行为" });
 });
+
+it("moves revised cards into dedicated revising status, hides them from list(), and reopens on resubmit or idle", async () => {
+  const { kernel } = await boot({ start: false });
+  kernel.context.commitSync("desk", { artifact: { artifactId: "rep", content: { format: "markdown", body: "v1" }, updatedBy: "agent" } });
+  const card = kernel.humanItems.create(
+    { title: "验收报告", subjectKey: "rep:review", artifactId: "rep", options: [{ id: "done", label: "通过", effect: "reply" }] },
+    "desk",
+  );
+  expect(kernel.humanItems.list().map((i) => i.id)).toEqual([card.id]);
+
+  // Revise moves card out of pending list into dedicated revising state with revisionNote and empty options.
+  const res = await kernel.humanItems.decide(
+    card.id,
+    { optionId: "system.revise", seenItemRevision: card.itemRevision, seenArtifactVersion: 1, note: "补查上游行为" },
+    "owner",
+  );
+  expect(res).toMatchObject({ status: "revising" });
+  expect(kernel.humanItems.list()).toEqual([]);
+  expect(kernel.humanItems.listRevising()).toEqual([
+    expect.objectContaining({ id: card.id, status: "revising", revisionNote: "补查上游行为", options: [] }),
+  ]);
+  await expect(
+    kernel.humanItems.decide(card.id, { optionId: "done", seenItemRevision: card.itemRevision + 1, seenArtifactVersion: 1 }, "owner"),
+  ).rejects.toThrow(/正在由后台按你的意见修改中/);
+
+  // Resubmitting under the same subjectKey returns the card to pending and clears revisionNote.
+  kernel.context.commitSync("desk", { artifact: { artifactId: "rep", expectedVersion: 1, content: { format: "markdown", body: "v2" }, updatedBy: "agent" } });
+  const reopened = kernel.humanItems.create(
+    { title: "验收报告", subjectKey: "rep:review", artifactId: "rep", options: [{ id: "done", label: "通过", effect: "reply" }] },
+    "desk",
+  );
+  expect(reopened).toMatchObject({ id: card.id, status: "pending", artifactVersion: 2 });
+  expect(reopened.revisionNote).toBeUndefined();
+  expect(kernel.humanItems.listRevising()).toEqual([]);
+  expect(kernel.humanItems.list().map((i) => i.id)).toEqual([card.id]);
+
+  // A revising card can still be withdrawn cleanly.
+  await kernel.humanItems.decide(
+    card.id,
+    { optionId: "system.revise", seenItemRevision: reopened.itemRevision, seenArtifactVersion: 2, note: "再改一次" },
+    "owner",
+  );
+  expect(kernel.humanItems.withdrawOwn(card.id, "desk", "不再需要")).toBe("withdrawn");
+  expect(kernel.humanItems.get(card.id)?.status).toBe("cancelled");
+  expect(kernel.humanItems.listRevising()).toEqual([]);
+});

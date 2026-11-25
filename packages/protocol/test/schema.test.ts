@@ -29,7 +29,7 @@ describe("schema", () => {
     const db = openDatabase(":memory:");
     const names = new Set(all<{ name: string }>(db, "SELECT name FROM sqlite_master WHERE type IN ('table')").map((r) => r.name));
     for (const table of Object.keys(TABLE_OWNERS)) expect(names, table).toContain(table);
-    expect(schemaVersions(db)).toEqual(Object.fromEntries(ALL_SCHEMAS.map((m) => [m.owner, 1])));
+    expect(schemaVersions(db)).toEqual(Object.fromEntries(ALL_SCHEMAS.map((m) => [m.owner, m.version])));
   });
 
   it("applies twice without error (in-memory and on disk, WAL)", () => {
@@ -48,7 +48,7 @@ describe("schema", () => {
     b.close();
   });
 
-  it("reserves a human item's subject while snoozed and releases it when resolved", () => {
+  it("reserves a human item's subject while snoozed or revising and releases it when resolved", () => {
     const db = openDatabase(":memory:");
     const insertItem = (id: string) => run(db, `
       INSERT INTO human_items (action_id, principal_id, subject_key, category, action_type, action, action_hash, card, created_at, updated_at)
@@ -60,10 +60,77 @@ describe("schema", () => {
     run(db, "UPDATE human_items SET snoozed_until = 100 WHERE action_id = 'first'");
     expect(status()).toBe("snoozed");
     expect(() => insertItem("next")).toThrow(/UNIQUE/);
-    run(db, "UPDATE human_items SET disposition = 'executed' WHERE action_id = 'first'");
+    run(db, "UPDATE human_items SET disposition = 'revising', snoozed_until = NULL, revise_note = '再改改' WHERE action_id = 'first'");
+    expect(status()).toBe("revising");
+    expect(() => insertItem("next")).toThrow(/UNIQUE/);
+    run(db, "UPDATE human_items SET disposition = 'executed', revise_note = NULL WHERE action_id = 'first'");
     expect(status()).toBe("resolved");
     insertItem("next");
     db.close();
+  });
+
+  it("migrates an existing @ng/gate v1 database to v2 preserving rows and foreign keys", () => {
+    const path = tempPath();
+    const v1Gate = {
+      owner: "@ng/gate",
+      version: 1,
+      migrations: [],
+      ddl: `
+CREATE TABLE IF NOT EXISTS human_items (
+  action_id      TEXT PRIMARY KEY,
+  cell_id        TEXT REFERENCES cells(id),
+  epoch          INTEGER,
+  principal_id   TEXT NOT NULL,
+  subject_key    TEXT NOT NULL,
+  action_type    TEXT NOT NULL,
+  action         TEXT NOT NULL,
+  action_hash    TEXT NOT NULL,
+  card           TEXT NOT NULL,
+  artifact_id    TEXT,
+  bound_version  INTEGER,
+  proposed_version INTEGER,
+  item_revision  INTEGER NOT NULL DEFAULT 1,
+  disposition    TEXT NOT NULL DEFAULT 'pending' CHECK (disposition IN ('pending','approved','denied','cancelled','superseded','executed')),
+  status_reason  TEXT,
+  snoozed_until  INTEGER,
+  approver_id    TEXT,
+  human_edited   INTEGER NOT NULL DEFAULT 0,
+  outcome        TEXT,
+  created_at     INTEGER NOT NULL,
+  updated_at     INTEGER NOT NULL,
+  options        TEXT,
+  related_project_ids TEXT NOT NULL DEFAULT '[]',
+  category       TEXT NOT NULL DEFAULT 'decision' CHECK (category IN ('action','decision')),
+  effort         TEXT,
+  due_at         INTEGER,
+  status TEXT GENERATED ALWAYS AS (CASE
+    WHEN disposition='pending' THEN CASE WHEN snoozed_until IS NULL THEN 'pending' ELSE 'snoozed' END
+    WHEN disposition='cancelled' AND status_reason='replied' THEN 'resolved'
+    WHEN disposition IN ('denied','cancelled','superseded') THEN 'cancelled' ELSE 'resolved' END) VIRTUAL,
+  resolved_at    INTEGER
+);
+CREATE TABLE IF NOT EXISTS human_item_activity (
+  id TEXT PRIMARY KEY, item_id TEXT NOT NULL REFERENCES human_items(action_id), before_state TEXT NOT NULL,
+  after_revision INTEGER NOT NULL, after_disposition TEXT NOT NULL, closed_epoch INTEGER, receipt_cell TEXT, receipt_id TEXT, target_project TEXT, at INTEGER NOT NULL, undone_at INTEGER
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_human_items_active ON human_items(COALESCE(cell_id,''), subject_key)
+  WHERE status IN ('pending','snoozed');
+`,
+    };
+    const a = openDatabase(path, { schemas: ALL_SCHEMAS.map((m) => (m.owner === "@ng/gate" ? v1Gate : m)) });
+    run(a, "INSERT INTO cells (id, root_id, spec, bounds, principal_id, created_at, updated_at) VALUES ('desk','desk','{}','{}','owner',1,1)");
+    run(a, "INSERT INTO human_items (action_id, cell_id, epoch, principal_id, subject_key, category, action_type, action, action_hash, card, created_at, updated_at) VALUES ('act_1','desk',0,'cell:desk','sub:1','action','custom','{}','','{}',1,1)");
+    run(a, "INSERT INTO human_item_activity (id, item_id, before_state, after_revision, after_disposition, at) VALUES ('ha_1','act_1','{}',2,'executed',2)");
+    expect(schemaVersions(a)["@ng/gate"]).toBe(1);
+    a.close();
+
+    const b = openDatabase(path);
+    expect(schemaVersions(b)["@ng/gate"]).toBe(2);
+    run(b, "UPDATE human_items SET disposition = 'revising', revise_note = '补查上游' WHERE action_id = 'act_1'");
+    expect(get(b, "SELECT status, revise_note FROM human_items WHERE action_id = 'act_1'")).toEqual({ status: "revising", revise_note: "补查上游" });
+    expect(get<{ n: number }>(b, "SELECT count(*) AS n FROM human_item_activity WHERE item_id = 'act_1'")?.n).toBe(1);
+    expect(all(b, "PRAGMA foreign_key_check")).toEqual([]);
+    b.close();
   });
 
   it("enforces foreign keys to cells", () => {

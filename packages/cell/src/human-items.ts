@@ -45,6 +45,7 @@ interface ItemRow {
   epoch: number | null;
   subject_key: string;
   status_reason: string | null;
+  revise_note: string | null;
   outcome: string | null;
   resolved_at: number | null;
   approver_id: string | null;
@@ -285,7 +286,7 @@ export function createHumanItems(core: KernelCore) {
     const controlled = action && !!r.action_hash && requiresApproval(action);
     const callback = r.cell_id !== null;
     let options: CardOption[];
-    if (r.status === "resolved" || r.status === "cancelled") options = [];
+    if (r.status === "resolved" || r.status === "cancelled" || r.status === "revising") options = [];
     else {
       const defaults: CardOption[] = callback
         ? [
@@ -345,6 +346,7 @@ export function createHumanItems(core: KernelCore) {
       humanEdited,
       action,
       snoozedUntil: r.snoozed_until,
+      ...(r.status === "revising" && r.revise_note ? { revisionNote: r.revise_note } : {}),
       ...(r.due_at !== null ? { dueAt: r.due_at } : {}),
       ...(r.effort ? { effort: r.effort } : {}),
     };
@@ -374,7 +376,7 @@ export function createHumanItems(core: KernelCore) {
       if (draft.artifactId && !art) throw new NgError("invalid_argument", `there is no artifact "${draft.artifactId}"`);
       const prior = get<ItemRow>(
         db,
-        "SELECT * FROM human_items WHERE subject_key = ? AND cell_id IS ? AND status IN ('pending','snoozed')",
+        "SELECT * FROM human_items WHERE subject_key = ? AND cell_id IS ? AND status IN ('pending','snoozed','revising')",
         [draft.subjectKey, cellId],
       );
       const card = JSON.stringify({
@@ -394,8 +396,8 @@ export function createHumanItems(core: KernelCore) {
         id = prior.action_id;
         run(
           db,
-          `UPDATE human_items SET action=?, card=?, options=?, related_project_ids=?, item_revision=item_revision+1,
-          updated_at=?, due_at=?, effort=?, category=?, artifact_id=?, proposed_version=?, bound_version=?, human_edited=0 WHERE action_id=?`,
+          `UPDATE human_items SET action=?, card=?, options=?, related_project_ids=?, disposition='pending', snoozed_until=NULL, status_reason=NULL, revise_note=NULL,
+          item_revision=item_revision+1, updated_at=?, due_at=?, effort=?, category=?, artifact_id=?, proposed_version=?, bound_version=?, human_edited=0 WHERE action_id=?`,
           [
             JSON.stringify(action),
             card,
@@ -452,7 +454,7 @@ export function createHumanItems(core: KernelCore) {
   /** Closes a pending item as answered by `actor`. What they said stays on the item (`outcome.note`). */
   function closeAnswered(r: ItemRow, how: { disposition: "executed" | "cancelled"; reason: string | null; actor: string; note?: string | undefined }): void {
     const note = how.note?.trim();
-    run(db, "UPDATE human_items SET disposition=?, status_reason=?, approver_id=?, outcome=?, snoozed_until=NULL, resolved_at=?, updated_at=?, item_revision=item_revision+1 WHERE action_id=?",
+    run(db, "UPDATE human_items SET disposition=?, status_reason=?, revise_note=NULL, approver_id=?, outcome=?, snoozed_until=NULL, resolved_at=?, updated_at=?, item_revision=item_revision+1 WHERE action_id=?",
       [how.disposition, how.reason, how.actor, note ? JSON.stringify({ note }) : r.outcome, clock.now(), clock.now(), r.action_id]);
   }
 
@@ -509,10 +511,10 @@ export function createHumanItems(core: KernelCore) {
 
   function withdraw(id: string, reason: string) {
     const r = row(id);
-    if (!r || r.disposition !== "pending") return;
+    if (!r || (r.disposition !== "pending" && r.disposition !== "revising")) return;
     if (r.action_hash) gate.withdrawSync(id, reason, {seenItemRevision: r.item_revision});
     else {
-      run(db, "UPDATE human_items SET disposition='cancelled',status_reason=?,resolved_at=?,updated_at=?,item_revision=item_revision+1 WHERE action_id=?",
+      run(db, "UPDATE human_items SET disposition='cancelled',status_reason=?,revise_note=NULL,resolved_at=?,updated_at=?,item_revision=item_revision+1 WHERE action_id=?",
         [reason, clock.now(), clock.now(), id]);
       changed(row(id)!);
     }
@@ -558,6 +560,39 @@ export function createHumanItems(core: KernelCore) {
     ).map(project);
   }
 
+  function listRevising(): HumanItem[] {
+    return all<ItemRow>(
+      db,
+      `SELECT * FROM human_items WHERE status = 'revising' ORDER BY updated_at DESC, action_id`,
+    ).map(project);
+  }
+
+  function hasRevising(cellId: string): boolean {
+    return get(db, "SELECT 1 FROM human_items WHERE cell_id = ? AND disposition = 'revising' LIMIT 1", [cellId]) !== undefined;
+  }
+
+  /** Returns revising items owned by `cellId` back to `pending` when its revision turn ends with nothing else in flight. */
+  function reopenRevising(cellId: string): HumanItem[] {
+    return withTx(db, () => {
+      const rows = all<ItemRow>(db, "SELECT * FROM human_items WHERE cell_id = ? AND disposition = 'revising'", [cellId]);
+      if (rows.length === 0) return [];
+      const now = clock.now();
+      const reopened: HumanItem[] = [];
+      for (const r of rows) {
+        const latestVersion = r.artifact_id ? (context.getArtifactSync(r.artifact_id)?.version ?? r.bound_version) : r.bound_version;
+        run(
+          db,
+          "UPDATE human_items SET disposition='pending', snoozed_until=NULL, status_reason=NULL, revise_note=NULL, bound_version=?, item_revision=item_revision+1, updated_at=? WHERE action_id=?",
+          [latestVersion, now, r.action_id],
+        );
+        const updated = row(r.action_id)!;
+        changed(updated);
+        reopened.push(project(updated));
+      }
+      return reopened;
+    });
+  }
+
   async function decide(id: string, decision: HumanDecision, actor: string, onAccepted?: (item: HumanItem, option: CardOption) => void): Promise<DecisionResult> {
     const key = stableStringify({ actor, decision });
     const existing = inflight.get(id);
@@ -587,6 +622,7 @@ export function createHumanItems(core: KernelCore) {
     const r = row(id);
     if (!r) throw new NgError("not_found", "item is unavailable");
     const item = project(r);
+    if (r.status === "revising") throw new NgError("conflict", "这件事项正在由后台按你的意见修改中，等新版提交后再决定");
     if (r.status !== "pending" && r.status !== "snoozed") throw new NgError("conflict", `这件事项已经处理过了（${r.status === "cancelled" ? "已撤回或取消" : "已办结"}），不用再决定`);
     // A refusal says what is current (INV-UC01-03: "被拒并给出新版本"): whoever decides reads that version, not a guess.
     if (d.seenItemRevision !== item.itemRevision)
@@ -642,19 +678,24 @@ export function createHumanItems(core: KernelCore) {
       }
       if (o.effect === "revise") {
         if (!r.cell_id) throw new NgError("conflict", "修改意见没有接收方");
+        const instruction = d.note?.trim() || o.label;
         const rec = gate.getApprovalSync(id);
-        if (rec && gate.reviseSync(id, actor, locks) !== "revised") throw new NgError("conflict", "草稿已变动");
+        if (rec && gate.reviseSync(id, actor, { ...locks, note: instruction }) !== "revised") throw new NgError("conflict", "草稿已变动");
         const target = rec ? deliveryTarget(rec) : { to: r.cell_id, expectedEpoch: r.epoch! };
         sendRevision(target.to, target.expectedEpoch, actor, {
           actionId: id,
           subjectKey: r.subject_key,
-          instruction: d.note?.trim() || o.label,
+          instruction,
           ...(r.artifact_id ? { artifactId: r.artifact_id } : {}),
           ...humanEditInfo({ artifactId: r.artifact_id, humanEdited: item.humanEdited, proposedVersion: r.proposed_version,
             boundVersion: item.artifactVersion }, item.artifactVersion),
         });
         if (!rec) {
-          run(db, "UPDATE human_items SET item_revision=item_revision+1,updated_at=? WHERE action_id=?", [clock.now(), id]);
+          run(
+            db,
+            "UPDATE human_items SET disposition='revising', snoozed_until=NULL, revise_note=?, item_revision=item_revision+1, updated_at=? WHERE action_id=?",
+            [instruction, clock.now(), id],
+          );
           changed(row(id)!);
         }
         return { status: "revising" };
@@ -795,7 +836,7 @@ export function createHumanItems(core: KernelCore) {
         if (
           get(
             db,
-            `SELECT 1 FROM human_items WHERE subject_key=? AND cell_id IS ? AND action_id<>? AND status IN ('pending','snoozed')`,
+            `SELECT 1 FROM human_items WHERE subject_key=? AND cell_id IS ? AND action_id<>? AND status IN ('pending','snoozed','revising')`,
             [current.subject_key, current.cell_id, current.action_id],
           )
         )
@@ -804,7 +845,7 @@ export function createHumanItems(core: KernelCore) {
         const prior = JSON.parse(event.before_state);
         run(
           db,
-          `UPDATE human_items SET disposition=?,status_reason=?,outcome=?,snoozed_until=?,approver_id=?,resolved_at=?,updated_at=?,epoch=CASE WHEN ? THEN (SELECT epoch FROM cells WHERE id=human_items.cell_id) ELSE epoch END,item_revision=item_revision+1 WHERE action_id=?`,
+          `UPDATE human_items SET disposition=?,status_reason=?,revise_note=NULL,outcome=?,snoozed_until=?,approver_id=?,resolved_at=?,updated_at=?,epoch=CASE WHEN ? THEN (SELECT epoch FROM cells WHERE id=human_items.cell_id) ELSE epoch END,item_revision=item_revision+1 WHERE action_id=?`,
           [prior.disposition, prior.reason, prior.outcome ?? null, prior.until > clock.now() ? prior.until : null, prior.actor, prior.resolvedAt, clock.now(), event.target_project ? 1 : 0, event.item_id],
         );
         if (prior.until > clock.now()) armResurface(event.item_id, prior.until, actor);
@@ -864,13 +905,16 @@ export function createHumanItems(core: KernelCore) {
     },
     create,
     list,
+    listRevising,
+    hasRevising,
+    reopenRevising,
     undo,
     withdrawForClosedCells(closed: readonly {id: string; epoch: number}[]) {
       for (const {id,epoch} of closed) {
-        for (const r of all<{action_id: string}>(db, "SELECT action_id FROM human_items WHERE cell_id=? AND epoch<? AND disposition='pending'", [id,epoch]))
+        for (const r of all<{action_id: string}>(db, "SELECT action_id FROM human_items WHERE cell_id=? AND epoch<? AND disposition IN ('pending','revising')", [id,epoch]))
           withdraw(r.action_id, "issuer_closed");
         if (!isProjectRoot(core.registry, cells.get(id))) continue;
-        const held = all<ItemRow>(db, `SELECT * FROM human_items WHERE cell_id=? AND category='decision' AND disposition='pending'
+        const held = all<ItemRow>(db, `SELECT * FROM human_items WHERE cell_id=? AND category='decision' AND disposition IN ('pending','revising')
           AND (subject_key=? OR EXISTS(SELECT 1 FROM json_each(related_project_ids) WHERE value=?))`,
           [core.deskCellId, subjectKeys.project(id), id]);
         for (const r of held) {
@@ -883,7 +927,7 @@ export function createHumanItems(core: KernelCore) {
     withdrawOwn(id: string, cellId: string, reason: string): "withdrawn" | "not_pending" | "not_found" {
       const r = row(id);
       if (!r || !ownedBy(r, cellId)) return "not_found";
-      if (r.disposition !== "pending") return "not_pending";
+      if (r.disposition !== "pending" && r.disposition !== "revising") return "not_pending";
       withdraw(id, reason);
       return "withdrawn";
     },
@@ -898,7 +942,7 @@ export function createHumanItems(core: KernelCore) {
       return withTx(db, () => {
         const r = row(id);
         if (!r || !ownedBy(r, cellId)) return { status: "not_found" };
-        if (r.disposition !== "pending") return { status: "not_pending" };
+        if (r.disposition !== "pending" && r.disposition !== "revising") return { status: "not_pending" };
         const item = project(r);
         if (item.options.some((o) => o.effect === "execute")) return { status: "needs_owner" };
         if (how.seenItemRevision !== item.itemRevision || (item.artifactId !== null && how.seenArtifactVersion !== item.artifactVersion))

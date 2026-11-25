@@ -141,25 +141,56 @@ function runCallbacks(callbacks: Array<() => void>): void {
 
 // ==================== schema ====================
 
-/** Creates all owners' tables atomically and records the schema each owner opened. */
+/** Creates all owners' tables atomically, runs pending schema migrations, and records the schema each owner opened. */
 export function applySchemas(db: Db, modules: readonly SchemaModule[]): void {
-  withTx(db, () => {
-    db.exec(`CREATE TABLE IF NOT EXISTS schema_versions (
-      owner      TEXT PRIMARY KEY,
-      version    INTEGER NOT NULL,
-      applied_at INTEGER NOT NULL
-    )`);
-    for (const module of modules) {
-      const row = get<{ version: number }>(db, "SELECT version FROM schema_versions WHERE owner = ?", [module.owner]);
-      if (row && row.version !== module.version) {
-        throw new NgError("schema", `${module.owner}: expected schema v${module.version}, found v${row.version}`);
-      }
-      db.exec(module.ddl);
-      if (!row) {
-        run(db, "INSERT INTO schema_versions(owner, version, applied_at) VALUES (?, ?, ?)", [module.owner, module.version, Date.now()]);
-      }
-    }
+  db.exec(`CREATE TABLE IF NOT EXISTS schema_versions (
+    owner      TEXT PRIMARY KEY,
+    version    INTEGER NOT NULL,
+    applied_at INTEGER NOT NULL
+  )`);
+  const needsMigration = modules.some((m) => {
+    const row = get<{ version: number }>(db, "SELECT version FROM schema_versions WHERE owner = ?", [m.owner]);
+    return row !== undefined && row.version < m.version;
   });
+  // SQLite requires PRAGMA foreign_keys = OFF outside a transaction when a migration rebuilds a referenced table.
+  const toggleFk = needsMigration && !inTransaction(db);
+  if (toggleFk) db.exec("PRAGMA foreign_keys = OFF");
+  try {
+    withTx(db, () => {
+      for (const module of modules) {
+        const row = get<{ version: number }>(db, "SELECT version FROM schema_versions WHERE owner = ?", [module.owner]);
+        if (!row) {
+          db.exec(module.ddl);
+          run(db, "INSERT INTO schema_versions(owner, version, applied_at) VALUES (?, ?, ?)", [module.owner, module.version, Date.now()]);
+          continue;
+        }
+        if (row.version > module.version) {
+          throw new NgError("schema", `${module.owner}: expected schema v${module.version}, found v${row.version}`);
+        }
+        if (row.version < module.version) {
+          let cur = row.version;
+          while (cur < module.version) {
+            const step = module.migrations.find((m) => m.from === cur);
+            if (!step || step.to <= cur || step.to > module.version) {
+              throw new NgError("schema", `${module.owner}: expected schema v${module.version}, found v${row.version}`);
+            }
+            step.run(db);
+            cur = step.to;
+          }
+          run(db, "UPDATE schema_versions SET version = ?, applied_at = ? WHERE owner = ?", [module.version, Date.now(), module.owner]);
+        }
+        db.exec(module.ddl);
+      }
+    });
+  } finally {
+    if (toggleFk) db.exec("PRAGMA foreign_keys = ON");
+  }
+  if (toggleFk) {
+    const violations = all(db, "PRAGMA foreign_key_check");
+    if (violations.length > 0) {
+      throw new NgError("schema", `foreign key check failed after schema migration (${violations.length} violation(s))`);
+    }
+  }
 }
 
 export function schemaVersions(db: Db): Record<string, number> {

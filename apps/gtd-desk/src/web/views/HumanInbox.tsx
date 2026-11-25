@@ -3,6 +3,7 @@ import { Component, useEffect, useLayoutEffect, useRef, useState, type ReactNode
 import type { CardOption } from "@ng/protocol";
 import { EFFORT_LABELS, type Effort, type HumanItemDTO as Item, type StatusDTO } from "../../shared/api";
 import { References } from "../components/bits";
+import { Chevron } from "../components/controls";
 import { PlanEditor, hasUnsavedPlan, retainUnsavedPlans } from "../components/PlanEditor";
 import { Parked } from "../components/Parked";
 import { dueText } from "../text";
@@ -45,6 +46,7 @@ export function HumanInbox({ cardId }: { cardId?: string | undefined }) {
   const res = useResource("human-inbox", pool, ["inbox", "radar", "status"]);
   const navigate = useNavigate();
   const [filter, setFilter] = useState("all");
+  const [revisingOpen, setRevisingOpen] = useState(false);
   const [editing, setEditing] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(cardId ?? null);
   const editingItem = useRef<Item | null>(null);
@@ -55,8 +57,13 @@ export function HumanInbox({ cardId }: { cardId?: string | undefined }) {
   const items = (res.data?.items ?? [])
     .filter(i => filter === "all" || i.category === filter || i.id === cardId)
     .sort((a, b) => b.category.localeCompare(a.category) || (a.dueAt ?? Infinity) - (b.dueAt ?? Infinity));
+  const revising = (res.data?.revising ?? [])
+    .filter(i => filter === "all" || i.category === filter || i.id === cardId);
   const editingFallback = editing && editingItem.current?.proposal && editingItem.current.id === editing ? editingItem.current : undefined;
-  const item = items.find(i => i.id === selectedId) ?? editingFallback ?? items[0];
+  const item = items.find(i => i.id === selectedId) ?? revising.find(i => i.id === selectedId) ?? editingFallback ?? items[0];
+  useLayoutEffect(() => {
+    if (item && revising.some(r => r.id === item.id)) setRevisingOpen(true);
+  }, [item?.id, revising.length]);
   useLayoutEffect(() => { if (item) setSelectedId(item.id); }, [item?.id]);
   useLayoutEffect(() => {
     listRef.current?.querySelector<HTMLElement>('.inbox-row[aria-current="true"]')?.scrollIntoView({ block: "nearest", inline: "nearest" });
@@ -136,6 +143,28 @@ export function HumanInbox({ cardId }: { cardId?: string | undefined }) {
               )
             );
           })}
+          {revising.length > 0 && (
+            <div className="someday">
+              <button type="button" className="disclosure" aria-expanded={revisingOpen} onClick={() => setRevisingOpen((o) => !o)}>
+                <Chevron dir="right" open={revisingOpen} />
+                后台修订中 <span className="count">{revising.length}</span>
+              </button>
+              {revisingOpen && (
+                <div>
+                  {revising.map((i) => (
+                    <button type="button" className="inbox-row" key={i.id} aria-current={i.id === item?.id} onClick={() => choose(i.id)}>
+                      <strong>{i.title}</strong>
+                      <small>
+                        修订中
+                        {i.project ? ` · ${i.project.title}` : ""}
+                        {i.revisionNote ? ` · ${i.revisionNote.length > 40 ? `${i.revisionNote.slice(0, 40)}…` : i.revisionNote}` : ""}
+                      </small>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
         </aside>
       )}
       {item ? (
@@ -151,12 +180,16 @@ export function HumanInbox({ cardId }: { cardId?: string | undefined }) {
           reloadItem={async () => {
             const latest = await pool();
             res.set(latest);
-            return latest.items.find(i => i.id === item.id);
+            return latest.items.find(i => i.id === item.id) ?? latest.revising?.find(i => i.id === item.id);
           }}
         />
       ) : (
         <Empty title={questions.length > 0 ? "没有待处理的卡片" : "待办已清空"}>
-          {questions.length > 0 ? "后台有问题在等你回答，见左侧。" : "有新的事项时会出现在这里。"}
+          {questions.length > 0
+            ? "后台有问题在等你回答，见左侧。"
+            : revising.length > 0
+              ? `有 ${revising.length} 张卡正在后台按你的意见修改，新版就绪后会自动回到这里。`
+              : "有新的事项时会出现在这里。"}
         </Empty>
       )}
     </div>
@@ -180,7 +213,9 @@ function Detail({
   const draft = useDraft(item.artifact);
   const now = useNow();
   const toast = useToast();
+  const navigate = useNavigate();
   const { setStatus } = useStatus();
+  const isRevising = item.status === "revising";
   const [editingChoice, setEditingChoice] = useState<{ itemId: string; optionId: string } | null>(null);
   const [reviewedRevision, setReviewedRevision] = useState(item.itemRevision);
   const itemChanged = reviewedRevision < item.itemRevision;
@@ -273,7 +308,7 @@ function Detail({
       const id = result.activityId;
       toast({
         tone: "success",
-        text: result.status === "revising" ? "修改意见已送达" : "已处理",
+        text: result.status === "revising" ? "修改意见已送达，卡片已转入修订中" : "已处理",
         ...(id
           ? {
               action: {
@@ -384,7 +419,24 @@ function Detail({
     <article className={focused ? "inbox-detail split split-8-4" : "inbox-detail"}>
       <section className="inbox-paper">
         <h1>{item.title}</h1>
-        {itemChanged && <div className="banner warn" role="alert">
+        {isRevising && (
+          <div className="banner info" role="status">
+            <div>
+              <strong>后台正在按你的意见修改中，新版就绪后会自动回到「待我处理」。</strong>
+              {item.revisionNote && <p className="small muted">修改意见：{item.revisionNote}</p>}
+            </div>
+            {item.cellId && (
+              <button
+                type="button"
+                className="btn sm"
+                onClick={() => navigate({ view: "agents", ...(item.project ? { projectId: item.project.id } : {}), cellId: item.cellId! })}
+              >
+                查看后台进展 →
+              </button>
+            )}
+          </div>
+        )}
+        {!isRevising && itemChanged && <div className="banner warn" role="alert">
           <strong>事项已更新，请核对最新内容和选项。</strong>
           <button type="button" className="btn sm" onClick={() => {
             setReviewedRevision(item.itemRevision);
@@ -433,10 +485,11 @@ function Detail({
         )}
         {item.artifact && (
           <>
-            <button className="btn" type="button" onClick={toggle}>
-              {focused ? "回到事项" : "展开专注编辑"}
-            </button>
-            {!focused && hasUnsavedPlan(item.id) && <p role="status">方案有未保存的修改，请展开编辑后保存或放弃。</p>}
+            {!isRevising && (
+              <button className="btn" type="button" onClick={toggle}>
+                {focused ? "回到事项" : "展开专注编辑"}
+              </button>
+            )}            {!focused && hasUnsavedPlan(item.id) && <p role="status">方案有未保存的修改，请展开编辑后保存或放弃。</p>}
             {!focused && draft && <DraftRefreshNotice draft={draft} />}
             {plan ? (
               focused && (

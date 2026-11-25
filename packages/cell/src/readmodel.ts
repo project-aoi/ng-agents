@@ -473,15 +473,18 @@ export function createReadModel(core: KernelCore): ReadModel {
     // What this cell has on the owner's list, with the numbers a decision is checked against. The desk also holds what
     // belongs to no cell: the owner's personal reminders that have come due.
     const personal = cellId === core.deskCellId ? " OR (h.cell_id IS NULL AND (h.due_at IS NULL OR h.due_at<=?))" : "";
-    const held = all<{action_id: string; category: string; subject_key: string; status: string; card: string; item_revision: number; artifact_id: string | null; version: number | null}>(db, `SELECT h.action_id,h.category,h.subject_key,h.status,h.card,h.item_revision,h.artifact_id,a.version
+    const held = all<{action_id: string; category: string; subject_key: string; status: string; card: string; item_revision: number; artifact_id: string | null; version: number | null; revise_note: string | null}>(db, `SELECT h.action_id,h.category,h.subject_key,h.status,h.card,h.item_revision,h.artifact_id,a.version,h.revise_note
       FROM human_items h LEFT JOIN artifacts a ON a.artifact_id=h.artifact_id
-      WHERE (h.cell_id=?${personal}) AND h.status IN ('pending','snoozed')`, personal ? [cellId, clock.now()] : [cellId]);
+      WHERE (h.cell_id=?${personal}) AND h.status IN ('pending','snoozed','revising')`, personal ? [cellId, clock.now()] : [cellId]);
     const seen = (h: (typeof held)[number]) => `rev ${h.item_revision}${h.artifact_id ? ` about ${h.artifact_id} v${h.version ?? "?"}` : ""}`;
-    const heldById = new Map(held.map((h) => [h.action_id, h]));
+    const revising = held.filter((h) => h.status === "revising");
+    const revisingIds = new Set(revising.map((h) => h.action_id));
+    const activeHeld = held.filter((h) => h.status !== "revising");
+    const heldById = new Map(activeHeld.map((h) => [h.action_id, h]));
     const listed = new Set<string>();
     if (isProjectRoot(core.registry, cell)) {
       const preset = cell.preset ? core.registry.presets.get(cell.preset) : undefined;
-      const openActions = (preset?.actionBooks?.(core, cellId)?.list() ?? []).filter(a => a.status === "open");
+      const openActions = (preset?.actionBooks?.(core, cellId)?.list() ?? []).filter(a => a.status === "open" && !revisingIds.has(a.id));
       if (openActions.length) {
         notes.push("[your open actions]\n" + openActions.map(a =>
           `- ${a.id}${heldById.has(a.id) ? ` ${seen(heldById.get(a.id)!)}` : ""} [${a.owner}] "${a.title}"${a.cellId ? ` (cell ${a.cellId})` : ""}${a.phase ? ` (phase ${a.phase})` : ""}${a.nextStep && a.nextStep !== a.title ? ` — ${a.nextStep}` : ""}`
@@ -490,7 +493,7 @@ export function createReadModel(core: KernelCore): ReadModel {
       }
     }
     // An action that is the owner's to do is shown once, under the actions above; what is left are the cards.
-    const cards = held.filter((h) => !listed.has(h.action_id));
+    const cards = activeHeld.filter((h) => !listed.has(h.action_id));
     if (cards.length) notes.push("[your open cards]\n" + cards.map(c => {
       let title = "";
       let body = "";
@@ -501,6 +504,15 @@ export function createReadModel(core: KernelCore): ReadModel {
       } catch { /* ignore malformed card json */ }
       const detail = c.category === "action" && body && body !== title ? ` — ${body.replace(/\s+/g, " ").slice(0, 120)}` : "";
       return `${c.action_id} ${seen(c)} [${c.category}]${title ? ` "${title}"` : ""} ${c.subject_key} (${c.status})${detail}`;
+    }).join("\n"));
+    if (revising.length) notes.push("[your cards being revised — hidden from the owner until you resubmit or reopen them]\n" + revising.map(c => {
+      let title = "";
+      try {
+        title = (JSON.parse(c.card) as { title?: string }).title?.trim() ?? "";
+      } catch { /* ignore malformed card json */ }
+      const note = c.revise_note ? ` — owner asked: ${c.revise_note.replace(/\s+/g, " ").slice(0, 160)}` : "";
+      const how = c.category === "action" ? 'reopen with track_action status "open" only when ready' : `resubmit with subjectKey "${c.subject_key}" when ready`;
+      return `- ${c.action_id} ${seen(c)} [${c.category}]${title ? ` "${title}"` : ""} (revising; ${how})${note}`;
     }).join("\n"));
     // … and what it has set to fire later: for the desk these are the owner's reminders, which become items only when
     // they fire — nothing else shows them to it.
@@ -523,7 +535,7 @@ export function createReadModel(core: KernelCore): ReadModel {
     const edits = all<{artifact_id:string; version:number; current:number}>(db, `SELECT a.artifact_id, max(v.version) AS version, a.version AS current
       FROM artifacts a JOIN artifact_versions v ON v.artifact_id=a.artifact_id AND v.updated_by='human'
       WHERE a.cell_id IN (SELECT value FROM json_each(?)) AND (v.created_at>=? OR
-        (v.version=a.version AND EXISTS(SELECT 1 FROM human_items h WHERE h.artifact_id=a.artifact_id AND h.status IN ('pending','snoozed'))))
+        (v.version=a.version AND EXISTS(SELECT 1 FROM human_items h WHERE h.artifact_id=a.artifact_id AND h.status IN ('pending','snoozed','revising'))))
       GROUP BY a.artifact_id ORDER BY max(v.created_at) DESC LIMIT 12`, [JSON.stringify(authors), since]);
     if (edits.length) notes.push("[human-edited artifacts — changed by the owner since you last looked; read_artifact before you rely on or write to them]\n" + edits.map(a => `${a.artifact_id} v${a.version}${a.current > a.version ? ` (a cell has saved v${a.current} on top since)` : ""}`).join("\n"));
     const watches = all<{id:number; thread:string | null; cancel_group:string | null}>(db, "SELECT id,thread,cancel_group FROM cell_watches WHERE active=1 AND cell_id=?", [cellId]);

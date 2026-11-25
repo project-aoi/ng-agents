@@ -15,11 +15,11 @@ export interface Gate {
   findPendingBySubjectSync(subjectKey: string, cellId: string): ApprovalRecord | undefined;
   snoozeSync(actionId: string, until: number, opts?: { seenItemRevision?: number; approverId?: string }): "snoozed" | "not_pending" | "revision_mismatch";
   denySync(actionId: string, approverId: string, reason?: string, opts?: { seenItemRevision?: number }): "denied" | "not_pending" | "revision_mismatch";
-  /** Record an accepted revise instruction against a pending card: checks & increments itemRevision in the same tx. */
+  /** Record an accepted revise instruction against a pending card: moves it to `revising` & increments itemRevision in the same tx. */
   reviseSync(
     actionId: string,
     approverId: string,
-    opts?: { seenItemRevision?: number; seenArtifactVersion?: number },
+    opts?: { seenItemRevision?: number; seenArtifactVersion?: number; note?: string },
   ): "revised" | "not_pending" | "version_mismatch" | "revision_mismatch";
   withdrawSync(actionId: string, reason: string, opts?: { seenItemRevision?: number }): "cancelled" | "not_pending" | "revision_mismatch";
   recordOutcomeSync(actionId: string, status: "executed", outcome: ApprovalOutcome): void;
@@ -90,7 +90,7 @@ export type AuthorizeResult =
   | { type: "defer"; actionId: string; boundArtifactVersion?: number; approvalCard: Deliverable };
 export type ApproveResult = "approved" | "version_mismatch" | "revision_mismatch" | "already_cancelled" | "not_found";
 
-export type ApprovalStatus = "pending" | "approved" | "denied" | "cancelled" | "superseded" | "executed";
+export type ApprovalStatus = "pending" | "revising" | "approved" | "denied" | "cancelled" | "superseded" | "executed";
 
 export interface ApprovalOutcome {
   result?: unknown;

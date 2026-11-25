@@ -787,6 +787,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
   const handlers: Record<string, Handler> = {
     workbench_overview(args, _principalId, call) {
       const all = desk.listHumanItems(true);
+      const revising = desk.listRevisingHumanItems();
       const items = all.filter((item) => item.snoozedUntil == null || item.snoozedUntil <= now());
       const actions = items.filter((item) => item.category === "action");
       const cards = items.filter((item) => item.category === "decision");
@@ -804,9 +805,12 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         const info = desk.pauseInfo(p.id);
         return `- ${p.id}「${p.title}」— 以后再说${info ? `（${info.text}）` : ""}${p.summary ? `；摘要：${oneLine(p.summary, 120)}` : ""}${p.cwd ? `；目录 ${p.cwd}` : ""}`;
       };
+      const revisingLine = (i: (typeof revising)[number]) =>
+        `- ${i.id}「${oneLine(i.title, 80)}」${i.project ? `（${i.project.title}）` : ""}${i.revisionNote ? ` — 修改意见：${oneLine(i.revisionNote, 100)}` : ""}`;
       const parts = [
         ...(call.baseUrl ? [`工作台地址：${call.baseUrl}`] : []),
         section("待我处理", [...items.map(cardLine), ...questions.lines]),
+        ...(revising.length ? [section("后台修订中（暂不在待我处理，改完新版后会回到待我处理）", revising.map(revisingLine))] : []),
         ...(deskSaid.length ? [section("主台最近对主人说的", deskSaid)] : []),
         ...(reminders.lines.length ? [section("已设好、还没到点的提醒", reminders.lines)] : []),
         section("进行中的项目", radar.projects.map(projectLine)),
@@ -867,6 +871,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         running: running.data,
         workspaces: ws.data,
         snoozedCards: snoozed,
+        revisingCards: revising.length,
         today,
         backend,
         model: model ?? null,
@@ -1062,6 +1067,9 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const jobs = jobsOf(ids);
       const cards = desk.listHumanItems(true).filter(r => r.category === "decision" &&
         ((r.cellId && ids.includes(r.cellId)) || r.relatedProjectIds.includes(id) || r.subjectKey === `project:${id}`));
+      const revisingItems = desk.listRevisingHumanItems().filter(r =>
+        (r.cellId && ids.includes(r.cellId)) || r.relatedProjectIds.includes(id) || r.subjectKey === `project:${id}`);
+      const revisingIdSet = new Set(revisingItems.map((r) => r.id));
       const anchors = cell && cell.status !== "closed" ? kernel.anchorsOf(id) : null;
       const notices = noticesOf(ids, 6);
       // BUG-011.3: a parked project is paused underneath, but it is brought back with activate — never resume.
@@ -1077,7 +1085,8 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       const actionLine = (a: Located<ActionRecord>) => {
         const r = a.record;
         const carrier = r.cellId ? `，由 ${r.cellId} 承担` : "";
-        return `- ${r.id}「${r.title}」${OWNER_TEXT[r.owner]}，${r.status}${carrier}${r.status === "open" && r.nextStep && r.nextStep !== r.title ? ` — 下一步：${oneLine(r.nextStep, 120)}` : ""}${r.status === "open" && r.dueAt ? `，到期 ${isoMin(r.dueAt)}` : ""}`;
+        const revisingTag = r.owner === "human" && revisingIdSet.has(r.id) ? "（后台修订中）" : "";
+        return `- ${r.id}「${r.title}」${OWNER_TEXT[r.owner]}${revisingTag}，${r.status}${carrier}${r.status === "open" && r.nextStep && r.nextStep !== r.title ? ` — 下一步：${oneLine(r.nextStep, 120)}` : ""}${r.status === "open" && r.dueAt ? `，到期 ${isoMin(r.dueAt)}` : ""}`;
       };
       const runnerInfo = (cell: CellRecord) => {
         if (cell.spec.processor.kind !== "llm") return null;
@@ -1129,6 +1138,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         ...(saidBack.length ? [section("它对主人上一句话的答复（没有发通知，主人没看到）", saidBack)] : []),
         ...(notices.length ? [section("它最近发给主人的通知", notices.map((n) => `- ${desk.localTime(n.at)} ${n.text.replace(/\n+/g, "\n  ")}`))] : []),
         section("报告与草稿", artifacts.map((a) => `- ${a.artifactId} v${a.version}${a.content.title ? `「${a.content.title}」` : ""}（${a.content.format}，${a.updatedBy} 更新于 ${isoMin(a.updatedAt)}）`)),
+        ...(revisingItems.length ? [section("后台修订中", revisingItems.map((r) => `- ${r.id}「${oneLine(r.title, 80)}」${r.revisionNote ? ` — 修改意见：${oneLine(r.revisionNote, 100)}` : ""}`))] : []),
         section("等你决定", cards.map(cardLine)),
       ].join("\n\n");
       return ok(text, {
@@ -1146,7 +1156,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         actions: actions.map(({ record, cellId }) => {
           const item = record.owner === "human" ? kernel.humanItems.get(record.id) : undefined;
           return { id: record.id, cellId, title: record.title, owner: record.owner, status: record.status, nextStep: record.nextStep ?? null,
-            carriedBy: record.cellId ?? null, ...(item ? { itemRevision: item.itemRevision } : {}) };
+            carriedBy: record.cellId ?? null, ...(item ? { itemRevision: item.itemRevision, itemStatus: item.status } : {}) };
         }),
         cells: below.map((c) => ({ id: c.id, title: c.title, preset: c.preset, status: c.status, state: cellStateText(c), running: running.has(c.id), waitingFor: waits.filter((w) => w.cellId === c.id).map((w) => w.waitingFor), statusLine: statusLineOf(c.id) })),
         notes,
@@ -1156,6 +1166,7 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
         waits: waits.map((w) => ({ cellId: w.cellId, waitingFor: w.waitingFor, reason: w.reason })),
         artifacts: artifacts.map((a) => ({ id: a.artifactId, title: a.content.title ?? null, version: a.version, cellId: a.cellId, updatedAt: a.updatedAt })),
         cards,
+        revisingItems,
       });
     },
 
@@ -1224,13 +1235,17 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
 
     list_human_items(args) {
       const items = desk.listHumanItems(args["includeSnoozed"] === true);
+      const revising = desk.listRevisingHumanItems();
       // A project confirmation card's plan in one line each (stages included), ahead of the full JSON (audit E17).
       const plans = items.flatMap((i) => {
         if (!i.proposal) return [];
         const marked = planDecisions(i.proposal);
         return [`- ${i.id} 立项方案 v${i.artifactVersion ?? "—"}：${planFacts(i.proposal)}${marked.length ? `；需要主人拍板的段落 ${marked.length} 处：${marked.map((d) => `「${oneLine(d.label, 80)}」`).join("、")}（逐条问过主人再批准；没答的在改方案时留着）` : ""}`];
       });
-      return ok(`待处理 ${items.length} 项\n${plans.length ? `${plans.join("\n")}\n` : ""}${JSON.stringify(items, null, 2)}`, {items});
+      const revisingNote = revising.length
+        ? `\n后台修订中 ${revising.length} 项（暂不在待我处理）：\n${revising.map((i) => `- ${i.id}「${oneLine(i.title, 80)}」${i.revisionNote ? ` — 修改意见：${oneLine(i.revisionNote, 100)}` : ""}`).join("\n")}`
+        : "";
+      return ok(`待处理 ${items.length} 项${revisingNote}\n${plans.length ? `${plans.join("\n")}\n` : ""}${JSON.stringify(items, null, 2)}`, {items, revising});
     },
     async decide_human_item(args,principalId) {
       // Whose item it is, read before the decision closes it.

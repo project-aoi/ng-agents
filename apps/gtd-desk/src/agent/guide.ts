@@ -155,7 +155,7 @@ export const AGENT_TOOLS: readonly AgentToolDoc[] = [
   {
     name: "list_human_items",
     description:
-      "Everything waiting on the owner in 待我处理: open human actions (their to-dos) and pending cards, with their options, itemRevision, artifactVersion, the plan of a project confirmation card (proposal), resumeTarget and closeTargets. Snoozed items are left out unless includeSnoozed.",
+      "Everything waiting on the owner in 待我处理: open human actions (their to-dos) and pending cards, with their options, itemRevision, artifactVersion, the plan of a project confirmation card (proposal), resumeTarget and closeTargets. Cards currently being revised by the background are reported separately under `revising` (not in `items`). Snoozed items are left out unless includeSnoozed.",
     inputSchema: obj({ includeSnoozed: { type: "boolean", description: "also list items put off until later (default false)" } }),
   },
   {

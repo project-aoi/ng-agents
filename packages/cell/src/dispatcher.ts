@@ -31,9 +31,10 @@ import {
 } from "@ng/protocol";
 import { RESURFACE_MARKER, MESSAGE_ARRIVED, notCarriedOut } from "./constants";
 import { effectiveCwd } from "./workdir";
-import type { KernelCore } from "./core";
+import { isProjectRoot, type KernelCore } from "./core";
 import { recordPaused } from "./pauses";
 import { buildRunPorts } from "./ports";
+import { WAIT_HUMAN } from "./waits";
 import type { IdleOptions, RunInfo, RunResult } from "./types";
 
 /** Why the kernel stopped a Run: decides whether releasing its claim counts as a failed attempt. */
@@ -586,6 +587,27 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
       // earlier tool of the same turn arranged a wake-up (it spawned a child, started a job). A pending card is the
       // one thing that outranks it: the cell asked the owner something and must be there for the answer.
       const self = result === "completed" || result === "yielded_waiting" ? handle.selfSettle : null;
+      // Safety net: if a cell finishes a turn while holding a card in `revising` and has no further background work
+      // in flight (no pending wakeups, running jobs, non-human waits, or active project subtree work), bring the card
+      // back to `pending` so it is never stranded hidden from the owner.
+      if ((result === "completed" || result === "yielded_waiting") && !self) {
+        const hasPendingWakeup = inbox.pendingWakeupCountSync(cellId) > 0 || inbox.activeClaimCountSync(cellId, handle.claimId) > 0;
+        if (!hasPendingWakeup && core.humanItems.hasRevising(cellId)) {
+          const waits = core.waits.list([cellId]);
+          const hasNonHumanWait = waits.some((w) => w.waitingFor !== WAIT_HUMAN);
+          const hasHumanWait = waits.some((w) => w.waitingFor === WAIT_HUMAN);
+          const hasJobs = core.workspace.listJobsSync({ cellId, state: ["running"] }).length > 0;
+          const projectBusy = isProjectRoot(core.registry, cur)
+            ? (() => {
+                const a = core.readModel.anchorsOf(cellId);
+                return a.agent || a.internal || (!hasHumanWait && a.external);
+              })()
+            : false;
+          if (!hasNonHumanWait && !hasJobs && !projectBusy) {
+            core.humanItems.reopenRevising(cellId);
+          }
+        }
+      }
       // A wakeable leaf that ended its turn "waiting" may have arranged nothing to wait for (a bare `wait`): whether
       // its turn is over is decided below by what is actually out, not by how the Run was labelled.
       const restingLeaf = leaf && !oneShot && result === "yielded_waiting";

@@ -133,13 +133,13 @@ export function createGate(opts: GateOptions): GateService {
   }
 
   function pendingBySubject(subjectKey: string, cellId: string): ApprovalRow | undefined {
-    return get<ApprovalRow>(db, `${approvalSelect} WHERE subject_key=? AND cell_id=? AND disposition='pending'`,
+    return get<ApprovalRow>(db, `${approvalSelect} WHERE subject_key=? AND cell_id=? AND disposition IN ('pending','revising')`,
       [subjectKey, cellId]);
   }
 
   function resolveRow(row: ApprovalRow, status: ApprovalStatus, reason: string | null): void {
     const now = clock.now();
-    run(db, "UPDATE human_items SET disposition = ?, status_reason = ?, item_revision = item_revision + 1, resolved_at = ?, updated_at = ? WHERE action_id = ?", [
+    run(db, "UPDATE human_items SET disposition = ?, status_reason = ?, revise_note = NULL, item_revision = item_revision + 1, resolved_at = ?, updated_at = ? WHERE action_id = ?", [
       status,
       reason === null ? null : reason,
       now,
@@ -201,7 +201,7 @@ export function createGate(opts: GateOptions): GateService {
       run(
         db,
         `UPDATE human_items SET principal_id = ?, action = ?, action_hash = ?, card = ?, artifact_id = ?, bound_version = ?,
-           proposed_version = ?, item_revision = item_revision + 1, status_reason = NULL, updated_at = ? WHERE action_id = ?`,
+           proposed_version = ?, disposition = 'pending', snoozed_until = NULL, item_revision = item_revision + 1, status_reason = NULL, revise_note = NULL, updated_at = ? WHERE action_id = ?`,
         [meta.principalId, toJson(storedAction), actionHash, toJson(card), artifactId, boundVersion ?? null, proposed, now, actionId],
       );
     } else {
@@ -358,7 +358,7 @@ export function createGate(opts: GateOptions): GateService {
         const now = clock.now();
         run(
           db,
-          `UPDATE human_items SET disposition = 'approved', status_reason = NULL, approver_id = ?, bound_version = ?, human_edited = ?,
+          `UPDATE human_items SET disposition = 'approved', status_reason = NULL, revise_note = NULL, approver_id = ?, bound_version = ?, human_edited = ?,
              item_revision = item_revision + 1, resolved_at = COALESCE(resolved_at, ?), updated_at = ? WHERE action_id = ?`,
           [approverId, bound, humanEdited ? 1 : 0, now, now, row.action_id],
         );
@@ -375,7 +375,7 @@ export function createGate(opts: GateOptions): GateService {
         const now = clock.now();
         const inList = placeholders(ids.length);
         run(db, `UPDATE cells SET revoked_at = COALESCE(revoked_at, ?) WHERE id IN (${inList})`, [now, ...ids]);
-        const pending = all<ApprovalRow>(db, `${approvalSelect} WHERE disposition='pending' AND cell_id IN (${inList})`, ids);
+        const pending = all<ApprovalRow>(db, `${approvalSelect} WHERE disposition IN ('pending','revising') AND cell_id IN (${inList})`, ids);
         for (const row of pending) resolveRow(row, "cancelled", "authority revoked");
       });
     },
@@ -492,8 +492,12 @@ export function createGate(opts: GateOptions): GateService {
             return "version_mismatch";
           }
         }
-        run(db, "UPDATE human_items SET item_revision = item_revision + 1, updated_at = ? WHERE action_id = ?", [clock.now(), actionId]);
-        emitApproval(row, "pending");
+        run(
+          db,
+          "UPDATE human_items SET disposition = 'revising', snoozed_until = NULL, revise_note = ?, item_revision = item_revision + 1, updated_at = ? WHERE action_id = ?",
+          [reviseOpts.note?.trim() || null, clock.now(), actionId],
+        );
+        emitApproval(row, "revising");
         return "revised";
       });
     },
@@ -501,7 +505,7 @@ export function createGate(opts: GateOptions): GateService {
     withdrawSync(actionId, reason, withdrawOpts = {}) {
       return withTx(db, () => {
         const row = approvalRow(actionId);
-        if (!row || row.status !== "pending") return "not_pending";
+        if (!row || (row.status !== "pending" && row.status !== "revising")) return "not_pending";
         if (withdrawOpts.seenItemRevision !== undefined && withdrawOpts.seenItemRevision !== row.item_revision) return "revision_mismatch";
         resolveRow(row, "cancelled", reason);
         return "cancelled";

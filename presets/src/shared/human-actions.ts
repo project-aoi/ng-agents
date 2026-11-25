@@ -71,13 +71,13 @@ export function writeActionRecordSync(store: ActionStore, cellId: string, record
       throw new NgError("conflict", "这个行动编号已被使用");
     const subject = prior?.subject_key ?? `action:${cellId}:${record.id}`;
     if (record.status === "open" && get(db, `SELECT 1 FROM human_items WHERE cell_id IS ? AND subject_key=? AND action_id<>?
-        AND status IN ('pending','snoozed')`, [issuer, subject, record.id])) throw new NgError("conflict", "该行动已有待处理事项");
+        AND status IN ('pending','snoozed','revising')`, [issuer, subject, record.id])) throw new NgError("conflict", "该行动已有待处理事项");
     const changed = (status: ApprovalStatus) => afterCommit(db, () => bus.emit("approval.changed", {
       cellId: issuer ?? deskCellId, actionId: record.id, subjectKey: subject, status,
     }));
     if (record.owner !== "human") {
       if (prior && prior.status_reason !== "reassigned") {
-        run(db, `UPDATE human_items SET disposition='cancelled',status_reason='reassigned',snoozed_until=NULL,
+        run(db, `UPDATE human_items SET disposition='cancelled',status_reason='reassigned',revise_note=NULL,snoozed_until=NULL,
           resolved_at=?,updated_at=?,item_revision=item_revision+1 WHERE action_id=?`,
           [record.updatedAt, record.updatedAt, record.id]);
         changed("cancelled");
@@ -97,7 +97,7 @@ export function writeActionRecordSync(store: ActionStore, cellId: string, record
         card,options,disposition,category,related_project_ids,effort,due_at,artifact_id,created_at,updated_at,resolved_at)
       VALUES(?,?,?,?,?,'custom',?,'',?,?,?,'action',?,?,?,?,?,?,?)
       ON CONFLICT(action_id) DO UPDATE SET cell_id=excluded.cell_id,principal_id=excluded.principal_id,epoch=excluded.epoch,action=excluded.action,card=excluded.card,options=excluded.options,
-        disposition=excluded.disposition,status_reason=NULL,related_project_ids=excluded.related_project_ids,effort=excluded.effort,
+        disposition=excluded.disposition,status_reason=NULL,revise_note=NULL,related_project_ids=excluded.related_project_ids,effort=excluded.effort,
         due_at=excluded.due_at,artifact_id=excluded.artifact_id,updated_at=excluded.updated_at,resolved_at=excluded.resolved_at,
         snoozed_until=CASE WHEN excluded.disposition='pending' AND human_items.disposition='pending' THEN human_items.snoozed_until END,
         item_revision=human_items.item_revision+1`,

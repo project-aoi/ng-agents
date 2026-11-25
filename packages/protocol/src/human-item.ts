@@ -2,7 +2,7 @@ import { NgError } from "./errors";
 import type { ProposedAction } from "./contract/gate";
 
 export type CardEffect = "reply" | "revise" | "execute" | "defer" | "terminate" | "complete";
-export type HumanItemStatus = "pending" | "snoozed" | "resolved" | "cancelled";
+export type HumanItemStatus = "pending" | "snoozed" | "revising" | "resolved" | "cancelled";
 
 export interface CardOption {
   id: string;
@@ -49,6 +49,8 @@ export interface HumanItem extends Omit<HumanItemDraft, "artifactId"> {
   artifactVersion: number | null;
   humanEdited: boolean;
   action: ProposedAction | null;
+  /** The owner's latest revision instruction while `status === "revising"`. */
+  revisionNote?: string;
 }
 
 export interface HumanDecision {

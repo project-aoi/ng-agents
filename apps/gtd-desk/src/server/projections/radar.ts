@@ -216,6 +216,7 @@ export function radarProjects(input: ProjectionInput): Omit<RadarDTO, "review"> 
   for (const item of kernel.humanItems.list()) {
     if (item.category==="decision") for (const pid of item.relatedProjectIds) if (!visibleCards.has(pid)) visibleCards.set(pid,{id:item.id,title:item.title});
   }
+  const revisingIds = new Set(kernel.humanItems.listRevising().map((item) => item.id));
   const stalls = new Map(all<{ cell_id: string; since: number }>(kernel.db, "SELECT cell_id,since FROM cell_stalls").map(r => [r.cell_id, r.since]));
   const rows: ProjectRowDTO[] = [];
   for (const p of projects) {
@@ -233,7 +234,9 @@ export function radarProjects(input: ProjectionInput): Omit<RadarDTO, "review"> 
     const stalled = stalledSince !== null;
     const act = stalled ? { running: 0, waiting: 0, busy: null, waitLine: null } : subtreeActivity(nodes.get(p.cellId), activity, now);
     const subtree = subtreeIds(p.cellId, byParent);
-    const open = (actionsByProject.get(p.cellId) ?? []).filter((a) => a.record.status === "open");
+    const open = (actionsByProject.get(p.cellId) ?? []).filter(
+      (a) => a.record.status === "open" && !(a.record.owner === "human" && revisingIds.has(a.record.id)),
+    );
     open.sort((a, b) => compareBallOwner(a.record.owner, b.record.owner) || (a.record.dueAt ?? Infinity) - (b.record.dueAt ?? Infinity) || a.record.createdAt - b.record.createdAt);
     const projectCellIds = new Set(subtree);
     // Dispatch also records the action ID on the child. Recover an omitted carrier only for a unique match.
