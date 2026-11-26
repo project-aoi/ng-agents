@@ -105,7 +105,7 @@ describe("stall check", () => {
 
     // @Agent: a worker with work queued; @Human: a pending card; @Waiting(internal): an open wait on a live cell.
     h.kernel.spawnCell("p-agent", { id: "w", preset: "worker", meta: { role: "w" } }, "分析 trae 代码", { principalId: h.kernel.ownerPrincipal });
-    h.script.add("w", tool("wait", { reason: "等编译" }));
+    h.script.add("w", { text: "等编译" });
     h.script.add("p-human", tool("request_approval", { kind: "escalation", title: "需要你确认", summary: "blocked", escalation: { reason: "blocked", explanation: "仓库里有你没提交的改动" } }));
     h.kernel.sendToCell("p-human", { text: "go" }, { principalId: h.kernel.ownerPrincipal });
     h.script.add("p-wait", tool("wait", { reason: "等 desk 裁决", waitingFor: "inbox:desk" }));
@@ -143,7 +143,7 @@ describe("waits (the internal anchor)", () => {
     let sawOpenWait = false;
     h.script.add("proj", (req) => {
       sawOpenWait = requestText(req).includes("waiting for inbox:desk");
-      return tool("wait", { reason: "还在等" });
+      return {};
     });
     h.kernel.inbox.enqueueSync("proj", { id: "remark", from: "channel:memory:carol", principalId: "memory:carol", kind: "event", type: PAYLOAD.userMessage, payload: { text: "顺便说一句，周五前要" }, createdAt: h.clock.now() });
     await h.kernel.idle();
@@ -276,7 +276,7 @@ describe("agent principal on the control plane", () => {
     const h = await boot();
     h.kernel.spawnCell("desk", { id: "proj", preset: "project", title: "改 TUI 表格复制", meta: { role: "proj" } }, "coordinate", { principalId: AGENT });
     expect(h.kernel.getCell("proj")!.principalId).toBe(AGENT);
-    h.script.add("proj", tool("wait", { reason: "等指示" }));
+    h.script.add("proj", {});
     await h.kernel.idle();
 
     expect(h.kernel.sendToCell("proj", { text: "仓库在 /srv/tui" }, { principalId: AGENT })).toMatchObject({ status: "delivered" });

@@ -30,6 +30,7 @@ it("a worker's result: the notes show its actions closed, the answered wait gone
       };
     },
     () => tool("wait", { reason: "等它做完", waitingFor: `inbox:${worker}` }),
+    {},
     (req) => {
       seen = requestText(req);
       return {};

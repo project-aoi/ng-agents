@@ -34,6 +34,7 @@ export interface ActivityRecord {
   rawInput?: string;
   envelope?: Envelope;                  // original inbound envelope, re-enqueued to the desk on "交回主台"
   actionId?: string;                    // the withdrawn approval, for card_withdrawn
+  resultId?: string;                    // envelope id of the completion result, for action_completed dedup across reopens
   remindAt?: number;                    // for reminder_set
   restorable: boolean;
   restoredAt?: number;

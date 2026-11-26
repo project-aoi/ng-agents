@@ -7,14 +7,16 @@ const jobStart = defineTool({
   name: "job_start",
   kind: "bash",
   description:
-    "Start a long-running command (build, test suite, migration) as a background job that outlives this run. You are woken with a job.result message when it ends, so you can finish your turn instead of waiting.",
+    "Start a long-running command (build, test suite, migration) as a background job that outlives this run; stdout/stderr are captured automatically for job_observe (do not redirect to /tmp/*.log), stdin is /dev/null unless interactive: true, and job.result wakes you when it ends.",
   input: z.object({
     command: z.string().min(1),
-    timeoutMs: z.number().int().min(1_000).optional().describe("max run time in ms. Default 30 minutes — give more for anything that may run longer (a soak test, a long build); clamped to the workspace ceiling. Time the machine was asleep does not count"),
+    timeoutMs: z.number().int().min(1_000).optional().describe("max run time in ms (default 30m, clamped to ceiling; host sleep excluded)"),
+    interactive: z.boolean().optional().describe("true only if you must send lines with job_input; default false connects stdin to /dev/null so non-interactive tools never hang on EOF"),
   }),
   async handler(args, ctx) {
-    const spec: { command: string; timeoutMs?: number } = { command: args.command };
+    const spec: { command: string; timeoutMs?: number; interactive?: boolean } = { command: args.command };
     if (args.timeoutMs !== undefined) spec.timeoutMs = args.timeoutMs;
+    if (args.interactive !== undefined) spec.interactive = args.interactive;
     const { jobId } = await ctx.ports.workspace.startJob(spec);
     return {
       output: `Started job ${jobId}. You will get a job.result message when it finishes; check on it with job_observe.`,
@@ -27,7 +29,7 @@ const jobStart = defineTool({
 const jobObserve = defineTool({
   name: "job_observe",
   kind: "bash",
-  description: "Show a background job's state and the tail of its output.",
+  description: "Show a background job's state and output tail (yours, a descendant's, or another cell's in the same project).",
   input: z.object({ jobId: z.string().min(1) }),
   async handler(args, ctx) {
     const r = await ctx.ports.workspace.observeJob(args.jobId);

@@ -20,6 +20,7 @@ export interface BridgeToolSpec {
 export interface BridgeCallResult {
   text: string;
   isError?: boolean;
+  structuredContent?: Record<string, unknown>;
 }
 
 export interface ToolBridgeOptions {
@@ -118,6 +119,7 @@ export async function startToolBridge(opts: ToolBridgeOptions): Promise<ToolBrid
     socket.setNoDelay(true);
     socket.setEncoding("utf8");
     let authed = false;
+    let clientProtocolVersion = "2024-11-05";
     let buf = "";
     const authTimer = setTimeout(() => {
       if (!authed) {
@@ -173,12 +175,20 @@ export async function startToolBridge(opts: ToolBridgeOptions): Promise<ToolBrid
           log({ type: "connected", connections: sessions });
           continue;
         }
-        handle(msg, send, callAborts);
+        handle(msg, send, callAborts, (v) => {
+          clientProtocolVersion = v;
+        }, () => clientProtocolVersion);
       }
     });
   });
 
-  function handle(msg: JsonRpcMessage, send: (m: object) => void, callAborts: Map<string, AbortController>): void {
+  function handle(
+    msg: JsonRpcMessage,
+    send: (m: object) => void,
+    callAborts: Map<string, AbortController>,
+    setProtocolVersion: (v: string) => void,
+    getProtocolVersion: () => string,
+  ): void {
     const { id, method } = msg;
     if (method === undefined) return; // a response to nothing we asked: ignore
     const isRequest = id !== undefined && id !== null;
@@ -195,6 +205,7 @@ export async function startToolBridge(opts: ToolBridgeOptions): Promise<ToolBrid
         const params = (msg.params ?? {}) as { protocolVersion?: unknown; clientInfo?: unknown };
         const requested = typeof params.protocolVersion === "string" ? params.protocolVersion : "";
         const protocolVersion = (MCP_PROTOCOL_VERSIONS as readonly string[]).includes(requested) ? requested : MCP_PROTOCOL_VERSIONS[1];
+        setProtocolVersion(protocolVersion);
         log({ type: "initialize", protocolVersion, clientInfo: params.clientInfo });
         send({
           id,
@@ -248,7 +259,14 @@ export async function startToolBridge(opts: ToolBridgeOptions): Promise<ToolBrid
         queue = p.catch(() => undefined);
         void p.then((r) => {
           callAborts.delete(requestId);
-          send({ id, result: { content: [{ type: "text", text: r.text }], isError: r.isError === true } });
+          send({
+            id,
+            result: {
+              content: [{ type: "text", text: r.text }],
+              isError: r.isError === true,
+              ...(r.structuredContent && getProtocolVersion() >= "2025-06-18" ? { structuredContent: r.structuredContent } : {}),
+            },
+          });
         });
         return;
       }

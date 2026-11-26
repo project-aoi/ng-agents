@@ -116,11 +116,17 @@ export function createAgentsApi({ requireActor, commands, kernel, settings, stat
     if (!Number.isInteger(limit) || limit < 1) throw errors.bad("limit 必须是正整数");
     const max = Math.min(limit, RESOURCE_PAGE_MAX);
     if (typeof uri === "string" && NOTE_SCHEMES.some((scheme) => uri.startsWith(scheme))) {
-      if (!cellId) throw errors.bad("读取笔记需要 cellId：笔记所属的分身（信源列表和 get_cell 里有）");
-      if (!kernel.getCell(cellId)) throw errors.missing("找不到这个分身");
+      let targetCellId = cellId;
+      if (!targetCellId) {
+        const rest = uri.slice(uri.indexOf("://") + 3);
+        const slash = rest.indexOf("/");
+        if (slash > 0 && slash < rest.length - 1) targetCellId = rest.slice(0, slash);
+      }
+      if (!targetCellId) throw errors.bad("读取笔记需要 cellId：笔记所属的分身（信源列表和 get_cell 里有）");
+      if (!kernel.getCell(targetCellId)) throw errors.missing("找不到这个分身");
       let text: string;
       try {
-        text = kernel.context.readResourceSync(cellId, uri, { offset: 0, limit: Number.MAX_SAFE_INTEGER });
+        text = kernel.context.readResourceSync(targetCellId, uri, { offset: 0, limit: Number.MAX_SAFE_INTEGER });
       } catch (err) {
         if (isNgError(err, "not_found")) throw errors.missing("这个分身没有这份笔记");
         if (isNgError(err, "invalid_argument")) throw errors.bad(`读不了这个地址：${uri}`);

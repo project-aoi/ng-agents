@@ -1,19 +1,43 @@
 import type { SchemaModule } from "./types";
 
-// Owner: @ng/workspace.
-export const workspaceSchema: SchemaModule = {
-  owner: "@ng/workspace",
-  version: 1,
-  migrations: [],
-  ddl: /* sql */ `
-CREATE TABLE IF NOT EXISTS workspaces (
+const WORKSPACES_COLUMNS = /* sql */ `
   cell_id       TEXT PRIMARY KEY REFERENCES cells(id),
   path          TEXT,                          -- host working directory
-  status        TEXT NOT NULL CHECK (status IN ('active','failed')),
+  status        TEXT NOT NULL CHECK (status IN ('active','failed','closed')),
   error         TEXT,
   created_at    INTEGER NOT NULL,
   updated_at    INTEGER NOT NULL
-);
+`;
+
+// Owner: @ng/workspace.
+export const workspaceSchema: SchemaModule = {
+  owner: "@ng/workspace",
+  version: 2,
+  migrations: [
+    {
+      from: 1,
+      to: 2,
+      run(db) {
+        db.exec(/* sql */ `
+CREATE TABLE workspaces_v2 (${WORKSPACES_COLUMNS});
+INSERT INTO workspaces_v2 (cell_id, path, status, error, created_at, updated_at)
+SELECT
+  w.cell_id,
+  w.path,
+  CASE WHEN c.status = 'closed' THEN 'closed' ELSE w.status END,
+  w.error,
+  w.created_at,
+  w.updated_at
+FROM workspaces w
+LEFT JOIN cells c ON c.id = w.cell_id;
+DROP TABLE workspaces;
+ALTER TABLE workspaces_v2 RENAME TO workspaces;
+`);
+      },
+    },
+  ],
+  ddl: /* sql */ `
+CREATE TABLE IF NOT EXISTS workspaces (${WORKSPACES_COLUMNS});
 
 CREATE TABLE IF NOT EXISTS jobs (
   job_id              TEXT PRIMARY KEY,

@@ -127,12 +127,11 @@ describe("a wakeable worker's turn settles: the parent is told, the worker stays
     expect(h.kernel.getCell("w1")!.status).toBe("active");
   });
 
-  it("a turn that ends with a bare wait — nothing arranged, nobody named — is over: the parent is told", async () => {
+  it("a turn that ends naturally — nothing arranged, nobody named — is over: the parent is told", async () => {
     const h = await boot();
     project(h);
     worker(h, "w1");
-    h.script.add("w1", { text: "分析完了，结论在上面" }, tool("wait", { reason: "没有别的事了" }));
-    h.script.add("w1", tool("wait", { reason: "没有别的事了" }));
+    h.script.add("w1", { text: "分析完了，结论在上面" });
     await h.kernel.idle();
     expect(activity(h, "w1")).toBe("dormant");
     expect(results(h, "proj")).toMatchObject([{ childCellId: "w1", childState: "dormant", turn: { outcome: "completed" } }]);

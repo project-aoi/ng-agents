@@ -2,22 +2,56 @@ import type { SummaryInput } from "./deps";
 import { oneLine, safeTail } from "./text";
 
 /** Extract references from the original strings, before any excerpt or JSON escaping. */
+const REF_PATTERN = /(?:res|artifact):\/\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_./:@-]+(?!…|\.\.\.)|artifact:\/\/[A-Za-z0-9_.-]+(?:@\d+)?(?!…|\.\.\.)|\bart_(?:[A-Za-z_][A-Za-z0-9_.-]*|[0-9a-z]{8,})\b(?!…|\.\.\.)/g;
+
 export function referencesIn(...values: unknown[]): string[] {
   const refs = new Set<string>();
   function visit(value: unknown) {
     if (typeof value === "string") {
-      for (const match of value.matchAll(/(?:res|artifact):\/\/[^\s"'<>\x60\\\]\[(){}，。；、,;]+|\bart_[\w.-]+/gu))
-        refs.add(match[0].replace(/[.!?]+$/, ""));
+      for (const match of value.matchAll(REF_PATTERN)) {
+        const cleaned = match[0].replace(/[.:/-]+$/, "");
+        if (cleaned.startsWith("res://") && !/^res:\/\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+/.test(cleaned)) continue;
+        if (cleaned.startsWith("artifact://") && cleaned.length <= "artifact://".length) continue;
+        refs.add(cleaned);
+      }
     } else if (value && typeof value === "object") {
       for (const child of Object.values(value)) visit(child);
     }
   }
   for (const value of values) visit(value);
-  return [...refs];
+  const coveredArtIds = new Set<string>();
+  for (const r of refs) {
+    const m = /^artifact:\/\/(art_[A-Za-z0-9_.-]+?)(?:@\d+)?$/.exec(r);
+    if (m?.[1]) coveredArtIds.add(m[1]);
+  }
+  return [...refs].filter((r) => !coveredArtIds.has(r));
 }
 
 export function referenceLine(refs: readonly string[]): string {
   return refs.length ? "[references] " + refs.join(" ") : "";
+}
+
+/**
+ * Fit whole references within `maxChars` without ever slicing mid-URI.
+ * Formal `art_*` / `artifact://` references take priority; temporary `res://` spill links keep the newest entries first.
+ */
+export function boundedReferenceLine(refs: readonly string[], maxChars: number): { line: string; dropped: string[] } {
+  if (refs.length === 0 || maxChars <= "[references] ".length) return { line: "", dropped: [...refs] };
+  const isFormal = (r: string) => r.startsWith("art_") || r.startsWith("artifact://");
+  const formal = refs.filter(isFormal);
+  const ephemeral = refs.filter((r) => !isFormal(r));
+  // Select newest formal refs first, then newest res:// refs, then restore original relative order.
+  const keptSet = new Set<string>();
+  let used = "[references]".length;
+  for (const r of [...[...formal].reverse(), ...[...ephemeral].reverse()]) {
+    if (used + 1 + r.length <= maxChars) {
+      keptSet.add(r);
+      used += 1 + r.length;
+    }
+  }
+  const kept = refs.filter((r) => keptSet.has(r));
+  const dropped = refs.filter((r) => !keptSet.has(r));
+  return { line: kept.length ? "[references] " + kept.join(" ") : "", dropped };
 }
 
 /**
@@ -34,8 +68,9 @@ export function truncatingSummary(input: SummaryInput): string {
       else lines.push(`${b.isError ? "tool error" : "tool result"}: ${oneLine(b.content, 160)}`);
     }
   }
-  const refs = referenceLine(referencesIn(input.previousSummary, input.messages));
-  const body = lines.filter(line => !line.startsWith("[references] ")).join("\n");
-  const remaining = input.maxChars - refs.length - (refs ? 1 : 0);
+  const refBudget = Math.min(1_200, Math.max(96, Math.floor(input.maxChars / 5)));
+  const refs = boundedReferenceLine(referencesIn(input.previousSummary, input.messages), refBudget).line;
+  const body = lines.filter(line => !line.startsWith("[references] ") && !line.startsWith("[original task]") && !line.startsWith("[project goal]")).join("\n");
+  const remaining = Math.max(0, input.maxChars - refs.length - (refs ? 1 : 0));
   return [safeTail(body, remaining), refs].filter(Boolean).join("\n");
 }

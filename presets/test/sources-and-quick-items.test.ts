@@ -40,7 +40,7 @@ describe("docs/03 §四 row 1 — a sensor is a source, not a task", () => {
     h.script.add(
       "desk",
       tool("add_source", { title: "核心指标巡检", description: "注册转化率环比下跌超过 10% 才算", cron: "0 9 * * 1", tz: "Asia/Shanghai", check: "test.metrics" }),
-      tool("wait", { reason: "done" }),
+      {},
     );
     await h.ui.capture({ text: "每周一早 9 点帮我看下核心指标有没有掉" }, "owner");
     await h.kernel.idle();
@@ -132,7 +132,7 @@ describe("docs/03 §四 row 1 — a sensor is a source, not a task", () => {
     const h = await boot({
       setup: (r) => r.codeProcessors.register(defineSensorCheck("test.group", () => ({ title: "支付报错", summary: "有人说付款页面白屏" }))),
     });
-    h.script.add("desk", tool("add_source", { title: "研发群反馈", watchThread: "memory:dev-group", check: "test.group", mode: "observe" }), tool("wait", { reason: "ok" }));
+    h.script.add("desk", tool("add_source", { title: "研发群反馈", watchThread: "memory:dev-group", check: "test.group", mode: "observe" }), {});
     await h.ui.capture({ text: "盯一下研发群有没有人反馈支付报错，先观察两天别弹卡" }, "owner");
     await h.kernel.idle();
     const [sensor] = sensorsOf(h);
@@ -159,7 +159,7 @@ describe("docs/03 §四 row 1 — a sensor is a source, not a task", () => {
           }),
         ),
     });
-    h.script.add("desk", tool("add_source", { title: "指标", cron: "0 9 * * 1", tz: "Asia/Shanghai", check: "test.broken" }), tool("wait", { reason: "ok" }));
+    h.script.add("desk", tool("add_source", { title: "指标", cron: "0 9 * * 1", tz: "Asia/Shanghai", check: "test.broken" }), {});
     await h.ui.capture({ text: "每周一查指标" }, "owner");
     await h.kernel.idle();
     const [sensor] = sensorsOf(h);
@@ -176,7 +176,7 @@ describe("docs/03 §四 row 2 — personal zero-side-effect items: done at once,
     h.script.add(
       "desk",
       tool("capture_note", { title: "Agent 架构长文", url: "https://example.com/post", list: "阅读清单" }),
-      tool("wait", { reason: "saved" }),
+      {},
     );
     const env = await h.ui.capture({ text: "把这篇链接存进阅读清单 https://example.com/post" }, "owner");
     await h.kernel.idle();
@@ -199,7 +199,7 @@ describe("docs/03 §四 row 2 — personal zero-side-effect items: done at once,
 
   it("a reminder: set at once with a light notice; when it fires it becomes a quick to-do, still no card", async () => {
     const h = await boot();
-    h.script.add("desk", tool("remind_me", { text: "给牙医打电话约时间", at: "2026-11-20T15:00:00+08:00" }), tool("wait", { reason: "set" }));
+    h.script.add("desk", tool("remind_me", { text: "给牙医打电话约时间", at: "2026-11-20T15:00:00+08:00" }), {});
     await h.ui.capture({ text: "周五下午 3 点提醒我给牙医打电话" }, "owner");
     await h.kernel.idle();
 
@@ -228,20 +228,20 @@ describe("docs/03 §四 row 2 — personal zero-side-effect items: done at once,
 
   it("a reminder becomes a to-do when it fires even if the model ignores the wake-up it shares with a new item", async () => {
     const h = await boot();
-    h.script.add("desk", tool("remind_me", { text: "交房租", inMinutes: 60 }), tool("wait", { reason: "set" }));
+    h.script.add("desk", tool("remind_me", { text: "交房租", inMinutes: 60 }), {});
     await h.ui.capture({ text: "一小时后提醒我交房租" }, "owner");
     await h.kernel.idle();
     // The desk is busy with one item while the reminder comes due and another message arrives: both land in one batch,
-    // and the model answers it with a bare wait (no desk tool at all).
+    // and the model answers it with no desk tool at all.
     let release!: () => void;
     const busy = new Promise<void>((r) => (release = r));
     h.script.add("desk", async () => {
       await busy;
-      return tool("wait", { reason: "thinking about something else" });
+      return {};
     });
     h.script.add("desk", (req) => {
       expect(JSON.stringify(req.messages)).toContain("下午开会记得带电脑");
-      return tool("wait", { reason: "ignored" });
+      return {};
     });
     await h.ui.capture({ text: "帮我想想周报怎么写" }, "owner");
     while (h.script.callsOf("desk").length < 3) await new Promise((r) => setTimeout(r, 5));

@@ -32,13 +32,14 @@ export interface AgentLoop {
     | "cancelled"
 
     | "step_limit"                      // [ext] docs/05: hit the per-Run step cap with work left; the kernel schedules a continuation
+    | "timeout"                         // [ext] Run stalled past idle timeout after making progress; the kernel schedules a continuation
     | "refused"                         // [ext] docs/05: the model refused the task; never reported as completed
   >;
 }
 
 // ==================== [ext] ====================
 
-export type RunOutcome = "completed" | "yielded_waiting" | "deferred_for_approval" | "cancelled" | "step_limit" | "refused";
+export type RunOutcome = "completed" | "yielded_waiting" | "deferred_for_approval" | "cancelled" | "step_limit" | "timeout" | "refused";
 
 export const CLI_ENGINES = ["claude", "codex", "agy"] as const;
 export type CliEngine = typeof CLI_ENGINES[number];

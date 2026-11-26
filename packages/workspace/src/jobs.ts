@@ -23,7 +23,7 @@ import {
 } from "@ng/protocol";
 import type { WorkspaceStore } from "./store";
 import type { CommandRunner, JobObservation, WorkspaceLimits, WorkspaceManagerOptions } from "./types";
-import { leaderGoneOrZombie, markedGroupState, processIdentity } from "@ng/protocol";
+import { leaderGoneOrZombie, markedGroupState, processIdentity, readGroupCpuTicks } from "@ng/protocol";
 import { errorMessage, groupAlive, killGroup, pidAlive, processHasMarker, sleep } from "./util";
 
 export const JOB_MARKER = "NG_JOB_ID";
@@ -57,6 +57,7 @@ interface LiveJob {
   pid: number;
   logPath: string;
   child: ChildProcess | null;           // null when re-attached after a restart (not our child)
+  interactive: boolean;
   poller: NodeJS.Timeout | null;
   timeoutTimer: NodeJS.Timeout | null;
   quietTimer: NodeJS.Timeout | null;
@@ -177,7 +178,7 @@ export class JobManager {
 
   async start(
     ws: WorkspaceRecord,
-    spec: { command: string; timeoutMs?: number | undefined },
+    spec: { command: string; timeoutMs?: number | undefined; interactive?: boolean | undefined },
   ): Promise<{ jobId: string }> {
     if (this.#closed) throw new NgError("conflict", "the workspace manager is closed");
     if (typeof spec?.command !== "string" || !spec.command.trim()) throw new NgError("invalid_argument", "startJob: command must be a non-empty string");
@@ -214,13 +215,14 @@ export class JobManager {
       throw err;
     }
 
+    const interactive = spec.interactive === true;
     let started!: () => void;
     this.#starting.set(jobId, new Promise<void>(resolve => { started = resolve; }));
     let child: ChildProcess;
     try {
       child = this.d.runner.spawn({
         file: "/bin/sh", args: ["-c", JOB_WRAPPER, `${JOB_MARKER}=${jobId}`, exitPath, this.d.shell, "-c", spec.command],
-        cwd: root, env: { ...this.d.hostEnv(), [JOB_MARKER]: jobId }, detached: true, stdio: ["pipe", fd, fd],
+        cwd: root, env: { ...this.d.hostEnv(), [JOB_MARKER]: jobId }, detached: true, stdio: [interactive ? "pipe" : "ignore", fd, fd],
       });
       child.on("error", (err) => console.error(`[workspace] job ${jobId} process error:`, err));
       if (child.pid === undefined) {
@@ -240,7 +242,7 @@ export class JobManager {
     const pid = child.pid!;
     store.setJobPid(jobId, pid, process.platform === "darwin" ? processIdentity(pid) : null);
 
-    const live = this.#register(jobId, cellId, pid, logPath, child);
+    const live = this.#register(jobId, cellId, pid, logPath, child, interactive);
     this.#starting.delete(jobId);
     started();
     this.#armTimeout(live, timeoutMs, timeoutMs);
@@ -270,7 +272,7 @@ export class JobManager {
     });
   }
 
-  #register(jobId: string, cellId: string, pid: number, logPath: string, child: ChildProcess | null): LiveJob {
+  #register(jobId: string, cellId: string, pid: number, logPath: string, child: ChildProcess | null, interactive = false): LiveJob {
     let markDone!: () => void;
     const done = new Promise<void>((r) => (markDone = r));
     const live: LiveJob = {
@@ -279,6 +281,7 @@ export class JobManager {
       pid,
       logPath,
       child,
+      interactive,
       groupConfirmed: child !== null,
       poller: null,
       timeoutTimer: null,
@@ -323,16 +326,38 @@ export class JobManager {
     const threshold = this.d.limits.jobQuietWarningMs;
     if (!live.logPath || threshold <= 0) return;
     const awake = this.#awakeClock();
+    let lastActiveAt = live.watchedFrom;
+    let lastCpuTicks = live.pid > 0 ? readGroupCpuTicks(live.pid) : null;
     const check = () => {
       const job = this.d.store.getJob(live.jobId);
       if (!job || job.state !== "running" || live.cancelReason !== null) return;
+      const now = Date.now();
+      // Do not race the job's own timeout: if timeoutMs <= threshold or the job is right at its timeout boundary, let #onTimeout settle it.
+      const limit = job.timeoutMs ?? this.d.limits.jobTimeoutMs;
+      const activeElapsed = Math.max(0, now - live.watchedFrom - awake.asleepBetween(live.watchedFrom, now));
+      const nearTimeoutMargin = Math.min(60_000, Math.max(250, Math.floor(threshold / 4)));
+      if (limit > 0 && (limit <= threshold || limit - activeElapsed <= nearTimeoutMargin)) return;
       // Log timestamps are filesystem wall time, independent of the scheduler clock. Time the host (and the job with
       // it) stood still is not time without output.
       const modified = statSync(live.logPath, { throwIfNoEntry: false })?.mtimeMs;
-      const now = Date.now();
-      const remaining = modified === undefined ? 0 : threshold - (now - modified - awake.asleepBetween(modified, now));
-      if (remaining > 0) arm(remaining);
-      else if (!this.#warn(job, "quiet", `Job has produced no output for ${threshold} ms: ${job.command}`)) arm(threshold);
+      const refAt = Math.max(lastActiveAt, modified ?? 0);
+      const remaining = modified === undefined && lastActiveAt === live.watchedFrom
+        ? 0
+        : threshold - (now - refAt - awake.asleepBetween(refAt, now));
+      if (remaining > 0) {
+        arm(remaining);
+        return;
+      }
+      // Healthy builds/tests whose stdout was redirected (e.g. `> /tmp/build.log`) keep consuming CPU in their process group.
+      const cpuNow = live.pid > 0 ? readGroupCpuTicks(live.pid) : null;
+      if (cpuNow !== null && lastCpuTicks !== null && cpuNow > lastCpuTicks + 2) {
+        lastCpuTicks = cpuNow;
+        lastActiveAt = now;
+        arm(threshold);
+        return;
+      }
+      if (cpuNow !== null) lastCpuTicks = cpuNow;
+      if (!this.#warn(job, "quiet", `Job has produced no output for ${threshold} ms: ${job.command}`)) arm(threshold);
     };
     const arm = (ms: number) => {
       live.quietTimer = setTimeout(() => {
@@ -526,7 +551,14 @@ export class JobManager {
     const job = this.d.store.getJob(jobId);
     if (!job) throw new NgError("not_found", `job "${jobId}" not found`);
     if (job.state !== "running") throw new NgError("conflict", `job "${jobId}" is ${job.state}`);
-    const stdin = this.#live.get(jobId)?.child?.stdin;
+    const live = this.#live.get(jobId);
+    if (live?.child && !live.interactive) {
+      throw new NgError(
+        "conflict",
+        `job "${jobId}" was started without interactive: true (stdin is /dev/null); restart it with interactive: true if it needs stdin`,
+      );
+    }
+    const stdin = live?.child?.stdin;
     if (!stdin || stdin.destroyed || !stdin.writable) {
       throw new NgError("conflict", `job "${jobId}" does not accept input (its stdin was lost when the previous kernel stopped)`);
     }

@@ -36,7 +36,7 @@ import { spawnCli, type CliProcess } from "./process";
 import { launchChoice, type CliModelChoice } from "./models";
 import { rebuildFreshPrompt, renderEvidenceExternal, renderEvidenceInbound, type AppendedInput } from "./input";
 import { CLI_MCP_SERVER, kernelSystem } from "./instructions";
-import { forkNoteIndex, freshPrompt, historyUnderOwnSystem, tailText } from "./render";
+import { forkNoteIndex, freshPrompt, historyCoversTask, historyUnderOwnSystem, tailText } from "./render";
 import type { CliAdapter, CliCapabilities, CliDriver, CliEvent, CliModels, CliSessionRecord, DriverIO, LaunchRequest } from "./types";
 
 /** Set in the environment of every CLI process a cell runs (and so of whatever that CLI starts): the cell's id. */
@@ -85,13 +85,13 @@ export interface CliAgentLoopOptions {
   /** Variable names exempt from CLI_ENV_DROP (e.g. ANTHROPIC_API_KEY when the owner's CLI login is an API key). */
   keepEnv?: readonly string[];
   dropEnv?: readonly (string | RegExp)[];
-  /** After a kernel tool ends the Run, how long the CLI may take to finish its turn before it is stopped. Default 10 s. */
+  /** After a kernel tool ends the Run, how long the CLI may take to finish its turn before it is stopped. Default 45 s. */
   endRunGraceMs?: number;
   /** SIGTERM → SIGKILL grace. Default 3 s. */
   killGraceMs?: number;
   /** How often steer messages are polled (also the lease heartbeat). Default 250 ms. */
   pollMs?: number;
-  /** Hard limit for one Run. Default 60 minutes. */
+  /** Idle (no-progress) limit for one Run, excluding host sleep/suspend gaps. Default 20 minutes. */
   runTimeoutMs?: number;
   /** Extra CLI arguments (appended to the adapter's). */
   extraArgs?: readonly string[];
@@ -154,10 +154,10 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
   const clock = opts.clock ?? systemClock;
   const bin = opts.bin ?? adapter.defaultBin;
   const models: CliModels = { ...adapter.defaultModels, ...opts.models };
-  const endRunGraceMs = opts.endRunGraceMs ?? 10_000;
+  const endRunGraceMs = opts.endRunGraceMs ?? 45_000;
   const killGraceMs = opts.killGraceMs ?? 3_000;
   const pollMs = opts.pollMs ?? 250;
-  const runTimeoutMs = opts.runTimeoutMs ?? 60 * 60_000;
+  const runTimeoutMs = opts.runTimeoutMs ?? 20 * 60_000;
   const debug = (e: CliDebugEvent) => {
     try {
       opts.onDebug?.(e);
@@ -219,11 +219,16 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
     // Words after the tool that ended the Run answer a person who spoke in it and has not been sent a message since, or
     // are the only words of the Run (said or sent); otherwise they recap it. "OK" is what RUN_ENDED_NOTICE asks for.
     const said = new Set<string>();
+    let spokenCount = 0;
+    const sentTexts = new Set<string>();
     const isPerson = (principalId: string) => ["owner", "agent"].includes(parsePrincipal(principalId).kind);
     let personWaits = snapshot.batch.envelopes.some((e) => e.delivery !== "silent_inject" && isPerson(e.principalId) && speaks(e));
     const worthKeeping = (closing: string) => (personWaits || said.size === 0) && bare(closing) !== "ok" && !said.has(bare(closing));
     const speak = async (text: string) => {
-      if (text.trim()) said.add(bare(text));
+      if (text.trim()) {
+        said.add(bare(text));
+        spokenCount++;
+      }
       await append({ kind: "assistant_text", text, model: sessionModel ?? model ?? engine });
     };
     const tracked = new Map<string, AppendedInput>();
@@ -265,7 +270,8 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
       });
       plan = { session: { id: own.sessionId, mode: "resume" }, prompt: [...(catchup.length ? ["[Earlier events already handled while you were asleep — use as context]\n" + catchup.join("\n")] : []), resumedInput].join("\n\n") };
     } else {
-      plan = { prompt: freshPrompt(ownHistory, input) };
+      const freshInput = inputOf(tailText(snapshot, { resumed: historyCoversTask(ownHistory, snapshot.tail.originalTask) })) || input;
+      plan = { prompt: freshPrompt(ownHistory, freshInput) };
       const forkIdx = snapshot.mode === "fork_prefix" && adapter.canFork && !own ? forkNoteIndex(snapshot.history) : -1;
       if (forkIdx >= 0) {
         const parent = await ports.context.readState<CliSessionRecord>(cellId, CLI_FORK_SESSION_KEY);
@@ -308,9 +314,15 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
     let awaitsWakeup = false;
     let stopReason: StopReason | null = null;
     let steps = 0;
+    let completedTurns = 0;
     let callCounter = 0;
     let leg = 0;
-    const live: { proc: CliProcess | null; driver: CliDriver | null; legTurns: number } = { proc: null, driver: null, legTurns: 0 };
+    const live: { proc: CliProcess | null; driver: CliDriver | null; legTurns: number; turnSteps: number } = {
+      proc: null,
+      driver: null,
+      legTurns: 0,
+      turnSteps: 0,
+    };
     let endTimer: ReturnType<typeof setTimeout> | undefined;
     let persist: Promise<unknown> = Promise.resolve();
     const io: DriverIO = {
@@ -376,10 +388,33 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
 
     const onAbort = () => stop("cancelled");
     signal.addEventListener("abort", onAbort, { once: true });
-    const runTimer = setTimeout(() => stop("timeout"), runTimeoutMs);
+    let lastProgressAt = Date.now();
+    let lastBeatAt = lastProgressAt;
+    let asleepSinceProgressMs = 0;
+    const touchActivity = () => {
+      const now = Date.now();
+      lastProgressAt = now;
+      lastBeatAt = now;
+      asleepSinceProgressMs = 0;
+    };
+    const idleBeatMs = Math.min(1_000, Math.max(50, Math.floor(runTimeoutMs / 6)));
+    const runTimer = setInterval(() => {
+      const now = Date.now();
+      const gap = now - lastBeatAt;
+      lastBeatAt = now;
+      if (gap > idleBeatMs + Math.max(1_000, idleBeatMs)) {
+        asleepSinceProgressMs += gap - idleBeatMs;
+      }
+      if (now - lastProgressAt - asleepSinceProgressMs >= runTimeoutMs) {
+        if (live.turnSteps > 0) confirmTurn(leg, live.legTurns + 1);
+        stop("timeout");
+      }
+    }, idleBeatMs);
+    runTimer.unref?.();
 
     // ---------- kernel tools over MCP ----------
     async function callTool(name: string, args: unknown, meta: { requestId: string; signal: AbortSignal }): Promise<BridgeCallResult> {
+      touchActivity();
       if (endOutcome || stopReason) {
         if (endOutcome) interruptAndKill();
         return { text: RUN_ALREADY_ENDED, isError: true };
@@ -407,12 +442,16 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
       } catch (err) {
         result = { output: `Error: ${err instanceof Error ? err.message : String(err)}`, isError: true };
       }
+      touchActivity();
       const ev = await append({ kind: "tool_result", toolUseId, name, output: result.output, ...(result.isError ? { isError: true } : {}) });
       let text = ev.modelText ?? result.output;
       if (stale()) return {text: RUN_ALREADY_ENDED, isError: true};
       if (result.awaitsWakeup) awaitsWakeup = true;
       if (result.sent && !result.isError) {
-        said.add(bare(result.sent.text));
+        if (result.sent.text.trim()) {
+          said.add(bare(result.sent.text));
+          sentTexts.add(bare(result.sent.text));
+        }
         if (isChannelAddr(result.sent.to)) personWaits = false;
       }
       if (result.endRun) {
@@ -425,7 +464,11 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
         text = `${text}\n\n${RUN_ENDED_NOTICE}`;
         armEndGrace();
       }
-      return { text, ...(result.isError ? { isError: true } : {}) };
+      const structuredContent =
+        result.data !== null && typeof result.data === "object" && !Array.isArray(result.data)
+          ? (result.data as Record<string, unknown>)
+          : undefined;
+      return { text, ...(result.isError ? { isError: true } : {}), ...(structuredContent ? { structuredContent } : {}) };
     }
 
     function confirmTurn(legNo: number, turn: number) {
@@ -456,6 +499,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
 
     async function countStep(): Promise<void> {
       steps++;
+      live.turnSteps++;
       if (maxSteps !== undefined && steps > maxSteps && !endOutcome) {
         confirmTurn(leg, live.legTurns + 1);
         stop("steps");
@@ -496,7 +540,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
               !plan.parentHash || !ports.canForkSession(point.fromCellId,point.uptoSeq,nextSession.id,sessionBaselineSeq,plan.parentHash)) {
             nextSession=undefined;
             sessionBaselineSeq = snapshot.historyUptoSeq;
-            nextPrompt=freshPrompt(ownHistory,input);
+            nextPrompt=freshPrompt(ownHistory, inputOf(tailText(snapshot, { resumed: historyCoversTask(ownHistory, snapshot.tail.originalTask) })) || input);
             delete plan.forkedFrom;
           } else {
             readingParent.set(point.fromCellId,new Promise<void>(resolve=>{
@@ -524,7 +568,18 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
         const out = await runLeg(req, nextPromptItems);
         releaseParent?.();
         if (stopReason === "cancelled" || signal.aborted) return "cancelled";
-        if (stopReason === "timeout") throw new Error(`${engine} run exceeded ${runTimeoutMs} ms and was stopped`);
+        if (stopReason === "timeout") {
+          if (steps > 0 || completedTurns > 0) {
+            confirmCursor();
+            await append({
+              kind: "system_note",
+              text: `[run stopped after ${Math.max(1, Math.round(runTimeoutMs / 1_000))}s without progress (idle timeout); the kernel wakes you to continue]`,
+            });
+            requeueUnconfirmed("run hit idle timeout before mid-run input was confirmed");
+            return "timeout";
+          }
+          throw new Error(`${engine} run exceeded ${runTimeoutMs} ms without progress and was stopped`);
+        }
         if (endOutcome) {
           requeueUnconfirmed("run ended by tool before mid-run input was confirmed");
           return finish(endOutcome);
@@ -605,7 +660,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
     } finally {
       releaseParent?.();
       signal.removeEventListener("abort", onAbort);
-      clearTimeout(runTimer);
+      clearInterval(runTimer);
       if (endTimer) clearTimeout(endTimer);
       if (live.proc) await live.proc.kill(killGraceMs);
       persistSession(true);
@@ -622,6 +677,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
       const d = adapter.createDriver(req);
       live.driver = d;
       live.legTurns = 0;
+      live.turnSteps = 0;
       debug({ type: "launch", engine, cellId, runId, argv: d.argv, cwd: req.cwd, ...(req.session ? { session: req.session } : {}), caps, permissions: adapter.describePermissions(caps) });
       const legNo = leg;
       const native = new Map<string, string>();
@@ -727,6 +783,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
       };
 
       const handle = async (e: CliEvent): Promise<void> => {
+        if (e.type !== "notice") touchActivity();
         if ((endOutcome || refused) && e.type !== "session") {
           // The closing words after the tool that ended the Run (the kernel asked for them: RUN_ENDED_NOTICE) are
           // what the owner reads as the answer — "方案已提交，等你确认后开始" — so they go on the record.
@@ -761,6 +818,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
             break;
           case "text":
             progressed();
+            if (e.text.trim() && !(personWaits && spokenCount === 0) && sentTexts.has(bare(e.text))) break;
             await speak(e.text);
             break;
           case "tool_start": {
@@ -789,7 +847,9 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
           case "turn_end":
             legTurns++;
             live.legTurns = legTurns;
+            live.turnSteps = 0;
             if (e.ok && !e.stopped) {
+              completedTurns++;
               state.turnOk = true;
               confirmTurn(legNo, legTurns);
             } else if (e.refused) {

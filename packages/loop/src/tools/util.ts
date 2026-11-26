@@ -57,6 +57,23 @@ export function clip(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
+const TOKEN_CHAR = /[\w./:#@%+=~-]/;
+
+/** Clip a single status line on a token/word boundary so hashes, identifiers and English words are never cut in half. */
+export function clipLine(text: string, max: number): string {
+  const t = (text.split("\n")[0] ?? "").trim();
+  if (t.length <= max) return t;
+  let end = max;
+  if (TOKEN_CHAR.test(t[end - 1]!) && TOKEN_CHAR.test(t[end]!)) {
+    let start = end;
+    while (start > 0 && TOKEN_CHAR.test(t[start - 1]!)) start--;
+    if (start >= max / 2) end = start;
+  }
+  const code = t.charCodeAt(end - 1);
+  if (code >= 0xd800 && code <= 0xdbff) end--;
+  return `${t.slice(0, end).trimEnd()}…`;
+}
+
 export function firstLine(text: string, max = 120): string {
   return clip((text.split("\n").find((l) => l.trim()) ?? "").trim(), max);
 }

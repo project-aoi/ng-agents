@@ -202,11 +202,16 @@ describe("⚡ sources", () => {
     expect(notice?.envelope).toMatchObject({principalId:"owner", delivery:"silent_inject"});
   });
 
-  it("an llm source starts with its instruction as the first task", async () => {
+  it("an llm source records setup without a startup LLM turn, then runs its instruction on schedule", async () => {
     const d = await bootDesk();
     const c = await d.post<SourcesMutationResponse>("/api/sources", { title: "群反馈挖掘", schedule: { everyMinutes: 30 }, check: { kind: "llm", instruction: "看看研发群里有没有人反馈支付报错" }, mode: "observe" });
     const id = c.sensorId!;
     expect(d.kernel.getCell(id)!.spec.schedules).toEqual([{ cron: "*/30 * * * *" }]);
+    await d.kernel.idle();
+    expect(d.script.requests.some((r) => r.cellId === id)).toBe(false);
+    expect(d.kernel.inspectCell(id, { afterSeq: 0, detail: "full" }).text).toContain("看看研发群里有没有人反馈支付报错");
+    d.script.add("sensor", { toolCalls: [{ name: "no_hit", input: {} }] });
+    d.clock.advance(30 * 60_000);
     await d.kernel.idle();
     expect(d.script.requests.some((r) => r.cellId === id)).toBe(true);
   });

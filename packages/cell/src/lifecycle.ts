@@ -360,6 +360,7 @@ export function createLifecycle(core: KernelCore): Lifecycle {
       if (given.cwd !== undefined) {
         next.cwd = normalizeCwd(given.cwd);
         assertDirectory(next.cwd, "cwd");
+        run(db, "UPDATE workspaces SET path = ?, updated_at = ? WHERE cell_id = ?", [next.cwd, clock.now(), cellId]);
         refreshPrefix = true;
       }
       if (given.title !== undefined) next.title = given.title;
@@ -471,6 +472,7 @@ export function createLifecycle(core: KernelCore): Lifecycle {
         cells.setStatus(c.id, "closed", c.id === target.id || archived ? reason : "cancelled");
         inbox.cancelScheduledSync({ cellId: c.id });
         deactivateWatches(c.id);
+        core.workspace.markWorkspaceClosedSync(c.id);
         closed.push({ id: c.id, epoch });
       }
       core.waits.dropFor(closed.map((c) => c.id));

@@ -882,9 +882,9 @@ export function createDesk({ kernel, ui, assets, settings, onError = (err, where
     const id = newId("src", clock);
     const spec = createSensorSpec(id, {
       title, kind: "cron", schedule, mode, processor: processor ? "code" : "llm",
-      ...(typeof req.description === "string" && req.description && { description: req.description }),
+      description: instruction,
     }, processor ?? kernel.registry.presets.get("sensor")?.defaults?.processor);
-    kernel.spawnCell(desk, spec, { instruction, title }, actorOf(as));
+    kernel.spawnCell(desk, spec, undefined, actorOf(as));
     return sourcesResult("created", true, `已添加信源「${title}」`, id);
   }
 

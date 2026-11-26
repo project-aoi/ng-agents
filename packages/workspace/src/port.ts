@@ -57,9 +57,12 @@ export function createPort(deps: PortDeps, initial: WorkspaceRecord): ManagedWor
     return { output: out.text(), exitCode, ...(out.truncated ? { truncated: true } : {}) };
   }
 
-  const ownJob = (jobId: string) => {
+  const ownJob = (jobId: string, action: string) => {
     const job = deps.store.getJob(jobId);
-    if (!job || job.cellId !== cellId) throw new NgError("not_found", `job "${jobId}" not found in this workspace`);
+    if (!job) throw new NgError("not_found", `job "${jobId}" not found`);
+    if (job.cellId !== cellId) {
+      throw new NgError("bounds_violation", `job "${jobId}" belongs to cell "${job.cellId}"; only the cell that started a job may ${action} it`);
+    }
     return job;
   };
 
@@ -71,16 +74,16 @@ export function createPort(deps: PortDeps, initial: WorkspaceRecord): ManagedWor
       return deps.jobs.start(current(), spec);
     },
     async observeJob(jobId) {
-      ownJob(jobId);
+      ownJob(jobId, "observe");
       return deps.jobs.observeSync(jobId)!;
     },
     async writeJobInput(jobId, input) {
-      ownJob(jobId);
+      ownJob(jobId, "send input to");
       if (typeof input !== "string") throw new NgError("invalid_argument", "input must be a string");
       await deps.jobs.writeInput(jobId, input);
     },
     async cancelJob(jobId) {
-      ownJob(jobId);
+      ownJob(jobId, "cancel");
       await deps.jobs.cancel(jobId, "cancelled by the cell", { silent: true });
     },
   };

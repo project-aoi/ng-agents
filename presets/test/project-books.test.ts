@@ -86,9 +86,9 @@ describe("a project's books are kept before its model runs", () => {
       const title = h.kernel.getCell(req.metadata!.cellId!)!.title;
       if (title === "写方案") return tool("report_to_parent", { kind: "result", text: "方案已写好", artifactId: "art_plan" });
       if (title === "跑基准") return tool("report_to_parent", { kind: "result", text: "机器上没有基准数据", status: "failed" });
-      return tool("wait", { reason: "还在查" });
+      return tool("wait", { reason: "还在查", waitingFor: "inbox:desk" });
     });
-    h.script.setDefault("checker", () => tool("wait", { reason: "CI 还没跑完", waitingFor: "external" }));
+    h.script.setDefault("checker", (req) => (continuesRun(req) ? {} : tool("wait", { reason: "CI 还没跑完", waitingFor: "external" })));
     const { projectId } = startProjectSync(h.kernel, { title: "性能优化", outcome: "p99 降一半", brief: "做性能优化" }, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     // Its next wake-up: the books have caught up with the children it started without dispatch.

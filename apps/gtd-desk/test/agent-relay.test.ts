@@ -1641,4 +1641,28 @@ describe("live rerun rounds 6–8 (uc64, uc74, uc76, uc82, uc84): what counts as
     expect((await d.get<HumanItemsResponse>("/api/human-items")).questions).toEqual([]);
     expect((await d.get<StatusDTO>("/api/status")).humanQuestions).toBe(0);
   });
+
+  it("Round 1 E2E catches: external read_resource opens working_note://<cellId>/<name> directly, and reopened project records a second completion entry on desk", async () => {
+    const d = await bootRealDesk();
+    const p = makeProject(d.kernel, "HTTP 重试与退避");
+    d.kernel.context.upsertSkillOrNoteSync(p, { kind: "working_note", name: "board", scope: "cell", mode: "upsert", description: "白板", body: "重试序列 0.5/1/2/4/8s" });
+
+    // A8-2 control-plane symmetry: read_resource without cellId resolves working_note://<cellId>/board from search hit URI
+    const noteRes = await ok<{ content: string }>(d, "read_resource", { uri: `working_note://${p}/board` });
+    expect(noteRes.data.content).toContain("重试序列 0.5/1/2/4/8s");
+
+    // UC08 second closure: close project twice (with reopen in between) via set_project_state("complete") -> 2 activity records!
+    await ok(d, "set_project_state", { id: p, state: "complete" });
+    await d.kernel.idle();
+    await ok(d, "reopen_project", { projectId: p });
+    d.script.add("project", {});
+    await d.kernel.idle();
+    d.clock.advance(MIN);
+    await ok(d, "set_project_state", { id: p, state: "complete" });
+    await d.kernel.idle();
+
+    const act = await ok<{ items: Array<{ id: string; kind: string; title: string }> }>(d, "list_activity", { kind: "action_completed" });
+    const doneEntries = act.data.items.filter((i) => i.kind === "action_completed" && i.title.includes("HTTP 重试与退避"));
+    expect(doneEntries.length).toBe(2);
+  });
 });

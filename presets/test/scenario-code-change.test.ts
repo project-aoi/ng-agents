@@ -21,7 +21,7 @@ describe("docs/05 scenario 2 — a small code change, follow-ups in the same dir
         brief: "修改 markdown 表格复制的行为：复制出 Markdown 源码格式，而不是 Unicode 制表符。",
         cwd: repo,
       }),
-      tool("wait", { reason: "started" }),
+      {},
     );
     let writer1 = "";
     h.script.add(
@@ -71,7 +71,7 @@ describe("docs/05 scenario 2 — a small code change, follow-ups in the same dir
 
     // 3. "继续用 /ship-mr 跟进": the desk passes it on. It is more work on what the worker just did, so the project sends
     // it to that worker — recorded as a new action carried by it — instead of starting another one from nothing.
-    h.script.add("desk", tool("save_note", { name: "code-change-followup", kind: "preference", body: "改完代码后直接用 /ship-mr 提 MR，并附一段验证录屏，不用再等主人说。" }), tool("steer_item", { itemId: project, message: "继续用 /ship-mr 跟进" }), tool("wait", { reason: "passed on" }));
+    h.script.add("desk", tool("save_note", { name: "code-change-followup", kind: "preference", body: "改完代码后直接用 /ship-mr 提 MR，并附一段验证录屏，不用再等主人说。" }), tool("steer_item", { itemId: project, message: "继续用 /ship-mr 跟进" }), {});
     h.script.add(
       "project",
       (req) => {

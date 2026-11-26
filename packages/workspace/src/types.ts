@@ -71,6 +71,8 @@ export interface WorkspaceManager extends Workspace {
   acquire(cellId: string, opts?: WorkspaceAcquireOptions): Promise<ManagedWorkspacePort>;
   /** State and log tail of any job (UI/kernel use; ports only see their own cell's jobs). */
   observeJobSync(jobId: string): JobObservation | undefined;
+  /** Mark a closed cell's workspace row as `'closed'`. */
+  markWorkspaceClosedSync(cellId: string): void;
   /**
    * Stop watching: timers and pipes are released and exit handlers detached, but running jobs are NOT killed — they
    * keep running and the next process's `recover()` re-attaches or finalizes them.

@@ -181,7 +181,7 @@ export function searchHistory(
 
   const hits: Snippet[] = [
     ...searchEvidence(deps, t, limit, filter.evidence),
-    ...searchKnowledge(deps, t, limit, filter.knowledge),
+    ...searchKnowledge(deps, t, limit, filter.knowledge, chain),
   ];
   if (filter.owned) {
     hits.push(
@@ -253,7 +253,8 @@ function searchEvidence(deps: Deps, t: Terms, limit: number, scope: Clause): Sni
   });
 }
 
-function searchKnowledge(deps: Deps, t: Terms, limit: number, scope: Clause): Snippet[] {
+function searchKnowledge(deps: Deps, t: Terms, limit: number, scope: Clause, visibleChain: readonly string[]): Snippet[] {
+  const visibleCells = new Set(visibleChain);
   const rows = runSource<KnowledgeHit>(deps, t, limit, {
     select: "k.seq, k.kind, k.cell_id, k.name, k.description, k.body, k.updated_at",
     fts: "knowledge_fts",
@@ -264,6 +265,7 @@ function searchKnowledge(deps: Deps, t: Terms, limit: number, scope: Clause): Sn
     recency: "k.updated_at DESC",
   });
   return rows.map((r) => {
+    const uri = r.cell_id !== null && !visibleCells.has(r.cell_id) ? `${r.kind}://${r.cell_id}/${r.name}` : `${r.kind}://${r.name}`;
     const s: Snippet = {
       seq: r.seq,
       cellId: r.cell_id,
@@ -273,7 +275,7 @@ function searchKnowledge(deps: Deps, t: Terms, limit: number, scope: Clause): Sn
       text: excerptOf(t, `${r.description}\n${r.body}`, r.description.length + 1),
       at: r.updated_at,
       source: "knowledge",
-      uri: `${r.kind}://${r.name}`,
+      uri,
       title: r.name,
     };
     if (r.rank !== null) s.rank = r.rank;

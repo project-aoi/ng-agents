@@ -225,6 +225,15 @@ export function createContextStore(opts: ContextStoreOptions): ContextStore {
       let decoded = raw;
       try { decoded = decodeURIComponent(raw); } catch { /* literal resource name */ }
       for (const name of new Set([raw, decoded])) {
+        const slash = name.indexOf("/");
+        if (slash > 0 && slash < name.length - 1) {
+          const ownerId = name.slice(0, slash);
+          const subName = name.slice(slash + 1);
+          if (deps.cells.get(ownerId)) {
+            try { return pageOf(knowledge.readBody(ownerId, kind, subName), page); }
+            catch (err) { if (!isNgError(err, "not_found")) throw err; }
+          }
+        }
         try { return pageOf(knowledge.readBody(cellId, kind, name), page); }
         catch (err) { if (!isNgError(err, "not_found")) throw err; }
       }

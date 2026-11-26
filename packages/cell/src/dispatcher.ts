@@ -2,9 +2,11 @@ import { CLI_SESSION_KEY, type CliSessionRecord, probeOrphanCliCell, reapOrphane
 import {
   all,
   get,
+  run,
   timerFrom,
   CELL_DIRECT_CHAT_KEY,
   CELL_RESULT_CANDIDATE_KEY,
+  CELL_STATUS_KEY,
   CELL_TURN_KEY,
   STEER_NOTE_HEAD,
   cellPrincipal,
@@ -425,21 +427,44 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
     let said: string | null = null;
     let account: string | null = null;
     let before: string[] = [];
+    let prevAccount: string | null = null;
+    let prevBefore: string[] = [];
+    let atRunStart = false;
     const artifactIds = new Set<string>();
     for (const { record: r } of records) {
       if (r.kind === "run_boundary" && r.phase === "start") {
+        prevAccount = account;
+        prevBefore = before;
+        atRunStart = true;
         said = account = null;
         before = [];
+        continue;
+      }
+      if (atRunStart && r.kind !== "inbound") {
+        atRunStart = false;
+        prevAccount = null;
+        prevBefore = [];
       }
       if (r.kind === "assistant_text" && r.text.trim()) said = account = r.text.trim();
       const spokenTo = r.kind === "inbound" ? SPOKEN.has(r.envelope.type) : r.kind === "system_note" && STEER_NOTE_HEAD.test(r.text);
-      if (spokenTo && account) {
+      if (atRunStart && spokenTo) {
+        before = prevBefore;
+        if (prevAccount) before.push(prevAccount);
+        prevAccount = null;
+        prevBefore = [];
+        atRunStart = false;
+      } else if (spokenTo && account) {
         before.push(account);
         said = account = null;
       }
       if (r.kind !== "tool_call") continue;
-      account = null;
       steps++;
+      const rep = r.name === "report_to_parent" ? (r.input as { kind?: unknown; text?: unknown } | null) : null;
+      if (rep?.kind === "result" && typeof rep.text === "string" && rep.text.trim()) {
+        said = account = rep.text.trim();
+      } else {
+        account = null;
+      }
       // Artifacts it wrote through the kernel tools, whoever created them first.
       const id = (r.input as { artifactId?: unknown } | null)?.artifactId;
       if ((r.name === "save_artifact" || r.name === "patch_artifact") && typeof id === "string") artifactIds.add(id);
@@ -501,6 +526,12 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
         ),
       );
     }
+    // A self-cancelled job's silent_inject receipt has no wakeup behind it once this leaf settles into dormancy.
+    run(
+      core.db,
+      "UPDATE inbox_messages SET status = 'done', status_reason = 'settled with turn', updated_at = ? WHERE cell_id = ? AND status = 'pending' AND delivery = 'silent_inject' AND type = ? AND deliver_at <= ?",
+      [now, cellId, PAYLOAD.jobResult, now],
+    );
     context.commitSync(cellId, {
       statePatches: {
         [CELL_TURN_KEY]: {
@@ -511,6 +542,9 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
         } satisfies CellTurnState,
         // Delivered: the next turn reports for itself.
         [CELL_RESULT_CANDIDATE_KEY]: null,
+        ...(!cand && said && context.readStateSync(cellId, CELL_STATUS_KEY) !== null
+          ? { [CELL_STATUS_KEY]: { text: said.replace(/\s+/g, " ").trim().length > 200 ? `${said.replace(/\s+/g, " ").trim().slice(0, 199)}…` : said.replace(/\s+/g, " ").trim(), updatedAt: now } }
+          : {}),
         ...(chat ? { [CELL_DIRECT_CHAT_KEY]: { ...chat, unsettled: 0 } satisfies CellDirectChatState } : {}),
       },
     });
@@ -553,14 +587,14 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
       }
       if (result !== "cancelled") core.waits.answeredBy(cellId, inputs, handle.claimId);
 
-      if (result === "step_limit") {
+      if (result === "step_limit" || result === "timeout") {
         const prev = batch.envelopes.reduce((n, e) => (e.type === PAYLOAD.runContinue ? Math.max(n, (e.payload as RunContinuePayload).count) : n), 0);
         if (prev >= core.maxStepContinuations) {
           core.escalations.stepLimit(cellId, prev + 1);
           core.stall.afterRun(cellId, inputs);
           return;
         }
-        const payload: RunContinuePayload = { reason: "step_limit", count: prev + 1 };
+        const payload: RunContinuePayload = { reason: result, count: prev + 1 };
         inbox.enqueueSync(
           cellId,
           createEnvelope<RunContinuePayload>(
@@ -614,6 +648,12 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
       const currentCandidate = leaf && candidateOf(handle);
       const reported = oneShot && result === "yielded_waiting" && currentCandidate;
       if ((result !== "completed" && !self && !restingLeaf && !reported) || (!leaf && !self)) {
+        if (!leaf && (result === "completed" || result === "yielded_waiting")) {
+          const chat = context.readStateSync<CellDirectChatState>(cellId, CELL_DIRECT_CHAT_KEY);
+          if (chat && chat.unsettled > 0) {
+            context.commitSync(cellId, { statePatches: { [CELL_DIRECT_CHAT_KEY]: { ...chat, unsettled: 0 } satisfies CellDirectChatState } });
+          }
+        }
         if (result !== "cancelled") core.stall.afterRun(cellId, inputs);
         return;
       }

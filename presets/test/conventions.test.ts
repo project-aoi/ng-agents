@@ -24,7 +24,7 @@ function restore(h: Harness, original: Envelope, activityId: string): void {
 describe("conventions the workbench app relies on", () => {
   it("an item moved back from the archive gets a card; archiving it again is refused", async () => {
     const h = await boot();
-    h.script.add("desk", tool("archive_notification", { title: "CI 构建通过" }), tool("wait", { reason: "ok" }));
+    h.script.add("desk", tool("archive_notification", { title: "CI 构建通过" }), {});
     const env = await h.memory.inject({ from: "ci-bot", text: "main 分支构建通过 #812" });
     await h.kernel.idle();
     const [archived] = h.activities();
@@ -69,7 +69,7 @@ describe("conventions the workbench app relies on", () => {
 
   it("stopping a project the owner had paused closes it and everything below it; the records say cancelled", async () => {
     const h = await boot();
-    h.script.add("desk", tool("start_project", { title: "整理客户名单", outcome: "一份去重后的客户名单", brief: "整理一下客户名单" }), tool("wait", { reason: "ok" }));
+    h.script.add("desk", tool("start_project", { title: "整理客户名单", outcome: "一份去重后的客户名单", brief: "整理一下客户名单" }), {});
     h.script.add("project", tool("dispatch", { title: "整理名单", instruction: "整理客户名单" }), {});
     // Still at work: it waits for an answer (a bare wait would end its turn).
     h.script.add("worker", tool("wait", { reason: "thinking", waitingFor: "inbox:desk" }));
@@ -79,7 +79,7 @@ describe("conventions the workbench app relies on", () => {
     const [worker] = childrenOf(h, project!);
     expect(h.kernel.control(project!, { action: "pause" }, { principalId: h.kernel.ownerPrincipal })).toMatchObject({ applied: true });
 
-    h.script.add("desk", tool("stop_item", { itemId: project, reason: "不需要了" }), tool("wait", { reason: "ok" }));
+    h.script.add("desk", tool("stop_item", { itemId: project, reason: "不需要了" }), {});
     await h.ui.capture({ text: "客户名单不用整理了" }, "owner");
     await h.kernel.idle();
     expect(h.project(project!)).toMatchObject({ lifecycle: "cancelled" });

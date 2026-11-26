@@ -25,6 +25,7 @@ export * from "./ids";
 export * from "./errors";
 export * from "./json";
 export * from "./process";
+export * from "./workdir-clean";
 
 // ---- SQLite ----
 export * from "./db/sqlite";

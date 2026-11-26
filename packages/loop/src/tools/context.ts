@@ -22,6 +22,8 @@ function describeArtifact(a: VersionedArtifact, withBody: boolean): string {
   return withBody ? `${head}\nformat: ${a.content.format}\n---\n${a.content.body}` : head;
 }
 
+const INTERNAL_STATE_PREFIXES = ["cli:", "pull:", "sys:", "cell:"] as const;
+
 const readState = defineTool({
   name: "read_state",
   kind: "kernel",
@@ -34,8 +36,11 @@ const readState = defineTool({
       const v = await ctx.ports.context.readState(cellId, args.key);
       return v === null ? `${args.key}: (not set)` : `${args.key} = ${json(v)}`;
     }
-    const entries = await ctx.ports.context.listState(cellId, args.prefix ?? "");
-    if (entries.length === 0) return `No state under "${args.prefix ?? ""}"${args.cellId ? ` in ${args.cellId}` : ""}.`;
+    const prefix = args.prefix ?? "";
+    const explicitInternal = INTERNAL_STATE_PREFIXES.some((p) => prefix.startsWith(p));
+    const raw = await ctx.ports.context.listState(cellId, prefix);
+    const entries = explicitInternal ? raw : raw.filter((e) => !INTERNAL_STATE_PREFIXES.some((p) => e.key.startsWith(p)));
+    if (entries.length === 0) return `No state under "${prefix}"${args.cellId ? ` in ${args.cellId}` : ""}.`;
     return entries.map((e) => `${e.key} = ${json(e.value)}`).join("\n");
   },
 });
@@ -61,16 +66,56 @@ function setState(registry: Registry) {
   });
 }
 
+const ARTIFACT_PAGE_CHARS = 28_000;
+const CONFLICT_INLINE_CHARS = 8_000;
+
 const readArtifact = defineTool({
   name: "read_artifact",
   kind: "kernel",
   description:
-    "Read a draft/document (artifact) with its current version — any cell's, by id. Without an id: list the artifacts of this cell, or of cellId (e.g. the reports a project's workers saved).",
-  input: z.object({ artifactId: z.string().min(1).optional(), cellId: z.string().min(1).optional().describe("list this cell's artifacts instead of yours") }),
+    "Read a draft/document (artifact) with its current version — any cell's, by id (supports offset/limit paging up to 28,000 chars per call, or outline: true for headings). Without an id: list the artifacts of this cell, or of cellId.",
+  input: z.object({
+    artifactId: z.string().min(1).optional(),
+    cellId: z.string().min(1).optional().describe("list this cell's artifacts instead of yours"),
+    offset: z.number().int().min(0).optional().describe("character offset into body"),
+    limit: z.number().int().min(1).optional().describe(`max characters to return (default/max ${ARTIFACT_PAGE_CHARS})`),
+    outline: z.boolean().optional().describe("true: return version metadata and Markdown headings with line/offset instead of full body"),
+  }),
   async handler(args, ctx) {
     if (args.artifactId) {
       const a = await ctx.ports.context.getArtifact(args.artifactId);
-      return a ? { output: describeArtifact(a, true), data: { version: a.version } } : { output: `No artifact ${args.artifactId}.`, isError: true };
+      if (!a) return { output: `No artifact ${args.artifactId}.`, isError: true };
+      const body = a.content.body;
+      const totalChars = body.length;
+      const head = `${a.artifactId} v${a.version} (last edited by ${a.updatedBy}) [${totalChars} chars]${a.content.title ? ` — ${a.content.title}` : ""}\nformat: ${a.content.format}`;
+      if (args.outline) {
+        const headings = markdownHeadings(body).map((h) => ({ level: h.level, heading: h.text, line: h.line, offset: h.start }));
+        const list = headings.length
+          ? headings.map((h) => `${"  ".repeat(h.level - 1)}- L${h.line} @${h.offset}: ${"#".repeat(h.level)} ${h.heading}`).join("\n")
+          : "(no Markdown headings)";
+        return {
+          output: `${head}\n--- outline ---\n${list}`,
+          data: { artifactId: a.artifactId, version: a.version, updatedBy: a.updatedBy, format: a.content.format, totalChars, headings },
+        };
+      }
+      const offset = args.offset ?? 0;
+      const pageLimit = Math.min(args.limit ?? ARTIFACT_PAGE_CHARS, ARTIFACT_PAGE_CHARS);
+      if (offset > 0 && offset >= totalChars) {
+        return {
+          output: `${head}\n---\n(nothing at offset ${offset}: artifact has ${totalChars} characters)`,
+          data: { artifactId: a.artifactId, version: a.version, updatedBy: a.updatedBy, format: a.content.format, totalChars, offset, limit: pageLimit, hasMore: false },
+        };
+      }
+      const slice = body.slice(offset, offset + pageLimit);
+      const end = offset + slice.length;
+      const hasMore = end < totalChars;
+      const moreNote = hasMore
+        ? `\n…[characters ${offset}–${end} of ${totalChars} shown; more follows: read_artifact({ artifactId: "${a.artifactId}", offset: ${end}${args.limit !== undefined ? `, limit: ${pageLimit}` : ""} })]`
+        : "";
+      return {
+        output: `${head}\n---\n${slice}${moreNote}`,
+        data: { artifactId: a.artifactId, version: a.version, updatedBy: a.updatedBy, format: a.content.format, totalChars, offset, limit: pageLimit, hasMore },
+      };
     }
     const list = await ctx.ports.context.listArtifacts(args.cellId ?? selfId(ctx));
     return list.length ? list.map((a) => describeArtifact(a, false)).join("\n") : `${args.cellId ?? "This cell"} has no artifacts.`;
@@ -84,10 +129,25 @@ const readArtifact = defineTool({
  */
 function artifactConflict(cur: VersionedArtifact, retry: string, parked = cur.updatedBy === "human"): ToolResult {
   const kept = parked ? " Your text was kept beside it as a suggestion until you save a version of your own; the human's version stays." : "";
+  const body = cur.content.body;
+  const totalChars = body.length;
+  if (totalChars <= CONFLICT_INLINE_CHARS) {
+    return {
+      output: `Version conflict: ${cur.artifactId} is at v${cur.version} (last edited by ${cur.updatedBy}).${kept} Its current text is below: ${retry} with expectedVersion ${cur.version}.\n---\n${body}`,
+      isError: true,
+      data: { artifactId: cur.artifactId, currentVersion: cur.version, updatedBy: cur.updatedBy, totalChars },
+    };
+  }
+  const headings = markdownHeadings(body);
+  const outline = headings.length
+    ? `\n--- outline (${headings.length} headings) ---\n` +
+      headings.slice(0, 40).map((h) => `L${h.line} @${h.start}: ${"#".repeat(h.level)} ${h.text}`).join("\n") +
+      (headings.length > 40 ? `\n…(${headings.length - 40} more headings)` : "")
+    : "";
   return {
-    output: `Version conflict: ${cur.artifactId} is at v${cur.version} (last edited by ${cur.updatedBy}).${kept} Its current text is below: ${retry} with expectedVersion ${cur.version}.\n---\n${cur.content.body}`,
+    output: `Version conflict: ${cur.artifactId} is at v${cur.version} (last edited by ${cur.updatedBy}, ${totalChars} chars).${kept} Read the section you need with read_artifact({ artifactId: "${cur.artifactId}", offset, limit }) before you ${retry} with expectedVersion ${cur.version}.${outline}`,
     isError: true,
-    data: { artifactId: cur.artifactId, currentVersion: cur.version, updatedBy: cur.updatedBy },
+    data: { artifactId: cur.artifactId, currentVersion: cur.version, updatedBy: cur.updatedBy, totalChars },
   };
 }
 
@@ -426,11 +486,8 @@ const searchHistory = defineTool({
             : h.source === "evidence"
               ? `#${h.seq} ${h.kind} ${new Date(h.at).toISOString()}${cell}`
               : `${h.source}${h.title ? ` ${h.title}` : ""}${cell}`;
-        // Another cell's note (a source's observation notes, …) is found by a global search but cannot be opened from
-        // here: say whose it is instead of handing out an address that answers "not found".
-        const foreignNote = h.source === "knowledge" && h.cellId !== undefined && h.cellId !== null && h.cellId !== selfId(ctx);
-        const full = foreignNote ? undefined : (h.spillUri ?? h.uri);
-        return `- [${where}] ${clip(h.text.replace(/\s+/g, " "), 300)}${full ? ` (full: ${full})` : foreignNote ? ` (a note kept by cell ${h.cellId}; this excerpt is what you can read of it)` : ""}`;
+        const full = h.spillUri ?? h.uri;
+        return `- [${where}] ${clip(h.text.replace(/\s+/g, " "), 300)}${full ? ` (full: ${full})` : ""}`;
       })
       .join("\n");
   },
@@ -439,7 +496,7 @@ const readResource = defineTool({
   name: "read_resource",
   kind: "kernel",
   description: [
-    "Read a stored resource by URI, in pages: res://… (full output that was truncated), skill://<name> (a skill's body), working_note://<name>, reference://<name>, preference://<name>, artifact://<id>[@version].",
+    "Read a stored resource by URI, in pages: res://… (full output that was truncated), skill://<name>, working_note://[<cellId>/]<name>, reference://[<cellId>/]<name>, preference://<name>, artifact://<id>[@version].",
     `A page is ${DEFAULT_RESOURCE_PAGE_CHARS} characters unless you pass limit (up to ${MAX_RESOURCE_PAGE_CHARS}, to read a large document in few calls); each page says whether more follows and from which offset.`,
   ].join(" "),
   input: z.object({

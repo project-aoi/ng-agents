@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs";
-import { join, resolve } from "node:path";
-import { cellsRepo, NgError, systemClock } from "@ng/protocol";
+import { join } from "node:path";
+import { cellsRepo, defaultCellsRoot, NgError, realOrResolved, systemClock } from "@ng/protocol";
 import { defaultCommandRunner } from "./exec/process";
 import { JobManager } from "./jobs";
 import { createPort } from "./port";
@@ -47,8 +47,11 @@ export function createWorkspaceManager(opts: WorkspaceManagerOptions): Workspace
     async acquire(cellId, options = {}) {
       cells.require(cellId);
       const configured = options.cwd ?? opts.defaultRepoPath;
-      const path = configured ? resolve(configured) : join(dataDir, "cells", slugify(cellId));
-      if (!configured) mkdirSync(path, { recursive: true });
+      let path = configured ? realOrResolved(configured) : join(defaultCellsRoot(dataDir), slugify(cellId));
+      if (!configured) {
+        mkdirSync(path, { recursive: true });
+        path = realOrResolved(path);
+      }
       if (!statSync(path, { throwIfNoEntry: false })?.isDirectory()) {
         const error = `working directory does not exist: ${path}`;
         store.upsertWorkspace({ cellId, path, status: "failed", error });
@@ -78,6 +81,9 @@ export function createWorkspaceManager(opts: WorkspaceManagerOptions): Workspace
     },
     observeJobSync(jobId: string) {
       return jobs.observeSync(jobId);
+    },
+    markWorkspaceClosedSync(cellId: string) {
+      store.closeWorkspace(cellId);
     },
     close() {
       jobs.close();

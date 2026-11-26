@@ -1,6 +1,6 @@
 import type { Envelope, EvidenceEntry, EvidenceOf, ModelMessage, PromptSnapshot, RunPorts } from "@ng/protocol";
 import { messageText } from "@ng/protocol";
-import { freshPrompt } from "./render";
+import { freshPrompt, historyCoversTask } from "./render";
 
 export interface AppendedInput {
   envelopeId: string;
@@ -92,7 +92,8 @@ export function rebuildFreshPrompt(
   const parts: string[] = [];
   const initial = snapshot.batch.envelopes.filter(env => initialBatchIds.has(env.id));
   const batchEnd = snapshot.tail.messages.length - initial.length;
-  const opening = snapshot.tail.messages.slice(0, Math.max(0, batchEnd));
+  const skipTask = historyCoversTask([...history, ...earlier], snapshot.tail.originalTask) ? snapshot.tail.originalTask : undefined;
+  const opening = snapshot.tail.messages.slice(0, Math.max(0, batchEnd)).filter((m) => !skipTask || messageText(m) !== skipTask);
   initial.forEach((env, index) => {
     if (emitted.has(env.id) || pendingIds.has(env.id)) return;
     const message = snapshot.tail.messages[batchEnd + index];

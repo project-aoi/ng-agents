@@ -11,6 +11,7 @@ import {
   openDatabase,
   run,
   schemaVersions,
+  type SchemaModule,
 } from "../src";
 
 const dirs: string[] = [];
@@ -129,6 +130,61 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_human_items_active ON human_items(COALESCE(
     run(b, "UPDATE human_items SET disposition = 'revising', revise_note = '补查上游' WHERE action_id = 'act_1'");
     expect(get(b, "SELECT status, revise_note FROM human_items WHERE action_id = 'act_1'")).toEqual({ status: "revising", revise_note: "补查上游" });
     expect(get<{ n: number }>(b, "SELECT count(*) AS n FROM human_item_activity WHERE item_id = 'act_1'")?.n).toBe(1);
+    expect(all(b, "PRAGMA foreign_key_check")).toEqual([]);
+    b.close();
+  });
+
+  it("migrates @ng/workspace v1 → v2 so existing workspaces tables accept status = 'closed' and sync closed cells", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ng-ws-mig-"));
+    dirs.push(dir);
+    const path = join(dir, "ng.db");
+    const v1Workspace: SchemaModule = {
+      owner: "@ng/workspace",
+      version: 1,
+      migrations: [],
+      ddl: `
+CREATE TABLE IF NOT EXISTS workspaces (
+  cell_id       TEXT PRIMARY KEY REFERENCES cells(id),
+  path          TEXT,
+  status        TEXT NOT NULL CHECK (status IN ('active','failed')),
+  error         TEXT,
+  created_at    INTEGER NOT NULL,
+  updated_at    INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS jobs (
+  job_id              TEXT PRIMARY KEY,
+  cell_id             TEXT NOT NULL REFERENCES cells(id),
+  epoch               INTEGER NOT NULL,
+  command             TEXT NOT NULL,
+  cwd                 TEXT,
+  state               TEXT NOT NULL CHECK (state IN ('running','succeeded','failed','cancelled')),
+  pid                 INTEGER,
+  process_identity    TEXT,
+  log_path            TEXT,
+  exit_code           INTEGER,
+  result_envelope_id  TEXT,
+  error               TEXT,
+  started_at          INTEGER NOT NULL,
+  finished_at         INTEGER,
+  updated_at          INTEGER NOT NULL,
+  cancel_requested_at INTEGER,
+  timeout_ms          INTEGER
+);
+`,
+    };
+    const a = openDatabase(path, { schemas: ALL_SCHEMAS.map((m) => (m.owner === "@ng/workspace" ? v1Workspace : m)) });
+    run(a, "INSERT INTO cells (id, root_id, status, spec, bounds, principal_id, created_at, updated_at) VALUES ('desk','desk','active','{}','{}','owner',1,1)");
+    run(a, "INSERT INTO cells (id, parent_id, root_id, status, spec, bounds, principal_id, created_at, updated_at) VALUES ('w_old','desk','desk','closed','{}','{}','cell:desk',1,2)");
+    run(a, "INSERT INTO workspaces (cell_id, path, status, created_at, updated_at) VALUES ('desk','/tmp/d','active',1,1)");
+    run(a, "INSERT INTO workspaces (cell_id, path, status, created_at, updated_at) VALUES ('w_old','/tmp/w','active',1,1)");
+    expect(schemaVersions(a)["@ng/workspace"]).toBe(1);
+    a.close();
+
+    const b = openDatabase(path);
+    expect(schemaVersions(b)["@ng/workspace"]).toBe(2);
+    expect(get(b, "SELECT status FROM workspaces WHERE cell_id = 'w_old'")).toEqual({ status: "closed" });
+    run(b, "UPDATE workspaces SET status = 'closed', updated_at = 3 WHERE cell_id = 'desk'");
+    expect(get(b, "SELECT status FROM workspaces WHERE cell_id = 'desk'")).toEqual({ status: "closed" });
     expect(all(b, "PRAGMA foreign_key_check")).toEqual([]);
     b.close();
   });

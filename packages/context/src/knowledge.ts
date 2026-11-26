@@ -5,6 +5,8 @@ import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import {
   afterCommit,
   all,
+  CELL_ROLES,
+  cellRoleOf,
   fromJson,
   get,
   newId,
@@ -411,7 +413,15 @@ export function createKnowledge(deps: Deps): KnowledgeModule {
     },
     visible,
     listSkills(cellId) {
-      return visible(cellId, "skill").map((r) => ({ name: r.name, description: r.description, scope: r.scope, tags: r.tags }));
+      const cell = cellId !== undefined ? cells.get(cellId) : undefined;
+      const role = cell ? cellRoleOf(cell.spec) : null;
+      return visible(cellId, "skill")
+        .filter((r) => {
+          if (cellId === undefined || r.scope !== "global" || !r.tags.includes("builtin")) return true;
+          const roleTags = r.tags.filter((t) => (CELL_ROLES as readonly string[]).includes(t));
+          return roleTags.length === 0 || (role !== null && roleTags.includes(role));
+        })
+        .map((r) => ({ name: r.name, description: r.description, scope: r.scope, tags: r.tags }));
     },
     upsert,
     rescan,

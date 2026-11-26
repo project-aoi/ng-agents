@@ -217,6 +217,8 @@ function boundaryItem(seq: number, at: number, r: Extract<StepOrExternalEvidence
       return { seq, at, id: e, kind: "system_event", text: "已被打断" };
     case "step_limit":
       return { seq, at, id: e, kind: "system_event", text: "这一轮步数到上限，先停下，稍后自动接着做" };
+    case "timeout":
+      return { seq, at, id: e, kind: "system_event", text: "这一轮空闲超时已切分，稍后自动接着做" };
     case "refused":
       return { seq, at, id: e, kind: "system_event", text: "这一轮没有执行" };
     case "error":

@@ -32,6 +32,24 @@ export function renderTranscript(messages: readonly ModelMessage[]): string {
 }
 
 /**
+ * Whether `history` already holds the cell's task anchor — either verbatim (in a compacted summary) or, for an
+ * un-updated `[original task]`, as the original `cell.task` inbound message — so a cold fresh session does not
+ * receive `[original task]` twice. An updated `[project goal]` not yet in `history` is still kept.
+ */
+export function historyCoversTask(history: readonly ModelMessage[], originalTask: string | undefined): boolean {
+  if (!originalTask) return false;
+  const isOriginal = originalTask.startsWith("[original task]");
+  for (const m of history) {
+    for (const b of m.content) {
+      if (b.type !== "text") continue;
+      if (b.text.includes(originalTask)) return true;
+      if (isOriginal && m.role === "user" && b.text.startsWith("[cell.task · ")) return true;
+    }
+  }
+  return false;
+}
+
+/**
  * The snapshot's volatile tail (children roster + the new batch) as the text of one user turn. `resumed`: the session
  * being continued already holds the cell's first task, so the reminder of it (stale by then more often than not) is
  * left out.

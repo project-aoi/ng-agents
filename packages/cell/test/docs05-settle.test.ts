@@ -205,9 +205,15 @@ describe("step limit and refusal are never 'completed'", () => {
   it("queues the continuation before deciding whether a stalled project needs the owner", async () => {
     const h = await boot({kernel: {stallGraceMs: 500}});
     h.kernel.spawnCell("desk", {id:"p", preset:"project", meta:{role:"p"},
-      processor:{kind:"llm", maxSteps:1, toolsets:["kernel.context","kernel.comms"]}}, undefined, { principalId: h.kernel.ownerPrincipal });
+      processor:{kind:"llm", maxSteps:2, toolsets:["kernel.context","kernel.comms"]}}, undefined, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
-    h.script.add("p", tool("set_state", {patches: {step: 1}}), tool("wait", {reason:"等人审阅", waitingFor:"human"}));
+    h.script.add(
+      "p",
+      tool("set_state", {patches: {step: 1}}),
+      tool("set_state", {patches: {step: 2}}),
+      tool("wait", {reason:"等人审阅", waitingFor:"human"}),
+      {},
+    );
     h.clock.advance(500);
     await h.kernel.idle();
     expect(h.of("run.finished").filter(r => r.cellId === "p").map(r => r.outcome)).toEqual(["step_limit", "yielded_waiting"]);
@@ -285,7 +291,7 @@ describe("complete_self / pause_self (persistent cells)", () => {
     h.script.add("proj", tool("complete_self", { summary: "too early" }));
     h.script.add("proj", (req) => {
       refusal = lastToolResult(req);
-      return tool("wait", { reason: "等 worker" });
+      return {};
     });
     const g = gate();
     h.script.add("w", async () => {
@@ -316,7 +322,7 @@ describe("complete_self / pause_self (persistent cells)", () => {
     });
     h.script.add("proj", (req) => {
       expect(requestText(req)).toContain("还要补一个录屏");
-      return tool("wait", { reason: "去补录屏" });
+      return {};
     });
     await h.kernel.idle();
     expect(h.kernel.getCell("proj")!.status).toBe("active");
@@ -345,7 +351,7 @@ describe("complete_self / pause_self (persistent cells)", () => {
     expect(h.script.callsOf("idea")).toHaveLength(2);
     h.script.add("idea", (req) => {
       expect(requestText(req)).toContain("现在开做");
-      return tool("wait", { reason: "拆阶段" });
+      return {};
     });
     h.kernel.control("idea", { action: "resume" }, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();

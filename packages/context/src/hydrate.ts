@@ -32,7 +32,7 @@ import {
   summaryMessage,
 } from "./render";
 import { oneLine, safeHead, safeTail } from "./text";
-import { referenceLine, referencesIn } from "./summarize";
+import { boundedReferenceLine, referencesIn } from "./summarize";
 
 interface PrefixRow {
   cell_id: string;
@@ -138,12 +138,14 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
 
   /** The frozen system prefix of a cell. Deterministic in its inputs; no timestamps. */
   function systemHash(cell: CellRecord, text: string, forkNote = "", parentHash = ""): string {
+    const listedNames = new Set(knowledge.listSkills(cell.id).map((s) => s.name));
+    const inlinedNames = new Set(cell.spec.processor.kind === "llm" ? (cell.spec.processor.skills ?? []) : []);
     return sha256Hex(stableStringify({
       templateVersion: deps.runtimeVersion,
       text, parentHash, forkNote, processor: cell.spec.processor, bounds: describeBounds(cell.bounds),
       tools: deps.toolContract(cell),
-      skills: knowledge.visible(cell.id,"skill").map(k => [k.name,k.description,k.body]),
-      preferences: preferencesFor(cell).map(k => [k.name,k.body,k.applies]),
+      skills: knowledge.visible(cell.id, "skill").filter(k => listedNames.has(k.name) || inlinedNames.has(k.name)).map(k => [k.name, k.description, k.body]),
+      preferences: preferencesFor(cell).map(k => [k.name, k.body, k.applies]),
     }));
   }
 
@@ -156,10 +158,56 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
   }
 
   function originalTask(cellId: string): string | null {
+    const projRow = get<{ value: string }>(db, "SELECT value FROM cell_state WHERE cell_id = ? AND key = 'gtd:project'", [cellId]);
     const row = get<{payload: string | null}>(db, `SELECT content -> '$.envelope.payload' AS payload FROM evidence
       WHERE cell_id=? AND kind='inbound' AND json_extract(content,'$.envelope.type')='cell.task' ORDER BY seq LIMIT 1`,[cellId]);
-    if (!row?.payload) return null;
-    const task = JSON.parse(row.payload);
+    const task = row?.payload ? JSON.parse(row.payload) : null;
+    if (projRow?.value) {
+      try {
+        const proj = JSON.parse(projRow.value) as {
+          title?: string;
+          outcome?: string;
+          summary?: string;
+          createdAt?: number;
+          updatedAt?: number;
+          proposal?: { phases?: string[]; actions?: Array<{ title?: string; owner?: string }> };
+        };
+        const cell = cells.get(cellId);
+        const initProj = (task?.input as { project?: Record<string, unknown> } | undefined)?.project;
+        const initInstr = typeof task?.instruction === "string" ? task.instruction : "";
+        const cwdChanged = Boolean(cell?.spec.cwd && initInstr && !initInstr.includes(cell.spec.cwd));
+        const changed =
+          (typeof proj.updatedAt === "number" && typeof proj.createdAt === "number" && proj.updatedAt > proj.createdAt) ||
+          Boolean(proj.summary) ||
+          cwdChanged ||
+          (initProj !== undefined &&
+            (proj.title !== initProj["title"] ||
+              proj.outcome !== initProj["outcome"] ||
+              stableStringify(proj.proposal ?? null) !== stableStringify(initProj["proposal"] ?? null)));
+        if (proj && changed) {
+          const refs = referencesIn(proj, task);
+          const steps = proj.proposal?.actions?.length
+            ? `plan=[${proj.proposal.actions.slice(0, 8).map((a) => `${a.owner ?? "agent"}:${oneLine(a.title ?? "", 60)}`).join("; ")}]`
+            : "";
+          const phases = proj.proposal?.phases?.length ? `phases=[${proj.proposal.phases.join(" -> ")}]` : "";
+          const full = [
+            `[project goal] (current — updated since initial task) parent=${task?.parentCellId ?? "desk"}`,
+            proj.title ? `title=${JSON.stringify(oneLine(proj.title, 160))}` : "",
+            proj.outcome ? `outcome=${JSON.stringify(oneLine(proj.outcome, 400))}` : "",
+            cell?.spec.cwd ? `cwd=${cell.spec.cwd}` : "",
+            proj.summary ? `summary=${JSON.stringify(oneLine(proj.summary, 240))}` : "",
+            phases,
+            steps,
+            ...refs,
+          ]
+            .filter(Boolean)
+            .join(" ");
+          return resourceExcerpt(cellId, full, Math.max(128, Math.floor(limits.summaryMaxChars / 4)), "project-goal");
+        }
+      } catch {
+        // fall back to original cell.task below
+      }
+    }
     if (task == null) return null;
     const refs = referencesIn(task);
     const instruction = typeof task.instruction === "string" ? oneLine(task.instruction, 800) : "";
@@ -341,9 +389,23 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
       if (!row || row.summary_upto_seq !== plan.baseUpto || row.compactions !== plan.baseCompactions) return null;
       const cell = cells.require(plan.cellId);
       const task = originalTask(cell.id);
-      const body = summary.split("\n").filter(line => !line.startsWith("[original task]") && !line.startsWith("[references] ")).join("\n");
-      const refs = resourceExcerpt(cell.id, referenceLine(referencesIn(plan.input.previousSummary, plan.input.messages, summary, task)),
-        Math.max(64, Math.floor(limits.summaryMaxChars / 3)), "compaction-references");
+      const body = summary
+        .split("\n")
+        .filter(line => !line.startsWith("[original task]") && !line.startsWith("[project goal]") && !line.startsWith("[references] "))
+        .join("\n");
+      const allRefs = referencesIn(plan.input.previousSummary, plan.input.messages, summary, task);
+      const refBudget = Math.min(1_200, Math.max(96, Math.floor(limits.summaryMaxChars / 5)));
+      let { line: refs, dropped } = boundedReferenceLine(allRefs, refBudget);
+      if (dropped.length > 0) {
+        const fullText = "[references] " + allRefs.join(" ");
+        const existing = get<{ uri: string }>(db, "SELECT uri FROM resources WHERE cell_id=? AND source=? AND content=? LIMIT 1", [
+          cell.id,
+          "compaction-references",
+          fullText,
+        ]);
+        const overflowUri = existing?.uri ?? evidence.writeResource(cell.id, fullText, { source: "compaction-references" });
+        refs = boundedReferenceLine([...allRefs.filter((r) => !dropped.includes(r)), overflowUri], refBudget).line;
+      }
       const available = Math.max(0, limits.summaryMaxChars - refs.length - (refs ? 1 : 0));
       const prefix = task ? safeHead(task, Math.floor(available / 2)) : "";
       const remaining = Math.max(0, available - prefix.length - (prefix ? 1 : 0));

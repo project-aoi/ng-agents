@@ -31,7 +31,7 @@ export interface WorkspacePort {
   // `result` envelope carrying expectedEpoch into the owning Cell's Inbox
   // [ext] every job that started ends with exactly one job.result (succeeded | failed | cancelled), id `${jobId}:result`;
   //       delivery "wakeup", except "silent_inject" for a job the cell cancelled itself through `cancelJob`.
-  startJob(spec: { command: string; timeoutMs?: number }): Promise<{ jobId: string }>;
+  startJob(spec: { command: string; timeoutMs?: number; interactive?: boolean }): Promise<{ jobId: string }>;
   observeJob(jobId: string): Promise<{ state: "running" | "succeeded" | "failed" | "cancelled"; tail: string }>;
   writeJobInput?(jobId: string, input: string): Promise<void>;
   cancelJob(jobId: string): Promise<void>;
@@ -81,7 +81,7 @@ export interface JobRecord {
   timeoutMs?: number | null;
 }
 
-export type WorkspaceStatus = "active" | "failed";
+export type WorkspaceStatus = "active" | "failed" | "closed";
 
 export interface WorkspaceRecord {
   cellId: string;

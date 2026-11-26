@@ -523,7 +523,7 @@ export function createReadModel(core: KernelCore): ReadModel {
       .slice(0, 20);
     if (timers.length) notes.push("[your timers that have not fired yet]\n" + timers.map((m) => {
       const label = (m.envelope.payload as { label?: unknown } | null)?.label;
-      return `${new Date(m.deliverAt).toISOString()}${typeof label === "string" && label ? ` "${label}"` : ""}${m.cancelGroup ? ` cancelGroup "${m.cancelGroup}"` : ""}`;
+      return `${new Date(m.deliverAt).toISOString()}${typeof label === "string" && label ? ` "${label}"` : ""}${m.cancelGroup ? ` cancelGroup "${m.cancelGroup}"` : ""} envelopeId "${m.envelope.id}"`;
     }).join("\n"));
     const jobs = core.workspace.listJobsSync({ cellId, state: ["running"] });
     if (jobs.length) notes.push("[your running jobs]\n" + jobs.map(j => `${j.jobId} ${j.command.slice(0,120)}`).join("\n"));
@@ -546,11 +546,9 @@ export function createReadModel(core: KernelCore): ReadModel {
     ].join("\n"));
     const occ = occupancyNote(cell);
     if (occ) notes.push(occ);
-    // Last, right before the batch: the one thing a coordinator must not lose to a compacted or rebuilt session.
-    if (!leaf) {
-      const mine = notesNote(cellId);
-      if (mine) notes.push(mine);
-    }
+    // Last, right before the batch: a cell's own saved working_notes (coordinators and leaves alike; zero cost when none exist).
+    const mine = notesNote(cellId);
+    if (mine) notes.push(mine);
     return notes;
   }
 

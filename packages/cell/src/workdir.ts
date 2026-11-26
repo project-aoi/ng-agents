@@ -2,18 +2,18 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
-import { NgError, type CellRecord } from "@ng/protocol";
+import { defaultCellsRoot, NgError, realOrResolved, type CellRecord } from "@ng/protocol";
 import type { KernelCore } from "./core";
 
 // docs/05 principle 3/4: cells work in real directories of the owner's machine. The kernel never creates, snapshots
 // or removes them, and it does not schedule them either: it reports which cells are active in which work tree
 // (ReadModel.activeWorkspaces) and leaves the sharing to the cells and their coordinators.
 
-/** `~/x` → the owner's home; the result must be absolute. */
+/** `~/x` → the owner's home; the result must be absolute (and symlink-resolved when it exists on disk). */
 export function normalizeCwd(input: string): string {
   const expanded = input === "~" ? homedir() : input.startsWith("~/") ? join(homedir(), input.slice(2)) : input;
   if (!isAbsolute(expanded)) throw new NgError("invalid_argument", `cwd must be an absolute path (got "${input}")`);
-  return resolve(expanded);
+  return realOrResolved(expanded);
 }
 
 export function assertDirectory(path: string, what: string): void {
@@ -26,9 +26,9 @@ export function assertDirectory(path: string, what: string): void {
   if (!ok) throw new NgError("invalid_argument", `${what} is not an existing directory: ${path}. Ask the owner for the right path instead of guessing.`);
 }
 
-/** The kernel's own per-cell directory (under its data dir): the cwd of a cell nobody gave one. Never removed. */
+/** Clean isolated per-cell directory for a cell nobody gave a `cwd` (never inside a host git repo or AGENTS.md tree). */
 export function ownCellDir(core: Pick<KernelCore, "dataDir">, cellId: string): string {
-  return join(core.dataDir, "cells", encodeURIComponent(cellId));
+  return join(defaultCellsRoot(core.dataDir), encodeURIComponent(cellId));
 }
 
 type CwdCore = Pick<KernelCore, "dataDir" | "repoPath" | "registry">;
@@ -43,15 +43,19 @@ function keepsPrivateDir(core: CwdCore, cell: Pick<CellRecord, "spec">): boolean
  * preset that does not inherit — the kernel's own per-cell directory.
  */
 export function effectiveCwd(core: CwdCore, cell: Pick<CellRecord, "id" | "spec">): string {
-  if (cell.spec.cwd) return cell.spec.cwd;
-  if (core.repoPath && !keepsPrivateDir(core, cell)) return resolve(core.repoPath);
+  if (cell.spec.cwd) return realOrResolved(cell.spec.cwd);
+  if (core.repoPath && !keepsPrivateDir(core, cell)) return realOrResolved(core.repoPath);
   return ownCellDir(core, cell.id);
 }
 
 /** Creates the kernel-owned fallback directory when that is what the cell uses (a configured cwd must already exist). */
 export function ensureCwd(core: CwdCore, cell: Pick<CellRecord, "id" | "spec">): string {
+  const fallback = ownCellDir(core, cell.id);
   const cwd = effectiveCwd(core, cell);
-  if (cwd === ownCellDir(core, cell.id)) mkdirSync(cwd, { recursive: true });
+  if (cwd === fallback) {
+    mkdirSync(cwd, { recursive: true });
+    return realOrResolved(cwd);
+  }
   return cwd;
 }
 

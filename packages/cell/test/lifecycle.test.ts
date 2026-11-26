@@ -322,8 +322,8 @@ describe("closeCell", () => {
     expect(h.count(`human_items WHERE cell_id IN ${inList} AND status = 'pending'`)).toBe(0);
     expect(h.kernel.workspace.listJobsSync({ state: ["running"] })).toEqual([]);
     expect(h.kernel.workspace.listJobsSync({ cellId: "build" }).map((j) => j.state)).toEqual(["cancelled"]);
-    // guard 4: closing stops the runtime only — the directory, its files and the workspace record stay
-    expect(h.kernel.workspace.getWorkspaceSync("build")!.status).toBe("active");
+    // guard 4: closing stops the runtime and marks the workspace row closed — the directory and its files stay
+    expect(h.kernel.workspace.getWorkspaceSync("build")!.status).toBe("closed");
     expect(readFileSync(join(dir, "work.txt"), "utf8")).toBe("unfinished");
 
     // the killed job's late result arrived and died on the closed cell; nothing ran again

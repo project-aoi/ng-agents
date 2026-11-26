@@ -3,6 +3,7 @@ import { z } from "zod";
 import { gtdKeys } from "../shared/keys";
 import type { ActivityRecord, ProjectRecord } from "../shared/product-records";
 import {
+  asDecisionCard,
   childRunnerOverride,
   defineTool,
   isEnvelopeOfType,
@@ -356,11 +357,16 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
     async run(args, ctx) {
       const env = currentItem(ctx);
       const raw = itemRawInput(env).text;
+      const baseSource = itemSource(env, now(ctx));
+      const cardRefId = args.itemId ?? (env && isEnvelopeOfType(env, "approval.resolved") ? (env.payload as { actionId?: string }).actionId : undefined);
+      const cardSource = cardRefId
+        ? asDecisionCard(ctx.ports.listOwnDecisions().find((d) => d.record.actionId === cardRefId)?.record.card.data)?.source
+        : undefined;
       const init: ProjectInit = {
         title: args.title,
         outcome: args.outcome,
         brief: args.brief,
-        source: itemSource(env, now(ctx)),
+        source: baseSource.label === "系统" && cardSource ? cardSource : baseSource,
         ...(raw ? { rawInput: raw } : {}),
         ...(args.cwd ? { cwd: args.cwd } : {}),
         ...(args.repos?.length ? { repos: args.repos.map((r) => ({ name: r.name, cwd: r.cwd, ...(r.defaultBranch ? { defaultBranch: r.defaultBranch } : {}) })) } : {}),
@@ -605,8 +611,8 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
     runnerOptions: true,
     description: [
       "Add a source that runs on a schedule or a workbench capture topic (ui:<topic>), for example a weekly metrics check.",
-      "It stays silent when nothing is found and posts to you only on a hit. mode observe = only keep observation notes, never create items (for a source the owner does not trust yet).",
-      "check: a registered zero-cost check; script: a local script path (zero-token: exit 0 + empty stdout = no hit; exit 0 + non-empty stdout = hit; non-zero = error; trigger envelope arrives in NG_TRIGGER_JSON or NG_TRIGGER_FILE when >64KB); otherwise a small model filters with your description.",
+      "It stays silent when nothing is found and posts to you only on a hit. mode observe = only keep observation notes, never create items.",
+      "Prefer script (zero-token local script: exit 0 + empty stdout = no hit; exit 0 + non-empty stdout = hit; non-zero = error; trigger in NG_TRIGGER_JSON/NG_TRIGGER_FILE) or check for deterministic command/threshold checks; omit both only when a small model must judge unstructured text.",
     ].join(" "),
     input: z.object({
       title: z.string().min(1),
@@ -628,7 +634,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
           : SENSOR_LLM_PROCESSOR;
       const source: SourceInit = {
         title: args.title,
-        ...(args.description ? { description: args.description } : {}),
+        description: args.description ?? args.title,
         kind: args.cron ? "cron" : "watch",
         ...(args.cron ? { schedule: { cron: args.cron, ...(args.tz ? { tz: args.tz } : {}) } } : {}),
         mode: args.mode ?? "active",
@@ -636,7 +642,7 @@ export function deskToolset(cfg: PresetsConfig, books: DeskBooks): Toolset {
       };
       const runner = await childRunnerOverride(ctx.ports, args, { kind: processor.kind, role: "sensor", tier: "fast" });
       const spec = createSensorSpec(newId("src", ctx.clock), source, { ...processor, ...runner }, args.watchThread);
-      const addr = await ctx.ports.spawnCell(spec, { instruction: args.description ?? args.title });
+      const addr = await ctx.ports.spawnCell(spec);
       await notifyOwner(ctx.ports, `已添加信源：${args.title}${args.mode === "observe" ? "（观察模式，只记笔记不出卡）" : ""}`, `source:${spec.id}`);
       return `Source added (${addr}). It stays silent unless it finds something.`;
     },

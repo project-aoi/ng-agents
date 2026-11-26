@@ -128,6 +128,7 @@ const PAGE_NOTE_CHARS = 2_000;
  */
 const SELF_BOUNDED_READS: Readonly<Record<string, number>> = {
   read_resource: MAX_RESOURCE_PAGE_CHARS + PAGE_NOTE_CHARS,
+  read_artifact: 28_000 + PAGE_NOTE_CHARS,
   inspect_cell: 40_000 + PAGE_NOTE_CHARS,
 };
 

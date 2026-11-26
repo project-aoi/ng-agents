@@ -115,7 +115,8 @@ export function describeBounds(b: PolicyBounds): string {
   return [
     `Tools: ${list(b.tools)}.`,
     `May send to: ${list(b.canSendTo)}.`,
-
-    `Children: up to ${b.maxConcurrentChildren} concurrent, ${b.maxDepth} more level(s) of spawning.`,
+    b.maxDepth <= 0
+      ? "Children: none (leaf cell)."
+      : `Children: up to ${b.maxConcurrentChildren} concurrent, ${b.maxDepth} more level(s) of spawning.`,
   ].join("\n");
 }

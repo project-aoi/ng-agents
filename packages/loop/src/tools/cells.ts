@@ -180,17 +180,29 @@ export function cellsToolset(registry: Registry): Toolset {
       const inspect = ctx.ports.inspectCell;
       if (!inspect) return { output: "inspect_cell is not available in this environment.", isError: true };
       const r = await inspect.call(ctx.ports, args.cellId, { ...(args.afterSeq !== undefined ? { afterSeq: args.afterSeq } : {}), ...(args.detail ? { detail: args.detail } : {}) });
-      return { output: r.text, data: { fromSeq: r.fromSeq, toSeq: r.toSeq, more: r.more, state: r.state, directChats: r.directChats, artifactIds: r.artifactIds } };
+      return {
+        output: r.text,
+        data: {
+          fromSeq: r.fromSeq,
+          toSeq: r.toSeq,
+          more: r.more,
+          ...(r.resumeAfterSeq !== undefined ? { resumeAfterSeq: r.resumeAfterSeq } : {}),
+          state: r.state,
+          directChats: r.directChats,
+          artifactIds: r.artifactIds,
+        },
+      };
     },
   });
   const updateCell = defineTool({
     name: "update_cell",
     kind: "kernel",
     description:
-      "Change a cell's title, watches, schedules or meta (given fields replace the old ones). cellId is a child's id — or leave it out to change your own watches/schedules, e.g. to start watching a thread or drop a schedule you no longer need.",
+      "Change a cell's title, cwd, watches, schedules or meta (given fields replace the old ones). cellId is a child's id — or leave it out to change your own watches/schedules.",
     input: z.object({
       cellId: z.string().min(1).optional().describe("default: this cell"),
       title: z.string().min(1).optional(),
+      cwd: z.string().min(1).optional().describe("absolute directory path (e.g. when moving a reusable worker to a new git worktree)"),
       watches: z.array(watchInput).optional(),
       schedules: z.array(scheduleInput).optional(),
       meta: z.record(z.string(), z.unknown()).optional(),
@@ -198,6 +210,7 @@ export function cellsToolset(registry: Registry): Toolset {
     async handler(args, ctx) {
       const patch: Partial<CellSpec> = {};
       if (args.title) patch.title = args.title;
+      if (args.cwd) patch.cwd = args.cwd;
       if (args.watches) patch.watches = toWatches(args.watches);
       if (args.schedules) patch.schedules = toSchedules(args.schedules);
       if (args.meta) patch.meta = args.meta;

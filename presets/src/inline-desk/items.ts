@@ -208,11 +208,15 @@ export async function settleDeskBatch(cfg: PresetsConfig, ctx: ToolContext): Pro
     // the second time (the first closing keeps the id it always had).
     const first = `done-${p.childCellId}`;
     const earlier = await ports.context.readState<ActivityRecord>(self, gtdKeys.activity(first));
-    const id = !earlier || earlier.detail === p.summary ? first : `${first}-${sha256Hex(resultId).slice(0, 10)}`;
-    if (await ports.context.readState(self, gtdKeys.activity(id))) return true;
+    const id = !earlier || earlier.resultId === resultId || (!earlier.resultId && earlier.detail === p.summary && resultId.endsWith(":0:closed"))
+      ? first
+      : `${first}-${sha256Hex(resultId).slice(0, 10)}`;
+    if (earlier?.resultId === resultId || (id !== first && (await ports.context.readState(self, gtdKeys.activity(id))))) return true;
+    const isSynthetic = Boolean((p.data as { synthetic?: unknown } | null)?.synthetic);
+    const detail = isSynthetic && project.summary ? project.summary : p.summary;
     // The owner is told once, by the project itself: finish_project sends its summary as the completion notice. A
     // second, shortened notice from here cut the sentence before its main caveat (audit M14).
-    const a: ActivityRecord = newActivity({ id, kind: "action_completed", title: `已完成：${project.title}`, detail: p.summary, ...(project.source ? { source: project.source } : {}), restorable: false }, now);
+    const a: ActivityRecord = { ...newActivity({ id, kind: "action_completed", title: `已完成：${project.title}`, detail, ...(project.source ? { source: project.source } : {}), restorable: false }, now), resultId };
     await ports.context.commit(self, { statePatches: { [gtdKeys.activity(id)]: a } });
     out.push(`项目已完成：${project.title}`);
     return true;

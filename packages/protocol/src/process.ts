@@ -191,6 +191,59 @@ export function markedAlive(pid: number, name: string, value: string): boolean {
   return processHasMarker(pid, name, value) === true;
 }
 
+/** Cumulative CPU ticks (100 Hz equivalent) across a process group (`utime + stime + cutime + cstime` on `/proc`). Null when unavailable. */
+export function readGroupCpuTicks(pgid: number): number | null {
+  if (!Number.isInteger(pgid) || pgid <= 0) return null;
+  if (processInspection.useProc) {
+    let entries: string[];
+    try {
+      entries = readdirSync("/proc");
+    } catch {
+      return null;
+    }
+    let total = 0;
+    let matched = 0;
+    for (const e of entries) {
+      if (!/^\d+$/.test(e)) continue;
+      try {
+        const stat = readFileSync(`/proc/${e}/stat`, "utf8");
+        const closeParen = stat.lastIndexOf(")");
+        if (closeParen < 0) continue;
+        const after = stat.slice(closeParen + 2).split(" ");
+        if (Number(after[2]) !== pgid) continue;
+        const ticks = (Number(after[11]) || 0) + (Number(after[12]) || 0) + (Number(after[13]) || 0) + (Number(after[14]) || 0);
+        total += ticks;
+        matched++;
+      } catch {
+        // process vanished while scanning
+      }
+    }
+    return matched > 0 ? total : null;
+  }
+  try {
+    const out = execFileSync("ps", ["-eo", "pgid=,cputime="], {
+      encoding: "utf8",
+      timeout: 2_000,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    let total = 0;
+    let matched = 0;
+    for (const line of out.split("\n")) {
+      const m = /^\s*(\d+)\s+(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+(?:\.\d+)?)\s*$/.exec(line);
+      if (!m || Number(m[1]) !== pgid) continue;
+      const days = Number(m[2] ?? 0);
+      const hours = Number(m[3] ?? 0);
+      const mins = Number(m[4] ?? 0);
+      const secs = Number(m[5] ?? 0);
+      total += Math.round(((days * 86_400) + (hours * 3_600) + (mins * 60) + secs) * 100);
+      matched++;
+    }
+    return matched > 0 ? total : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Descendant PIDs of `root` (cross-platform: `/proc/<pid>/stat` on Linux, `ps -eo pid=,ppid=` on macOS/POSIX). */
 export function processDescendants(root: number): number[] {
   if (!Number.isInteger(root) || root <= 0) return [];

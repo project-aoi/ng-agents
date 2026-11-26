@@ -255,10 +255,13 @@ export function inspectCell(
       : null;
   const text = [head.join(" · "), ...lines, ...(foot ? [foot] : [])].join("\n");
 
-  // The cursor is the inspector's own, and only for cells below it: a desk that looks into a project's worker does
-  // not make the project believe it has read anything.
-  if (inspector && inspector !== targetId && resumeAfterSeq > cursor && afterSeq <= cursor && cells.ancestors(targetId).some((a) => a.id === inspector)) {
-    context.commitSync(inspector, { statePatches: { [pullCursorKey(targetId)]: resumeAfterSeq } });
+  // The cursor is the inspector's own high-water mark, and only for cells below it: a desk that looks into a
+  // project's worker does not make the project believe it has read anything. Even when middle steps were omitted
+  // (head 20% + tail 80%, `resumeAfterSeq` shown above for optional drill-down) or an explicit `afterSeq > cursor`
+  // jumped ahead, advance to `toSeq` so later wake-ups never keep reporting already-seen records as unread.
+  const seenSeq = lines.length > 0 ? toSeq : 0;
+  if (inspector && inspector !== targetId && seenSeq > cursor && cells.ancestors(targetId).some((a) => a.id === inspector)) {
+    context.commitSync(inspector, { statePatches: { [pullCursorKey(targetId)]: seenSeq } });
   }
   return {
     cellId: targetId,

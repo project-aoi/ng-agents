@@ -27,7 +27,7 @@ describe("docs/05 scenario 1 — part of the work waits for the owner; the repor
           { name: "doubao-work", cwd: doubao },
         ],
       }),
-      tool("wait", { reason: "started" }),
+      {},
     );
     // The project starts what it can and puts the missing piece on the owner.
     h.script.add(

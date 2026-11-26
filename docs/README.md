@@ -17,3 +17,4 @@
 - [内部专题与连续补充](02-workflows/uc06-domain-hub-direct-stream.md)
 - [外部助手交办与跨夜续接](02-workflows/uc07-external-agent-and-overnight-hosting.md)
 - [分身直聊与父项目同步](02-workflows/uc08-direct-worker-chat-and-pull-sync.md)
+- [长周期多路并行研发与冷恢复](02-workflows/uc09-long-running-parallel-project.md)

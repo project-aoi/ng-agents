@@ -122,8 +122,8 @@ describe("project tools", () => {
         return {};
       },
     );
-    h.script.setDefault("worker", () => tool("wait", { reason: "reading" }));
-    h.script.setDefault("checker", () => tool("wait", { reason: "not yet", waitingFor: "external" }));
+    h.script.setDefault("worker", () => ({}));
+    h.script.setDefault("checker", (req) => (continuesRun(req) ? {} : tool("wait", { reason: "not yet", waitingFor: "external" })));
     const { projectId } = startProjectSync(h.kernel, { title: "t", outcome: "o", brief: "b", cwd: repo }, { principalId: h.kernel.ownerPrincipal });
     await h.kernel.idle();
     expect(h.script.pending("project")).toBe(0);
@@ -193,7 +193,7 @@ describe("project tools", () => {
     let worker = "";
     // Still at work: it asked the desk something and waits for the answer. (A worker that simply ends its turn is
     // dormant, and a dormant worker is no reason to keep a project open.)
-    h.script.setDefault("worker", () => tool("wait", { reason: "等 desk 回复", waitingFor: "inbox:desk" }));
+    h.script.setDefault("worker", (req) => (continuesRun(req) ? {} : tool("wait", { reason: "等 desk 回复", waitingFor: "inbox:desk" })));
     const stillActive = () => {
       expect(h.kernel.getCell(projectId)).toMatchObject({ status: "active" });
       expect(h.project(projectId)).toMatchObject({ lifecycle: "active" });
@@ -249,7 +249,7 @@ describe("project tools", () => {
     const h = await boot();
     const repo = gitRepo("y");
     let worker = "";
-    h.script.setDefault("worker", () => tool("wait", { reason: "busy", waitingFor: "inbox:desk" }));
+    h.script.setDefault("worker", (req) => (continuesRun(req) ? {} : tool("wait", { reason: "busy", waitingFor: "inbox:desk" })));
     h.script.add(
       "project",
       tool("dispatch", { title: "实现", instruction: "实现" }),
@@ -304,7 +304,7 @@ describe("desk tools for projects in flight", () => {
       tool("start_project", { title: "改 TUI", outcome: "o", brief: "b", cwd: "/no/such/tui" }),
       (req) => {
         expect(lastToolResult(req)).toContain("Ask the owner for the absolute path");
-        return tool("wait", { reason: "asked" });
+        return {};
       },
     );
     await h.ui.capture({ text: "改一下 TUI" }, "owner");
@@ -341,7 +341,7 @@ describe("desk tools for projects in flight", () => {
       },
       (req) => {
         expect(lastToolResult(req)).toContain("There is no item nope");
-        return tool("wait", { reason: "done" });
+        return {};
       },
     );
     await h.ui.capture({ text: "几件事" }, "owner");
@@ -419,7 +419,7 @@ describe("audit 2026-11-23: desk and project tools", () => {
     let decision = "";
     h.script.add("desk", (req) => {
       decision = JSON.stringify(req.messages);
-      return tool("wait", { reason: "ok" });
+      return {};
     });
     h.kernel.context.commitSync("desk", { artifact: { artifactId, expectedVersion: 2, updatedBy: "human", content: { format: "markdown", body: "房东您好，下周四上午可以来修热水器吗？" } } });
     const current = h.kernel.humanItems.get(card!.id)!;
@@ -444,7 +444,7 @@ describe("audit 2026-11-23: desk and project tools", () => {
       },
       (req) => {
         expect(lastToolResult(req)).toContain("no longer waiting for the owner");
-        return tool("wait", { reason: "ok" });
+        return {};
       },
     );
     await h.ui.capture({ text: "查一下原因并修好，修好我验收" }, "owner");
@@ -470,7 +470,7 @@ describe("audit 2026-11-23: desk and project tools", () => {
       },
       (req) => {
         expect(lastToolResult(req)).toContain(`Withdrew ${card!.id}`);
-        return tool("wait", { reason: "ok" });
+        return {};
       },
     );
     h.kernel.sendToCell(projectId, { text: "不用分阶段了，一次做完" }, owner(h));
@@ -498,7 +498,7 @@ describe("audit 2026-11-23: desk and project tools", () => {
       },
       (req) => {
         expect(lastToolResult(req)).toContain(`Resumed ${projectId}`);
-        return tool("wait", { reason: "ok" });
+        return {};
       },
     );
     await h.ui.capture({ text: "之前那个笔记导入现在开始做吧，只做导入预览" }, "owner");
@@ -520,7 +520,7 @@ describe("audit 2026-11-23: desk and project tools", () => {
         queuedAtResume = h.kernel.inbox.listMessagesSync({ cellId: projectId, type: PAYLOAD.cellMessage }).map((m) => (m.envelope.payload as { text: string }).text);
       }
     });
-    h.script.add("desk", tool("reactivate_item", { itemId: projectId, message: "主人：开始做吧" }), tool("wait", { reason: "ok" }));
+    h.script.add("desk", tool("reactivate_item", { itemId: projectId, message: "主人：开始做吧" }), {});
     await h.ui.capture({ text: "开始做吧" }, "owner");
     await h.kernel.idle();
     expect(queuedAtResume).toEqual(["主人：开始做吧"]);
@@ -529,7 +529,7 @@ describe("audit 2026-11-23: desk and project tools", () => {
   it("E34: finish_project someday with closeChildren pauses the children with the project and says so", async () => {
     const h = await boot();
     let worker = "";
-    h.script.setDefault("worker", () => tool("wait", { reason: "等 desk 回复", waitingFor: "inbox:desk" }));
+    h.script.setDefault("worker", (req) => (continuesRun(req) ? {} : tool("wait", { reason: "等 desk 回复", waitingFor: "inbox:desk" })));
     h.script.add(
       "project",
       tool("dispatch", { title: "调研", instruction: "调研" }),
@@ -560,7 +560,7 @@ describe("audit 2026-11-23: desk and project tools", () => {
     expect(h.notices().filter((n) => n.includes("「改重试」已完成"))).toEqual([`「改重试」已完成：${summary}`]);
 
     h.script.add("worker", { text: "ci 已修好，修复在分支 fix/ci" });
-    h.script.add("desk", tool("wait", { reason: "ok" }));
+    h.script.add("desk", {});
     h.kernel.spawnCell("desk", { preset: "worker", title: "修公共 CI" }, "修公共 CI", owner(h));
     await h.kernel.idle();
     expect(h.script.callsOf("desk")).toHaveLength(1);
@@ -685,7 +685,7 @@ describe("audit 2026-11-23 rerun: desk and project tools", () => {
 
     // Reopened, it finishes again with another account: a second record. A cell waiting on the desk makes that result
     // reach the desk's model, whose first try fails — so the desk's books run twice on the same result.
-    h.script.setDefault("worker", () => tool("wait", { reason: "等主台答复", waitingFor: "inbox:desk" }));
+    h.script.setDefault("worker", (req) => (continuesRun(req) ? {} : tool("wait", { reason: "等主台答复", waitingFor: "inbox:desk" })));
     h.kernel.spawnCell("desk", { preset: "worker", title: "等主台的分身" }, "问主台一件事", owner(h));
     await h.kernel.idle();
     h.script.add("project", tool("finish_project", { outcome: "completed", summary: second }));
@@ -1113,7 +1113,7 @@ describe("built-in skills", () => {
     expect(systemOf(h, projectId)).toContain("# Skill: project-relay");
     const relay = BUILTIN_SKILLS.find((skill) => skill.name === "project-relay")!;
     expect(systemOf(h, projectId)).toContain(relay.body.trim());
-    h.script.add("desk", tool("wait", { reason: "ok" }));
+    h.script.add("desk", {});
     await h.ui.capture({ text: "hi" }, "owner");
     await h.kernel.idle();
     expect(systemOf(h, "desk")).toContain("- workspace-arbitration:");
@@ -1175,7 +1175,7 @@ describe("live rerun round 3: desk and project tools", () => {
       return {};
     });
     const words = "主人：现在开始做，只做导入预览";
-    h.script.add("desk", tool("reactivate_item", { itemId: projectId, message: words }), tool("wait", { reason: "ok" }));
+    h.script.add("desk", tool("reactivate_item", { itemId: projectId, message: words }), {});
     await h.ui.capture({ text: "笔记导入现在开始做吧，只做导入预览" }, "owner");
     await h.kernel.idle();
     expect(h.kernel.getCell(projectId)?.status).toBe("active");

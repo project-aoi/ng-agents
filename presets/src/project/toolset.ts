@@ -187,7 +187,21 @@ export function projectToolset(): Toolset {
       const next = check
         ? ` No model runs for it: it runs \`${clip(check.command, 200)}\` now and then every ${everySec}s${where ? ` in ${where}` : ""}${deadline ? ` for up to ${check.deadlineHours}h` : ""}, at no cost while the answer is "not yet". You are woken once: when the condition holds, ${deadline ? "when the deadline passes, " : ""}or if the command cannot run at all.`
         : ` It is running now; you are woken when its turn is over${preset === "worker" ? " — then inspect_cell shows what it did, and send_message continues it" : ""}.`;
-      return { output: started + next, data: { cellId: childId, actionId }, awaitsWakeup: true };
+      let otherCheckers: string[] = [];
+      if (preset === "checker") {
+        const seen = new Map<string, string | null | undefined>();
+        for (const c of ctx.snapshot.tail.roster) {
+          if (c.cellId !== childId && c.preset === "checker" && c.status === "active") seen.set(c.cellId, c.title);
+        }
+        for (const a of await readActions(ctx.ports)) {
+          if (a.id !== action.id && a.status === "open" && a.owner === "waiting" && a.cellId && a.cellId !== childId && !seen.has(a.cellId)) {
+            seen.set(a.cellId, a.title);
+          }
+        }
+        otherCheckers = [...seen.entries()].map(([id, title]) => `${id}${title ? `「${title}」` : ""}`);
+      }
+      const dupNote = otherCheckers.length ? ` Note: active checker(s) ${otherCheckers.join(", ")} are also running — if they watch the same target, close the duplicate with close_cell.` : "";
+      return { output: started + next + dupNote, data: { cellId: childId, actionId }, awaitsWakeup: true };
     },
   });
 
@@ -296,6 +310,7 @@ export function projectToolset(): Toolset {
       };
       const replan = args.plan !== undefined || args.phases !== undefined;
       if (Object.keys(patch).length === 0 && !cwd && !replan) return { output: "Nothing to update.", isError: true };
+      const prevCwd = ctx.ports.self.spec.cwd;
       if (args.title || args.cwd) await ctx.ports.updateCell(self(ctx),{...(args.title ? {title:args.title} : {}),...(cwd ? {cwd} : {})});
       const current = await projectOf(ctx);
       // The plan on the record follows the goal: its outcome and title are the project's, its steps and stages the ones given.
@@ -313,8 +328,18 @@ export function projectToolset(): Toolset {
       }
       const next = patchProject(current, patch, now);
       await save(ctx, { [gtdKeys.project]: next, ...(args.summary ? { [CELL_STATUS_KEY]: statusLine(clip(args.summary, 200), now) } : {}) });
-
-      return `Project record updated${args.summary ? "; the owner's board shows the new summary" : ""}${replan ? "; the recorded plan now has the steps and stages you gave" : ""}.`;
+      let activeWorkers: string[] = [];
+      if (cwd && cwd !== prevCwd) {
+        const seen = new Set(ctx.snapshot.tail.roster.filter((c) => c.preset === "worker" && c.status === "active").map((c) => c.cellId));
+        for (const a of await readActions(ctx.ports)) {
+          if (a.status === "open" && a.owner === "agent" && a.cellId) seen.add(a.cellId);
+        }
+        activeWorkers = [...seen];
+      }
+      const cwdHint = activeWorkers.length
+        ? ` Reusable worker(s) (${activeWorkers.join(", ")}) still use their previous directory unless you move them with update_cell({ cellId, cwd: "${cwd}" }).`
+        : "";
+      return `Project record updated${args.summary ? "; the owner's board shows the new summary" : ""}${replan ? "; the recorded plan now has the steps and stages you gave" : ""}.${cwdHint}`;
     },
   });
 

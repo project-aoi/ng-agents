@@ -29,7 +29,7 @@ import {
   type ToolResult,
   type Toolset,
 } from "@ng/protocol";
-import { defaultSubjectKey, itemRawInput, itemSource, clip, primaryEnvelope, selfId } from "./util";
+import { defaultSubjectKey, itemRawInput, itemSource, clip, clipLine, primaryEnvelope, selfId } from "./util";
 
 export const COMMS_TOOLSET = "kernel.comms";
 
@@ -118,7 +118,7 @@ async function sendToInbox(ctx: ToolContext, to: `inbox:${string}`, args: { text
             ? `Left for ${target} as background: it reads it at its next turn, is not woken for it, and no wait of its is answered by it.`
             : r.targetStatus === "paused"
             ? `Delivered to ${target}, which is paused: it reads the message when it is resumed.`
-            : `Delivered to ${target}. It handles the message in its current run, or is woken with it (a dormant worker continues with everything it knows); if you need its answer, end your turn with wait (waitingFor "${to}").`,
+            : `Delivered to ${target}. It handles the message in its current run, or is woken with it (a dormant worker continues with everything it knows).`,
         data: r,
         sent: { to, text: args.text },
       };
@@ -342,7 +342,7 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
     ),
     async handler(args, ctx) {
       const childCellId = selfId(ctx);
-      const status: CellStatusLine = { text: args.text.split("\n")[0]!.slice(0, 200), at: ctx.clock.now(), ...(args.progress ? { progress: args.progress } : {}) };
+      const status: CellStatusLine = { text: clipLine(args.text, 200), at: ctx.clock.now(), ...(args.progress ? { progress: args.progress } : {}) };
       if (args.kind === "progress") {
         const payload: CellProgressPayload = {
           childCellId,
@@ -452,29 +452,30 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
     name: "wait",
     kind: "kernel",
     description: [
-      "End this run and sleep until the next message wakes you. Sleeping costs nothing. Because wait ends the run immediately, write any chat reply or send any message before calling wait.",
-      "Say who you are waiting for with waitingFor, so the wait is on record until exactly that party answers (other wake-ups do not clear it): an address such as \"inbox:desk\" (you asked the desk to arbitrate) or a child's \"inbox:<cellId>\"; \"human\" (the owner must do, decide or answer something — after you raised a card, recorded a human action, or asked the owner a concrete question); \"external\" (an outside event — only with a watch, background job, or reminder/schedule set).",
-      "timeoutMinutes wakes you if nothing came by then. Without waitingFor it simply ends the run (a job, a reminder or a reply you already arranged will wake you).",
+      "Register an explicit wait so the board records who has the ball until that party answers (unrelated wake-ups leave it open): \"inbox:desk\" or your parent's \"inbox:<cellId>\" after asking it a question or arbitration; \"human\" after asking the owner a plain-text question or recording a human action; \"external\" on a checker waiting on a schedule or watch.",
+      "timeoutMinutes wakes you if nothing came by then. Never call wait to end an ordinary turn, or to wait for your own dispatched children or job_start — those wake you automatically; simply finish your turn.",
     ].join(" "),
     input: z.object({
       reason: z.string().min(1).describe("what you are waiting for, in one line"),
       waitId: z.string().trim().min(1).optional(),
       refId: z.string().trim().min(1).optional(),
-      waitingFor: z.string().min(1).optional().describe('"inbox:<cellId>", "human", or "external"'),
+      waitingFor: z.string().min(1).describe('"inbox:<cellId>", "human", or "external"'),
       timeoutMinutes: z.number().positive().max(60 * 24 * 30).optional(),
     }),
     async handler(args, ctx) {
-      if (args.waitingFor === undefined) {
-        if (args.timeoutMinutes !== undefined || args.waitId || args.refId) return { output: "timeoutMinutes needs waitingFor (who are you waiting for?). For a plain reminder use the schedule tools.", isError: true };
-        return { output: "Waiting.", endRun: "yielded_waiting" };
+      if (!args.waitingFor) {
+        return {
+          output: 'wait requires waitingFor ("inbox:<cellId>", "human", or "external"). To end a normal turn — or after dispatch or job_start — simply stop without calling wait.',
+          isError: true,
+        };
       }
       const register = ctx.ports.registerWait;
-      if (!register) return { output: "Waiting.", endRun: "yielded_waiting" };
+      if (!register) return { output: `Waiting for ${args.waitingFor}.`, awaitsWakeup: true, data: { waitingFor: args.waitingFor } };
       const timeoutAt = args.timeoutMinutes !== undefined ? ctx.clock.now() + Math.round(args.timeoutMinutes * 60_000) : undefined;
       await register.call(ctx.ports, { waitingFor: args.waitingFor, reason: args.reason, ...(args.waitId ? { waitId: args.waitId } : {}), ...(args.refId ? { refId: args.refId } : {}), ...(timeoutAt !== undefined ? { timeoutAt } : {}) });
       return {
-        output: `Waiting for ${args.waitingFor}${timeoutAt !== undefined ? ` (you are woken at ${new Date(timeoutAt).toISOString()} if nothing came)` : ""}. This run ends now.`,
-        endRun: "yielded_waiting",
+        output: `Registered wait for ${args.waitingFor}${timeoutAt !== undefined ? ` (timeout at ${new Date(timeoutAt).toISOString()})` : ""}.`,
+        awaitsWakeup: true,
         data: { waitingFor: args.waitingFor, ...(timeoutAt !== undefined ? { timeoutAt } : {}) },
       };
     },
@@ -569,7 +570,7 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
       const settle = ctx.ports.settleSelf;
       if (!settle) return { output: "This environment cannot close a cell from inside.", isError: true };
       await settle.call(ctx.ports, { action: args.cancelled ? "cancel" : "complete", summary: args.summary, ...(args.closeChildren ? { force: true } : {}) });
-      const status: CellStatusLine = { text: args.summary.split("\n")[0]!.slice(0, 200), at: ctx.clock.now() };
+      const status: CellStatusLine = { text: clipLine(args.summary, 200), at: ctx.clock.now() };
       await ctx.ports.context.commit(selfId(ctx), { statePatches: { [CELL_STATUS_KEY]: status } });
       return { output: "Closing after this run. Stop here.", endRun: "completed", data: { action: args.cancelled ? "cancel" : "complete" } };
     },
@@ -590,7 +591,7 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
       const settle = ctx.ports.settleSelf;
       if (!settle) return { output: "This environment cannot park a cell from inside.", isError: true };
       await settle.call(ctx.ports, { action: "pause", pauseReason: "parked", summary: args.reason, ...(args.closeChildren ? { force: true } : {}) });
-      const status: CellStatusLine = { text: `已停靠：${args.reason}`.slice(0, 200), at: ctx.clock.now() };
+      const status: CellStatusLine = { text: clipLine(`已停靠：${args.reason}`, 200), at: ctx.clock.now() };
       await ctx.ports.context.commit(selfId(ctx), { statePatches: { [CELL_STATUS_KEY]: status } });
       return { output: "Parked after this run. Stop here.", endRun: "completed", data: { action: "pause" } };
     },

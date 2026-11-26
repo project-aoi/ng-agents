@@ -276,12 +276,12 @@ describe("llm run", () => {
     expect(ev && ev.kind === "tool_result" && ev.output.length).toBe(10_000);
   });
 
-  it("ends yielded_waiting after wait, and after starting a job even if the model then finishes", async () => {
+  it("ends yielded_waiting after wait (without forcing endRun), and after starting a job even if the model then finishes", async () => {
     const registry = makeRegistry();
-    const w = createFakeRun({ spec: llm(["kernel.comms"]), batch: ["nothing to do"] });
-    const waiting = new ScriptedModelClient([call("wait", { reason: "no action needed" }), say("never")]);
+    const w = createFakeRun({ spec: llm(["kernel.comms"]), batch: ["ask desk"] });
+    const waiting = new ScriptedModelClient([call("wait", { reason: "等 desk 答复", waitingFor: "inbox:desk" }), say("Waiting for desk.")]);
     expect(await createScriptedLoop({ model: waiting, registry }).run(w.snapshot, w.ports, w.controller.signal)).toBe("yielded_waiting");
-    expect(waiting.calls).toHaveLength(1);
+    expect(waiting.calls).toHaveLength(2);
 
     // job_start (a bash-kind tool) is offered to any cell whose bounds allow bash
     const j = createFakeRun({ spec: llm(["workspace"]), batch: ["run the tests"] });

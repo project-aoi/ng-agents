@@ -130,7 +130,7 @@ export function createCheckProbe(cfg: PresetsConfig): CodeProcessor {
       const now = clock.now();
       const when = formatWhen(now, cfg.timeZone);
       const n = prev.checks + 1;
-      const cmd = `\`${clip(a.command, 300)}\``;
+      const label = ports.self.spec.title ? `「${ports.self.spec.title}」` : "检查项";
       const facts = { command: a.command, until: a.until, checks: n, at: now, output: clip(check.output, 4_000) };
       await ports.context.appendEvidence(self, {
         kind: "system_note",
@@ -145,17 +145,17 @@ export function createCheckProbe(cfg: PresetsConfig): CodeProcessor {
         st = { v: 1, checks: n, cannotRun: 0, last: check.output, lastExit: check.exitCode, lastAt: now };
         if (a.until === "exit_zero" && check.exitCode === 0) {
           const out = check.output ? `输出：${clip(check.output, 800)}` : "没有输出。";
-          return report("completed", `条件已满足：${cmd} 在 ${when} 返回 0（第 ${n} 次检查）。${out}`, st, { ...facts, exitCode: 0, outcome: "holds" }, `已满足 · 第 ${n} 次检查 · ${when}`);
+          return report("completed", `条件已满足：${label}在 ${when} 返回 0（第 ${n} 次检查）。${out}`, st, { ...facts, exitCode: 0, outcome: "holds" }, `已满足 · 第 ${n} 次检查 · ${when}`);
         }
         if (a.until === "output_changes" && changed) {
-          const summary = `输出变了：${cmd} 在 ${when}（第 ${n} 次检查）的输出与上一次不同。\n之前：${clip(prev.last || "（空）", 400)}\n现在：${clip(check.output || "（空）", 800)}`;
+          const summary = `输出变了：${label}在 ${when}（第 ${n} 次检查）的输出与上一次不同。\n之前：${clip(prev.last || "（空）", 400)}\n现在：${clip(check.output || "（空）", 800)}`;
           return report("completed", summary, st, { ...facts, exitCode: check.exitCode, previous: clip(prev.last ?? "", 2_000), outcome: "changed" }, `输出已变化 · 第 ${n} 次检查 · ${when}`);
         }
       } else {
         st = { ...prev, v: 1, checks: n, cannotRun: prev.cannotRun + 1, lastAt: now };
         if (st.cannotRun >= 2) {
           const out = check.output ? `输出：${clip(check.output, 800)}` : "";
-          return report("failed", `检查命令连续 ${st.cannotRun} 次没能运行，已停止监听：${cmd}（${check.why}，${when}）。${out}`, st, { ...facts, reason: check.why, outcome: "cannot_run" }, `检查命令没能运行 · 已停止 · ${when}`);
+          return report("failed", `检查命令连续 ${st.cannotRun} 次没能运行，已停止监听：${label}（${check.why}，${when}）。${out}`, st, { ...facts, reason: check.why, outcome: "cannot_run" }, `检查命令没能运行 · 已停止 · ${when}`);
         }
       }
 
@@ -164,7 +164,7 @@ export function createCheckProbe(cfg: PresetsConfig): CodeProcessor {
         const out = check.output ? `，输出：${clip(check.output, 400)}` : "";
         return report(
           "failed",
-          `到期仍未满足，已停止监听：${cmd} 检查了 ${n} 次，截止时间 ${formatWhen(a.deadlineAt, cfg.timeZone)} 已过；${last}${out}。`,
+          `到期仍未满足，已停止监听：${label}检查了 ${n} 次，截止时间 ${formatWhen(a.deadlineAt, cfg.timeZone)} 已过；${last}${out}。`,
           st,
           { ...facts, ...(check.ran ? { exitCode: check.exitCode } : { reason: check.why }), deadlineAt: a.deadlineAt, outcome: "deadline" },
           `到期未满足 · 已停止 · ${when}`,

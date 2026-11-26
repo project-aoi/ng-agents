@@ -250,20 +250,24 @@ describe.each(ENGINES)("CLI loop with a fake %s", (engine) => {
   });
 
   it("ends the Run when a kernel tool says so, refuses later calls and stops the CLI", async () => {
+    const gateCall = {
+      mcp: "request_approval",
+      args: { kind: "escalation", title: "确认", summary: "等确认", escalation: { reason: "blocked", explanation: "需要确认" } },
+    };
     const s = setup(engine, [
       {
         actions: [
-          { mcp: "wait", args: { reason: "nothing to do" } },
+          gateCall,
           { mcp: "set_state", args: { patches: { late: true } } },
           { sleep: 30_000 },
         ],
       },
-    ]);
+    ], { endRunGraceMs: 1_000 });
     const r = s.run();
     await recordBatch(r);
     const cursor = watchCursor(r);
     const t0 = Date.now();
-    expect(await runOf(s, r)).toBe("yielded_waiting");
+    expect(await runOf(s, r)).toBe("deferred_for_approval");
     expect(cursor.at(-1)).toBe(1);
     expect(Date.now() - t0).toBeLessThan(8_000);
     expect(r.ports.state.has("late")).toBe(false);
@@ -470,10 +474,14 @@ describe.each(ENGINES)("CLI loop with a fake %s", (engine) => {
 
   // Audit 2026-11-23 E09: the kernel asked for one closing sentence and then threw it away — the desk's "方案已提交，
   // 等你确认" never reached the owner.
+  const endGate = {
+    mcp: "request_approval",
+    args: { kind: "escalation", title: "确认", summary: "等主人确认", escalation: { reason: "blocked", explanation: "需要确认" } },
+  };
   it("keeps what the model says after the tool that ended the run", async () => {
-    const s = setup(engine, [{ actions: [{ mcp: "wait", args: { reason: "等主人确认", waitingFor: "human" } }, { text: "方案已提交到待我处理，等你确认后开始。" }] }]);
+    const s = setup(engine, [{ actions: [endGate, { text: "方案已提交到待我处理，等你确认后开始。" }] }]);
     const r = s.run();
-    expect(await runOf(s, r)).toBe("yielded_waiting");
+    expect(await runOf(s, r)).toBe("deferred_for_approval");
     expect(r.ports.log.evidence.filter((e) => e.kind === "assistant_text").map((e) => e.text)).toEqual(["方案已提交到待我处理，等你确认后开始。"]);
   });
 
@@ -488,9 +496,9 @@ describe.each(ENGINES)("CLI loop with a fake %s", (engine) => {
       ["OK，方案已提交到待我处理。", true],
     ];
     for (const [closing, kept] of closings) {
-      const s = setup(engine, [{ actions: [{ mcp: "wait", args: { reason: "等主人确认", waitingFor: "human" } }, { text: closing }] }]);
+      const s = setup(engine, [{ actions: [endGate, { text: closing }] }]);
       const r = s.run();
-      expect(await runOf(s, r)).toBe("yielded_waiting");
+      expect(await runOf(s, r)).toBe("deferred_for_approval");
       const said = r.ports.log.evidence.filter((e) => e.kind === "assistant_text").map((e) => e.text);
       expect(said, closing).toEqual(kept ? [closing] : []);
       // What the model read in the result of the tool that ended its run.
@@ -500,73 +508,120 @@ describe.each(ENGINES)("CLI loop with a fake %s", (engine) => {
     }
   });
 
-  // Live rerun (uc23, uc06): a project woken by a worker's result said what it did, called wait from a script that
-  // swallowed the tool result (so it never read the request to keep quiet), and then wrote the same account again —
+  // Live rerun (uc23, uc06): a project woken by a worker's result said what it did, called an endRun tool from a script
+  // that swallowed the tool result (so it never read the request to keep quiet), and then wrote the same account again —
   // on the record the owner reads, every turn. Words after the end are an answer only when a person is being
   // answered, or when they are the only thing the turn said.
   it("keeps closing words for a person or when nothing was said before; drops a recap in a turn nobody is talking in", async () => {
     const fromWorker = () => createEnvelope({ id: "res_1", from: "inbox:w1", to: "inbox:cell_1", principalId: "cell:w1", kind: "result", type: "cell.result",
       payload: { childCellId: "w1", status: "completed", summary: "改好了", childState: "dormant" } });
-    const turn = [{ actions: [{ text: "分身交付了，我去通知主人并等验收。" }, { mcp: "wait", args: { reason: "等主人验收", waitingFor: "human" } }, { text: "已通知主人，现在等待验收：改动在 feat/x。" }] }];
+    const turn = [{ actions: [{ text: "分身交付了，我去通知主人并等验收。" }, endGate, { text: "已通知主人，现在等待验收：改动在 feat/x。" }] }];
     const said = (r: ReturnType<ReturnType<typeof setup>["run"]>) => r.ports.log.evidence.filter((e) => e.kind === "assistant_text").map((e) => e.text);
 
     // Woken by a cell: the recap after the end is not kept.
     const quiet = setup(engine, turn);
     const r1 = quiet.run({ batch: [fromWorker()] });
-    expect(await runOf(quiet, r1)).toBe("yielded_waiting");
+    expect(await runOf(quiet, r1)).toBe("deferred_for_approval");
     expect(said(r1)).toEqual(["分身交付了，我去通知主人并等验收。"]);
 
     // The same turn in answer to the owner: what it says after the end is their answer.
     const chat = setup(engine, turn);
     const r2 = chat.run({ batch: ["验收前先说说现在到哪了"] });
-    expect(await runOf(chat, r2)).toBe("yielded_waiting");
+    expect(await runOf(chat, r2)).toBe("deferred_for_approval");
     expect(said(r2)).toEqual(["分身交付了，我去通知主人并等验收。", "已通知主人，现在等待验收：改动在 feat/x。"]);
 
     // Woken by a cell and silent until the end: the closing words are all there is, and they are kept.
-    const only = setup(engine, [{ actions: [{ mcp: "wait", args: { reason: "等主人验收", waitingFor: "human" } }, { text: "已通知主人，等验收。" }] }]);
+    const only = setup(engine, [{ actions: [endGate, { text: "已通知主人，等验收。" }] }]);
     const r3 = only.run({ batch: [fromWorker()] });
-    expect(await runOf(only, r3)).toBe("yielded_waiting");
+    expect(await runOf(only, r3)).toBe("deferred_for_approval");
     expect(said(r3)).toEqual(["已通知主人，等验收。"]);
   });
 
-  // Live rerun round 7 (uc73): the desk asked its question, called wait, and said the question again as its closing
+  // Live rerun round 7 (uc73): the desk asked its question, ended the run, and said the question again as its closing
   // words — both were on its record and both went to the owner's agent.
   it("does not record closing words that only repeat what the turn already said, also when a person is listening", async () => {
     const said = (r: ReturnType<ReturnType<typeof setup>["run"]>) => r.ports.log.evidence.filter((e) => e.kind === "assistant_text").map((e) => e.text);
-    const asked = setup(engine, [{ actions: [{ text: "这份手册要针对 harness-a、harness-b，还是两者都包括？" }, { mcp: "wait", args: { reason: "等主人确认范围", waitingFor: "human" } }, { text: "这份手册要针对 harness-a、harness-b,还是两者都包括?" }] }]);
+    const asked = setup(engine, [{ actions: [{ text: "这份手册要针对 harness-a、harness-b，还是两者都包括？" }, endGate, { text: "这份手册要针对 harness-a、harness-b,还是两者都包括?" }] }]);
     const r1 = asked.run({ batch: ["先出方案：写一份权限上线手册"] });
-    expect(await runOf(asked, r1)).toBe("yielded_waiting");
+    expect(await runOf(asked, r1)).toBe("deferred_for_approval");
     expect(said(r1)).toEqual(["这份手册要针对 harness-a、harness-b，还是两者都包括？"]);
 
     // New words after it are kept.
-    const added = setup(engine, [{ actions: [{ text: "已交给分身。" }, { mcp: "wait", args: { reason: "等结果", waitingFor: "external" } }, { text: "大约十分钟有结果。" }] }]);
+    const added = setup(engine, [{ actions: [{ text: "已交给分身。" }, endGate, { text: "大约十分钟有结果。" }] }]);
     const r2 = added.run({ batch: ["手册进展如何"] });
-    expect(await runOf(added, r2)).toBe("yielded_waiting");
+    expect(await runOf(added, r2)).toBe("deferred_for_approval");
     expect(said(r2)).toEqual(["已交给分身。", "大约十分钟有结果。"]);
   });
 
-  // Live round 11 (uc02): woken by a worker's result, the project sent the owner a notice, waited, and said it again — in
+  // Live round 11 (uc02): woken by a worker's result, the project sent the owner a notice, ended, and said it again — in
   // every turn. What a tool reports as sent (ToolResult.sent) counts as said.
   it("what the turn sent counts as said: a recap of it is not recorded, unless a person is still waiting for an answer", async () => {
     const said = (r: ReturnType<ReturnType<typeof setup>["run"]>) => r.ports.log.evidence.filter((e) => e.kind === "assistant_text").map((e) => e.text);
     const result = () => createEnvelope({ id: "res_1", from: "inbox:w1", to: "inbox:cell_1", principalId: "cell:w1", kind: "result", type: "cell.result",
       payload: { childCellId: "w1", status: "completed", summary: "改好了", childState: "dormant" } });
     const send = (to: string) => ({ mcp: "send_message", args: { to, text: "修复已提交 MR !1，main 没有改动。", summary: "交付" } });
-    const wait = { mcp: "wait", args: { reason: "等验收", waitingFor: "human" } };
     const closing = { text: "修复已提交，等待验收和维护者合并。" };
     const outcome = async (actions: object[], batch: Array<string | Envelope>) => {
       const s = setup(engine, [{ actions: actions as never }]);
       const r = s.run({ batch });
-      expect(await runOf(s, r)).toBe("yielded_waiting");
+      expect(await runOf(s, r)).toBe("deferred_for_approval");
       return said(r);
     };
     // Nobody is talking: whatever was sent, to the owner or to a cell, the closing words recap it.
-    expect(await outcome([send("channel:ui:owner"), wait, closing], [result()])).toEqual([]);
-    expect(await outcome([send("inbox:w1"), wait, closing], [result()])).toEqual([]);
+    expect(await outcome([send("channel:ui:owner"), endGate, closing], [result()])).toEqual([]);
+    expect(await outcome([send("inbox:w1"), endGate, closing], [result()])).toEqual([]);
     // A person spoke and was answered by the notice: the same.
-    expect(await outcome([send("channel:ui:owner"), wait, closing], ["现在到哪了"])).toEqual([]);
+    expect(await outcome([send("channel:ui:owner"), endGate, closing], ["现在到哪了"])).toEqual([]);
     // A person spoke and only a worker was written to: these words are their answer.
-    expect(await outcome([send("inbox:w1"), wait, closing], ["现在到哪了"])).toEqual([closing.text]);
+    expect(await outcome([send("inbox:w1"), endGate, closing], ["现在到哪了"])).toEqual([closing.text]);
+  });
+
+  // Audit 2026-11-26 B2: wait is a pure state registration (no RUN_ENDED_NOTICE, no 10s interrupt), and normal text
+  // without endRun deduplicates exact repeats of send_message text.
+  it("B2: wait registers state without RUN_ENDED_NOTICE or grace kill, and normal text deduplicates send_message echo", async () => {
+    const s = setup(engine, [
+      {
+        actions: [
+          { mcp: "send_message", args: { to: "channel:ui:owner", text: "一阶段已完成，请确认范围。", summary: "确认范围" } },
+          { mcp: "wait", args: { reason: "等主人答复", waitingFor: "human" } },
+          { sleep: 250 },
+          { text: "一阶段已完成,请确认范围!" },
+        ],
+      },
+    ], { endRunGraceMs: 80 });
+    const r = s.run();
+    expect(await runOf(s, r)).toBe("yielded_waiting");
+    const mcpResults = s.fake.log().filter((e) => e.type === "mcp_result").map((e) => String(e["text"]));
+    expect(mcpResults.some((t) => t.includes(RUN_ENDED_NOTICE))).toBe(false);
+    const said = r.ports.log.evidence.filter((e) => e.kind === "assistant_text").map((e) => e.text);
+    expect(said).toEqual([]);
+  });
+
+  // Audit 2026-11-26 A3: cold fresh rebuild omits [original task] when history already carries it or cell.task,
+  // while keeping an updated [project goal] anchor.
+  it("A3: cold fresh session deduplicates [original task] already in history while keeping updated [project goal]", async () => {
+    const s = setup(engine, [{ actions: [{ text: "cold1" }] }, { actions: [{ text: "cold2" }] }]);
+    const orig = "[original task] (as first given — later messages may have changed it) parent=desk build v1";
+    const r1 = s.run({
+      runId: "cold_1",
+      history: [{ role: "user", content: [{ type: "text", text: `[summary]\n${orig}` }] }],
+      tailNotes: [orig],
+      batch: ["continue"],
+    });
+    r1.snapshot.tail.originalTask = orig;
+    expect(await runOf(s, r1)).toBe("completed");
+    expect(s.fake.prompts()[0]!.split(orig).length - 1).toBe(1);
+
+    const updatedGoal = '[project goal] (current — updated since initial task) parent=desk title="v2" outcome="ship v2"';
+    const r2 = s.run({
+      runId: "cold_2",
+      history: [{ role: "user", content: [{ type: "text", text: "[cell.task · from inbox:desk · principal owner · at 2026-11-26T00:00:00.000Z]\nbuild v1" }] }],
+      tailNotes: [updatedGoal],
+      batch: ["continue v2"],
+    });
+    r2.snapshot.tail.originalTask = updatedGoal;
+    expect(await runOf(s, r2)).toBe("completed");
+    expect(s.fake.prompts()[1]).toContain(updatedGoal);
   });
 
   // Audit 2026-11-23 E33: a kernel killed in the middle of a cell's first turn lost the CLI session (it was put on
@@ -732,14 +787,14 @@ describe("CLI loop errors", () => {
 
   it("confirms a waiting tool's input when stdout reports the new session after its MCP result", async () => {
     const s = setup("claude", [{actions:[
-      {mcp:"wait", args:{reason:"nothing left"}},
+      {mcp:"request_approval", args:{kind:"escalation", title:"确认", summary:"确认", escalation:{reason:"blocked", explanation:"等确认"}}},
       {sleep:10_000},
     ]}], {endRunGraceMs:300});
     s.fake.env["FAKECLI_DELAY_INIT"] = "1";
     const r = s.run();
     await recordBatch(r);
     const confirmed = watchCursor(r);
-    expect(await runOf(s,r)).toBe("yielded_waiting");
+    expect(await runOf(s,r)).toBe("deferred_for_approval");
     expect(confirmed).toEqual([1]);
     expect(r.ports.state.get(CLI_SESSION_KEY)).toMatchObject({engine:"claude"});
   });
@@ -777,23 +832,28 @@ describe("CLI loop errors", () => {
 
   it.each(["claude", "agy"] as const)("%s requeues an unconfirmed live steer and delivers it once on resume", async engine => {
     const hold = join(tempDir("cancelled-turn"), "release");
-    const turns: FakeCliTurn[] = [{acknowledgeCancelDuringTool: true, actions:[{mcp:"wait",args:{reason:"waiting for input", waitingFor:"human"}}]}];
+    const gateArgs = {kind:"escalation", title:"确认", summary:"waiting for input", escalation:{reason:"blocked", explanation:"waiting"}};
+    const turns: FakeCliTurn[] = [{acknowledgeCancelDuringTool: true, actions:[{mcp:"request_approval",args:gateArgs}]}];
     if (engine === "agy") turns.push({actions: [{waitFile: hold}]});
     turns.push({actions: [{text: "continued"}]});
     const s = setup(engine, turns, {endRunGraceMs:100});
     const first = s.run();
     await recordBatch(first);
     const cursor = watchCursor(first);
-    let releaseWait!: () => void;
-    const waitBarrier = new Promise<void>(resolve => { releaseWait = resolve; });
-    first.ports.registerWait = () => waitBarrier;
+    let releaseAuth!: () => void;
+    const authBarrier = new Promise<void>(resolve => { releaseAuth = resolve; });
+    const origAuthorize = first.ports.authorize.bind(first.ports);
+    first.ports.authorize = async (action, opts) => {
+      await authBarrier;
+      return origAuthorize(action, opts);
+    };
     const outcome = runOf(s,first);
-    await waitFor(() => first.ports.log.evidence.some(e => e.kind === "tool_call" && e.name === "wait"), "wait tool entered");
+    await waitFor(() => first.ports.log.evidence.some(e => e.kind === "tool_call" && e.name === "request_approval"), "request_approval tool entered");
     first.ports.pushSteer("review the red folder");
-    await waitFor(() => first.ports.log.evidence.some(e => e.kind === "system_note" && e.envelopeId === "steer_1"), "steer written during wait");
+    await waitFor(() => first.ports.log.evidence.some(e => e.kind === "system_note" && e.envelopeId === "steer_1"), "steer written during tool");
     if (engine === "agy") await waitFor(() => s.fake.log().some(e => e.type === "waiting_file" && e.path === hold), "steer started its next turn");
-    releaseWait();
-    expect(await outcome).toBe("yielded_waiting");
+    releaseAuth();
+    expect(await outcome).toBe("deferred_for_approval");
     expect(first.ports.log.requeued.flatMap(r=>r.envelopeIds)).toEqual(["steer_1"]);
     expect(cursor.at(-1)).toBe(1);
     const history = first.ports.listEvidence!({});
@@ -807,5 +867,54 @@ describe("CLI loop errors", () => {
     expect(await runOf(s,next)).toBe("completed");
     expect(launches(s).at(-1)?.session?.mode).toBe("resume");
     expect(s.fake.prompts().at(-1)?.match(/review the red folder/g)).toHaveLength(1);
+  });
+
+  // Audit 2026-11-26 B3: active runs reset the idle watchdog; progressed runs that stall idle return "timeout" continuation.
+  it("B3: resets idle timeout on active tool progress, and returns 'timeout' continuation when stalling after progress", async () => {
+    const active = setup("codex", [
+      {
+        actions: [
+          { sleep: 250 },
+          { mcp: "set_state", args: { patches: { a: 1 } } },
+          { sleep: 250 },
+          { mcp: "set_state", args: { patches: { b: 2 } } },
+          { sleep: 250 },
+          { text: "finished active work" },
+        ],
+      },
+    ], { runTimeoutMs: 450 });
+    const rActive = active.run();
+    expect(await runOf(active, rActive)).toBe("completed");
+    expect(rActive.ports.state.get("b")).toBe(2);
+
+    const stalled = setup("codex", [
+      {
+        actions: [
+          { mcp: "set_state", args: { patches: { step: 1 } } },
+          { sleep: 5_000 },
+        ],
+      },
+    ], { runTimeoutMs: 400 });
+    const rStalled = stalled.run();
+    rStalled.ports.pushSteer("initial correction already in prompt");
+    await recordBatch(rStalled);
+    const cursor = watchCursor(rStalled);
+    expect(await runOf(stalled, rStalled)).toBe("timeout");
+    expect(cursor.at(-1)).toBeGreaterThanOrEqual(1);
+    expect(rStalled.ports.log.requeued).toEqual([]);
+    expect(rStalled.ports.log.evidence.some((e) => e.kind === "system_note" && e.text.includes("(idle timeout); the kernel wakes you to continue"))).toBe(true);
+
+    // B2 edge guard: when a person is waiting in chat and send_message only went to an internal inbox, keep the owner's first reply even if worded identically.
+    const internalAndChat = setup("codex", [
+      {
+        actions: [
+          { mcp: "send_message", args: { to: "inbox:w1", text: "已暂停构建", summary: "暂停" } },
+          { text: "已暂停构建" },
+        ],
+      },
+    ]);
+    const rChat = internalAndChat.run({ batch: ["先暂停构建"] });
+    expect(await runOf(internalAndChat, rChat)).toBe("completed");
+    expect(rChat.ports.log.evidence.filter((e) => e.kind === "assistant_text").map((e) => e.text)).toEqual(["已暂停构建"]);
   });
 });

@@ -100,6 +100,13 @@ export class WorkspaceStore {
     return this.getWorkspace(w.cellId)!;
   }
 
+  closeWorkspace(cellId: string): void {
+    run(this.db, "UPDATE workspaces SET status = 'closed', updated_at = ? WHERE cell_id = ? AND status != 'closed'", [
+      this.clock.now(),
+      cellId,
+    ]);
+  }
+
   getJob(jobId: string): JobRecord | undefined {
     const r = get<JobRow>(this.db, "SELECT * FROM jobs WHERE job_id = ?", [jobId]);
     return r ? toJob(r) : undefined;

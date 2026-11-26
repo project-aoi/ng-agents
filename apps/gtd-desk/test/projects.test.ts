@@ -71,7 +71,7 @@ describe("closing and the directory", () => {
     mkdirSync(join(repo, "src"));
     writeFileSync(join(repo, "src", "a.ts"), "export const a = 1;\n");
     d.script.add("project", tool("dispatch", { title: "改 a.ts", instruction: "把 a 改成 2" }));
-    d.script.add("worker", tool("wait", { reason: "等 CI" }));
+    d.script.add("worker", {});
     const { projectId } = startProjectSync(d.kernel, { title: "改 a", outcome: "a = 2", brief: "改 a", cwd: repo }, { principalId: d.kernel.ownerPrincipal });
     await d.kernel.idle();
     const human = d.kernel.humanItems.create({ title: "看改动", subjectKey: "project-review", category: "action", options: [{ id: "done", label: "看过了", effect: "reply" }] }, projectId);

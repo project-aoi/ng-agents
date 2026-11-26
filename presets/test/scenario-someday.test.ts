@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { PAYLOAD } from "@ng/protocol";
-import { boot, childrenOf, cleanupAll, lastToolResult, projects, requestText, tool } from "./helpers";
+import { boot, childrenOf, cleanupAll, continuesRun, lastToolResult, projects, requestText, tool } from "./helpers";
 
 afterEach(cleanupAll);
 
@@ -12,7 +12,7 @@ describe("docs/05 scenario 5 — an idea for later: research, park, bring it bac
     h.script.add(
       "desk",
       tool("start_project", { title: "极简模式", outcome: "弄清极简模式该做成什么样", brief: "用户在意 Token 消耗，想做个极简模式，先随手记一下。", mode: "research_then_park" }),
-      tool("wait", { reason: "noted" }),
+      {},
     );
     h.script.add(
       "project",
@@ -57,7 +57,7 @@ describe("docs/05 scenario 5 — an idea for later: research, park, bring it bac
       },
       (req) => {
         expect(lastToolResult(req)).toContain(`Resumed ${project}`);
-        return tool("wait", { reason: "resumed" });
+        return {};
       },
     );
     let phase2 = "";
@@ -106,7 +106,7 @@ describe("docs/05 scenario 5 — an idea for later: research, park, bring it bac
       },
       {},
     );
-    h.script.setDefault("worker", () => tool("wait", { reason: "working", waitingFor: "inbox:desk" }));
+    h.script.setDefault("worker", (req) => (continuesRun(req) ? {} : tool("wait", { reason: "working", waitingFor: "inbox:desk" })));
     const decision = h.kernel.humanItems.get(card!.actionId)!;
     expect(await h.kernel.humanItems.decide(decision.id, { optionId: "system.reply", seenItemRevision: decision.itemRevision }, "owner")).toMatchObject({ status: "resolved" });
     await h.kernel.idle();

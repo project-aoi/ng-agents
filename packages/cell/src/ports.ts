@@ -156,7 +156,17 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
       return port.startJob(spec);
     },
     async observeJob(jobId) {
-      return (await acquire()).observeJob(jobId);
+      const job = core.workspace.getJobSync(jobId);
+      if (!job) throw new NgError("not_found", `job "${jobId}" not found`);
+      if (job.cellId !== cellId && !isDescendant(job.cellId)) {
+        const projectRootOf = (id: string) => [cells.get(id), ...cells.ancestors(id)].find((c) => c && isProjectRoot(core.registry, c))?.id ?? null;
+        const myProj = projectRootOf(cellId);
+        const ownerProj = projectRootOf(job.cellId);
+        if (!myProj || myProj !== ownerProj) {
+          throw new NgError("bounds_violation", `job "${jobId}" belongs to cell "${job.cellId}" outside your project; job_observe is only allowed within the same project`);
+        }
+      }
+      return core.workspace.observeJobSync(jobId)!;
     },
     async writeJobInput(jobId, input) {
       assertLive("job_input");

@@ -82,7 +82,7 @@ describe("kernel.comms send_message", () => {
     const ok = await invoke(run, "send_message", { to: "inbox:w1", text: "顺便把单测也补上", summary: "追加要求" });
     expect(ok).toMatchObject({
       output:
-        'Delivered to w1. It handles the message in its current run, or is woken with it (a dormant worker continues with everything it knows); if you need its answer, end your turn with wait (waitingFor "inbox:w1").',
+        "Delivered to w1. It handles the message in its current run, or is woken with it (a dormant worker continues with everything it knows).",
     });
     expect(ok.isError).toBeUndefined();
     expect(run.ports.log.cellMessages[0]).toEqual({
@@ -436,12 +436,13 @@ describe("kernel.comms request_approval / report_to_parent / handback / wait", (
     expect(tool("pause_self").description).toContain("closeChildren: true");
   });
 
-  it("wait ends the run as yielded_waiting, recording who it waits for when told", async () => {
+  it("wait requires waitingFor and registers an explicit wait with awaitsWakeup (no forced endRun)", async () => {
     const run = fakeRun();
-    expect(await invoke(run, "wait", { reason: "nothing new" })).toMatchObject({ endRun: "yielded_waiting" });
+    expect((await invoke(run, "wait", { reason: "nothing new" })).isError).toBe(true);
     expect(run.ports.log.waits).toEqual([]);
     const r = await invoke(run, "wait", { reason: "desk 裁决脏改动", waitingFor: "inbox:desk", timeoutMinutes: 30 });
-    expect(r).toMatchObject({ endRun: "yielded_waiting", data: { waitingFor: "inbox:desk", timeoutAt: c.now() + 30 * 60_000 } });
+    expect(r).toMatchObject({ awaitsWakeup: true, data: { waitingFor: "inbox:desk", timeoutAt: c.now() + 30 * 60_000 } });
+    expect(r.endRun).toBeUndefined();
     expect(run.ports.log.waits).toEqual([{ waitingFor: "inbox:desk", reason: "desk 裁决脏改动", timeoutAt: c.now() + 30 * 60_000 }]);
     expect((await invoke(run, "wait", { reason: "x", timeoutMinutes: 5 })).isError).toBe(true); // a timeout needs a party
   });
@@ -645,7 +646,7 @@ describe("kernel.context", () => {
       expect(stale.output).toContain(`Version conflict: ${id} is at v2 (last edited by agent).`);
       expect(stale.output).toContain("patch with expectedVersion 2");
       expect(stale.output).toContain("另一个分身补的一段");
-      expect(stale.data).toEqual({ artifactId: id, currentVersion: 2, updatedBy: "agent" });
+      expect(stale.data).toMatchObject({ artifactId: id, currentVersion: 2, updatedBy: "agent", totalChars: expect.any(Number) });
       expect(run.ports.artifacts.get(id)!.version).toBe(2);
       expect(run.ports.log.parked).toEqual([]);
 

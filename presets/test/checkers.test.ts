@@ -29,6 +29,7 @@ describe("the default checker: a one-shot checker that watches on its own", () =
         return tool("update_cell", { watches: [{ thread: "memory:mr-5" }] });
       },
       tool("wait", { reason: "MR 还没合入", waitingFor: "external" }),
+      {},
       (req) => {
         expect(requestText(req)).toContain("merged");
         return tool("report_to_parent", { kind: "result", text: "MR !5 已合入" });
@@ -52,7 +53,7 @@ describe("the default checker: a one-shot checker that watches on its own", () =
 describe("a source filtered by a small model", () => {
   it("silent on noise, one hit on a real problem; it may run commands, in a directory of its own", async () => {
     const h = await boot();
-    h.script.add("desk", tool("add_source", { title: "支付反馈", description: "有人反馈付款失败、白屏或扣款异常才算", watchThread: "memory:pay-group" }), tool("wait", { reason: "ok" }));
+    h.script.add("desk", tool("add_source", { title: "支付反馈", description: "有人反馈付款失败、白屏或扣款异常才算", watchThread: "memory:pay-group" }), {});
     h.script.setDefault("sensor", (req) => {
       if (continuesRun(req)) return {};
       const text = lastUserText(req);
@@ -74,7 +75,7 @@ describe("a source filtered by a small model", () => {
     h.script.add("desk", (req) => {
       expect(requestText(req)).toContain("用户反馈重复扣款");
       return tool("archive_notification", { title: "重复扣款反馈（已转给支付组）" });
-    }, tool("wait", { reason: "ok" }));
+    }, {});
     await h.memory.inject({ from: "u2", text: "我昨天的订单被扣了两次款", threads: ["memory:pay-group"] });
     await h.kernel.idle();
     expect(h.source(sensor.id)).toMatchObject({ runCount: 2, hitCount: 1 });

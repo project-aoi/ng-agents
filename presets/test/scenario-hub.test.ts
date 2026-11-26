@@ -20,7 +20,7 @@ describe("docs/05 scenario 6 — a hub for direct review requests: batched, rout
         watch: { filter: { "payload.text": { $contains: "@bot" } } },
         coalesceMinutes: 2,
       }),
-      tool("wait", { reason: "hub added" }),
+      {},
     );
     const titleOf = (id: string) => h.kernel.getCell(id)?.title ?? "";
     const hubChild = (title: string) => childrenOf(h, hub()).find((id) => titleOf(id) === title)!;
@@ -62,7 +62,7 @@ describe("docs/05 scenario 6 — a hub for direct review requests: batched, rout
     h.script.setDefault("worker", (req, ctx) => {
       if (continuesRun(req)) return {};
       const title = titleOf(req.metadata!.cellId!);
-      if (title === "评审 MR !41") return ctx.lastUserText.includes("再看下锁") ? tool("report_to_parent", { kind: "result", text: "!41：并发与锁粒度均已评审，1 个建议项" }) : tool("wait", { reason: "评审中" });
+      if (title === "评审 MR !41") return ctx.lastUserText.includes("再看下锁") ? tool("report_to_parent", { kind: "result", text: "!41：并发与锁粒度均已评审，1 个建议项" }) : {};
       if (title === "评审 MR !38") {
         // Woken again for the author's follow-up: it continues on its own record (its first review is in front of it).
         if (!ctx.lastUserText.includes("改好了")) return tool("report_to_parent", { kind: "result", text: "!38 评审完成：2 个阻塞项" });
@@ -95,7 +95,7 @@ describe("docs/05 scenario 6 — a hub for direct review requests: batched, rout
       expect(requestText(req)).toContain("帮忙订会议室");
       expect(requestText(req)).toContain("不是代码评审的事");
       return tool("archive_notification", { title: "群里有人想订会议室" });
-    }, tool("wait", { reason: "ok" }));
+    }, {});
     h.clock.advance(2 * MIN);
     await h.kernel.idle();
 

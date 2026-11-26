@@ -12,8 +12,19 @@ export function sensorPreset(): PresetDef {
     // It may need commands for its check, in a directory of its own; it only looks (its prompt's red line).
     defaults: { processor: SENSOR_LLM_PROCESSOR, lifetime: "persistent", meta: { role: ROLES.sensor } },
     inheritCwd: false,
+    requestBounds: () => ({ maxDepth: 0 }),
     onCellCreated(cell, store, clock) {
-      store.commitSync(cell.id, { statePatches: { [gtdKeys.source]: newSource(sourceInit(cell.spec), clock.now()) } });
+      const init = sourceInit(cell.spec);
+      const now = clock.now();
+      store.commitSync(cell.id, { statePatches: { [gtdKeys.source]: newSource(init, now) } });
+      if (cell.spec.processor.kind === "llm" && init.description) {
+        store.appendEvidenceSync(cell.id, {
+          kind: "system_note",
+          runId: null,
+          at: now,
+          text: `[source setup] ${init.title}: ${init.description}`,
+        });
+      }
     },
   };
 }

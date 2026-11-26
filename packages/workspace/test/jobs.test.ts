@@ -74,7 +74,7 @@ describe("jobs", () => {
   it("observeJob shows the tail while running; writeJobInput feeds stdin", async () => {
     const h = harness();
     const port = await h.mgr.acquire("w1");
-    const { jobId } = await port.startJob({ command: "echo ready; read name; echo hello:$name" });
+    const { jobId } = await port.startJob({ command: "echo ready; read name; echo hello:$name", interactive: true });
     await waitFor(() => h.mgr.observeJobSync(jobId)?.tail.includes("ready"));
     expect((await port.observeJob(jobId)).state).toBe("running");
     await port.writeJobInput(jobId, "ng\n");
@@ -267,8 +267,8 @@ describe("jobs", () => {
     const p2 = await h.mgr.acquire("w2");
     const { jobId } = await p1.startJob({ command: "sleep 30" });
     await expect(p1.startJob({ command: "true" })).rejects.toSatisfy((e) => isNgError(e, "conflict"));
-    await expect(p2.observeJob(jobId)).rejects.toSatisfy((e) => isNgError(e, "not_found"));
-    await expect(p2.cancelJob(jobId)).rejects.toSatisfy((e) => isNgError(e, "not_found"));
+    await expect(p2.observeJob(jobId)).rejects.toSatisfy((e) => isNgError(e, "bounds_violation"));
+    await expect(p2.cancelJob(jobId)).rejects.toSatisfy((e) => isNgError(e, "bounds_violation"));
     await p1.cancelJob(jobId);
     h.cells.setStatus("w2", "closed");
     await expect(p2.startJob({ command: "true" })).rejects.toSatisfy((e) => isNgError(e, "conflict"));

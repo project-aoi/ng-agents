@@ -31,7 +31,7 @@ describe("docs/05 scenario 4 — several workers blocked by the same CI failure:
       if (continuesRun(req)) return {};
       const n = steps.get(self) ?? 0;
       steps.set(self, n + 1);
-      if (h.kernel.getCell(self)?.parentId === "desk") return n === 0 ? tool("wait", { reason: "修复中" }) : tool("report_to_parent", { kind: "result", text: "develop 的 lint 已修复（MR !77 已合入）" });
+      if (h.kernel.getCell(self)?.parentId === "desk") return n === 0 ? {} : tool("report_to_parent", { kind: "result", text: "develop 的 lint 已修复（MR !77 已合入）" });
       if (n === 0) {
         return {
           toolCalls: [
@@ -61,7 +61,7 @@ describe("docs/05 scenario 4 — several workers blocked by the same CI failure:
       },
       (req) => {
         fixers.push(/cell id (\S+)\. It starts now; you are woken when its turn is over\./.exec(lastToolResult(req))![1]!);
-        return tool("wait", { reason: "修复中" });
+        return {};
       },
     );
     const p1 = startProjectSync(h.kernel, { title: "服务一的 feature", outcome: "feature 上线", brief: "实现 feature", cwd: repo1 }, { principalId: h.kernel.ownerPrincipal }).projectId;
@@ -79,7 +79,7 @@ describe("docs/05 scenario 4 — several workers blocked by the same CI failure:
         expect(requestText(req)).toContain("工作区冲突/公共受阻请求裁决");
         expect(requestText(req)).toContain(repo2);
         expect(requestText(req)).toContain(fixers[0]!);
-        return tool("wait", { reason: "joined" });
+        return {};
       },
     );
     const p2 = startProjectSync(h.kernel, { title: "服务二的 bugfix", outcome: "bug 修复", brief: "修 bug", cwd: repo2 }, { principalId: h.kernel.ownerPrincipal }).projectId;
@@ -111,7 +111,7 @@ describe("docs/05 scenario 4 — several workers blocked by the same CI failure:
         const out = lastToolResult(req);
         expect(out).toContain(`Delivered to ${w1}.`);
         expect(out).toContain(`NOT DELIVERED — ${w2} is closed (it was cancelled). Nothing was stored.`);
-        return tool("wait", { reason:"resolved" });
+        return {};
       },
     );
     expect(h.kernel.sendToCell(fixers[0]!, { text: "主人：CI 已经绿了，收尾吧" }, { principalId: h.kernel.ownerPrincipal })).toMatchObject({ status: "delivered" });
@@ -152,7 +152,7 @@ describe("docs/05 scenario 4 — several workers blocked by the same CI failure:
       },
       (req) => {
         expect(lastToolResult(req)).toContain("reserved");
-        return tool("wait",{reason:"done"});
+        return {};
       },
     );
     await h.ui.capture({ text: "测试一下仲裁笔记" }, "owner");

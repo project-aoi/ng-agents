@@ -267,9 +267,9 @@ export interface StalledCheckPayload {
   detail: string;
 }
 
-/** [docs/05 guard 1] The previous Run stopped at its step limit with work left; continue where it stopped. */
+/** [docs/05 guard 1] The previous Run stopped at its step or idle-timeout limit with work left; continue where it stopped. */
 export interface RunContinuePayload {
-  reason: "step_limit";
+  reason: "step_limit" | "timeout";
   /** Consecutive continuations so far (1 = first). */
   count: number;
 }
@@ -437,7 +437,7 @@ export const kernelPayloadSchemas = {
   }),
   "kernel.arbitration_unanswered": z.looseObject({causeKey: z.string(), waiters: z.array(z.object({cellId:z.string(),waitId:z.string(),registrationId:z.string().nullable()}))}),
   "kernel.stalled_check": z.looseObject({ projectCellId: z.string(), stalledSince: z.number(), detail: z.string() }),
-  "kernel.continue": z.looseObject({ reason: z.enum(["step_limit"]), count: z.number().int() }),
+  "kernel.continue": z.looseObject({ reason: z.enum(["step_limit", "timeout"]), count: z.number().int() }),
   "kernel.wait_timeout": z.looseObject({ waitingFor: z.string(), reason: z.string(), since: z.number() }),
 } as const satisfies Record<KernelPayloadType, z.ZodType>;
 

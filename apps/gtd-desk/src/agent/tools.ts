@@ -276,7 +276,9 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       item.project && `${item.project.title}${item.project.parked ? "（项目已停靠在以后再说，这一项暂时不用办）" : item.project.paused ? "（项目已暂停）" : ""}`].filter(Boolean);
     // What it asks of the owner: a title alone ("确认范围") does not say what to answer.
     const ask = item.description && item.description.trim() !== item.title.trim() ? `\n  ↳ ${oneLine(item.description, 240)}` : "";
-    const choices = item.category === "decision" && item.options.length ? `\n  ↳ 选项：${item.options.map((o) => o.label).join(" / ")}` : "";
+    const choices = item.options.length
+      ? `\n  ↳ 选项：${item.options.map((o) => (item.category === "action" ? `${o.label} (${o.id})` : o.label)).join(" / ")}`
+      : "";
     return `- ${item.id}「${item.title}」 ${parts.join(" · ")}${ask}${choices}`;
   }
 
@@ -1264,7 +1266,10 @@ export function createAgentControlPlane(deps: AgentControlPlaneDeps): AgentContr
       // owner, and "还要我做什么吗" is often asked in the same breath.
       const recent = ofProject ? noticesOf(subtreeIds(ofProject), 3) : [];
       const where = recent.length ? `\n这个项目最近发给主人的通知（在这个决定之前；交付落在哪个分支、由谁合并见其中）：\n${recent.map((n) => `- ${desk.localTime(n.at)} ${oneLine(n.text, NOTICE_CHARS)}`).join("\n")}` : "";
-      return ok(`${JSON.stringify(result)}${where}`,result);
+      const wrapUp = ofProject && str(args.optionId) === "done"
+        ? `\n项目 ${ofProject} 已收到办结回执并唤醒收尾（若工作已全部完成会自行 finish_project 结项，无需紧接着再调 set_project_state("complete")）。`
+        : "";
+      return ok(`${JSON.stringify(result)}${where}${wrapUp}`,result);
     },
     async reopen_project(args,principalId) {
       const text = str(args["text"]);

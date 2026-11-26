@@ -76,7 +76,7 @@ describe("a checker with a check command", () => {
     const [result] = results(h, project);
     expect(results(h, project)).toHaveLength(1);
     expect(result).toMatchObject({ childCellId: checker, status: "completed", childState: "closed", data: { check: { command: "test -f flag", checks: 4, exitCode: 0, outcome: "holds" } } });
-    expect(result!.summary).toMatch(/^条件已满足：`test -f flag` 在 .+ 返回 0（第 4 次检查）。没有输出。$/);
+    expect(result!.summary).toMatch(/^条件已满足：「等发布标记」在 .+ 返回 0（第 4 次检查）。没有输出。$/);
     expect(projectSaw).toContain("条件已满足");
     expect(h.kernel.getCell(checker)).toMatchObject({ status: "closed", closeReason: "completed" });
     expect(pendingTimers(h, checker)).toEqual([]);
@@ -101,7 +101,7 @@ describe("a checker with a check command", () => {
     await h.kernel.idle();
     const [result] = results(h, project);
     expect(result).toMatchObject({ status: "failed", childState: "closed", data: { check: { outcome: "cannot_run", checks: 2 } } });
-    expect(result!.summary).toContain("检查命令连续 2 次没能运行，已停止监听：`ng-no-such-forge-cli pr view 1 | grep -qx MERGED`");
+    expect(result!.summary).toContain("检查命令连续 2 次没能运行，已停止监听：「等发布标记」");
     expect(result!.summary).toContain("（exit 1：命令不存在，");
     expect(h.kernel.getCell(checker)).toMatchObject({ status: "closed" });
     // The project's books: the wait is still open, without a cell — the project decides what comes next.
@@ -144,7 +144,7 @@ describe("a checker with a check command", () => {
     expect(results(h, project)).toHaveLength(1);
     const [result] = results(h, project);
     expect(result).toMatchObject({ status: "failed", data: { check: { outcome: "deadline", checks: 3, exitCode: 1, deadlineAt: T0 + 3 * MIN } } });
-    expect(result!.summary).toMatch(/^到期仍未满足，已停止监听：`.+` 检查了 3 次，截止时间 .+ 已过；最后一次 exit 1。$/);
+    expect(result!.summary).toMatch(/^到期仍未满足，已停止监听：「等发布标记」检查了 3 次，截止时间 .+ 已过；最后一次 exit 1。$/);
     expect(h.kernel.getCell(checker)?.status).toBe("closed");
     expect(modelCalls(h, checker)).toBe(0);
   });

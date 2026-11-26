@@ -136,7 +136,10 @@ export function renderEnvelope(env: Envelope): string {
   // the workbench and the owner's agent — refer to messages by it.
   else if (env.from === "kernel:control" && (env.type === "user.message" || env.type === "cell.message")) head.push(`id ${env.id}`);
   const payload = renderPayload(env);
-  const lead = LEAD[env.type];
+  const lead =
+    env.type === "kernel.continue" && (env.payload as { reason?: unknown } | null)?.reason === "timeout"
+      ? "Your previous run stopped after an idle timeout before the work was finished. Continue from where you stopped — do not start over, and do not repeat what is already done."
+      : LEAD[env.type];
   const body = lead ? (payload ? `${lead}\n${payload}` : lead) : payload;
   return body ? `[${head.join(" · ")}]\n${body}` : `[${head.join(" · ")}]`;
 }
