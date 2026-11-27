@@ -62,9 +62,12 @@ export interface CellPorts {            // the controlled capability surface a L
     | "listState" | "getArtifact" | "getArtifactVersion" | "listArtifacts">; // [ext] listState/getArtifact/listArtifacts
   cancelScheduled: Inbox["cancelScheduled"];
   spawnCell(spec: SpawnSpec /* [ext] the processor may come from the preset */, initialPayload?: unknown): Promise<InboxAddr>;
-  updateCell(cellId: string, patch: Partial<CellSpec>): Promise<void>; // [ext] own id allowed for watches/schedules/title/meta
+  updateCell(cellId: string, patch: CellUpdatePatch): Promise<void>; // [ext] own id allowed for watches/schedules/title/meta
   closeCell(cellId: string, reason?: "completed" | "cancelled"): Promise<boolean>;
 }
+
+/** [ext] Mutable fields of a cell (plus `resetSession` to smoothly roll over an overlong native CLI thread at a stage boundary). */
+export type CellUpdatePatch = Partial<CellSpec> & { resetSession?: boolean };
 
 /** [ext] A spec as a spawner writes it: `processor` may be left to the preset's defaults. */
 export type SpawnSpec = Omit<CellSpec, "processor"> & { processor?: ProcessorSpec };
@@ -231,6 +234,15 @@ export interface RunPorts extends CellPorts {
    * this cell's cursor for it (the "new since your last inspect" figure in the roster) to the end of what was returned.
    */
   inspectCell?(cellId: string, opts?: InspectCellOptions): Promise<CellInspection>;
+  /**
+   * [ext] True when this cell's parent project is paused or blocked on a pending human decision card (no other active
+   * agent work), so background code probes can suspend polling until the owner responds.
+   */
+  parentBlockedOnHuman?(): boolean;
+  /**
+   * [ext] Read a direct child cell's current spec (e.g. so project tools can update an existing probe checker in place).
+   */
+  getChildCell?(cellId: string): { cellId: string; title: string | null; status: CellStatus; spec: CellSpec } | null;
 }
 
 export interface InspectCellOptions {

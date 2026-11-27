@@ -501,6 +501,8 @@ export interface PromptSnapshot {
   system: { text: string; hash: string; own?: string };
   history: ModelMessage[];
   summaryUptoSeq?: number;
+  /** Number of kernel compactions recorded on this cell so far. */
+  compactions?: number;
   historyUptoSeq: number;               // last evidence seq folded into history
   tail: {
     roster: ChildSummary[];

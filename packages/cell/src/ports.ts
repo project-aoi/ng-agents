@@ -553,6 +553,39 @@ export function buildRunPorts(core: KernelCore, rc: RunContext): RunPorts {
     async inspectCell(targetId, o) {
       return inspectCell(core, targetId, o, { inspectorId: cellId });
     },
+
+    parentBlockedOnHuman() {
+      const parent = cell.parentId ? cells.get(cell.parentId) : undefined;
+      const project = parent ? [parent, ...cells.ancestors(parent.id)].find((c) => isProjectRoot(core.registry, c)) : undefined;
+      if (!project) return false;
+      if (project.status === "paused" || cells.ancestors(cellId).some((c) => c.status === "paused")) return true;
+      const blockingCard = core.humanItems.list().some(
+        (item) =>
+          item.category === "decision" &&
+          (item.cellId === project.id || (item.blockingProjectIds?.includes(project.id) ?? false)),
+      );
+      if (!blockingCard) return false;
+      // Do not suspend if non-probe agent work is still actively running or queued in the project's subtree.
+      const subtree = [project, ...cells.descendants(project.id, { status: ["active"] })];
+      const isCodeProbe = (c: CellRecord) => c.spec.processor.kind === "code" && c.spec.processor.entry === "gtd.check_probe";
+      const runningIds = new Set(core.dispatcher.running().filter((r) => !r.stallOnly).map((r) => r.cellId));
+      for (const c of subtree) {
+        if (c.id === cellId || isCodeProbe(c)) continue;
+        if (runningIds.has(c.id)) return false;
+        if (core.workspace.listJobsSync({ cellId: c.id, state: ["running"] }).length > 0) return false;
+        const due = inbox
+          .listMessagesSync({ cellId: c.id, status: ["pending"] })
+          .some((m) => m.envelope.delivery !== "silent_inject" && m.envelope.type !== PAYLOAD.stalledCheck && m.deliverAt <= clock.now());
+        if (due) return false;
+      }
+      return true;
+    },
+
+    getChildCell(targetId) {
+      const child = cells.get(targetId);
+      if (!child || child.parentId !== cellId) return null;
+      return { cellId: child.id, title: child.title, status: child.status, spec: child.spec };
+    },
   };
   return ports;
 }

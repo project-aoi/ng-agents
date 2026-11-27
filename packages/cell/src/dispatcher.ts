@@ -3,6 +3,7 @@ import {
   all,
   get,
   run,
+  stripAnsi,
   timerFrom,
   CELL_DIRECT_CHAT_KEY,
   CELL_RESULT_CANDIDATE_KEY,
@@ -26,6 +27,7 @@ import {
   type ClaimedBatch,
   type CloseReason,
   type Envelope,
+  type PromptSnapshot,
   type RunContinuePayload,
   type SelfSettleRequest,
   type SettledTurn,
@@ -97,6 +99,54 @@ function isResurface(env: Envelope): boolean {
 
 /** Somebody speaking to a cell, as opposed to its own machinery waking it. */
 const SPOKEN: ReadonlySet<string> = new Set([PAYLOAD.cellMessage, PAYLOAD.userMessage, PAYLOAD.controlSteer]);
+
+/** Read-only tools whose completion produces no external or persistent write side effects (M1). */
+const READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
+  "read_state",
+  "read_artifact",
+  "read_resource",
+  "search_history",
+  "inspect_cell",
+  "list_artifacts",
+  "job_observe",
+  "review_week",
+  "no_hit",
+  "Read",
+  "Glob",
+  "Grep",
+  "LS",
+  "WebSearch",
+  "WebFetch",
+  "read_file",
+  "list_dir",
+  "find_by_name",
+  "grep_search",
+  "view_file",
+]);
+
+function summarizeWriteCall(name: string, input: unknown): string {
+  const rec = input && typeof input === "object" && !Array.isArray(input) ? (input as Record<string, unknown>) : null;
+  if (!rec) return name;
+  if (name === "send_message" && typeof rec["to"] === "string") return `send_message(to=${rec["to"]})`;
+  if (name === "set_state" && rec["patches"] && typeof rec["patches"] === "object") {
+    const keys = Object.keys(rec["patches"] as Record<string, unknown>).slice(0, 4).join(",");
+    return `set_state(keys=${keys})`;
+  }
+  if ((name === "save_artifact" || name === "patch_artifact") && typeof rec["artifactId"] === "string") {
+    return `${name}(${rec["artifactId"]})`;
+  }
+  if ((name === "spawn_cell" || name === "dispatch") && typeof rec["title"] === "string") {
+    return `${name}(${String(rec["title"]).slice(0, 40)})`;
+  }
+  if (name === "request_approval" && typeof rec["title"] === "string") {
+    return `request_approval(${String(rec["title"]).slice(0, 40)})`;
+  }
+  if (typeof rec["command"] === "string") {
+    return `${name}(${rec["command"].replace(/\s+/g, " ").trim().slice(0, 60)})`;
+  }
+  const compact = JSON.stringify(rec);
+  return compact.length <= 80 ? `${name}(${compact})` : `${name}(${compact.slice(0, 77)}…)`;
+}
 
 export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number }): Dispatcher {
   const { inbox, cells, bus, clock, context } = core;
@@ -337,17 +387,97 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
     return n;
   }
 
+  /** M1: Extract completed non-error write tool calls executed during this Run before it failed. */
+  function executedWritesOf(cellId: string, runId: string): string[] {
+    const records = context.listEvidenceSync(cellId, { runId });
+    const calls = new Map<string, { name: string; input: unknown }>();
+    const writes: string[] = [];
+    for (const { record: r } of records) {
+      if (r.kind === "tool_call") {
+        calls.set(r.toolUseId, { name: r.name, input: r.input });
+      } else if (r.kind === "tool_result" && !r.isError) {
+        const call = calls.get(r.toolUseId);
+        const name = call?.name ?? r.name;
+        if (!READ_ONLY_TOOLS.has(name)) {
+          writes.push(summarizeWriteCall(name, call?.input));
+        }
+      }
+    }
+    if (writes.length <= 20) return writes;
+    return [...writes.slice(0, 19), `…(+${writes.length - 19} more writes)`];
+  }
+
   /** The Run failed or was stopped: its batch goes back to the queue (or is cancelled with the epoch). */
   function releaseClaim(handle: RunHandle, result: "error" | "cancelled", error: string | undefined): void {
     if (result === "error") {
+      const cleanError = stripAnsi(error ?? "unknown error");
       const attempts = attemptsOf(handle.claimId);
       const delay = Math.min(core.maxRetryBackoffMs, core.retryBackoffMs * 2 ** attempts);
-      inbox.releaseSync(handle.claimId, `run failed: ${error ?? "unknown error"}`, { retryAt: clock.now() + delay });
+      inbox.releaseSync(handle.claimId, `run failed: ${cleanError}`, { retryAt: clock.now() + delay });
       return;
     }
     const reason = handle.stopReason ?? "aborted";
     // Pause and shutdown are not failures; cancel/close moved the epoch, so the batch is cancelled anyway.
     inbox.releaseSync(handle.claimId, `run stopped: ${reason}`, { countAttempt: reason !== "pause" && reason !== "shutdown" });
+  }
+
+  /**
+   * M1: When a Run fails AFTER completing external/state write side effects, never blindly re-deliver the raw original
+   * batch. Acknowledge the consumed batch and enqueue a compact recovery prompt listing already-executed writes.
+   */
+  function recoverAfterWrites(handle: RunHandle, batch: ClaimedBatch, cleanError: string, executedWrites: string[]): void {
+    const cellId = handle.cellId;
+    const prev = batch.envelopes.reduce(
+      (n, e) => (e.type === PAYLOAD.runContinue && (e.payload as RunContinuePayload).reason === "error_recovery" ? Math.max(n, (e.payload as RunContinuePayload).count) : n),
+      0,
+    );
+    const maxRecoveries = Math.max(1, Math.min(4, core.maxStepContinuations || 4));
+    inbox.completeSync(handle.claimId, () => {
+      const inputs = inbox.listMessagesSync({ claimId: handle.claimId, status: ["done"] }).map((row) => row.envelope);
+      const cur = cells.get(cellId);
+      if (!cur || cur.status === "closed" || cur.epoch !== handle.epoch) return;
+      if (handle.cliInput) {
+        const session = context.readStateSync<CliSessionRecord>(cellId, CLI_SESSION_KEY);
+        if (session?.sessionId === handle.cliInput.sessionId) {
+          context.commitSync(cellId, {
+            statePatches: {
+              [CLI_SESSION_KEY]: { ...session, lastDeliveredEvidenceSeq: Math.max(session.lastDeliveredEvidenceSeq, handle.cliInput.throughSeq) },
+            },
+          });
+        }
+      }
+      core.waits.answeredBy(cellId, inputs, handle.claimId);
+      if (prev >= maxRecoveries) {
+        core.escalations.errorRecoveryLimit(cellId, prev + 1, cleanError, executedWrites);
+        core.stall.afterRun(cellId, inputs);
+        return;
+      }
+      const delay = Math.min(core.maxRetryBackoffMs, core.retryBackoffMs * 2 ** prev);
+      const payload: RunContinuePayload = {
+        reason: "error_recovery",
+        count: prev + 1,
+        error: cleanError.slice(0, 600),
+        executedWrites,
+        originalEnvelopeIds: batch.envelopes.map((e) => e.id).slice(0, 20),
+      };
+      inbox.enqueueSync(
+        cellId,
+        createEnvelope<RunContinuePayload>(
+          {
+            id: `${handle.claimId}:error_recovery`,
+            from: KERNEL_FROM.dispatcher,
+            principalId: cellPrincipal(cellId),
+            kind: "event",
+            type: PAYLOAD.runContinue,
+            payload,
+            expectedEpoch: handle.epoch,
+          },
+          clock,
+        ),
+        { deliverAt: clock.now() + delay },
+      );
+      core.stall.afterRun(cellId, inputs);
+    });
   }
 
   function lastWords(cellId: string, runId: string): string | null {
@@ -683,6 +813,7 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
         // card with the owner, no timer or watch it set for itself: exactly when it is dormant (this Run has already
         // left the run table and its claim is completed, so the read model sees the cell as it will be).
         if (core.readModel.activityOf([cellId]).get(cellId)?.state !== "dormant") {
+          forwardOrphanReplyIfNeeded(cur, handle, inputs);
           core.stall.afterRun(cellId, inputs);
           return;
         }
@@ -737,11 +868,82 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
     }
   }
 
+  /**
+   * M6: Orphan-reply safeguard for wakeable workers. If a worker consumed a non-silent parent `cell.message`,
+   * produced non-empty `assistant_text`, sent no reply to its parent, and did not settle into dormancy (so
+   * `notifySettled` did not fire — e.g. an older open wait kept it in `waiting`), relay its answer to the parent
+   * so parent and child never deadlock waiting on each other.
+   */
+  function forwardOrphanReplyIfNeeded(cur: CellRecord, handle: RunHandle, inputs: readonly Envelope[]): void {
+    const parent = cur.parentId ? cells.get(cur.parentId) : undefined;
+    if (!parent || parent.status === "closed") return;
+    const parentAddr = inboxAddr(parent.id);
+    const parentPrincipal = cellPrincipal(parent.id);
+    const parentQuestions = inputs.filter(
+      (e) =>
+        e.type === PAYLOAD.cellMessage &&
+        e.delivery !== "silent_inject" &&
+        (e.from === parentAddr || e.principalId === parentPrincipal),
+    );
+    if (parentQuestions.length === 0) return;
+    const said = lastWords(cur.id, handle.claimId);
+    if (!said) return;
+    const runRecords = context.listEvidenceSync(cur.id, { runId: handle.claimId });
+    let sentToParent = false;
+    let startedAsyncWork = false;
+    for (const { record: r } of runRecords) {
+      if (r.kind !== "tool_call") continue;
+      if (r.name === "report_to_parent") sentToParent = true;
+      if (r.name === "send_message") {
+        const to = (r.input as { to?: unknown } | null)?.to;
+        if (to === parentAddr) sentToParent = true;
+        else if (typeof to === "string" && to.startsWith("inbox:")) startedAsyncWork = true;
+      }
+      if (r.name === "job_start" || r.name === "request_approval") startedAsyncWork = true;
+    }
+    if (sentToParent) return;
+    const parentWaitingOnChild = core.waits.list([parent.id]).some((w) => w.waitingFor === inboxAddr(cur.id));
+    if (!parentWaitingOnChild && startedAsyncWork) return;
+    const lastQ = parentQuestions[parentQuestions.length - 1]!;
+    const qPayload = lastQ.payload as { refId?: unknown; waitId?: unknown } | null;
+    const refId =
+      typeof qPayload?.refId === "string" && qPayload.refId.trim()
+        ? qPayload.refId.trim()
+        : typeof qPayload?.waitId === "string" && qPayload.waitId.trim()
+          ? qPayload.waitId.trim()
+          : undefined;
+    inbox.enqueueSync(
+      parent.id,
+      createEnvelope(
+        {
+          id: `${cur.id}:${handle.claimId}:orphan_reply`,
+          from: inboxAddr(cur.id),
+          to: parentAddr,
+          principalId: cellPrincipal(cur.id),
+          kind: "event",
+          type: PAYLOAD.cellMessage,
+          expectedEpoch: parent.epoch,
+          payload: {
+            fromCellId: cur.id,
+            summary: "分身回合答复（自动抄送）",
+            text: said.slice(0, 4_000),
+            ...(refId ? { refId } : {}),
+          },
+        },
+        clock,
+      ),
+    );
+  }
+
   /** Give the batch back or settle it, according to how the Run ended. */
   function settleClaim(handle: RunHandle, batch: ClaimedBatch, result: RunResult, error: string | undefined): void {
     try {
-      if (result === "error") releaseClaim(handle, "error", error);
-      else if (result === "cancelled" && handle.controller.signal.aborted) releaseClaim(handle, "cancelled", undefined);
+      if (result === "error") {
+        const cleanError = stripAnsi(error ?? "unknown error");
+        const writes = executedWritesOf(handle.cellId, handle.claimId);
+        if (writes.length > 0) recoverAfterWrites(handle, batch, cleanError, writes);
+        else releaseClaim(handle, "error", cleanError);
+      } else if (result === "cancelled" && handle.controller.signal.aborted) releaseClaim(handle, "cancelled", undefined);
       else settleRun(handle, batch, result);
     } catch (err) {
       // e.g. the lease expired under a very long Run: the batch already went back to the queue and will run again.
@@ -757,6 +959,12 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
     let error: string | undefined;
     let ranLoop = false;
 
+    const isCodeProcessor = cell.spec.processor.kind === "code";
+    const skipHydrate = isCodeProcessor && cell.spec.contextMode !== "fork_prefix";
+    const isRoutineCodeProbe =
+      cell.spec.processor.kind === "code" &&
+      cell.spec.processor.entry === "gtd.check_probe" &&
+      batch.envelopes.every((e) => e.type === PAYLOAD.timerFired);
     const signal = handle.controller.signal;
     try {
       if (stale(handle)) {
@@ -764,11 +972,30 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
         handle.controller.abort(new Error("cell paused, closed or cancelled before the run started"));
       }
       signal.throwIfAborted();
-      let snapshot = await context.hydrate(cellId, batch, cell.spec.contextMode ?? "isolated");
+      // M5: Pure code processors (non-fork_prefix) do not consume LLM context; skip context.hydrate() so they never scan history or trigger compaction.
+      let snapshot: PromptSnapshot = skipHydrate
+        ? {
+            cellId,
+            epoch: handle.epoch,
+            runId,
+            spec: cell.spec,
+            bounds: cell.bounds,
+            mode: cell.spec.contextMode ?? "isolated",
+            batch,
+            system: { text: "", hash: "" },
+            history: [],
+            historyUptoSeq: 0,
+            tail: { roster: [], notes: [], messages: [] },
+            skills: [],
+            createdAt: clock.now(),
+          }
+        : await context.hydrate(cellId, batch, cell.spec.contextMode ?? "isolated");
       signal.throwIfAborted();
       const at = clock.now();
-      context.appendEvidenceSync(cellId, { kind: "run_boundary", phase: "start", epoch: handle.epoch, runId, at });
-      for (const envelope of batch.envelopes) context.appendEvidenceSync(cellId, { kind: "inbound", envelope, runId, at });
+      if (!isRoutineCodeProbe) {
+        context.appendEvidenceSync(cellId, { kind: "run_boundary", phase: "start", epoch: handle.epoch, runId, at });
+        for (const envelope of batch.envelopes) context.appendEvidenceSync(cellId, { kind: "inbound", envelope, runId, at });
+      }
       ranLoop = true;
       const ports = buildRunPorts(core, { cell, batch, handle, snapshot });
       const preset = cell.preset ? core.registry.presets.get(cell.preset) : undefined;
@@ -807,7 +1034,7 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
       }
     }
 
-    if (ranLoop) {
+    if (ranLoop && (!isRoutineCodeProbe || result === "error")) {
       try {
         context.appendEvidenceSync(cellId, {
           kind: "run_boundary",

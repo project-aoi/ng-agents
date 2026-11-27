@@ -130,7 +130,7 @@ export function createStallMonitor(core: KernelCore): StallMonitor {
         description: waits.length
           ? [...new Set(waits.map(w => cells.get(w.cellId)?.title?.trim() || "后台任务"))].map(title => `${title}仍在等答复，请确认接下来怎么做。`).join("\n")
           : "后台已自查一次，仍没有可以推进的下一步。",
-        relatedProjectIds: projects, subjectKey: `kernel:stalled:${key}:${id}`, options: [{id:"reply", label:"回复后台", effect:"reply", input:{mode:"optional"}}],
+        relatedProjectIds: projects, blockingProjectIds: projects, subjectKey: `kernel:stalled:${key}:${id}`, options: [{id:"reply", label:"回复后台", effect:"reply", input:{mode:"optional"}}],
       }, issuer, undefined, "kernel:stall");
       run(db, `INSERT INTO stall_incidents(incident_id, cause_key, wait_ids, escalation_id, updated_at) VALUES(?,?,?,?,?)
         ON CONFLICT(incident_id) DO UPDATE SET escalation_id=excluded.escalation_id,wait_ids=excluded.wait_ids,updated_at=excluded.updated_at`,

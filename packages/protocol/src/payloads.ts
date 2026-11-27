@@ -267,11 +267,17 @@ export interface StalledCheckPayload {
   detail: string;
 }
 
-/** [docs/05 guard 1] The previous Run stopped at its step or idle-timeout limit with work left; continue where it stopped. */
+/** [docs/05 guard 1] The previous Run stopped at its step/idle-timeout limit or failed after write side effects; continue cleanly. */
 export interface RunContinuePayload {
-  reason: "step_limit" | "timeout";
+  reason: "step_limit" | "timeout" | "error_recovery";
   /** Consecutive continuations so far (1 = first). */
   count: number;
+  /** Compact summary of the failure that interrupted the previous run (error_recovery only). */
+  error?: string;
+  /** Write side effects already completed before the failure (error_recovery only). */
+  executedWrites?: string[];
+  /** Original batch envelope ids consumed before the failure (error_recovery only). */
+  originalEnvelopeIds?: string[];
 }
 
 /** [docs/05 guard 2] A wait registered with a timeout ran out without an answer from `waitingFor`. */
@@ -437,7 +443,13 @@ export const kernelPayloadSchemas = {
   }),
   "kernel.arbitration_unanswered": z.looseObject({causeKey: z.string(), waiters: z.array(z.object({cellId:z.string(),waitId:z.string(),registrationId:z.string().nullable()}))}),
   "kernel.stalled_check": z.looseObject({ projectCellId: z.string(), stalledSince: z.number(), detail: z.string() }),
-  "kernel.continue": z.looseObject({ reason: z.enum(["step_limit", "timeout"]), count: z.number().int() }),
+  "kernel.continue": z.looseObject({
+    reason: z.enum(["step_limit", "timeout", "error_recovery"]),
+    count: z.number().int(),
+    error: z.string().optional(),
+    executedWrites: z.array(z.string()).optional(),
+    originalEnvelopeIds: z.array(z.string()).optional(),
+  }),
   "kernel.wait_timeout": z.looseObject({ waitingFor: z.string(), reason: z.string(), since: z.number() }),
 } as const satisfies Record<KernelPayloadType, z.ZodType>;
 

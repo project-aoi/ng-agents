@@ -21,6 +21,8 @@ export interface SummaryInput {
   messages: ModelMessage[];
   /** Prose and reference list target. Complete reference addresses take precedence when they alone exceed this size. */
   maxChars: number;
+  /** Number of compactions already performed on this cell (0 = first compaction). */
+  compactions?: number;
 }
 
 /** May be async (e.g. a model call); the sync hydrate path never calls an injected summariser (see ContextStoreOptions). */

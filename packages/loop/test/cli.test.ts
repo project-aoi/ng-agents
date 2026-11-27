@@ -6,6 +6,7 @@ import { createEnvelope, createRegistry, makeBounds, TOOL_KINDS, type Address, t
 import {
   CLI_FORK_SESSION_KEY,
   CLI_SESSION_KEY,
+  CLI_SESSION_RESET_KEY,
   createCliAgentLoop,
   registerStandardToolsets,
   RUN_ALREADY_ENDED,
@@ -916,5 +917,49 @@ describe("CLI loop errors", () => {
     const rChat = internalAndChat.run({ batch: ["先暂停构建"] });
     expect(await runOf(internalAndChat, rChat)).toBe("completed");
     expect(rChat.ports.log.evidence.filter((e) => e.kind === "assistant_text").map((e) => e.text)).toEqual(["已暂停构建"]);
+  });
+
+  // Audit 2026-11-27 M7: smooth rollover after 3 compactions AND race-free resetSession mid-run.
+  it("M7: smoothly rolls over native CLI session after >=3 compactions and honors mid-run CLI_SESSION_RESET_KEY", async () => {
+    const s = setup("codex", [
+      { actions: [{ text: "turn 1 on initial session" }] },
+      { actions: [{ text: "turn 2 resumed" }] },
+      { actions: [{ text: "turn 3 rolled over cleanly" }] },
+      { actions: [{ text: "turn 4 fresh after mid-run reset" }] },
+    ]);
+
+    // Turn 1: establishes session with compactionsAtSessionStart = 0
+    const r1 = s.run({ batch: ["start work"] });
+    r1.snapshot.compactions = 0;
+    expect(await runOf(s, r1)).toBe("completed");
+    const rec1 = r1.ports.state.get(CLI_SESSION_KEY) as CliSessionRecord;
+    expect(rec1.compactionsAtSessionStart).toBe(0);
+
+    // Turn 2: 2 compactions -> still resumes same session
+    const r2 = s.run({ runId: "r2", batch: ["continue"] });
+    r2.snapshot.compactions = 2;
+    r2.ports.state.set(CLI_SESSION_KEY, rec1);
+    expect(await runOf(s, r2)).toBe("completed");
+    expect(launches(s).at(-1)?.session?.mode).toBe("resume");
+
+    // Turn 3: 3 compactions since session start -> rolls over to fresh session with new base = 3
+    const r3 = s.run({ runId: "r3", batch: ["stage 2"] });
+    r3.snapshot.compactions = 3;
+    r3.ports.state.set(CLI_SESSION_KEY, r2.ports.state.get(CLI_SESSION_KEY));
+    expect(await runOf(s, r3)).toBe("completed");
+    expect(launches(s).at(-1)?.session).toBeUndefined();
+    const rec3 = r3.ports.state.get(CLI_SESSION_KEY) as CliSessionRecord;
+    expect(rec3.sessionId).not.toBe(rec1.sessionId);
+    expect(rec3.compactionsAtSessionStart).toBe(3);
+
+    // Mid-run resetSession: if CLI_SESSION_RESET_KEY is written while Turn 4 runs, persistSession(true) does NOT overwrite the reset
+    const r4 = s.run({ runId: "r4", batch: ["before reset"] });
+    r4.snapshot.compactions = 3;
+    r4.ports.state.set(CLI_SESSION_KEY, rec3);
+    r4.ports.state.set(CLI_SESSION_RESET_KEY, rec3.updatedAt + 100);
+    expect(await runOf(s, r4)).toBe("completed");
+    // Started fresh because initialResetAt >= rec3.updatedAt, and cleared CLI_SESSION_RESET_KEY once persisted.
+    expect(launches(s).at(-1)?.session).toBeUndefined();
+    expect(r4.ports.state.get(CLI_SESSION_RESET_KEY)).toBeUndefined();
   });
 });

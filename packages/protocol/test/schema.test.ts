@@ -189,6 +189,135 @@ CREATE TABLE IF NOT EXISTS jobs (
     b.close();
   });
 
+  it("migrates @ng/context v1 → v2 losslessly: drops resource_fts, rebuilds selective evidence_fts and recreates triggers (M4)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ng-ctx-mig-"));
+    dirs.push(dir);
+    const path = join(dir, "ng.db");
+    const v1Context: SchemaModule = {
+      owner: "@ng/context",
+      version: 1,
+      migrations: [],
+      ddl: `
+CREATE TABLE IF NOT EXISTS cell_state (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  cell_id TEXT NOT NULL REFERENCES cells(id),
+  key TEXT NOT NULL,
+  value TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE (cell_id, key)
+);
+CREATE TABLE IF NOT EXISTS artifacts (
+  artifact_id TEXT PRIMARY KEY,
+  cell_id TEXT NOT NULL REFERENCES cells(id),
+  version INTEGER NOT NULL DEFAULT 1,
+  title TEXT,
+  content TEXT NOT NULL,
+  updated_by TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS artifact_versions (
+  artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id),
+  version INTEGER NOT NULL,
+  content TEXT NOT NULL,
+  updated_by TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  cell_id TEXT,
+  PRIMARY KEY (artifact_id, version)
+);
+CREATE TABLE IF NOT EXISTS artifact_parked (
+  id TEXT PRIMARY KEY,
+  artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id),
+  cell_id TEXT NOT NULL REFERENCES cells(id),
+  based_on_version INTEGER NOT NULL,
+  content TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  dismissed_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS evidence (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  cell_id TEXT NOT NULL REFERENCES cells(id),
+  run_id TEXT,
+  kind TEXT NOT NULL,
+  content TEXT NOT NULL,
+  text TEXT NOT NULL,
+  spill_uri TEXT,
+  at INTEGER NOT NULL
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS evidence_fts USING fts5(text, content = 'evidence', content_rowid = 'seq', tokenize = 'trigram');
+CREATE TRIGGER IF NOT EXISTS evidence_fts_ai AFTER INSERT ON evidence BEGIN INSERT INTO evidence_fts(rowid, text) VALUES (new.seq, new.text); END;
+CREATE TRIGGER IF NOT EXISTS evidence_fts_ad AFTER DELETE ON evidence BEGIN INSERT INTO evidence_fts(evidence_fts, rowid, text) VALUES ('delete', old.seq, old.text); END;
+CREATE TABLE IF NOT EXISTS resources (
+  uri TEXT PRIMARY KEY,
+  cell_id TEXT NOT NULL REFERENCES cells(id),
+  run_id TEXT,
+  source TEXT NOT NULL,
+  content TEXT NOT NULL,
+  byte_length INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS artifact_fts USING fts5(title, body, tokenize = 'trigram');
+CREATE VIRTUAL TABLE IF NOT EXISTS state_fts USING fts5(key, text, tokenize = 'trigram');
+CREATE VIRTUAL TABLE IF NOT EXISTS resource_fts USING fts5(content, content = 'resources', tokenize = 'trigram');
+CREATE TRIGGER IF NOT EXISTS resource_fts_ai AFTER INSERT ON resources BEGIN INSERT INTO resource_fts(rowid, content) VALUES (new.rowid, new.content); END;
+CREATE TRIGGER IF NOT EXISTS resource_fts_ad AFTER DELETE ON resources BEGIN INSERT INTO resource_fts(resource_fts, rowid, content) VALUES ('delete', old.rowid, old.content); END;
+CREATE TRIGGER IF NOT EXISTS resource_fts_au AFTER UPDATE ON resources BEGIN INSERT INTO resource_fts(resource_fts, rowid, content) VALUES ('delete', old.rowid, old.content); INSERT INTO resource_fts(rowid, content) VALUES (new.rowid, new.content); END;
+CREATE TABLE IF NOT EXISTS knowledge (
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  name TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  cell_id TEXT REFERENCES cells(id),
+  description TEXT NOT NULL,
+  body TEXT NOT NULL,
+  tags TEXT NOT NULL DEFAULT '[]',
+  applies TEXT,
+  updated_at INTEGER NOT NULL
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5(name, description, body, tags, tokenize = 'trigram');
+CREATE TABLE IF NOT EXISTS prompt_prefixes (
+  cell_id TEXT PRIMARY KEY REFERENCES cells(id),
+  text TEXT NOT NULL,
+  hash TEXT NOT NULL,
+  skills TEXT NOT NULL,
+  epoch INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  inherited TEXT,
+  fork_note TEXT,
+  summary TEXT,
+  summary_upto_seq INTEGER NOT NULL DEFAULT 0,
+  compactions INTEGER NOT NULL DEFAULT 0
+);
+`,
+    };
+    const a = openDatabase(path, { schemas: ALL_SCHEMAS.map((m) => (m.owner === "@ng/context" ? v1Context : m)) });
+    run(a, "INSERT INTO cells (id, root_id, status, spec, bounds, principal_id, created_at, updated_at) VALUES ('desk','desk','active','{}','{}','owner',1,1)");
+    run(a, "INSERT INTO evidence (cell_id, run_id, kind, content, text, at) VALUES ('desk','r1','inbound','{\"kind\":\"inbound\",\"envelope\":{\"id\":\"e1\"}}','hello inbound needle',1)");
+    run(a, "INSERT INTO evidence (cell_id, run_id, kind, content, text, at) VALUES ('desk','r1','tool_result','{\"kind\":\"tool_result\"}','giant cargo compile blob log_needle',2)");
+    run(a, "INSERT INTO evidence (cell_id, run_id, kind, content, text, at) VALUES ('desk','r1','tool_call','{\"kind\":\"tool_call\"}','" + "x".repeat(400) + "',3)");
+    run(a, "INSERT INTO resources (uri, cell_id, run_id, source, content, byte_length, created_at) VALUES ('res://desk/1','desk','r1','spill','spilled resource payload',24,4)");
+    expect(schemaVersions(a)["@ng/context"]).toBe(1);
+    a.close();
+
+    const b = openDatabase(path);
+    expect(schemaVersions(b)["@ng/context"]).toBe(2);
+    // resource_fts table and triggers are removed
+    expect(get(b, "SELECT name FROM sqlite_master WHERE name = 'resource_fts'")).toBeUndefined();
+    // evidence_fts retains inbound + capped tool_call only (excludes tool_result)
+    const indexed = all<{ rowid: number; text: string }>(b, "SELECT rowid, text FROM evidence_fts ORDER BY rowid");
+    expect(indexed.map((r) => r.rowid)).toEqual([1, 3]);
+    expect(indexed[1]!.text.length).toBe(256);
+    // Recreated evidence_fts_ai trigger indexes new conversational rows and ignores new tool_result rows
+    run(b, "INSERT INTO evidence (cell_id, run_id, kind, content, text, at) VALUES ('desk','r2','assistant_text','{\"kind\":\"assistant_text\"}','post migration answer',5)");
+    run(b, "INSERT INTO evidence (cell_id, run_id, kind, content, text, at) VALUES ('desk','r2','tool_result','{\"kind\":\"tool_result\"}','post migration blob',6)");
+    expect(all<{ rowid: number }>(b, "SELECT rowid FROM evidence_fts ORDER BY rowid").map((r) => r.rowid)).toEqual([1, 3, 4]);
+    // Raw evidence & resources data preserved 100% losslessly
+    expect(get<{ n: number }>(b, "SELECT count(*) AS n FROM evidence")?.n).toBe(5);
+    expect(get<{ n: number }>(b, "SELECT count(*) AS n FROM resources")?.n).toBe(1);
+    expect(all(b, "PRAGMA foreign_key_check")).toEqual([]);
+    b.close();
+  });
+
   it("enforces foreign keys to cells", () => {
     const db = openDatabase(":memory:");
     expect(() =>

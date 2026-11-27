@@ -1,5 +1,7 @@
 import {
+  cellPrincipal,
   describeEnvelopeSource,
+  inboxAddr,
   isEnvelopeOfType,
   parsePrincipal,
   projectCellIdOf,
@@ -25,6 +27,58 @@ export function primaryEnvelope(snapshot: PromptSnapshot): Envelope | undefined 
   return env;
 }
 
+function envelopeMatchesCell(env: Envelope, cellId: string): boolean {
+  if (env.from === inboxAddr(cellId) || env.principalId === cellPrincipal(cellId)) return true;
+  if (isEnvelopeOfType(env, "cell.result") && env.payload.childCellId === cellId) return true;
+  if (isEnvelopeOfType(env, "cell.message") && env.payload.fromCellId === cellId) return true;
+  return false;
+}
+
+/**
+ * M3: Resolve card source attribution for batch-processing runs (e.g. desk handling multiple cell messages at once).
+ * Prioritizes explicit `sourceCellId`, then the bound artifact's owning cell (matching its envelope in the batch when
+ * present), instead of blindly falling back to `envs[0]`.
+ */
+export function resolveCardAttribution(
+  snapshot: PromptSnapshot,
+  opts: {
+    sourceCellId?: string | undefined;
+    artifactCellId?: string | undefined;
+    selfCellId?: string | undefined;
+    blockingProjectIds?: readonly string[] | undefined;
+    relatedProjectIds?: readonly string[] | undefined;
+  } = {},
+): { env: Envelope | undefined; source: ItemSource } {
+  const envs = snapshot.batch.envelopes;
+  if (opts.sourceCellId) {
+    const matched = envs.find((e) => envelopeMatchesCell(e, opts.sourceCellId!));
+    if (matched) return { env: matched, source: describeEnvelopeSource(matched, snapshot.createdAt) };
+    return { env: undefined, source: { principalId: cellPrincipal(opts.sourceCellId), label: "后台分身", at: snapshot.createdAt } };
+  }
+  const humanItem = envs.find((e) => ITEM_TYPES.has(e.type));
+  if (humanItem) {
+    const unwrapped = isEnvelopeOfType(humanItem, "handback") ? humanItem.payload.original : humanItem;
+    return { env: unwrapped, source: describeEnvelopeSource(unwrapped, snapshot.createdAt) };
+  }
+  if (opts.artifactCellId && opts.artifactCellId !== opts.selfCellId) {
+    const matched = envs.find((e) => envelopeMatchesCell(e, opts.artifactCellId!));
+    if (matched) return { env: matched, source: describeEnvelopeSource(matched, snapshot.createdAt) };
+    return { env: undefined, source: { principalId: cellPrincipal(opts.artifactCellId), label: "后台分身", at: snapshot.createdAt } };
+  }
+  const targetProject =
+    opts.blockingProjectIds?.length === 1
+      ? opts.blockingProjectIds[0]
+      : opts.relatedProjectIds?.length === 1
+        ? opts.relatedProjectIds[0]
+        : undefined;
+  if (targetProject) {
+    const matched = envs.find((e) => envelopeMatchesCell(e, targetProject));
+    if (matched) return { env: matched, source: describeEnvelopeSource(matched, snapshot.createdAt) };
+  }
+  const env = primaryEnvelope(snapshot);
+  return { env, source: describeEnvelopeSource(env, snapshot.createdAt) };
+}
+
 /** A default issue is scoped to the current work item. Project membership is recorded independently. */
 export function defaultSubjectKey(ctx: ToolContext): string {
   const env = primaryEnvelope(ctx.snapshot);
@@ -37,8 +91,7 @@ export function itemSource(snapshot: PromptSnapshot): ItemSource {
   return describeEnvelopeSource(primaryEnvelope(snapshot), snapshot.createdAt);
 }
 
-export function itemRawInput(snapshot: PromptSnapshot): { text: string; kind: "message" | "voice_transcript" | "monitor_summary" | "system" } {
-  const env = primaryEnvelope(snapshot);
+export function itemRawInputFor(env: Envelope | undefined): { text: string; kind: "message" | "voice_transcript" | "monitor_summary" | "system" } {
   if (!env) return { text: "", kind: "system" };
   if (isEnvelopeOfType(env, "user.message")) return { text: env.payload.text, kind: env.payload.voice ? "voice_transcript" : "message" };
   if (isEnvelopeOfType(env, "source.hit")) return { text: env.payload.rawInput ?? env.payload.summary, kind: "monitor_summary" };
@@ -51,6 +104,10 @@ export function itemRawInput(snapshot: PromptSnapshot): { text: string; kind: "m
   const p = env.payload as { text?: unknown; note?: unknown } | null;
   const words = person ? [p?.text, p?.note].find((x): x is string => typeof x === "string" && x.trim().length > 0) : undefined;
   return { text: words ? clip(words, 2_000) : "", kind: "system" };
+}
+
+export function itemRawInput(snapshot: PromptSnapshot): { text: string; kind: "message" | "voice_transcript" | "monitor_summary" | "system" } {
+  return itemRawInputFor(primaryEnvelope(snapshot));
 }
 
 export function clip(text: string, max: number): string {

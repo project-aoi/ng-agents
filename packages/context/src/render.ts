@@ -136,10 +136,13 @@ export function renderEnvelope(env: Envelope): string {
   // the workbench and the owner's agent — refer to messages by it.
   else if (env.from === "kernel:control" && (env.type === "user.message" || env.type === "cell.message")) head.push(`id ${env.id}`);
   const payload = renderPayload(env);
+  const continueReason = env.type === "kernel.continue" ? (env.payload as { reason?: unknown } | null)?.reason : undefined;
   const lead =
-    env.type === "kernel.continue" && (env.payload as { reason?: unknown } | null)?.reason === "timeout"
+    continueReason === "timeout"
       ? "Your previous run stopped after an idle timeout before the work was finished. Continue from where you stopped — do not start over, and do not repeat what is already done."
-      : LEAD[env.type];
+      : continueReason === "error_recovery"
+        ? "Your previous run failed after already completing the write side effects listed below. The original batch was NOT re-delivered blindly so you do not duplicate writes or messages. Verify current state first (open waits, child status, state/artifacts), then finish only what remains uncompleted without repeating already-executed writes."
+        : LEAD[env.type];
   const body = lead ? (payload ? `${lead}\n${payload}` : lead) : payload;
   return body ? `[${head.join(" · ")}]\n${body}` : `[${head.join(" · ")}]`;
 }

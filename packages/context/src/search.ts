@@ -214,8 +214,9 @@ function spilledExcerpt(t: Terms, recordText: string, full: string | undefined):
 }
 
 function searchEvidence(deps: Deps, t: Terms, limit: number, scope: Clause): Snippet[] {
-  const rows = runSource<EvidenceHit>(deps, t, limit, {
-    select: "e.seq, e.cell_id, e.run_id, e.kind, e.text, e.at, e.spill_uri, e.content",
+  const select = "e.seq, e.cell_id, e.run_id, e.kind, e.text, e.at, e.spill_uri, e.content";
+  const ftsRows = runSource<EvidenceHit>(deps, t, limit, {
+    select,
     fts: "evidence_fts",
     ftsFrom: "evidence_fts JOIN evidence e ON e.seq = evidence_fts.rowid",
     likeFrom: "evidence e",
@@ -224,6 +225,25 @@ function searchEvidence(deps: Deps, t: Terms, limit: number, scope: Clause): Sni
     params: scope.params,
     recency: "e.seq DESC",
   });
+  let rows = ftsRows;
+  if (t.long.length > 0) {
+    // M4: tool_result blobs (and long tool_call payloads beyond 256 chars) are excluded from evidence_fts trigram
+    // to prevent massive index bloat; scan them on demand with parameterized LIKE within the scoped slice.
+    const wordLikes = t.words.map(() => ` AND e.text ${LIKE}`).join("");
+    const extra = all<EvidenceHit>(
+      deps.db,
+      `SELECT ${select}, NULL AS rank
+       FROM evidence e
+       WHERE (e.kind = 'tool_result' OR (e.kind = 'tool_call' AND length(e.text) > 256))
+         AND ${scope.where} AND ${NOT_A_SEARCH}${wordLikes}
+       ORDER BY e.seq DESC LIMIT ?`,
+      [...scope.params, ...t.words.map(likePattern), limit],
+    );
+    if (extra.length > 0) {
+      const seen = new Set(ftsRows.map((r) => r.seq));
+      rows = [...ftsRows, ...extra.filter((r) => !seen.has(r.seq))];
+    }
+  }
   const spillUris = rows.flatMap((r) => (r.spill_uri ? [r.spill_uri] : []));
   const spilled = new Map<string, string>();
   if (spillUris.length > 0) {
@@ -343,16 +363,16 @@ function searchState(deps: Deps, t: Terms, limit: number, scope: Clause): Snippe
 }
 
 function searchResources(deps: Deps, t: Terms, limit: number, scope: Clause): Snippet[] {
-  const rows = runSource<ResourceHit>(deps, t, limit, {
-    select: "r.uri, r.cell_id, r.run_id, r.source, r.content, r.created_at",
-    fts: "resource_fts",
-    ftsFrom: "resource_fts JOIN resources r ON r.rowid = resource_fts.rowid",
-    likeFrom: "resources r",
-    text: "r.content",
-    where: `${scope.where} AND ${NOT_A_SEARCH_SPILL}`,
-    params: scope.params,
-    recency: "r.created_at DESC, r.uri",
-  });
+  // M4: resources store large spilled logs/outputs; scan on demand via parameterized LIKE instead of a trigram FTS index.
+  const wordLikes = t.words.map(() => ` AND r.content ${LIKE}`).join("");
+  const rows = all<ResourceHit>(
+    deps.db,
+    `SELECT r.uri, r.cell_id, r.run_id, r.source, r.content, r.created_at, NULL AS rank
+     FROM resources r
+     WHERE ${scope.where} AND ${NOT_A_SEARCH_SPILL}${wordLikes}
+     ORDER BY r.created_at DESC, r.uri LIMIT ?`,
+    [...scope.params, ...t.words.map(likePattern), limit],
+  );
   return rows.map((r) => {
     const s: Snippet = {
       seq: 0,

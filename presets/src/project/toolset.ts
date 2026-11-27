@@ -7,6 +7,7 @@ import {
   cellIdOf,
   childRunnerOverride,
   defineTool,
+  inboxAddr,
   isNgError,
   newId,
   runnerSelectionInput,
@@ -20,9 +21,9 @@ import {
   type ToolResult,
   type Toolset,
 } from "@ng/protocol";
-import { TOOLSETS } from "../shared/config";
+import { PROCESSORS, TOOLSETS } from "../shared/config";
 import { errorText, isCwdError, parseIso, scheduleInput, toSchedule, toWatch, watchInput } from "../shared/inputs";
-import { PROBE, probeProcessor } from "../shared/probe";
+import { PROBE, probeProcessor, type ProbeArgs } from "../shared/probe";
 import { CHECKER_PROCESSOR, WORKER_PROCESSOR } from "../shared/processors";
 import { clip, newAction, newProject, patchAction, patchProject, statusLine } from "../shared/records";
 import { readActions, readProject, waitingFor } from "./books";
@@ -399,10 +400,61 @@ export function projectToolset(): Toolset {
     },
   });
 
+  const updateCheck = tool({
+    name: "update_check",
+    description:
+      "Update an existing active command-probe checker in place (e.g. a new commit SHA or updated MR check command) instead of closing and spawning a new checker. Resets its check baseline/backoff and triggers an immediate re-check.",
+    input: z.object({
+      cellId: z.string().min(1).describe("the active probe checker cell id to update"),
+      command: z.string().min(1).optional().describe("new shell command to run"),
+      everySec: z.number().int().min(PROBE.minEverySec).optional().describe(`new interval in seconds (min ${PROBE.minEverySec})`),
+      until: z.enum(["exit_zero", "output_changes"]).optional(),
+      deadlineHours: z.number().positive().optional().describe("reset deadline to this many hours from now"),
+      title: z.string().min(1).optional().describe("optional updated Chinese title"),
+    }),
+    async run(args, ctx) {
+      const child = ctx.ports.getChildCell?.(args.cellId);
+      if (!child) return { output: `${args.cellId} is not one of your direct child cells.`, isError: true };
+      if (child.status === "closed") return { output: `Checker ${args.cellId} is already closed; use dispatch to start a new one.`, isError: true };
+      if (child.spec.processor.kind !== "code" || child.spec.processor.entry !== PROCESSORS.checkProbe) {
+        return { output: `${args.cellId} is not a command-probe checker (gtd.check_probe).`, isError: true };
+      }
+      const prev = (child.spec.processor.args ?? {}) as Partial<ProbeArgs>;
+      const command = args.command ?? prev.command;
+      if (!command) return { output: "Checker has no command; pass command.", isError: true };
+      const everySec = args.everySec ?? prev.everySec ?? PROBE.everySec;
+      const until = args.until ?? prev.until ?? "exit_zero";
+      const now = ctx.clock.now();
+      const deadlineAt = args.deadlineHours !== undefined ? now + args.deadlineHours * 3_600_000 : prev.deadlineAt;
+      const nextProc = probeProcessor({
+        command,
+        everySec,
+        until,
+        ...(deadlineAt !== undefined ? { deadlineAt } : {}),
+        timeoutMs: Math.min(PROBE.timeoutMs, everySec * 1000),
+      });
+      await ctx.ports.updateCell(args.cellId, {
+        processor: nextProc,
+        ...(args.title ? { title: args.title } : {}),
+      });
+      if (args.title) {
+        const actions = await readActions(ctx.ports);
+        const linked = actions.find((a) => a.cellId === args.cellId && a.status === "open");
+        if (linked) ctx.ports.actionBooks?.write(patchAction(linked, { title: args.title, waiting: waitingFor(args.title) }, now));
+      }
+      await ctx.ports.sendToCell?.(inboxAddr(args.cellId), { text: "检查目标已更新，立即按新命令检查。" });
+      return {
+        output: `Updated checker ${args.cellId} in place (every ${everySec}s, command: \`${clip(command, 200)}\`) and triggered an immediate re-check.`,
+        data: { cellId: args.cellId },
+        awaitsWakeup: true,
+      };
+    },
+  });
+
   return {
     name: TOOLSETS.project,
-    description: "Dispatch workers or checkers, record the next action and its owner, update the project, and settle it.",
-    tools: [dispatch, trackAction, updateProject, finishProject],
+    description: "Dispatch workers or checkers, update command-probe checkers in place, record the next action and its owner, update the project, and settle it.",
+    tools: [dispatch, updateCheck, trackAction, updateProject, finishProject],
   };
 }
 

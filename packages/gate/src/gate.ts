@@ -165,7 +165,7 @@ export function createGate(opts: GateOptions): GateService {
     const storedAction = withoutCard(action);
     const actionHash = hashAction(action);
     const artifactId = action.artifactId ?? null;
-    const related = new Set(action.relatedProjectIds ?? []);
+    const related = new Set([...(action.relatedProjectIds ?? []), ...(action.blockingProjectIds ?? [])]);
     const issuerProject = chainOf(cell).find(c => opts.isProjectRoot?.(c))?.id;
     if (issuerProject) related.add(issuerProject);
     if (action.cardOptions) {
@@ -178,7 +178,7 @@ export function createGate(opts: GateOptions): GateService {
         }
       }
     }
-    for (const id of action.relatedProjectIds ?? []) {
+    for (const id of [...(action.relatedProjectIds ?? []), ...(action.blockingProjectIds ?? [])]) {
       const target = cells.get(id);
       if (!target || !opts.isProjectRoot?.(target)) throw new NgError("invalid_argument", "unknown related project");
       if (cell.id !== id && !isStrictDescendant(id, cell.id) && !isStrictDescendant(cell.id, id))

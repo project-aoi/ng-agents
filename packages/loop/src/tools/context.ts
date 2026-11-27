@@ -24,6 +24,9 @@ function describeArtifact(a: VersionedArtifact, withBody: boolean): string {
 
 const INTERNAL_STATE_PREFIXES = ["cli:", "pull:", "sys:", "cell:"] as const;
 
+const STATE_LIST_VALUE_CHARS = 800;
+const STATE_LIST_TOTAL_CHARS = 12_000;
+
 const readState = defineTool({
   name: "read_state",
   kind: "kernel",
@@ -41,7 +44,25 @@ const readState = defineTool({
     const raw = await ctx.ports.context.listState(cellId, prefix);
     const entries = explicitInternal ? raw : raw.filter((e) => !INTERNAL_STATE_PREFIXES.some((p) => e.key.startsWith(p)));
     if (entries.length === 0) return `No state under "${prefix}"${args.cellId ? ` in ${args.cellId}` : ""}.`;
-    return entries.map((e) => `${e.key} = ${json(e.value)}`).join("\n");
+    const lines: string[] = [];
+    let used = 0;
+    let omitted = 0;
+    for (const e of entries) {
+      const rawJson = json(e.value);
+      const val =
+        rawJson.length > STATE_LIST_VALUE_CHARS
+          ? `${rawJson.slice(0, STATE_LIST_VALUE_CHARS)}… (${rawJson.length} chars; call read_state({ key: ${JSON.stringify(e.key)}${args.cellId ? `, cellId: ${JSON.stringify(args.cellId)}` : ""} }) for full value)`
+          : rawJson;
+      const line = `${e.key} = ${val}`;
+      if (lines.length > 0 && used + line.length + 1 > STATE_LIST_TOTAL_CHARS) {
+        omitted++;
+        continue;
+      }
+      lines.push(line);
+      used += line.length + 1;
+    }
+    if (omitted > 0) lines.push(`… (${omitted} more key(s) omitted; narrow with prefix or read_state({ key }) for a specific entry)`);
+    return lines.join("\n");
   },
 });
 function setState(registry: Registry) {

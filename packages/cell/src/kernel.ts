@@ -19,15 +19,19 @@ import {
   STANDARD_TOOLSETS,
 } from "@ng/loop";
 import {
+  cellPrincipal,
   cellRoleOf,
   cellsRepo,
+  createEnvelope,
   KERNEL_FROM,
   newId, requirePrincipalId,
   createBus,
   createRegistry,
   NgError,
   openDatabase,
+  PAYLOAD,
   systemClock,
+  timerFrom,
   withTx,
   type AgentEngine,
   type AgentLoop,
@@ -283,6 +287,46 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
   unsubscribe.push(
     bus.on("inbox.dead", (e) => {
       core.escalations.deadLetter(e);
+    }),
+  );
+  // M5: Wake suspended code probes immediately when a blocking human decision card resolves.
+  unsubscribe.push(
+    bus.on("approval.changed", (ev) => {
+      if (ev.status === "pending" || ev.status === "revising") return;
+      try {
+        const item = core.humanItems.get(ev.actionId);
+        const targetProjects = new Set<string>([
+          ...(ev.cellId ? [ev.cellId] : []),
+          ...(item?.blockingProjectIds ?? []),
+          ...(item?.relatedProjectIds ?? []),
+        ]);
+        for (const c of cells.list({ status: ["active"] })) {
+          if (c.spec.processor.kind !== "code" || c.spec.processor.entry !== "gtd.check_probe") continue;
+          const st = context.readStateSync<{ suspended?: boolean }>(c.id, "probe:state");
+          if (!st?.suspended) continue;
+          const matches = (c.parentId && targetProjects.has(c.parentId)) || cells.ancestors(c.id).some((a) => targetProjects.has(a.id));
+          if (!matches) continue;
+          inbox.cancelScheduledSync({ cellId: c.id, cancelGroup: "probe" });
+          inbox.enqueueSync(
+            c.id,
+            createEnvelope(
+              {
+                id: `${c.id}:probe:resume:${ev.actionId}:${clock.now()}`,
+                from: timerFrom(c.id),
+                principalId: cellPrincipal(c.id),
+                kind: "event",
+                type: PAYLOAD.timerFired,
+                payload: { label: "父项目审批已结束，恢复检查" },
+                expectedEpoch: c.epoch,
+              },
+              clock,
+            ),
+            { cancelGroup: "probe" },
+          );
+        }
+      } catch (err) {
+        onError(err, "wake suspended probes after approval resolution");
+      }
     }),
   );
   unsubscribe.push(

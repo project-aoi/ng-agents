@@ -131,7 +131,9 @@ export function agentsView(input: ProjectionInput, focus?: readonly string[]): A
     }
     const ref = { id: item.id, title: item.title };
     if (item.cellId && !cards.has(item.cellId)) cards.set(item.cellId, ref);
-    for (const id of item.relatedProjectIds) if (!projectCards.has(id)) projectCards.set(id, ref);
+    // M2: Distinguish blocking project cards from FYI-only relatedProjectIds so active projects are not forced into blocked_human.
+    const blocking = item.blockingProjectIds ?? (item.cellId ? [item.cellId] : []);
+    for (const id of blocking) if (!projectCards.has(id)) projectCards.set(id, ref);
   }
   for (const id of cards.keys()) snoozedCards.delete(id);
 

@@ -368,6 +368,10 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
     // child's own records all have larger seqs, so they are still rendered after it).
     const inheritedUpto = row.inherited !== null ? (cell.spec.fork?.uptoSeq ?? 0) : 0;
     const latest = suffix[cut] === 0 ? records.findLast((_, i) => sizes[i]! > 0) : undefined;
+    const task = originalTask(cell.id);
+    const refReserve = Math.min(1_200, Math.max(96, Math.floor(limits.summaryMaxChars / 5)));
+    const taskReserve = task ? Math.min(task.length + 1, Math.floor(Math.max(0, limits.summaryMaxChars - refReserve) / 2) + 1) : 0;
+    const summaryBudget = Math.max(256, limits.summaryMaxChars - taskReserve);
     return {
       cellId,
       mode,
@@ -377,7 +381,7 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
       keptChars: suffix[cut]!,
       ...(latest ? {latestExcerpt:safeTail(JSON.stringify(latest.record), Math.min(1500,limits.keepRecentChars))} : {}),
       charsBefore: total,
-      input: { cellId, previousSummary: row.summary, messages: folded, maxChars: limits.summaryMaxChars },
+      input: { cellId, previousSummary: row.summary, messages: folded, maxChars: summaryBudget, compactions: row.compactions },
     };
   }
 
@@ -497,6 +501,7 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
       history: history.messages,
       historyUptoSeq: history.uptoSeq,
       summaryUptoSeq: row.summary_upto_seq,
+      compactions: row.compactions,
       tail: tailOf(cell, batch, []),
       skills: JSON.parse(row.skills) as SkillIndexEntry[],
       createdAt: clock.now(),

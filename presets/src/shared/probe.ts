@@ -41,6 +41,16 @@ export interface ProbeState {
   checks: number;
   /** Consecutive checks in which the command could not run at all. */
   cannotRun: number;
+  /** Command string this state belongs to; changing the command in place resets baselines and backoff. */
+  command?: string;
+  /** When polling started for the current target command. */
+  startedAt?: number;
+  /** Last timestamp when output/state changed (used for stagnant long-poll backoff). */
+  backoffResetAt?: number;
+  /** Count of consecutive checks with identical non-terminal output (updated in place without evidence bloat). */
+  unchangedChecks?: number;
+  /** True while suspended because the parent project is paused or waiting on a blocking human decision card. */
+  suspended?: boolean;
   /** Trimmed output of the last check that ran — the baseline for "output_changes". */
   last?: string;
   lastExit?: number;
@@ -52,6 +62,13 @@ export interface ProbeState {
 export const PROBE = {
   everySec: 300,
   minEverySec: 30,
+  /** Long-poll backoff thresholds and caps (M5). */
+  backoffAfter1Ms: 30 * 60_000,
+  backoffSec1: 300,
+  backoffAfter2Ms: 60 * 60_000,
+  backoffSec2: 600,
+  /** Safety-net check interval while suspended for a blocked/paused parent (also woken immediately on card resolution). */
+  suspendedEverySec: 1_800,
   /** A check is one quick command; it never gets longer than its interval. */
   timeoutMs: 60_000,
   timers: "probe",
@@ -125,34 +142,108 @@ export function createCheckProbe(cfg: PresetsConfig): CodeProcessor {
       const a = parseArgs(args);
       if (typeof a === "string") return report("failed", `监听没法开始：${a}。`, prev, { error: a }, `没法开始：${a}`);
 
+      const nowBefore = clock.now();
+      // M5: If the parent updated this checker's target command in place, reset baseline counters and backoff cleanly.
+      const commandChanged = prev.command !== undefined && prev.command !== a.command;
+      const base: ProbeState = commandChanged
+        ? { v: 1, checks: 0, cannotRun: 0, command: a.command, startedAt: nowBefore, backoffResetAt: nowBefore, unchangedChecks: 0, suspended: false }
+        : prev;
+
+      // M5: Auto-suspend polling while parent project is paused or blocked on a pending human decision card (unless deadline reached).
+      if (ports.parentBlockedOnHuman?.() && (a.deadlineAt === undefined || nowBefore < a.deadlineAt)) {
+        const next = Math.min(nowBefore + PROBE.suspendedEverySec * 1000, a.deadlineAt ?? Number.POSITIVE_INFINITY);
+        await ports.cancelScheduled({ cellId: self, cancelGroup: PROBE.timers });
+        await ports.scheduleSelf(
+          { id: `${self}:probe:${snapshot.runId}`, type: PAYLOAD.timerFired, payload: { label: "等待父项目恢复后再检查", data: { suspended: true } } satisfies TimerFiredPayload },
+          { deliverAt: next, cancelGroup: PROBE.timers },
+        );
+        const st: ProbeState = {
+          ...base,
+          v: 1,
+          command: a.command,
+          startedAt: base.startedAt ?? nowBefore,
+          backoffResetAt: base.backoffResetAt ?? nowBefore,
+          suspended: true,
+          lastAt: nowBefore,
+        };
+        await ports.context.commit(self, {
+          statePatches: { [KEYS.probe]: st, [CELL_STATUS_KEY]: statusLine(`父项目等待主人确认中，已暂停轮询 · 已检查 ${st.checks} 次`, nowBefore) },
+        });
+        return "yielded_waiting";
+      }
+
       const check = await runCheck(ports, a, signal);
       if (signal.aborted) return "cancelled";
       const now = clock.now();
       const when = formatWhen(now, cfg.timeZone);
-      const n = prev.checks + 1;
+      const n = base.checks + 1;
       const label = ports.self.spec.title ? `「${ports.self.spec.title}」` : "检查项";
       const facts = { command: a.command, until: a.until, checks: n, at: now, output: clip(check.output, 4_000) };
-      await ports.context.appendEvidence(self, {
-        kind: "system_note",
-        runId: snapshot.runId,
-        at: now,
-        text: `[check #${n} · ${check.ran ? `exit ${check.exitCode}` : check.why}]${check.output ? `\n${clip(check.output, 500)}` : ""}`,
-      });
+
+      const sameOutput =
+        check.ran &&
+        base.checks > 0 &&
+        base.cannotRun === 0 &&
+        base.lastExit === check.exitCode &&
+        base.last === check.output;
+      const willHold = check.ran && a.until === "exit_zero" && check.exitCode === 0;
+      const willChange = check.ran && a.until === "output_changes" && base.last !== undefined && check.output !== base.last;
+      const willFailCannotRun = !check.ran && base.cannotRun + 1 >= 2;
+      const willDeadline = a.deadlineAt !== undefined && now >= a.deadlineAt;
+      const isTerminal = willHold || willChange || willFailCannotRun || willDeadline;
+
+      // M5: Write evidence only on check #1, changed output/status, command failure, or terminal outcome.
+      // Identical non-terminal polls update ProbeState counters in place without spamming evidence.
+      if (n === 1 || !sameOutput || !check.ran || isTerminal) {
+        await ports.context.appendEvidence(self, {
+          kind: "system_note",
+          runId: snapshot.runId,
+          at: now,
+          text: `[check #${n} · ${check.ran ? `exit ${check.exitCode}` : check.why}]${check.output ? `\n${clip(check.output, 500)}` : ""}`,
+        });
+      }
+
+      const startedAt = base.startedAt ?? now;
+      const backoffResetAt = n === 1 || !sameOutput || base.suspended ? now : (base.backoffResetAt ?? startedAt);
+      const unchangedChecks = sameOutput ? (base.unchangedChecks ?? 0) + 1 : 0;
 
       let st: ProbeState;
       if (check.ran) {
-        const changed = prev.last !== undefined && check.output !== prev.last;
-        st = { v: 1, checks: n, cannotRun: 0, last: check.output, lastExit: check.exitCode, lastAt: now };
+        const changed = base.last !== undefined && check.output !== base.last;
+        st = {
+          v: 1,
+          checks: n,
+          cannotRun: 0,
+          command: a.command,
+          startedAt,
+          backoffResetAt,
+          unchangedChecks,
+          suspended: false,
+          last: check.output,
+          lastExit: check.exitCode,
+          lastAt: now,
+        };
         if (a.until === "exit_zero" && check.exitCode === 0) {
           const out = check.output ? `输出：${clip(check.output, 800)}` : "没有输出。";
           return report("completed", `条件已满足：${label}在 ${when} 返回 0（第 ${n} 次检查）。${out}`, st, { ...facts, exitCode: 0, outcome: "holds" }, `已满足 · 第 ${n} 次检查 · ${when}`);
         }
         if (a.until === "output_changes" && changed) {
-          const summary = `输出变了：${label}在 ${when}（第 ${n} 次检查）的输出与上一次不同。\n之前：${clip(prev.last || "（空）", 400)}\n现在：${clip(check.output || "（空）", 800)}`;
-          return report("completed", summary, st, { ...facts, exitCode: check.exitCode, previous: clip(prev.last ?? "", 2_000), outcome: "changed" }, `输出已变化 · 第 ${n} 次检查 · ${when}`);
+          const summary = `输出变了：${label}在 ${when}（第 ${n} 次检查）的输出与上一次不同。\n之前：${clip(base.last || "（空）", 400)}\n现在：${clip(check.output || "（空）", 800)}`;
+          return report("completed", summary, st, { ...facts, exitCode: check.exitCode, previous: clip(base.last ?? "", 2_000), outcome: "changed" }, `输出已变化 · 第 ${n} 次检查 · ${when}`);
         }
       } else {
-        st = { ...prev, v: 1, checks: n, cannotRun: prev.cannotRun + 1, lastAt: now };
+        st = {
+          ...base,
+          v: 1,
+          checks: n,
+          cannotRun: base.cannotRun + 1,
+          command: a.command,
+          startedAt,
+          backoffResetAt: now,
+          unchangedChecks: 0,
+          suspended: false,
+          lastAt: now,
+        };
         if (st.cannotRun >= 2) {
           const out = check.output ? `输出：${clip(check.output, 800)}` : "";
           return report("failed", `检查命令连续 ${st.cannotRun} 次没能运行，已停止监听：${label}（${check.why}，${when}）。${out}`, st, { ...facts, reason: check.why, outcome: "cannot_run" }, `检查命令没能运行 · 已停止 · ${when}`);
@@ -172,8 +263,15 @@ export function createCheckProbe(cfg: PresetsConfig): CodeProcessor {
       }
 
       // Not yet: one reminder for the next look (whatever woke this one, the pending reminder is replaced), and a
-      // line for the project's roster. Nothing is sent; no model runs.
-      const next = Math.min(now + a.everySec * 1000, a.deadlineAt ?? Number.POSITIVE_INFINITY);
+      // line for the project's roster. Long stagnant polls gradually back off (30m → 300s, 60m → 600s).
+      const stagnantMs = Math.max(0, now - backoffResetAt);
+      const effectiveEverySec =
+        stagnantMs >= PROBE.backoffAfter2Ms
+          ? Math.max(a.everySec, PROBE.backoffSec2)
+          : stagnantMs >= PROBE.backoffAfter1Ms
+            ? Math.max(a.everySec, PROBE.backoffSec1)
+            : a.everySec;
+      const next = Math.min(now + effectiveEverySec * 1000, a.deadlineAt ?? Number.POSITIVE_INFINITY);
       await ports.cancelScheduled({ cellId: self, cancelGroup: PROBE.timers });
       await ports.scheduleSelf(
         { id: `${self}:probe:${snapshot.runId}`, type: PAYLOAD.timerFired, payload: { label: "再检查一次", data: { probe: n + 1 } } satisfies TimerFiredPayload },

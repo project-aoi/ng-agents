@@ -12,6 +12,7 @@ import {
   KERNEL_FROM,
   newId,
   PAYLOAD,
+  sha256Hex,
   type CardPrep,
   type CellProgressPayload,
   type CellResultCandidate,
@@ -29,7 +30,7 @@ import {
   type ToolResult,
   type Toolset,
 } from "@ng/protocol";
-import { defaultSubjectKey, itemRawInput, itemSource, clip, clipLine, primaryEnvelope, selfId } from "./util";
+import { defaultSubjectKey, itemRawInputFor, resolveCardAttribution, clip, clipLine, primaryEnvelope, selfId } from "./util";
 
 export const COMMS_TOOLSET = "kernel.comms";
 
@@ -141,6 +142,7 @@ async function sendToInbox(ctx: ToolContext, to: `inbox:${string}`, args: { text
 export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
   const deskCellId = opts.deskCellId ?? DESK_CELL_ID;
 
+  const sentOwnerNotices = new WeakMap<object, Set<string>>();
   const sendMessage = defineTool({
     name: "send_message",
     kind: "kernel",
@@ -161,6 +163,13 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
         return { output: "Choose a cell inbox or the owner's workbench address.", isError: true };
       }
       if (!anyCovers(ctx.ports.self.bounds.canSendTo, args.to)) return { output: "This cell cannot notify the owner. Send to your parent or to the desk.", isError: true };
+      const bodyHash = sha256Hex(args.text.trim()).slice(0, 16);
+      let seen = sentOwnerNotices.get(ctx.snapshot);
+      if (!seen) sentOwnerNotices.set(ctx.snapshot, (seen = new Set()));
+      if (seen.has(bodyHash)) {
+        return { output: "已通知主人（本轮已发送过相同内容，未重复推送）。", sent: { to: args.to, text: args.text } };
+      }
+      seen.add(bodyHash);
       await ctx.ports.notifyOwner({ format: "text", body: args.text }, `${ctx.snapshot.runId}:${ctx.toolUseId}`);
       return { output: "已通知主人。", sent: { to: args.to, text: args.text } };
     },
@@ -191,7 +200,9 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
         targetCellIds: z.array(z.string()).optional().describe('for terminateMode "cancel_task": single project cell id to close'),
         confirm: z.string().optional().describe("extra confirmation prompt before executing a destructive choice"),
       })).optional().describe("explicit decision choices shown on the card"),
-      relatedProjectIds: z.array(z.string().min(1)).optional().describe("project cell ids this decision affects (links the card to those projects and required for cancel_task targets)"),
+      relatedProjectIds: z.array(z.string().min(1)).optional().describe("project cell ids this decision relates to (FYI links and required for cancel_task targets)"),
+      blockingProjectIds: z.array(z.string().min(1)).optional().describe("subset of relatedProjectIds that are actually blocked waiting for this decision (omit for FYI-only related projects so running projects are not marked blocked_human)"),
+      sourceCellId: z.string().min(1).optional().describe("optional cell id that triggered this card when processing a multi-message batch"),
       title: z.string().min(1),
       summary: z.string().min(1).describe("one line for the card and the audit log"),
       subjectKey: z.string().optional().describe('stable dedup key (e.g. "arb:<cause>"); reusing the same subjectKey updates an existing open card instead of creating a duplicate'),
@@ -227,16 +238,29 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
       const draft = args.artifactId && !protectedAction ? await ctx.ports.context.getArtifact(args.artifactId) : null;
       if (args.artifactId && !protectedAction && !draft) return { output: `There is no artifact ${args.artifactId}: save the draft first (save_artifact), then put its id on the card.`, isError: true };
       const bound = (v: number | undefined) => (draft && v !== undefined ? ` It is bound to ${draft.artifactId} v${v}: when the decision says humanEdited or a newer artifactVersion, read_artifact before you act on it.` : "");
-      if (!protectedAction && (args.kind !== "action" || (!args.action && !args.options?.some(o => o.effect === "execute"))) && (args.options || args.relatedProjectIds)) {
+      const blockingIds = args.blockingProjectIds ? [...new Set(args.blockingProjectIds)] : undefined;
+      const relatedIds =
+        args.relatedProjectIds || blockingIds
+          ? [...new Set([...(args.relatedProjectIds ?? []), ...(blockingIds ?? [])])]
+          : undefined;
+      const attr = resolveCardAttribution(ctx.snapshot, {
+        sourceCellId: args.sourceCellId,
+        artifactCellId: draft?.cellId,
+        selfCellId: selfId(ctx),
+        blockingProjectIds: blockingIds,
+        relatedProjectIds: relatedIds,
+      });
+      if (!protectedAction && (args.kind !== "action" || (!args.action && !args.options?.some(o => o.effect === "execute"))) && (args.options || relatedIds)) {
         if (!ctx.ports.createHumanItem) return { output: "Custom cards are unavailable.", isError: true };
         const item = ctx.ports.createHumanItem({
-          title: args.title, description: args.escalation?.explanation ?? args.summary, prep:prepOf(args.prep), source:itemSource(ctx.snapshot), rawInput:itemRawInput(ctx.snapshot), subjectKey: args.subjectKey ?? `arb:${primaryEnvelope(ctx.snapshot)?.id ?? ctx.snapshot.runId}`,
-          options: args.options ?? [{ id: "reply", label: "回复", effect: "reply" }], relatedProjectIds: args.relatedProjectIds ?? [],
+          title: args.title, description: args.escalation?.explanation ?? args.summary, prep:prepOf(args.prep), source: attr.source, rawInput: itemRawInputFor(attr.env), subjectKey: args.subjectKey ?? `arb:${attr.env?.id ?? primaryEnvelope(ctx.snapshot)?.id ?? ctx.snapshot.runId}`,
+          options: args.options ?? [{ id: "reply", label: "回复", effect: "reply" }], relatedProjectIds: relatedIds ?? [],
+          ...(blockingIds ? { blockingProjectIds: blockingIds } : {}),
           ...(draft ? { artifactId: draft.artifactId } : {}),
         });
         return { output: `Card ${item.id} is waiting for a decision.${bound(draft?.version)}`, data: { ...item, ...(draft ? { artifactId: draft.artifactId, artifactVersion: draft.version } : {}) }, endRun: "deferred_for_approval" };
       }
-      const base = { subjectKey, title: args.title, source: itemSource(ctx.snapshot), rawInput: itemRawInput(ctx.snapshot), prep: prepOf(args.prep) };
+      const base = { subjectKey, title: args.title, source: attr.source, rawInput: itemRawInputFor(attr.env), prep: prepOf(args.prep) };
       let action: ProposedAction;
       let artifactVersion: number | undefined;
       if (args.kind === "project") {
@@ -301,7 +325,8 @@ export function commsToolset(opts: CommsToolsetOptions = {}): Toolset {
         };
       }
       if (args.options) action.cardOptions = args.options;
-      if (args.relatedProjectIds) action.relatedProjectIds = args.relatedProjectIds;
+      if (relatedIds) action.relatedProjectIds = relatedIds;
+      if (blockingIds) action.blockingProjectIds = blockingIds;
       if (draft) {
         // Binds the decision to the draft version the owner saw, as for a project proposal.
         action.artifactId = draft.artifactId;

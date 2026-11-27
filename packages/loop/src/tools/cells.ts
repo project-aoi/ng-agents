@@ -10,6 +10,7 @@ import {
 
   type Address,
   type CellSpec,
+  type CellUpdatePatch,
   type PolicyBounds,
   type ProcessorSpec,
   type Registry,
@@ -198,7 +199,7 @@ export function cellsToolset(registry: Registry): Toolset {
     name: "update_cell",
     kind: "kernel",
     description:
-      "Change a cell's title, cwd, watches, schedules or meta (given fields replace the old ones). cellId is a child's id — or leave it out to change your own watches/schedules.",
+      "Change a cell's title, cwd, watches, schedules, meta, or request a fresh native CLI session (resetSession: true) at a stage boundary. cellId is a child's id — or leave it out to change your own watches/schedules.",
     input: z.object({
       cellId: z.string().min(1).optional().describe("default: this cell"),
       title: z.string().min(1).optional(),
@@ -206,14 +207,16 @@ export function cellsToolset(registry: Registry): Toolset {
       watches: z.array(watchInput).optional(),
       schedules: z.array(scheduleInput).optional(),
       meta: z.record(z.string(), z.unknown()).optional(),
+      resetSession: z.boolean().optional().describe("true: start a fresh native CLI session on the next wake-up while keeping the cell's summary, notes and artifacts"),
     }),
     async handler(args, ctx) {
-      const patch: Partial<CellSpec> = {};
+      const patch: CellUpdatePatch = {};
       if (args.title) patch.title = args.title;
       if (args.cwd) patch.cwd = args.cwd;
       if (args.watches) patch.watches = toWatches(args.watches);
       if (args.schedules) patch.schedules = toSchedules(args.schedules);
       if (args.meta) patch.meta = args.meta;
+      if (args.resetSession) patch.resetSession = true;
       if (Object.keys(patch).length === 0) return { output: "Nothing to update.", isError: true };
       const target = args.cellId ?? ctx.ports.self.cellId;
       await ctx.ports.updateCell(target, patch);

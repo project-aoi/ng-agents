@@ -10,8 +10,29 @@ const stateText = (row: string) =>
 // Owner: @ng/context. Gate/kernel read artifacts through artifactsRepo(db).
 export const contextSchema: SchemaModule = {
   owner: "@ng/context",
-  version: 1,
-  migrations: [],
+  version: 2,
+  migrations: [
+    {
+      from: 1,
+      to: 2,
+      run(db) {
+        db.exec(`
+DROP TRIGGER IF EXISTS evidence_fts_ai;
+DROP TRIGGER IF EXISTS evidence_fts_ad;
+DROP TABLE IF EXISTS evidence_fts;
+DROP TRIGGER IF EXISTS resource_fts_ai;
+DROP TRIGGER IF EXISTS resource_fts_ad;
+DROP TRIGGER IF EXISTS resource_fts_au;
+DROP TABLE IF EXISTS resource_fts;
+CREATE VIRTUAL TABLE IF NOT EXISTS evidence_fts USING fts5(text, tokenize = 'trigram');
+INSERT INTO evidence_fts(rowid, text)
+SELECT seq, CASE WHEN kind = 'tool_call' THEN substr(text, 1, 256) ELSE text END
+FROM evidence
+WHERE kind IN ('inbound','assistant_text','external','system_note','tool_call');
+`);
+      },
+    },
+  ],
   ddl: /* sql */ `
 -- Layer 1: business state (single writer per cell via the Inbox serial lock).
 CREATE TABLE IF NOT EXISTS cell_state (
@@ -74,28 +95,29 @@ CREATE TABLE IF NOT EXISTS evidence (
   at         INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_evidence_cell ON evidence(cell_id, seq);
-CREATE INDEX IF NOT EXISTS idx_evidence_steer ON evidence(cell_id,json_extract(content,\'$.envelopeId\')) WHERE kind=\'system_note\';
+CREATE INDEX IF NOT EXISTS idx_evidence_steer ON evidence(cell_id,json_extract(content,'$.envelopeId')) WHERE kind='system_note';
+CREATE INDEX IF NOT EXISTS idx_evidence_inbound ON evidence(cell_id,json_extract(content,'$.envelope.id')) WHERE kind='inbound';
 CREATE INDEX IF NOT EXISTS idx_evidence_run ON evidence(run_id) WHERE run_id IS NOT NULL;
 CREATE TRIGGER IF NOT EXISTS evidence_append_only BEFORE UPDATE ON evidence
 BEGIN
   SELECT RAISE(ABORT, 'evidence is append-only');
 END;
 
--- trigram tokenizer: substring search that works for Chinese. MATCH needs >= 3 characters;
--- for 1-2 character queries use: WHERE text LIKE '%' || :q || '%' on evidence_fts (still served by the trigram index for >= 3).
+-- Selective trigram index: conversational and summary records only (excludes large tool_result blobs and run_boundary).
+-- tool_call entries are capped to 256 chars; tool_result and resources are searched on demand without trigram bloat.
 CREATE VIRTUAL TABLE IF NOT EXISTS evidence_fts USING fts5(
   text,
-  content = 'evidence',
-  content_rowid = 'seq',
   tokenize = 'trigram'
 );
 CREATE TRIGGER IF NOT EXISTS evidence_fts_ai AFTER INSERT ON evidence
+WHEN new.kind IN ('inbound','assistant_text','external','system_note','tool_call')
 BEGIN
-  INSERT INTO evidence_fts(rowid, text) VALUES (new.seq, new.text);
+  INSERT INTO evidence_fts(rowid, text)
+  VALUES (new.seq, CASE WHEN new.kind = 'tool_call' THEN substr(new.text, 1, 256) ELSE new.text END);
 END;
 CREATE TRIGGER IF NOT EXISTS evidence_fts_ad AFTER DELETE ON evidence
 BEGIN
-  INSERT INTO evidence_fts(evidence_fts, rowid, text) VALUES ('delete', old.seq, old.text);
+  DELETE FROM evidence_fts WHERE rowid = old.seq;
 END;
 
 -- Inline & Spill: full large outputs addressed by URI (res://<cellId>/<id>), read in pages.
@@ -111,10 +133,9 @@ CREATE TABLE IF NOT EXISTS resources (
 );
 CREATE INDEX IF NOT EXISTS idx_resources_cell ON resources(cell_id, created_at);
 
--- Full-text indexes for searchHistory. Artifacts and state store derived text; resources use their source table.
+-- Full-text indexes for searchHistory. Artifacts and state store derived text; resources are scanned on demand.
 CREATE VIRTUAL TABLE IF NOT EXISTS artifact_fts USING fts5(title, body, tokenize = 'trigram');
 CREATE VIRTUAL TABLE IF NOT EXISTS state_fts USING fts5(key, text, tokenize = 'trigram');
-CREATE VIRTUAL TABLE IF NOT EXISTS resource_fts USING fts5(content, content = 'resources', tokenize = 'trigram');
 CREATE TRIGGER IF NOT EXISTS artifact_fts_ai AFTER INSERT ON artifacts
 BEGIN
   INSERT INTO artifact_fts(rowid, title, body) VALUES (new.rowid, new.title, ${artifactBody("new")});
@@ -140,19 +161,6 @@ END;
 CREATE TRIGGER IF NOT EXISTS state_fts_ad AFTER DELETE ON cell_state
 BEGIN
   DELETE FROM state_fts WHERE rowid = old.seq;
-END;
-CREATE TRIGGER IF NOT EXISTS resource_fts_ai AFTER INSERT ON resources
-BEGIN
-  INSERT INTO resource_fts(rowid, content) VALUES (new.rowid, new.content);
-END;
-CREATE TRIGGER IF NOT EXISTS resource_fts_ad AFTER DELETE ON resources
-BEGIN
-  INSERT INTO resource_fts(resource_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
-END;
-CREATE TRIGGER IF NOT EXISTS resource_fts_au AFTER UPDATE ON resources
-BEGIN
-  INSERT INTO resource_fts(resource_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
-  INSERT INTO resource_fts(rowid, content) VALUES (new.rowid, new.content);
 END;
 
 -- Layer 3: SKILL.md bodies, notes and preferences (separate from business state).

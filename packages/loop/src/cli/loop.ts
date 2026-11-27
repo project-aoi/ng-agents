@@ -45,6 +45,8 @@ export const WORKBENCH_CELL_ENV = "NG_WORKBENCH_CELL_ID";
 export const CLI_SESSION_KEY = "cli:session";
 /** Set by the kernel on a fork_prefix child: the parent's CliSessionRecord at spawn time. */
 export const CLI_FORK_SESSION_KEY = "cli:session:fork";
+/** Set by updateCell({ resetSession: true }) so an in-flight Run cannot overwrite the reset when it exits. */
+export const CLI_SESSION_RESET_KEY = "cli:session:reset";
 export { CLI_MCP_SERVER } from "./instructions";
 
 export const RUN_ENDED_NOTICE =
@@ -249,12 +251,25 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
     const ownHistory = ownSystem !== undefined && snapshot.spec.fork ? historyUnderOwnSystem(snapshot.history, cellId, snapshot.spec.fork.fromCellId) : snapshot.history;
 
     // ---------- session plan ----------
+    const MAX_COMPACTIONS_PER_NATIVE_SESSION = 3;
     const own = await ports.context.readState<CliSessionRecord>(cellId, CLI_SESSION_KEY);
+    const initialResetAt = await ports.context.readState<number>(cellId, CLI_SESSION_RESET_KEY);
     const sameModel = (r: CliSessionRecord) => (r.model ?? "") === (model ?? "");
+    const curCompactions = snapshot.compactions ?? 0;
+    const compactionsSinceSession = own ? curCompactions - (own.compactionsAtSessionStart ?? 0) : 0;
+    const sessionResetRequested = initialResetAt !== null && (!own || initialResetAt >= own.updatedAt);
+    const sessionBloated = own !== null && compactionsSinceSession >= MAX_COMPACTIONS_PER_NATIVE_SESSION;
+    if (sessionBloated && !sessionResetRequested) {
+      debug({
+        type: "notice",
+        cellId,
+        text: `${engine}: native session ${own.sessionId} crossed ${compactionsSinceSession} compactions; rolling over smoothly to a fresh session with structured summary`,
+      });
+    }
     let plan: { session?: LaunchRequest["session"]; prompt: string; forkedFrom?: string; parentHash?: string };
     let releaseParent: (()=>void) | undefined;
     let sessionBaselineSeq = snapshot.historyUptoSeq;
-    if (own && own.engine === engine && own.cwd === access.root && own.systemHash === snapshot.system.hash && sameModel(own)) {
+    if (own && !sessionResetRequested && !sessionBloated && own.engine === engine && own.cwd === access.root && own.systemHash === snapshot.system.hash && sameModel(own)) {
       sessionBaselineSeq = own.lastDeliveredEvidenceSeq;
       const resumedInput = inputOf(tailText(snapshot, { resumed: true })) || input;
       const seenEnvelopes = new Set([...initialBatchIds, ...tracked.keys()]);
@@ -307,6 +322,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
     let eventChain = Promise.resolve();
     let sessionModel: string | null = null;
     let sessionCreatedAt = own && plan.session?.mode === "resume" ? own.createdAt : clock.now();
+    let sessionCompactionsBase = own && plan.session?.mode === "resume" ? (own.compactionsAtSessionStart ?? 0) : curCompactions;
     let endOutcome: EndOutcome | undefined;
     /** The turn in which a tool ended the Run is over: nothing the CLI says after that is this Run's. */
     let closingDone = false;
@@ -348,11 +364,20 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
         createdAt: sessionCreatedAt,
         updatedAt: clock.now(),
         runs: (own && own.sessionId === sessionId ? own.runs : 0) + (final ? 1 : 0),
+        compactionsAtSessionStart: sessionCompactionsBase,
         ...(plan.forkedFrom ? { forkedFrom: plan.forkedFrom } : {}),
       };
       const patches: Record<string, unknown> = { [CLI_SESSION_KEY]: rec };
       if (plan.forkedFrom) patches[CLI_FORK_SESSION_KEY] = null;
-      persist = persist.then(() => ports.context.commit(cellId, { statePatches: patches })).catch(() => undefined);
+      if (sessionResetRequested) patches[CLI_SESSION_RESET_KEY] = null;
+      persist = persist
+        .then(async () => {
+          // If resetSession: true was requested during this Run, do not overwrite the reset with the old session.
+          const latestResetAt = await ports.context.readState<number>(cellId, CLI_SESSION_RESET_KEY);
+          if (latestResetAt !== null && (initialResetAt === null || latestResetAt > initialResetAt)) return;
+          await ports.context.commit(cellId, { statePatches: patches });
+        })
+        .catch(() => undefined);
     };
 
     /**
@@ -610,6 +635,7 @@ export function createCliAgentLoop(opts: CliAgentLoopOptions): AgentLoop & { rea
           awaitingSessionConfirmation = false;
           sessionBaselineSeq = snapshot.historyUptoSeq;
           sessionCreatedAt = clock.now();
+          sessionCompactionsBase = curCompactions;
           delete plan.forkedFrom;
           nextSession = undefined;
           nextPromptItems = out.relaunchItems;

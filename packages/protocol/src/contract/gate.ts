@@ -32,6 +32,7 @@ export type SideEffect = "none" | "internal" | "notify_owner" | "external";
 interface ActionBase {
   cardOptions?: import("../human-item").CardOption[];
   relatedProjectIds?: string[];
+  blockingProjectIds?: string[];
 
   summary: string;                      // one human-readable line (card title fallback, audit log)
   subjectKey: string;                   // the item this action belongs to; at most one pending approval per subjectKey

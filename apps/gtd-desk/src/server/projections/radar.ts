@@ -214,7 +214,11 @@ export function radarProjects(input: ProjectionInput): Omit<RadarDTO, "review"> 
   }
   const visibleCards = new Map<string, { id: string; title: string }>();
   for (const item of kernel.humanItems.list()) {
-    if (item.category==="decision") for (const pid of item.relatedProjectIds) if (!visibleCards.has(pid)) visibleCards.set(pid,{id:item.id,title:item.title});
+    if (item.category !== "decision") continue;
+    // M2: Only cards owned by the project or explicitly declared in blockingProjectIds hijack the project's ball;
+    // FYI-only relatedProjectIds stay side links without marking a running project blocked on the human.
+    const blocking = item.blockingProjectIds ?? (item.cellId ? [item.cellId] : []);
+    for (const pid of blocking) if (!visibleCards.has(pid)) visibleCards.set(pid, { id: item.id, title: item.title });
   }
   const revisingIds = new Set(kernel.humanItems.listRevising().map((item) => item.id));
   const stalls = new Map(all<{ cell_id: string; since: number }>(kernel.db, "SELECT cell_id,since FROM cell_stalls").map(r => [r.cell_id, r.since]));

@@ -14,6 +14,7 @@ import type {
   CellRole,
   CellSpec,
   CellStatus,
+  CellUpdatePatch,
   Channel,
   ChildSummary,
   Clock,
@@ -262,7 +263,7 @@ export interface Kernel {
   /** createRootCell unless a cell with `spec.id` exists (then it is returned unchanged). */
   ensureRootCell(spec: CellSpecInput & { id: string }, opts: RootCellOptions): CellRecord;
   spawnCell(parentId: string, spec: CellSpecInput, initialPayload: unknown, opts: SpawnOptions): InboxAddr;
-  updateCell(cellId: string, patch: Partial<CellSpec>, opts: ActorOptions): CellRecord;
+  updateCell(cellId: string, patch: CellUpdatePatch, opts: ActorOptions): CellRecord;
   /**
    * Cascade over the subtree in one transaction (epochs, status, pending messages, schedules, watches, waits,
    * pending decisions and project records); the returned promise settles after Runs are aborted and the runtime is stopped

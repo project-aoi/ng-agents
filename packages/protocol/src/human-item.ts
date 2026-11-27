@@ -26,6 +26,8 @@ export interface HumanItemDraft {
   source?: import("./gtd").ItemSource;
   rawInput?: import("./gtd").DecisionCard["rawInput"];
   relatedProjectIds?: string[];
+  /** Subset of relatedProjectIds actually blocked waiting for this decision (FYI-only related projects stay unblocked). */
+  blockingProjectIds?: string[];
   options: CardOption[];
   category?: "action" | "decision";
   dueAt?: number;
@@ -44,6 +46,8 @@ export interface HumanItem extends Omit<HumanItemDraft, "artifactId"> {
   /** When it was first raised (later changes to it do not move this). */
   createdAt: number;
   relatedProjectIds: string[];
+  /** Projects actually blocked waiting on this item (its owning project + any explicitly declared blocking projects). */
+  blockingProjectIds?: string[];
   snoozedUntil: number | null;
   artifactId: string | null;
   artifactVersion: number | null;

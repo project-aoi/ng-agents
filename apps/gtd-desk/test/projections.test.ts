@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { gtdKeys } from "@ng/presets";
 import { subjectKeys } from "@ng/protocol";
 import { DEFAULT_SETTINGS, inputOf, projectActivity, projectRadar, projectReview, projectSources, projectStatus, SENSOR_SUGGESTION_PREFIX, SKILL_SUGGESTION_PREFIX } from "../src/server/projections";
+import { projectTopology } from "../src/server/projections/agent-topology";
 import { topBallOwner } from "../src/server/projections/radar";
 import { cronText } from "../src/server/projections/sources";
 import { parseDecisions, waitingDTO } from "../src/server/projections/format";
@@ -219,5 +220,55 @@ describe("project action display order", () => {
     expect(topBallOwner([{ owner: "agent", status: "open" }, { owner: "human", status: "open" }])).toBe("human");
     expect(topBallOwner([{ owner: "human", status: "done" }, { owner: "waiting", status: "open" }])).toBe("waiting");
     expect(topBallOwner([{ owner: "human", status: "cancelled" }])).toBeNull();
+  });
+
+  // Audit 2026-11-27 M2: FYI-only relatedProjectIds on cross-project cards must NOT hijack blocked_human / human ball.
+  it("M2: distinguishes blockingProjectIds from FYI-only relatedProjectIds in Radar and Agent Topology", async () => {
+    const { kernel } = await bootDesk();
+    const blockedProj = makeProject(kernel, "公共阻塞项目");
+    const runningProj = makeProject(kernel, "全速推进项目");
+    writeAction(kernel, runningProj, { title: "推送 MR 与跑 CI", owner: "agent" });
+
+    // Desk creates a cross-project decision card: blockedProj is blocked, runningProj is FYI-only.
+    const card = kernel.humanItems.create(
+      {
+        title: "公共平台验证方案确认",
+        subjectKey: "arb:shared-win",
+        relatedProjectIds: [blockedProj, runningProj],
+        blockingProjectIds: [blockedProj],
+        options: [{ id: "ok", label: "批准", effect: "reply" }],
+      },
+      "desk",
+    );
+    expect(card.relatedProjectIds).toEqual(expect.arrayContaining([blockedProj, runningProj]));
+    expect(card.blockingProjectIds).toEqual([blockedProj]);
+
+    const radar = projectRadar(view(kernel));
+    const blockedRow = radar.projects.find((p) => p.id === blockedProj)!;
+    const runningRow = radar.projects.find((p) => p.id === runningProj)!;
+    expect(blockedRow.ball).toMatchObject({ owner: "human", cardId: card.id });
+    expect(blockedRow.pendingCardId).toBe(card.id);
+    expect(runningRow.ball).toMatchObject({ owner: "agent", text: "推送 MR 与跑 CI" });
+    expect(runningRow.pendingCardId).toBeNull();
+
+    const topo = projectTopology(view(kernel));
+    expect(topo.nodes.find((n) => n.cellId === blockedProj)).toMatchObject({ state: "blocked_human", pendingCardId: card.id });
+    expect(topo.nodes.find((n) => n.cellId === runningProj)?.state).not.toBe("blocked_human");
+    expect(topo.nodes.find((n) => n.cellId === runningProj)?.pendingCardId).toBeNull();
+
+    // Desk card with ONLY relatedProjectIds (no blockingProjectIds) is FYI-only and never hijacks runningProj.
+    const fyiCard = kernel.humanItems.create(
+      {
+        title: "顺带知会：公共脚本更新",
+        subjectKey: "arb:fyi-only",
+        relatedProjectIds: [runningProj],
+        options: [{ id: "ok", label: "知道了", effect: "reply" }],
+      },
+      "desk",
+    );
+    expect(fyiCard.blockingProjectIds).toEqual([]);
+    const radar2 = projectRadar(view(kernel));
+    expect(radar2.projects.find((p) => p.id === runningProj)?.ball).toMatchObject({ owner: "agent" });
+    expect(projectTopology(view(kernel)).nodes.find((n) => n.cellId === runningProj)?.state).not.toBe("blocked_human");
   });
 });

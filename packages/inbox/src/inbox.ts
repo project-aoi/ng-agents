@@ -175,6 +175,21 @@ export function createInbox(opts: InboxOptions): InboxService {
        WHERE cell_id = ? AND status = 'pending' AND expected_epoch IS NOT NULL AND expected_epoch != ?`,
       [String(cell.epoch), now, cell.id, cell.epoch],
     );
+    // M1: Drop non-terminal messages whose sender cell is already closed; terminal cell.result always survives.
+    run(
+      db,
+      `UPDATE inbox_messages SET status = 'cancelled', status_reason = 'sender cell is closed', updated_at = ?
+       WHERE cell_id = ? AND status = 'pending' AND type IN (?, ?)
+         AND EXISTS (
+           SELECT 1 FROM cells s
+           WHERE s.status = 'closed'
+             AND (
+               (json_extract(inbox_messages.envelope, '$.from') LIKE 'inbox:%' AND s.id = substr(json_extract(inbox_messages.envelope, '$.from'), 7))
+               OR (inbox_messages.principal_id LIKE 'cell:%' AND s.id = substr(inbox_messages.principal_id, 6))
+             )
+         )`,
+      [now, cell.id, PAYLOAD.cellMessage, PAYLOAD.cellProgress],
+    );
   }
 
   // ==================== insert paths ====================
@@ -289,6 +304,21 @@ export function createInbox(opts: InboxOptions): InboxService {
         [reason, retryAt ?? Number.MIN_SAFE_INTEGER, now, c.claim_id],
       ).changes;
     } else {
+      // M1: Before retrying or dead-lettering a failed batch, drop non-terminal messages whose sender has already closed.
+      res.cancelled += run(
+        db,
+        `UPDATE inbox_messages SET status = 'cancelled', claim_id = NULL, status_reason = 'sender cell is closed', updated_at = ?
+         WHERE claim_id = ? AND status = 'claimed' AND type IN (?, ?)
+           AND EXISTS (
+             SELECT 1 FROM cells s
+             WHERE s.status = 'closed'
+               AND (
+                 (json_extract(inbox_messages.envelope, '$.from') LIKE 'inbox:%' AND s.id = substr(json_extract(inbox_messages.envelope, '$.from'), 7))
+                 OR (inbox_messages.principal_id LIKE 'cell:%' AND s.id = substr(inbox_messages.principal_id, 6))
+               )
+           )`,
+        [now, c.claim_id, PAYLOAD.cellMessage, PAYLOAD.cellProgress],
+      ).changes;
       const dead = all<{ seq: number; envelope_id: string }>(
         db,
         `UPDATE inbox_messages SET status = 'dead', attempts = attempts + 1, status_reason = ?, updated_at = ?

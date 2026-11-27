@@ -14,7 +14,7 @@ import {
   type PromptSnapshot,
   type StepOrExternalEvidence,
 } from "@ng/protocol";
-import { FORK_PENDING_TEXT, NO_RESULT_TEXT, renderEnvelope } from "../src";
+import { FORK_PENDING_TEXT, NO_RESULT_TEXT, renderEnvelope, structuredSummary } from "../src";
 import { assertWireInvariants, batchOf, json, prng, setup, simulateRun, userEnvelope, type Harness } from "./helpers";
 
 const deskBounds = makeBounds({ tools: ["read"], canSendTo: ["inbox:*"], maxConcurrentChildren: 3, maxDepth: 2 });
@@ -787,4 +787,45 @@ it("hands the tail-notes provider the Run's id (the batch's claim) on the first 
   h.store.refreshTailSync(snap, ["[extra]"]);
   expect(calls).toHaveLength(2);
   for (const c of calls) expect(c).toEqual({ cellId: "desk", incoming: batch.envelopes, runId: batch.claimId });
+});
+
+it("M7: structuredSummary produces 4 semantic sections, filters noisy read dumps, and fits within budget", () => {
+  const summary = structuredSummary({
+    cellId: "proj_x",
+    compactions: 2,
+    maxChars: 2_000,
+    previousSummary: null,
+    messages: [
+      { role: "user", content: [{ type: "text", text: "[user.message · from channel:ui:owner] 实现 /home/dev/app/src/router.ts 并提 PR #42" }] },
+      {
+        role: "assistant",
+        content: [
+          { type: "tool_use", id: "t1", name: "read_state", input: { prefix: "gtd:" } },
+          { type: "tool_use", id: "t2", name: "save_artifact", input: { artifactId: "art_plan_1" } },
+        ],
+      },
+      {
+        role: "user",
+        content: [
+          { type: "tool_result", toolUseId: "t1", content: "NOISY_READ_STATE_DUMP_SHOULD_BE_FILTERED" },
+          { type: "tool_result", toolUseId: "t2", content: "Saved art_plan_1 v1" },
+        ],
+      },
+      {
+        role: "assistant",
+        content: [{ type: "tool_use", id: "t3", name: "bash", input: { command: "pnpm test" } }],
+      },
+      {
+        role: "user",
+        content: [{ type: "tool_result", toolUseId: "t3", isError: true, content: "FAIL src/router.test.ts: timeout" }],
+      },
+    ],
+  });
+  expect(summary).toContain("## 目标与要求");
+  expect(summary).toContain("## 进展与结论");
+  expect(summary).toContain("## 阻塞与错误");
+  expect(summary).toContain("## 关键路径与标识");
+  expect(summary).toContain("/home/dev/app/src/router.ts");
+  expect(summary).not.toContain("NOISY_READ_STATE_DUMP_SHOULD_BE_FILTERED");
+  expect(summary.length).toBeLessThanOrEqual(2_000);
 });

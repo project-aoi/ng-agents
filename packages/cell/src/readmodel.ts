@@ -591,8 +591,9 @@ export function createReadModel(core: KernelCore): ReadModel {
 
     const f = cachedFacts ?? facts();
     const working = new Set(core.dispatcher.running().filter(r => !r.stallOnly).map(r => r.cellId));
-    const cards = all<{cell_id:string; subject_key:string; related_project_ids:string}>(db, `SELECT cell_id, subject_key, related_project_ids FROM human_items
+    const cards = all<{action_id:string; cell_id:string; subject_key:string; related_project_ids:string}>(db, `SELECT action_id, cell_id, subject_key, related_project_ids FROM human_items
       WHERE cell_id IS NOT NULL AND category='decision' AND status IN ('pending','snoozed')`);
+    const openItemIds = new Set(all<{action_id:string}>(db, "SELECT action_id FROM human_items WHERE status IN ('pending','snoozed')").map(r => r.action_id));
     const incidents = openIncidentWaits();
     const cardOwners = new Set(cards.map(card => card.cell_id));
     // A cell that itself waits for the owner and holds an open item of any kind (a card, or an action it recorded as
@@ -613,6 +614,9 @@ export function createReadModel(core: KernelCore): ReadModel {
       return !Array.isArray(related) || (project !== undefined && related.includes(project));
     });
     function canAnswer(from: string, target: string, seen: Set<string>, wait?: WaitRecord): boolean {
+      // M6: A wait whose refId (or waitId) points directly to a still-pending/snoozed human_item is grounded
+      // regardless of whether waitingFor was recorded as "human" or "inbox:desk".
+      if ((wait?.refId && openItemIds.has(wait.refId)) || (wait?.waitId && openItemIds.has(wait.waitId))) return true;
       const t = live.get(target);
       if (!t || seen.has(target) || inCycle(target)) return false;
       const path = new Set(seen).add(target);
@@ -630,7 +634,7 @@ export function createReadModel(core: KernelCore): ReadModel {
           i.waitId === wait.waitId && i.registrationId === wait.registrationId)) return true;
         const refs = [wait?.refId, wait?.waitId];
         if (cards.some(c => c.cell_id === target && !c.subject_key.startsWith("kernel:stalled:") &&
-          (c.subject_key === `cell:${from}` || refs.includes(c.subject_key) ||
+          (c.subject_key === `cell:${from}` || refs.includes(c.subject_key) || refs.includes(c.action_id) ||
           (!wait?.refId && project && JSON.parse(c.related_project_ids).includes(project))))) return true;
         if (resultFor(target, project)) return true;
         if (!project) return false;
@@ -686,9 +690,11 @@ export function createReadModel(core: KernelCore): ReadModel {
     // A card about this project is the owner's ball whoever holds it (the desk raises some on a project's behalf).
     const open=all<{action_id:string;cell_id:string|null;related_project_ids:string;subject_key:string;category:string}>(db,
       "SELECT action_id,cell_id,related_project_ids,subject_key,category FROM human_items WHERE status IN ('pending','snoozed')");
+    const openItemIds = new Set(open.map(h => h.action_id));
+    const waitRefs = new Set(waits.flatMap(w => [w.refId, w.waitId].filter((x): x is string => Boolean(x))));
     const incidents = new Set(openIncidentWaits().filter(i => waits.some(w => w.cellId === i.cellId && w.waitId === i.waitId && w.registrationId === i.registrationId)).map(i => i.actionId));
-    const cards=open.filter(h=>incidents.has(h.action_id) || (h.cell_id && idSet.has(h.cell_id)) || (JSON.parse(h.related_project_ids) as string[]).includes(projectId ?? cellId));
-    const strandedWaits = waits.filter(w => waitTargetCell(w.waitingFor) !== null && !backed.includes(w));
+    const cards=open.filter(h=>incidents.has(h.action_id) || (h.cell_id && idSet.has(h.cell_id)) || waitRefs.has(h.action_id) || (JSON.parse(h.related_project_ids) as string[]).includes(projectId ?? cellId));
+    const strandedWaits = waits.filter(w => waitTargetCell(w.waitingFor) !== null && !backed.includes(w) && !(w.refId && openItemIds.has(w.refId)) && !openItemIds.has(w.waitId));
     const stranded = strandedWaits.length > 0;
     const human = cards.some(card => !stranded || card.category === "decision");
     if (human) why.push(`${cards.length} card(s) await the owner`);

@@ -3,7 +3,7 @@
 
 export { createContextStore } from "./store";
 export { DEFAULT_LIMITS, type ContextLimits, type ContextStoreOptions, type Summarizer, type SummaryInput } from "./deps";
-export { truncatingSummary } from "./summarize";
+export { structuredSummary, truncatingSummary } from "./summarize";
 export {
   FORK_PENDING_TEXT,
   HISTORY_START_TEXT,

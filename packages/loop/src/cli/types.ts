@@ -119,5 +119,7 @@ export interface CliSessionRecord {
   createdAt: number;
   updatedAt: number;
   runs: number;
+  /** Kernel compaction count when this native session began; triggers smooth rollover after >=3 compactions. */
+  compactionsAtSessionStart?: number;
   forkedFrom?: string;
 }

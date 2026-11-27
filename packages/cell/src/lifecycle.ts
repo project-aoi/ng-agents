@@ -1,5 +1,5 @@
 import { attenuateBounds, meetBounds } from "@ng/gate";
-import { CLI_FORK_SESSION_KEY, CLI_SESSION_KEY } from "@ng/loop";
+import { CLI_FORK_SESSION_KEY, CLI_SESSION_KEY, CLI_SESSION_RESET_KEY } from "@ng/loop";
 import {
   afterCommit,
   requirePrincipalId,
@@ -28,6 +28,7 @@ import {
   type CellResultPayload,
   type CellSpec,
   type CellTaskPayload,
+  type CellUpdatePatch,
   type CloseReason,
   type InboxAddr,
   type PolicyBounds,
@@ -43,7 +44,7 @@ export interface Lifecycle {
   createRootCell(spec: CellSpecInput, opts: RootCellOptions): CellRecord;
   ensureRootCell(spec: CellSpecInput & { id: string }, opts: RootCellOptions): CellRecord;
   spawnCell(parentId: string, spec: CellSpecInput, initialPayload: unknown, opts: SpawnOptions): InboxAddr;
-  updateCell(cellId: string, patch: Partial<CellSpec>, opts: ActorOptions): CellRecord;
+  updateCell(cellId: string, patch: CellUpdatePatch, opts: ActorOptions): CellRecord;
   /** The transactional cascade; returns the ids it closed (empty if already closed). Cleanup is the caller's. */
   closeCellSync(cellId: string, reason: CloseReason, opts: CloseOptions): string[];
   closeCell(cellId: string, reason: CloseReason | undefined, opts: CloseActorOptions): Promise<CloseResult>;
@@ -70,9 +71,9 @@ export interface CloseOptions extends CloseActorOptions {
   internal?: boolean;
 }
 
-const UPDATABLE = new Set(["title", "meta", "processor", "bounds", "watches", "schedules","cwd"]);
+const UPDATABLE = new Set(["title", "meta", "processor", "bounds", "watches", "schedules", "cwd", "resetSession"]);
 /** What a cell may change about itself (docs/05 §5.1.2): how it is woken and how it is labelled — never what it may do. */
-const SELF_UPDATABLE = new Set(["title", "meta", "watches", "schedules","cwd"]);
+const SELF_UPDATABLE = new Set(["title", "meta", "watches", "schedules", "cwd"]);
 
 function definedEntries<T extends object>(o: T): Partial<T> {
   const out: Partial<T> = {};
@@ -338,7 +339,7 @@ export function createLifecycle(core: KernelCore): Lifecycle {
 
   // ---------- update ----------
 
-  function updateCell(cellId: string, patch: Partial<CellSpec>, opts: ActorOptions): CellRecord {
+  function updateCell(cellId: string, patch: CellUpdatePatch, opts: ActorOptions): CellRecord {
     const principalId = requirePrincipalId(opts?.principalId);
     if (!patch || typeof patch !== "object") throw new NgError("invalid_argument", "patch must be an object");
     const given = definedEntries(patch);
@@ -350,7 +351,7 @@ export function createLifecycle(core: KernelCore): Lifecycle {
       if (cell.status === "closed") throw new NgError("conflict", `cell "${cellId}" is closed`);
       const by = assertManages(principalId, cell, "updateCell", true);
       if (by === "self") {
-        const refused = Object.keys(given).filter((k) => !SELF_UPDATABLE.has(k));
+        const refused = Object.keys(given).filter((k) => !SELF_UPDATABLE.has(k) && k !== "resetSession");
         if (refused.length) throw new NgError("bounds_violation", `a cell may change its own ${[...SELF_UPDATABLE].join(", ")} only, not ${refused.join(", ")}`);
       }
       // Only the owner widens bounds; an agent on the control plane narrows like an ancestor would.
@@ -394,6 +395,15 @@ export function createLifecycle(core: KernelCore): Lifecycle {
           for (const id of liveScheduleIds(cellId, base)) inbox.cancelScheduledSync({ cellId, envelopeId: id });
         }
         for (const [base, { r, i }] of after) if (!before.has(base)) enqueueSchedule(cell, r, i);
+      }
+      if (given.resetSession === true) {
+        context.commitSync(cellId, {
+          statePatches: {
+            [CLI_SESSION_KEY]: null,
+            [CLI_FORK_SESSION_KEY]: null,
+            [CLI_SESSION_RESET_KEY]: clock.now(),
+          },
+        });
       }
 
       const updated = cells.update(cellId, { spec: next, title: next.title ?? null, bounds });
@@ -481,6 +491,41 @@ export function createLifecycle(core: KernelCore): Lifecycle {
         if (closedCell.preset) registry.presets.get(closedCell.preset)?.onCellClosed?.(closedCell,id===target.id ? reason : "cancelled",context,clock,core);
       }
       core.humanItems.withdrawForClosedCells(closed);
+      // M7: Auto-archive desk `arb:*` state entries once all referenced cells/projects have closed.
+      if (cells.get(core.deskCellId)) {
+        const closedSet = new Set(closed.map((c) => c.id));
+        const arbEntries = context.listStateSync(core.deskCellId, "arb:");
+        const stalePatches: Record<string, null> = {};
+        const collectCellRefs = (val: unknown, into: Set<string>): void => {
+          if (typeof val === "string") {
+            for (const m of val.matchAll(/\b(?:proj|cell)_[a-z0-9]+\b/g)) into.add(m[0]);
+            if (cells.get(val)) into.add(val);
+            return;
+          }
+          if (Array.isArray(val)) {
+            for (const item of val) collectCellRefs(item, into);
+            return;
+          }
+          if (val && typeof val === "object") {
+            for (const v of Object.values(val as Record<string, unknown>)) collectCellRefs(v, into);
+          }
+        };
+        for (const entry of arbEntries) {
+          const refs = new Set<string>();
+          for (const m of entry.key.matchAll(/\b(?:proj|cell)_[a-z0-9]+\b/g)) refs.add(m[0]);
+          const suffix = entry.key.slice("arb:".length);
+          if (suffix && cells.get(suffix)) refs.add(suffix);
+          collectCellRefs(entry.value, refs);
+          if (![...refs].some((id) => closedSet.has(id))) continue;
+          const known = [...refs].map((id) => cells.get(id)).filter((c): c is CellRecord => c !== undefined);
+          if (known.length > 0 && known.every((c) => c.status === "closed")) {
+            stalePatches[entry.key] = null;
+          }
+        }
+        if (Object.keys(stalePatches).length > 0) {
+          context.commitSync(core.deskCellId, { statePatches: stalePatches });
+        }
+      }
       gate.revokeSync(target.id);
       afterCommit(db, () => {
         void core.track(cleanupClosed(closed.map(c => c.id)));

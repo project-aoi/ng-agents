@@ -1,5 +1,5 @@
 import {
-  afterCommit, hashAction, run,
+  afterCommit, hashAction, run, stripAnsi,
   isEnvelopeOfType,
   parseAddress,
   type ApprovalRecord,
@@ -25,6 +25,10 @@ export interface KernelEscalationArgs {
 
   /** docs/05 guard 1: a retry_limit card raised because a cell kept hitting its step limit; "continue" queues one more continuation. */
   stepLimit?: boolean;
+  /** M1: a retry_limit card raised after write-side-effect error recoveries exhausted retries; "continue" queues one fresh recovery turn. */
+  errorRecovery?: boolean;
+  /** M1: summary of write side effects already executed before the failure. */
+  executedWrites?: string[];
   /** docs/05 guard 1: a blocked card raised because the model refused; "continue" wakes the cell to try another way. */
   refused?: boolean;
 }
@@ -32,6 +36,8 @@ export interface KernelEscalationArgs {
 export interface Escalations {
   /** inbox.dead → a retry_limit card (never a silent loss). */
   deadLetter(e: BusTopics["inbox.dead"]): ApprovalRecord | null;
+  /** M1: write-side-effect recovery exhausted retries → a clean retry_limit card (ANSI stripped). */
+  errorRecoveryLimit(cellId: string, times: number, error: string, executedWrites: readonly string[]): ApprovalRecord | null;
   /** docs/05 guard 1: a cell hit its step limit `times` Runs in a row → a card instead of another silent continuation. */
   stepLimit(cellId: string, times: number): ApprovalRecord | null;
   /** docs/05 guard 1: a coordinating cell's model refused → a blocked card (a one-shot cell reports `failed` instead). */
@@ -78,7 +84,8 @@ export function createEscalations(core: KernelCore): Escalations {
   }
 
   function raise(cell: CellRecord, args: KernelEscalationArgs, title: string, explanation: string, envs: Envelope[]): ApprovalRecord | null {
-    const subjectKey = `kernel:${cell.id}:${args.stepLimit ? "step_limit" : args.reason}`;
+    const cleanExplanation = stripAnsi(explanation);
+    const subjectKey = `kernel:${cell.id}:${args.stepLimit ? "step_limit" : args.errorRecovery ? "error_recovery" : args.reason}`;
     // One card per item: an item that already waits on the owner is not given a second one.
     const existing = [cell, ...cells.ancestors(cell.id)].map(c => gate.findPendingBySubjectSync(subjectKey, c.id)).find(Boolean);
     const projectId = [cell, ...cells.ancestors(cell.id)].find(c => isProjectRoot(core.registry, c))?.id;
@@ -111,9 +118,9 @@ export function createEscalations(core: KernelCore): Escalations {
       subjectKey,
       title,
       source: sourceOf(primary, clock.now()),
-      rawInput: rawInputOf(primary, explanation),
-      prep: { summary: explanation, checked: [] },
-      escalation: { reason: args.reason, explanation },
+      rawInput: rawInputOf(primary, cleanExplanation),
+      prep: { summary: cleanExplanation, checked: [] },
+      escalation: { reason: args.reason, explanation: cleanExplanation },
     };
     const action: CustomAction = {
       type: "custom",
@@ -121,8 +128,9 @@ export function createEscalations(core: KernelCore): Escalations {
       args,
       summary: title,
       subjectKey,
+      ...(projectId ? { relatedProjectIds: [projectId], blockingProjectIds: [projectId] } : {}),
       sideEffect: "external",
-      card: { format: "card", title, body: `${title}\n\n${explanation}`, data: card },
+      card: { format: "card", title, body: `${title}\n\n${cleanExplanation}`, data: card },
     };
     // The affected cell holds the card (so closing it withdraws the card); if it cannot (paused, revoked), the nearest
     // ancestor that can.
@@ -144,8 +152,17 @@ export function createEscalations(core: KernelCore): Escalations {
       const envs = dead.map((m) => m.envelope);
       const attempts = Math.max(1, ...dead.map((m) => m.attempts));
       const title = cell.parentId === null ? "一条消息处理失败，需要你看一下" : `${label(cell)}处理失败，需要你看一下`;
-      const explanation = `连续 ${attempts} 次处理失败，已停止自动重试。最后一次错误：${e.reason}`;
+      const explanation = `连续 ${attempts} 次处理失败，已停止自动重试。最后一次错误：${stripAnsi(e.reason)}`;
       return raise(cell, { kernel: true, reason: "retry_limit", cellId: cell.id, envelopeIds: e.envelopeIds }, title, explanation, envs);
+    },
+
+    errorRecoveryLimit(cellId, times, error, executedWrites) {
+      const cell = cells.get(cellId);
+      if (!cell || cell.status === "closed") return null;
+      const title = cell.parentId === null ? "主台在写操作后连续失败，需要你看一下" : `${label(cell)}在写操作后连续失败，需要你看一下`;
+      const writesLine = executedWrites.length ? ` 失败前已执行写操作：${executedWrites.slice(0, 6).join("、")}${executedWrites.length > 6 ? ` 等 ${executedWrites.length} 项` : ""}。` : "";
+      const explanation = `连续 ${times} 次在执行写操作后异常中断，为避免重复投递已停止自动恢复。${writesLine}最后一次错误：${stripAnsi(error)}`;
+      return raise(cell, { kernel: true, reason: "retry_limit", cellId, errorRecovery: true, executedWrites: executedWrites.slice(0, 20) }, title, explanation, []);
     },
 
     stepLimit(cellId, times) {

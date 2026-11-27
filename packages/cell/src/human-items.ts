@@ -315,6 +315,8 @@ export function createHumanItems(core: KernelCore) {
     const holder = r.cell_id ? core.cells.get(r.cell_id) : undefined;
     const projectId = holder && [holder, ...cells.ancestors(holder.id)].find(c => isProjectRoot(core.registry, c))?.id;
     if (projectId && !related.includes(projectId)) related.push(projectId);
+    const explicitBlocking = Array.isArray(action?.blockingProjectIds) ? action.blockingProjectIds : [];
+    const blocking = [...new Set([...(projectId ? [projectId] : []), ...explicitBlocking])];
     const humanEdited =
       !!r.human_edited ||
       !!(
@@ -334,6 +336,7 @@ export function createHumanItems(core: KernelCore) {
       itemRevision: r.item_revision,
       createdAt: r.created_at,
       relatedProjectIds: related,
+      blockingProjectIds: blocking,
       options,
       title: card.title ?? action?.summary ?? r.subject_key,
       description: card.body,
@@ -359,7 +362,8 @@ export function createHumanItems(core: KernelCore) {
       if (!draft.title?.trim() || !draft.subjectKey?.trim()) throw new NgError("invalid_argument", "a title and subject are required");
       const cell = cellId === null ? null : core.cells.require(cellId);
       if (cell?.status === "closed") throw new NgError("conflict", "issuing cell is closed");
-      const related = [...new Set(draft.relatedProjectIds ?? [])];
+      const blocking = [...new Set(draft.blockingProjectIds ?? [])];
+      const related = [...new Set([...(draft.relatedProjectIds ?? []), ...blocking])];
       const manages = (id: string) => !cell || id === cell.id || cells.ancestors(id).some(a => a.id === cell.id);
       for (const pid of related) {
         if (!isProjectRoot(core.registry, cells.get(pid))) throw new NgError("invalid_argument", "unknown related project");
@@ -386,7 +390,15 @@ export function createHumanItems(core: KernelCore) {
         data: { prep: draft.prep, rawInput: draft.rawInput, source: draft.source },
       });
       // The draft's id travels on the action, as it does for a gated approval: `approval.resolved` names it there.
-      const action = { type: "custom", name: "human.reply", summary: draft.title, sideEffect: "none", subjectKey: draft.subjectKey, ...(art ? { artifactId: art.artifactId } : {}) };
+      const action = {
+        type: "custom",
+        name: "human.reply",
+        summary: draft.title,
+        sideEffect: "none",
+        subjectKey: draft.subjectKey,
+        ...(blocking.length ? { blockingProjectIds: blocking } : {}),
+        ...(art ? { artifactId: art.artifactId } : {}),
+      };
       const existingId = row(id);
       if (existingId && existingId.action_id !== prior?.action_id) throw new NgError("conflict", "事项编号已被占用");
       if (prior) {
@@ -672,6 +684,7 @@ export function createHumanItems(core: KernelCore) {
         const retry = isKernelEscalation(rec.action) && rec.action.args.reason === "retry_limit" ? rec.action.args : null;
         gate.recordOutcomeSync(id, "executed", { note: d.note ?? o.label });
         if (retry?.stepLimit) continueSteps(retry.cellId, id);
+        else if (retry?.errorRecovery) continueErrorRecovery(retry.cellId, id, retry.executedWrites);
         else if (retry) requeueDead(retry.cellId, retry.envelopeIds ?? []);
         deliverResolved(gate.getApprovalSync(id)!, "executed", actor, { decision: "continue", silent: !!retry, note: d.note, until: d.until });
         return { status: "continued" };
@@ -882,6 +895,22 @@ export function createHumanItems(core: KernelCore) {
       clock,
     );
     enqueueVerified(cellId, env, { what: `step-limit continue for ${actionId}` });
+  }
+
+  /** "Continue" on an M1 write-side-effect recovery card: one fresh error_recovery turn instead of blind batch replay. */
+  function continueErrorRecovery(cellId: string, actionId: string, executedWrites?: readonly string[]): void {
+    const cell = cells.get(cellId);
+    if (!cell || cell.status === "closed") return;
+    const payload: RunContinuePayload = {
+      reason: "error_recovery",
+      count: 1,
+      ...(executedWrites?.length ? { executedWrites: [...executedWrites] } : {}),
+    };
+    const env = createEnvelope<RunContinuePayload>(
+      { id: `${actionId}:continue`, from: KERNEL_FROM.dispatcher, principalId: cellPrincipal(cellId), kind: "event", type: PAYLOAD.runContinue, payload, expectedEpoch: cell.epoch },
+      clock,
+    );
+    enqueueVerified(cellId, env, { what: `error-recovery continue for ${actionId}` });
   }
 
   /** "Continue" on a dead letter: the same messages again, under new ids (the old rows stay `dead` for the record). */
