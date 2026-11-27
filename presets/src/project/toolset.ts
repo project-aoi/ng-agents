@@ -426,12 +426,14 @@ export function projectToolset(): Toolset {
       const until = args.until ?? prev.until ?? "exit_zero";
       const now = ctx.clock.now();
       const deadlineAt = args.deadlineHours !== undefined ? now + args.deadlineHours * 3_600_000 : prev.deadlineAt;
+      const updatedAt = Math.max(now, (typeof prev.updatedAt === "number" ? prev.updatedAt : 0) + 1);
       const nextProc = probeProcessor({
         command,
         everySec,
         until,
         ...(deadlineAt !== undefined ? { deadlineAt } : {}),
         timeoutMs: Math.min(PROBE.timeoutMs, everySec * 1000),
+        updatedAt,
       });
       await ctx.ports.updateCell(args.cellId, {
         processor: nextProc,

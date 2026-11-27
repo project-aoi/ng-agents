@@ -829,3 +829,41 @@ it("M7: structuredSummary produces 4 semantic sections, filters noisy read dumps
   expect(summary).not.toContain("NOISY_READ_STATE_DUMP_SHOULD_BE_FILTERED");
   expect(summary.length).toBeLessThanOrEqual(2_000);
 });
+
+it("M7: structuredSummary clips oversized goal/blocker lines under tight budgets and applyCompaction never decapitates ## 目标与要求", async () => {
+  const longGoal = `[user.message · from channel:ui:owner] ${"实现核心需求并保持接口兼容".repeat(12)}`;
+  const longErr = `FAIL src/worker.test.ts: ${"timeout waiting for ack ".repeat(10)}`;
+  const tight = structuredSummary({
+    cellId: "proj_tight",
+    compactions: 2,
+    maxChars: 700,
+    previousSummary: null,
+    messages: [
+      { role: "user", content: [{ type: "text", text: longGoal }] },
+      { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "bash", input: { command: "pnpm test" } }] },
+      { role: "user", content: [{ type: "tool_result", toolUseId: "t1", isError: true, content: longErr }] },
+      { role: "assistant", content: [{ type: "text", text: "已定位问题并准备修复 /home/dev/app/src/worker.ts" }] },
+    ],
+  });
+  expect(tight).toContain("## 目标与要求");
+  expect(tight).toContain("## 阻塞与错误");
+  expect(tight.length).toBeLessThanOrEqual(700);
+
+  // Full compaction with long originalTask + refs + latestExcerpt must preserve ## 目标与要求 instead of safeTail-chopping the top
+  const h = setup({ store: { limits: { compactAtChars: 800, keepRecentChars: 200, summaryMaxChars: 1_200 } } });
+  const env = userEnvelope(h.clock, `实现目标并引用 artifact://art_seed_00001 artifact://art_seed_00002 ${"背景要求".repeat(40)}`, { id: "e_goal" });
+  h.store.appendEvidenceSync("desk", { kind: "inbound", envelope: env, runId: "r1", at: 1 });
+  for (let i = 0; i < 8; i++) {
+    h.store.appendEvidenceSync("desk", { kind: "assistant_text", text: `第 ${i + 1} 步进展：${"详细推进说明".repeat(30)}`, runId: "r1", at: 2 + i });
+  }
+  await h.store.compact("desk", { mode: "isolated", force: true });
+  // Trigger a second compaction so structuredSummary activates
+  for (let i = 0; i < 8; i++) {
+    h.store.appendEvidenceSync("desk", { kind: "assistant_text", text: `第二阶段第 ${i + 1} 步：${"更多详细推进说明".repeat(30)}`, runId: "r2", at: 20 + i });
+  }
+  await h.store.compact("desk", { mode: "isolated", force: true });
+  const snap = h.store.hydrateSync("desk", batchOf("desk", [userEnvelope(h.clock, "继续", { id: "e_next" })], 0, h.clock), "isolated");
+  const summaryText = snap.history.map((m) => m.content.map((b) => (b.type === "text" ? b.text : "")).join("")).join("\n");
+  expect(summaryText).toContain("## 目标与要求");
+  expect(summaryText).toContain("artifact://art_seed_00001");
+});

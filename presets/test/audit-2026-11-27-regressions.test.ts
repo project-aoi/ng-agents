@@ -325,6 +325,120 @@ describe("2026-11-27 post-upgrade audit regressions (M1–M7 & Track B)", () => 
     expect(probeResults[0]).toMatchObject({ childCellId: checkerId, status: "completed" });
   });
 
+  it("M5: update_check resets 600s backoff even when command string is unchanged or legacy ProbeState lacked command", async () => {
+    const h = await boot();
+    const dir = tempDir("m5-reset-backoff");
+    const cmd = `test -f "${join(dir, "never-yet")}"`;
+
+    h.script.add(
+      "project",
+      tool("dispatch", {
+        preset: "checker",
+        title: "盯同一 MR",
+        instruction: "盯 MR 直到合入",
+        check: { command: cmd, everySec: 60 },
+      }),
+      {},
+    );
+    const { projectId } = startProjectSync(h.kernel, { title: "退避重置项目", outcome: "完成", brief: "盯 MR", cwd: dir }, { principalId: h.kernel.ownerPrincipal });
+    await h.kernel.idle();
+    const [checkerId] = childrenOf(h, projectId);
+
+    // Push past 60m stagnant threshold so effective interval backs off to 600s, and simulate legacy state missing `command`
+    h.clock.set(T0 + 65 * MIN);
+    await h.kernel.idle();
+    const backedOff = h.kernel.inbox.listMessagesSync({ cellId: checkerId!, type: PAYLOAD.timerFired, status: ["pending"] })[0]!;
+    expect(backedOff.deliverAt - h.clock.now()).toBe(600_000);
+    const curState = h.state<ProbeState>(checkerId!, KEYS.probe)!;
+    const legacyState: ProbeState = { v: 1, checks: curState.checks, cannotRun: 0, startedAt: curState.startedAt, backoffResetAt: curState.backoffResetAt, last: curState.last, lastExit: curState.lastExit };
+    h.kernel.context.commitSync(checkerId!, { statePatches: { [KEYS.probe]: legacyState } });
+
+    // Call update_check with the SAME command (e.g. new push on same MR) -> must reset checks & 600s backoff back to 60s!
+    h.script.add(
+      "project",
+      tool("update_check", { cellId: checkerId!, everySec: 60 }),
+      {},
+    );
+    h.kernel.sendToCell(projectId, { text: "新提交已推，重置轮询频率" }, { principalId: h.kernel.ownerPrincipal });
+    await h.kernel.idle();
+    const afterReset = h.kernel.inbox.listMessagesSync({ cellId: checkerId!, type: PAYLOAD.timerFired, status: ["pending"] })[0]!;
+    expect(afterReset.deliverAt - h.clock.now()).toBe(60_000);
+    expect(h.state<ProbeState>(checkerId!, KEYS.probe)).toMatchObject({ checks: 1, unchangedChecks: 0 });
+  });
+
+  it("M1/M6: summarizes string-input write calls cleanly, keeps read-only native web_search on normal retry, and relays orphan reply when send_message failed", async () => {
+    const h = await boot();
+    const { projectId } = startProjectSync(h.kernel, { title: "边角回归项目", outcome: "完成", brief: "验证" }, { principalId: h.kernel.ownerPrincipal });
+    await h.kernel.idle();
+
+    // 1. String-input write tool (like a native CLI command tool) produces descriptive executedWrites summary
+    h.script.add(
+      "desk",
+      (req) => {
+        const runId = h.kernel.inbox.listMessagesSync({ cellId: "desk", status: ["claimed"] })[0]!.claimId!;
+        h.kernel.context.appendEvidenceSync("desk", { kind: "tool_call", toolUseId: "str_cmd_1", name: "commandExecution", input: "git push origin feat/clean-test", runId, at: h.clock.now() });
+        h.kernel.context.appendEvidenceSync("desk", { kind: "tool_result", toolUseId: "str_cmd_1", name: "commandExecution", output: "ok", runId, at: h.clock.now() });
+        void req;
+        return { error: new Error("stream dropped") };
+      },
+      { text: "recovered" },
+    );
+    await h.ui.capture({ text: "触发字符串命令写操作" }, "owner");
+    await h.kernel.idle();
+    const recEnv = h.kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.runContinue })[0]!;
+    expect((recEnv.envelope.payload as RunContinuePayload).executedWrites).toContain("commandExecution(git push origin feat/clean-test)");
+    h.clock.advance(60_000);
+    await h.kernel.idle();
+
+    // 2. Native read-only web_search does NOT falsely trigger error_recovery (original message stays on normal retry)
+    let attempts = 0;
+    h.script.add(
+      "desk",
+      () => {
+        attempts++;
+        const runId = h.kernel.inbox.listMessagesSync({ cellId: "desk", status: ["claimed"] })[0]!.claimId!;
+        h.kernel.context.appendEvidenceSync("desk", { kind: "tool_call", toolUseId: "ws_1", name: "web_search", input: { query: "docs" }, runId, at: h.clock.now() });
+        h.kernel.context.appendEvidenceSync("desk", { kind: "tool_result", toolUseId: "ws_1", name: "web_search", output: "hit", runId, at: h.clock.now() });
+        return { error: new Error("transient") };
+      },
+      () => {
+        attempts++;
+        return { text: "done on normal retry" };
+      },
+    );
+    await h.ui.capture({ text: "只读搜索重试测试" }, "owner");
+    await h.kernel.idle();
+    h.clock.advance(60_000);
+    await h.kernel.idle();
+    expect(attempts).toBe(2);
+    expect(h.kernel.inbox.listMessagesSync({ cellId: "desk", type: PAYLOAD.runContinue })).toHaveLength(1); // still only the 1 from part 1!
+
+    // 3. M6: If a non-dormant worker's send_message to parent errored, orphan-reply safeguard still relays assistant_text
+    const workerAddr = h.kernel.spawnCell(projectId, { id: "cell_w_err_send", preset: "worker", title: "发信失败分身" }, undefined, { principalId: `cell:${projectId}` });
+    const workerId = workerAddr.slice("inbox:".length);
+    h.script.add(
+      "worker",
+      tool("wait", { waitingFor: "human", reason: "等待确认" }),
+      {},
+      () => {
+        const runId = h.kernel.inbox.listMessagesSync({ cellId: workerId, status: ["claimed"] })[0]!.claimId!;
+        h.kernel.context.appendEvidenceSync(workerId, { kind: "tool_call", toolUseId: "bad_send", name: "send_message", input: { to: inboxAddr(projectId), text: "" }, runId, at: h.clock.now() });
+        h.kernel.context.appendEvidenceSync(workerId, { kind: "tool_result", toolUseId: "bad_send", name: "send_message", output: "empty text", isError: true, runId, at: h.clock.now() });
+        return { text: "关键答复正文：发信工具报错但正文必须抄送父项目。" };
+      },
+    );
+    h.kernel.sendToCell(workerId, { text: "先登记等待" }, { principalId: `cell:${projectId}` });
+    await h.kernel.idle();
+    let parentGot = "";
+    h.script.add("project", (req) => {
+      parentGot = requestText(req);
+      return {};
+    });
+    h.kernel.sendToCell(workerId, { text: "汇报排查结果" }, { principalId: `cell:${projectId}` });
+    await h.kernel.idle();
+    expect(parentGot).toContain("关键答复正文：发信工具报错但正文必须抄送父项目。");
+  });
+
   // ==================== M6 ====================
 
   it("M6: relays orphan worker reply to parent when worker answers parent message in assistant_text while non-dormant, and stalled_check respects pending card refId", async () => {

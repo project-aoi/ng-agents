@@ -117,6 +117,9 @@ const READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
   "LS",
   "WebSearch",
   "WebFetch",
+  "web_search",
+  "webSearch",
+  "imageView",
   "read_file",
   "list_dir",
   "find_by_name",
@@ -125,6 +128,10 @@ const READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
 ]);
 
 function summarizeWriteCall(name: string, input: unknown): string {
+  if (typeof input === "string") {
+    const clean = input.replace(/\s+/g, " ").trim();
+    return clean ? `${name}(${clean.slice(0, 60)})` : name;
+  }
   const rec = input && typeof input === "object" && !Array.isArray(input) ? (input as Record<string, unknown>) : null;
   if (!rec) return name;
   if (name === "send_message" && typeof rec["to"] === "string") return `send_message(to=${rec["to"]})`;
@@ -889,17 +896,23 @@ export function createDispatcher(core: KernelCore, opts: { idleTimeoutMs: number
     const said = lastWords(cur.id, handle.claimId);
     if (!said) return;
     const runRecords = context.listEvidenceSync(cur.id, { runId: handle.claimId });
+    const toolCalls = new Map<string, { name: string; input: unknown }>();
+    const failedToolIds = new Set<string>();
+    for (const { record: r } of runRecords) {
+      if (r.kind === "tool_call") toolCalls.set(r.toolUseId, { name: r.name, input: r.input });
+      else if (r.kind === "tool_result" && r.isError) failedToolIds.add(r.toolUseId);
+    }
     let sentToParent = false;
     let startedAsyncWork = false;
-    for (const { record: r } of runRecords) {
-      if (r.kind !== "tool_call") continue;
-      if (r.name === "report_to_parent") sentToParent = true;
-      if (r.name === "send_message") {
-        const to = (r.input as { to?: unknown } | null)?.to;
+    for (const [toolUseId, call] of toolCalls) {
+      if (failedToolIds.has(toolUseId)) continue;
+      if (call.name === "report_to_parent") sentToParent = true;
+      if (call.name === "send_message") {
+        const to = (call.input as { to?: unknown } | null)?.to;
         if (to === parentAddr) sentToParent = true;
         else if (typeof to === "string" && to.startsWith("inbox:")) startedAsyncWork = true;
       }
-      if (r.name === "job_start" || r.name === "request_approval") startedAsyncWork = true;
+      if (call.name === "job_start" || call.name === "request_approval") startedAsyncWork = true;
     }
     if (sentToParent) return;
     const parentWaitingOnChild = core.waits.list([parent.id]).some((w) => w.waitingFor === inboxAddr(cur.id));

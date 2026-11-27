@@ -1,5 +1,5 @@
 import type { SummaryInput } from "./deps";
-import { oneLine, safeTail } from "./text";
+import { oneLine, safeHead, safeTail } from "./text";
 
 /** Extract references from the original strings, before any excerpt or JSON escaping. */
 const REF_PATTERN = /(?:res|artifact):\/\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_./:@-]+(?!…|\.\.\.)|artifact:\/\/[A-Za-z0-9_.-]+(?:@\d+)?(?!…|\.\.\.)|\bart_(?:[A-Za-z_][A-Za-z0-9_.-]*|[0-9a-z]{8,})\b(?!…|\.\.\.)/g;
@@ -89,17 +89,64 @@ function dedupeRecent(lines: readonly string[], maxItems: number): string[] {
 }
 
 function fitSection(heading: string, lines: readonly string[], budget: number): string {
-  if (lines.length === 0 || budget <= heading.length + 2) return "";
+  if (lines.length === 0 || budget <= heading.length + 4) return "";
   const kept: string[] = [];
   let used = heading.length;
   for (let i = lines.length - 1; i >= 0; i--) {
     const item = `- ${lines[i]!}`;
-    if (used + 1 + item.length > budget) break;
+    if (used + 1 + item.length > budget) {
+      // Never drop the entire section when the newest item alone exceeds the tight budget: clip it cleanly.
+      if (kept.length === 0) {
+        const avail = budget - heading.length - 4; // "\n- " + "…"
+        if (avail >= 8) kept.push(`- ${safeHead(lines[i]!, avail)}…`);
+      }
+      break;
+    }
     kept.push(item);
     used += 1 + item.length;
   }
   if (kept.length === 0) return "";
   return `${heading}\n${kept.reverse().join("\n")}`;
+}
+
+/**
+ * Trim a structured summary body to `maxChars` without letting `safeTail` decapitate `## 目标与要求`.
+ * Preserves goals, blockers, and key paths by shedding oldest lines from `## 进展与结论` first.
+ */
+export function fitStructuredBody(body: string, maxChars: number): string {
+  if (maxChars <= 0) return "";
+  if (body.length <= maxChars) return body;
+  if (!body.startsWith("## ")) return safeTail(body, maxChars);
+  const goals: string[] = [];
+  const progress: string[] = [];
+  const blockers: string[] = [];
+  const paths: string[] = [];
+  let section: "goals" | "progress" | "blockers" | "paths" = "progress";
+  for (const raw of body.split("\n")) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (line === "## 目标与要求") { section = "goals"; continue; }
+    if (line === "## 进展与结论") { section = "progress"; continue; }
+    if (line === "## 阻塞与错误") { section = "blockers"; continue; }
+    if (line === "## 关键路径与标识") { section = "paths"; continue; }
+    const item = line.startsWith("- ") ? line.slice(2).trim() : line;
+    if (!item) continue;
+    if (section === "goals") goals.push(item);
+    else if (section === "blockers") blockers.push(item);
+    else if (section === "paths") paths.push(item);
+    else progress.push(item);
+  }
+  const goalSec = fitSection("## 目标与要求", goals, goals.length ? Math.floor(maxChars * 0.25) : 0);
+  const blockerSec = fitSection("## 阻塞与错误", blockers, blockers.length ? Math.floor(maxChars * 0.22) : 0);
+  const pathSec = fitSection("## 关键路径与标识", paths, paths.length ? Math.floor(maxChars * 0.18) : 0);
+  const used =
+    (goalSec ? goalSec.length + 1 : 0) +
+    (blockerSec ? blockerSec.length + 1 : 0) +
+    (pathSec ? pathSec.length + 1 : 0);
+  const progressSec = fitSection("## 进展与结论", progress, Math.max(0, maxChars - used));
+  const rebuilt = [goalSec, progressSec, blockerSec, pathSec].filter(Boolean).join("\n");
+  if (rebuilt.length > 0 && rebuilt.length <= maxChars) return rebuilt;
+  return safeTail(body, maxChars);
 }
 
 /**
@@ -125,8 +172,8 @@ export function structuredSummary(input: SummaryInput): string {
       if (section === "paths") continue;
       const body = line.startsWith("- ") ? line.slice(2).trim() : line;
       if (!body) continue;
-      if (section === "goals") goals.push(body);
-      else if (section === "blockers" || body.startsWith("tool error:")) blockers.push(body);
+      if (section === "goals" || /^user:\s*\[(?:user\.message|cell\.task|approval\.revise)\b/.test(body)) goals.push(body);
+      else if (section === "blockers" || body.startsWith("tool error")) blockers.push(body);
       else progress.push(body);
     }
   }
@@ -201,26 +248,5 @@ export function structuredSummary(input: SummaryInput): string {
  * (and noise-filtered compaction on the first pass), keeping complete references and staying strictly within `maxChars`.
  */
 export function truncatingSummary(input: SummaryInput): string {
-  if ((input.compactions ?? 0) >= 1) return structuredSummary(input);
-  const lines: string[] = input.previousSummary ? input.previousSummary.split("\n") : [];
-  const toolNames = new Map<string, string>();
-  for (const m of input.messages) {
-    for (const b of m.content) {
-      if (b.type === "text") lines.push(`${m.role}: ${oneLine(b.text, 240)}`);
-      else if (b.type === "tool_use") {
-        toolNames.set(b.id, b.name);
-        lines.push(`assistant called ${b.name} ${oneLine(JSON.stringify(b.input ?? {}), 160)}`);
-      } else {
-        const toolName = toolNames.get(b.toolUseId);
-        if (b.isError || !toolName || !NOISY_READ_TOOLS.has(toolName)) {
-          lines.push(`${b.isError ? "tool error" : "tool result"}: ${oneLine(b.content, 160)}`);
-        }
-      }
-    }
-  }
-  const refBudget = Math.min(1_200, Math.max(96, Math.floor(input.maxChars / 5)));
-  const refs = boundedReferenceLine(referencesIn(input.previousSummary, input.messages), refBudget).line;
-  const body = lines.filter(line => !line.startsWith("[references] ") && !line.startsWith("[original task]") && !line.startsWith("[project goal]")).join("\n");
-  const remaining = Math.max(0, input.maxChars - refs.length - (refs ? 1 : 0));
-  return [safeTail(body, remaining), refs].filter(Boolean).join("\n");
+  return structuredSummary(input);
 }

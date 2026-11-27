@@ -33,6 +33,8 @@ export interface ProbeArgs {
   /** Epoch ms; absent = no deadline. */
   deadlineAt?: number;
   timeoutMs: number;
+  /** Monotonic timestamp bumped by update_check to force baseline/backoff reset even when command text is unchanged or legacy state lacked `command`. */
+  updatedAt?: number;
 }
 
 /** KEYS.probe: what the probe keeps between wake-ups. */
@@ -43,6 +45,8 @@ export interface ProbeState {
   cannotRun: number;
   /** Command string this state belongs to; changing the command in place resets baselines and backoff. */
   command?: string;
+  /** Last ProbeArgs.updatedAt applied to this state. */
+  targetUpdatedAt?: number;
   /** When polling started for the current target command. */
   startedAt?: number;
   /** Last timestamp when output/state changed (used for stagnant long-poll backoff). */
@@ -103,7 +107,7 @@ async function runCheck(ports: RunPorts, a: ProbeArgs, signal: AbortSignal): Pro
 }
 
 function parseArgs(args: Record<string, unknown>): ProbeArgs | string {
-  const { command, everySec, until, deadlineAt, timeoutMs } = args;
+  const { command, everySec, until, deadlineAt, timeoutMs, updatedAt } = args;
   if (typeof command !== "string" || !command.trim()) return "没有检查命令";
   if (typeof everySec !== "number" || !(everySec >= PROBE.minEverySec)) return `检查间隔无效（${String(everySec)}）`;
   if (until !== "exit_zero" && until !== "output_changes") return `判定方式无效（${String(until)}）`;
@@ -113,6 +117,7 @@ function parseArgs(args: Record<string, unknown>): ProbeArgs | string {
     until,
     ...(typeof deadlineAt === "number" ? { deadlineAt } : {}),
     timeoutMs: typeof timeoutMs === "number" && timeoutMs > 0 ? timeoutMs : Math.min(PROBE.timeoutMs, everySec * 1000),
+    ...(typeof updatedAt === "number" ? { updatedAt } : {}),
   };
 }
 
@@ -143,10 +148,23 @@ export function createCheckProbe(cfg: PresetsConfig): CodeProcessor {
       if (typeof a === "string") return report("failed", `监听没法开始：${a}。`, prev, { error: a }, `没法开始：${a}`);
 
       const nowBefore = clock.now();
-      // M5: If the parent updated this checker's target command in place, reset baseline counters and backoff cleanly.
-      const commandChanged = prev.command !== undefined && prev.command !== a.command;
-      const base: ProbeState = commandChanged
-        ? { v: 1, checks: 0, cannotRun: 0, command: a.command, startedAt: nowBefore, backoffResetAt: nowBefore, unchangedChecks: 0, suspended: false }
+      // M5: If the parent updated this checker via update_check (even with the same command or on legacy state
+      // without `prev.command`) or changed the command, reset baseline counters and backoff cleanly.
+      const targetUpdated =
+        (a.updatedAt !== undefined && a.updatedAt !== prev.targetUpdatedAt) ||
+        (prev.command !== undefined && prev.command !== a.command);
+      const base: ProbeState = targetUpdated
+        ? {
+            v: 1,
+            checks: 0,
+            cannotRun: 0,
+            command: a.command,
+            ...(a.updatedAt !== undefined ? { targetUpdatedAt: a.updatedAt } : {}),
+            startedAt: nowBefore,
+            backoffResetAt: nowBefore,
+            unchangedChecks: 0,
+            suspended: false,
+          }
         : prev;
 
       // M5: Auto-suspend polling while parent project is paused or blocked on a pending human decision card (unless deadline reached).
@@ -161,6 +179,7 @@ export function createCheckProbe(cfg: PresetsConfig): CodeProcessor {
           ...base,
           v: 1,
           command: a.command,
+          ...(a.updatedAt !== undefined ? { targetUpdatedAt: a.updatedAt } : base.targetUpdatedAt !== undefined ? { targetUpdatedAt: base.targetUpdatedAt } : {}),
           startedAt: base.startedAt ?? nowBefore,
           backoffResetAt: base.backoffResetAt ?? nowBefore,
           suspended: true,
@@ -215,6 +234,7 @@ export function createCheckProbe(cfg: PresetsConfig): CodeProcessor {
           checks: n,
           cannotRun: 0,
           command: a.command,
+          ...(a.updatedAt !== undefined ? { targetUpdatedAt: a.updatedAt } : base.targetUpdatedAt !== undefined ? { targetUpdatedAt: base.targetUpdatedAt } : {}),
           startedAt,
           backoffResetAt,
           unchangedChecks,
@@ -238,6 +258,7 @@ export function createCheckProbe(cfg: PresetsConfig): CodeProcessor {
           checks: n,
           cannotRun: base.cannotRun + 1,
           command: a.command,
+          ...(a.updatedAt !== undefined ? { targetUpdatedAt: a.updatedAt } : base.targetUpdatedAt !== undefined ? { targetUpdatedAt: base.targetUpdatedAt } : {}),
           startedAt,
           backoffResetAt: now,
           unchangedChecks: 0,

@@ -32,7 +32,7 @@ import {
   summaryMessage,
 } from "./render";
 import { oneLine, safeHead, safeTail } from "./text";
-import { boundedReferenceLine, referencesIn } from "./summarize";
+import { boundedReferenceLine, fitStructuredBody, referencesIn } from "./summarize";
 
 interface PrefixRow {
   cell_id: string;
@@ -368,10 +368,14 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
     // child's own records all have larger seqs, so they are still rendered after it).
     const inheritedUpto = row.inherited !== null ? (cell.spec.fork?.uptoSeq ?? 0) : 0;
     const latest = suffix[cut] === 0 ? records.findLast((_, i) => sizes[i]! > 0) : undefined;
+    const latestExcerpt = latest ? safeTail(JSON.stringify(latest.record), Math.min(1500, limits.keepRecentChars)) : undefined;
     const task = originalTask(cell.id);
     const refReserve = Math.min(1_200, Math.max(96, Math.floor(limits.summaryMaxChars / 5)));
-    const taskReserve = task ? Math.min(task.length + 1, Math.floor(Math.max(0, limits.summaryMaxChars - refReserve) / 2) + 1) : 0;
-    const summaryBudget = Math.max(256, limits.summaryMaxChars - taskReserve);
+    const availAfterRefs = Math.max(0, limits.summaryMaxChars - refReserve);
+    const taskReserve = task ? Math.min(task.length + 1, Math.floor(availAfterRefs / 2) + 1) : 0;
+    const remAfterTask = Math.max(0, availAfterRefs - taskReserve);
+    const latestReserve = latestExcerpt ? Math.min(latestExcerpt.length + 16, Math.floor(remAfterTask / 2)) : 0;
+    const summaryBudget = Math.max(256, limits.summaryMaxChars - taskReserve - latestReserve);
     return {
       cellId,
       mode,
@@ -379,7 +383,7 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
       baseCompactions: row.compactions,
       uptoSeq: cut > 0 ? records[cut - 1]!.seq : Math.max(row.summary_upto_seq, inheritedUpto),
       keptChars: suffix[cut]!,
-      ...(latest ? {latestExcerpt:safeTail(JSON.stringify(latest.record), Math.min(1500,limits.keepRecentChars))} : {}),
+      ...(latestExcerpt ? { latestExcerpt } : {}),
       charsBefore: total,
       input: { cellId, previousSummary: row.summary, messages: folded, maxChars: summaryBudget, compactions: row.compactions },
     };
@@ -415,7 +419,8 @@ export function createHydrate(deps: HydrateDeps): HydrateModule {
       const remaining = Math.max(0, available - prefix.length - (prefix ? 1 : 0));
       const latest = plan.latestExcerpt ? safeTail(plan.latestExcerpt, Math.floor(remaining / 2) - 15) : "";
       const suffix = latest ? "[latest work] " + latest : "";
-      summary = [prefix, safeTail(body, remaining - suffix.length - (suffix ? 1 : 0)), suffix, refs].filter(Boolean).join("\n").trim();
+      const bodyBudget = Math.max(0, remaining - suffix.length - (suffix ? 1 : 0));
+      summary = [prefix, fitStructuredBody(body, bodyBudget), suffix, refs].filter(Boolean).join("\n").trim();
       // The cache is lost at a compaction anyway, so the cell switches to its own, freshly built system prefix.
       const sys = buildSystem(cell);
       run(
